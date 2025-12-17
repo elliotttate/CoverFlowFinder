@@ -1354,12 +1354,12 @@ struct FileListSection: View {
     var body: some View {
         List(Array(items.enumerated()), id: \.element.id) { index, item in
             FileListRow(item: item)
+                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                 .listRowBackground(
                     selectedItems.contains(item)
                         ? Color.accentColor.opacity(0.2)
                         : Color.clear
                 )
-                .contentShape(Rectangle())
                 .onDrag {
                     NSItemProvider(object: item.url as NSURL)
                 }
@@ -1379,7 +1379,7 @@ struct FileListSection: View {
                     }
                 }
         }
-        .listStyle(.inset)
+        .listStyle(.plain)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
             return true
@@ -1465,6 +1465,9 @@ struct FileListRow: View {
                 .font(.caption)
                 .frame(width: 80, alignment: .trailing)
         }
-        .padding(.vertical, 2)
+        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+        .frame(maxWidth: .infinity)
+        .contentShape(Rectangle())
     }
 }

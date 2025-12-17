@@ -11,15 +11,24 @@ struct ContentView: View {
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var renamingItem: FileItem?
     @State private var renameText: String = ""
+    @State private var activePane: DualPaneView.Pane = .left
+
+    // The viewModel to navigate based on active pane in dual mode
+    private var activeViewModel: FileBrowserViewModel {
+        if viewModel.viewMode == .dualPane && activePane == .right {
+            return rightPaneViewModel
+        }
+        return viewModel
+    }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(viewModel: viewModel)
+            SidebarView(viewModel: activeViewModel, isDualPane: viewModel.viewMode == .dualPane)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 300)
         } detail: {
             if viewModel.viewMode == .dualPane {
                 // Dual pane mode - full width without path bar/status bar
-                DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel)
+                DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel, activePane: $activePane)
                     .frame(minWidth: 700, minHeight: 400)
             } else {
                 VStack(spacing: 0) {
@@ -148,6 +157,9 @@ struct ContentView: View {
         }
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
+        }
+        .sheet(item: $viewModel.infoItem) { item in
+            FileInfoView(item: item)
         }
     }
 }

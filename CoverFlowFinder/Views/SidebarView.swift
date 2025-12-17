@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SidebarView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
+    var isDualPane: Bool = false
     @State private var expandedSections: Set<String> = ["Favorites", "iCloud", "Locations"]
 
     var body: some View {

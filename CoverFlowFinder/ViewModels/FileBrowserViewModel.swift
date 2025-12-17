@@ -54,6 +54,9 @@ class FileBrowserViewModel: ObservableObject {
     // Debug state
     @Published var showDebug: Bool = false
 
+    // Info window state
+    @Published var infoItem: FileItem?
+
     private var cancellables = Set<AnyCancellable>()
 
     var canGoBack: Bool {
@@ -340,7 +343,7 @@ class FileBrowserViewModel: ObservableObject {
 
     func getInfo() {
         guard let item = selectedItems.first else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([item.url])
+        infoItem = item
     }
 
     func showInFinder() {

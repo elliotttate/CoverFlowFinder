@@ -4,7 +4,7 @@ import UniformTypeIdentifiers
 struct DualPaneView: View {
     @ObservedObject var leftViewModel: FileBrowserViewModel
     @ObservedObject var rightViewModel: FileBrowserViewModel
-    @State private var activePane: Pane = .left
+    @Binding var activePane: Pane
 
     enum Pane {
         case left, right
