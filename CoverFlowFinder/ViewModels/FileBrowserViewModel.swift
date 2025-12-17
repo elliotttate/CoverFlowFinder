@@ -7,6 +7,7 @@ enum ViewMode: String, CaseIterable {
     case icons = "Icons"
     case list = "List"
     case columns = "Columns"
+    case dualPane = "Dual Pane"
 
     var systemImage: String {
         switch self {
@@ -14,6 +15,7 @@ enum ViewMode: String, CaseIterable {
         case .icons: return "square.grid.2x2"
         case .list: return "list.bullet"
         case .columns: return "rectangle.split.3x1"
+        case .dualPane: return "rectangle.split.2x1"
         }
     }
 }
@@ -48,6 +50,9 @@ class FileBrowserViewModel: ObservableObject {
     // Clipboard state
     @Published var clipboardItems: [URL] = []
     @Published var clipboardOperation: ClipboardOperation = .copy
+
+    // Debug state
+    @Published var showDebug: Bool = false
 
     private var cancellables = Set<AnyCancellable>()
 

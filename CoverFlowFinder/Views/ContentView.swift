@@ -2,6 +2,7 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var viewModel = FileBrowserViewModel()
+    @StateObject private var rightPaneViewModel = FileBrowserViewModel()
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var renamingItem: FileItem?
     @State private var renameText: String = ""
@@ -11,35 +12,43 @@ struct ContentView: View {
             SidebarView(viewModel: viewModel)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 300)
         } detail: {
-            VStack(spacing: 0) {
-                // Path bar
-                PathBarView(viewModel: viewModel)
+            if viewModel.viewMode == .dualPane {
+                // Dual pane mode - full width without path bar/status bar
+                DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel)
+                    .frame(minWidth: 700, minHeight: 400)
+            } else {
+                VStack(spacing: 0) {
+                    // Path bar
+                    PathBarView(viewModel: viewModel)
 
-                Divider()
+                    Divider()
 
-                // Main content area
-                if viewModel.isLoading {
-                    ProgressView()
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if viewModel.filteredItems.isEmpty {
-                    EmptyFolderView()
-                } else {
-                    switch viewModel.viewMode {
-                    case .coverFlow:
-                        CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
-                    case .icons:
-                        IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
-                    case .list:
-                        FileListView(viewModel: viewModel, items: viewModel.filteredItems)
-                    case .columns:
-                        ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
+                    // Main content area
+                    if viewModel.isLoading {
+                        ProgressView()
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    } else if viewModel.filteredItems.isEmpty {
+                        EmptyFolderView()
+                    } else {
+                        switch viewModel.viewMode {
+                        case .coverFlow:
+                            CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
+                        case .icons:
+                            IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
+                        case .list:
+                            FileListView(viewModel: viewModel, items: viewModel.filteredItems)
+                        case .columns:
+                            ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
+                        case .dualPane:
+                            EmptyView() // Handled above
+                        }
                     }
-                }
 
-                // Status bar
-                StatusBarView(viewModel: viewModel)
+                    // Status bar
+                    StatusBarView(viewModel: viewModel)
+                }
+                .frame(minWidth: 500, minHeight: 400)
             }
-            .frame(minWidth: 500, minHeight: 400)
         }
         .toolbar {
             ToolbarItemGroup(placement: .navigation) {
@@ -66,7 +75,7 @@ struct ContentView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 180)
+                .frame(width: 220)
                 .help("Change view mode")
             }
 

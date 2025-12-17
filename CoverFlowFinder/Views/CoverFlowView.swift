@@ -49,8 +49,6 @@ struct CoverFlowView: View {
         }
     }
 
-    @State private var showDebug = false
-
     var body: some View {
         GeometryReader { geometry in
             ZStack(alignment: .topLeading) {
@@ -115,11 +113,11 @@ struct CoverFlowView: View {
                 )
             }
 
-            // Debug overlay - press D to toggle
-            if showDebug {
+            // Debug overlay
+            if viewModel.showDebug {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack {
-                        Text("DEBUG LOG (press D to hide)")
+                        Text("DEBUG LOG")
                             .font(.system(size: 10, weight: .bold))
                         Spacer()
                         Text("Loaded: \(thumbnails.count) | Pending: \(pendingThumbnails.count)")
@@ -145,10 +143,6 @@ struct CoverFlowView: View {
                 .padding(10)
             }
             }
-        }
-        .onKeyPress("d") {
-            showDebug.toggle()
-            return .handled
         }
         .onAppear {
             loadVisibleThumbnails()
@@ -263,7 +257,57 @@ struct CoverFlowView: View {
 
         log("🔄 Start: \(item.name)")
 
-        let size = CGSize(width: 200, height: 200)
+        // For image files, load directly for better quality and reliability
+        let imageExtensions = ["png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp"]
+        let ext = item.url.pathExtension.lowercased()
+
+        if imageExtensions.contains(ext) {
+            // Load image directly on background thread
+            DispatchQueue.global(qos: .userInitiated).async {
+                var resultImage: NSImage? = nil
+
+                if let image = NSImage(contentsOf: item.url) {
+                    // Resize to reasonable thumbnail size while maintaining aspect ratio
+                    let maxSize: CGFloat = 400
+                    let originalSize = image.size
+
+                    if originalSize.width > 0 && originalSize.height > 0 {
+                        let scale = min(maxSize / originalSize.width, maxSize / originalSize.height, 1.0)
+                        let newSize = NSSize(width: originalSize.width * scale, height: originalSize.height * scale)
+
+                        let resizedImage = NSImage(size: newSize)
+                        resizedImage.lockFocus()
+                        image.draw(in: NSRect(origin: .zero, size: newSize),
+                                   from: NSRect(origin: .zero, size: originalSize),
+                                   operation: .copy,
+                                   fraction: 1.0)
+                        resizedImage.unlockFocus()
+                        resultImage = resizedImage
+                    } else {
+                        resultImage = image
+                    }
+                }
+
+                DispatchQueue.main.async {
+                    self.pendingThumbnails.remove(item.url)
+                    self.pendingStartTimes.removeValue(forKey: item.url)
+
+                    if let image = resultImage {
+                        self.thumbnails[item.url] = image
+                        self.log("✅ Image: \(item.name)")
+                    } else {
+                        self.log("❌ ImageFail: \(item.name)")
+                        self.thumbnails[item.url] = item.icon
+                    }
+
+                    self.loadVisibleThumbnails()
+                }
+            }
+            return
+        }
+
+        // For non-image files, use QuickLook
+        let size = CGSize(width: 400, height: 400)
         let request = QLThumbnailGenerator.Request(
             fileAt: item.url,
             size: size,
@@ -368,6 +412,11 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     private var lastScrollTime: Date = .distantPast
     private var momentumTimer: Timer?
     private var accumulatedScroll: CGFloat = 0
+
+    // Type-ahead search
+    private var typeAheadBuffer: String = ""
+    private var typeAheadTimer: Timer?
+    private let typeAheadTimeout: TimeInterval = 1.0
 
     // Dynamic sizing based on view bounds
     private var baseCoverSize: CGFloat { min(bounds.height * 0.6, bounds.width * 0.22, 280) }
@@ -489,18 +538,41 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             // Convert NSImage to CGImage
             let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil)
 
-            // Find the image layer by searching all sublayers
+            // Find the image layer and reflection container
+            var imageLayer: CALayer?
+            var reflectionContainer: CALayer?
+
             for sublayer in coverLayer.sublayers ?? [] {
                 if sublayer.name == "imageLayer" {
-                    sublayer.contents = cgImage ?? thumbnail
-                    sublayer.contentsGravity = .resizeAspectFill
+                    imageLayer = sublayer
+                } else if sublayer.name == "reflectionContainer" {
+                    reflectionContainer = sublayer
                 }
             }
 
-            // Update reflection - it's in the last sublayer which is a container
-            if let reflectionContainer = coverLayer.sublayers?.last,
-               let reflectionImage = reflectionContainer.sublayers?.first {
-                reflectionImage.contents = cgImage ?? thumbnail
+            // Update main image
+            if let imageLayer = imageLayer {
+                imageLayer.contents = cgImage ?? thumbnail
+                imageLayer.contentsGravity = .resizeAspect
+            }
+
+            // Update reflection and fade it in
+            if let reflectionContainer = reflectionContainer {
+                // Find the reflection image layer
+                for sublayer in reflectionContainer.sublayers ?? [] {
+                    if sublayer.name == "reflectionImage" {
+                        sublayer.contents = cgImage ?? thumbnail
+                        sublayer.contentsGravity = .resizeAspect
+                    }
+                }
+
+                // Fade in the reflection smoothly if it was hidden
+                if reflectionContainer.opacity < 1.0 {
+                    CATransaction.begin()
+                    CATransaction.setAnimationDuration(0.3)
+                    reflectionContainer.opacity = 1.0
+                    CATransaction.commit()
+                }
             }
         }
     }
@@ -607,6 +679,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 
     private func createCoverLayer(for item: FileItem, at index: Int) -> CALayer {
         let thumbnail = thumbnails[item.url]
+        let hasThumbnail = thumbnail != nil
         let coverSize = getCoverSize(for: thumbnail)
         let coverWidth = coverSize.width
         let coverHeight = coverSize.height
@@ -615,6 +688,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         container.setValue(index, forKey: "itemIndex")
         container.setValue(coverWidth, forKey: "coverWidth")
         container.setValue(coverHeight, forKey: "coverHeight")
+        container.backgroundColor = NSColor.clear.cgColor
         // CRITICAL: Set bounds so anchorPoint works correctly for rotation
         container.bounds = CGRect(x: 0, y: 0, width: coverWidth, height: coverHeight)
         container.anchorPoint = CGPoint(x: 0.5, y: 0.5)
@@ -624,6 +698,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         imageLayer.name = "imageLayer"
         imageLayer.frame = CGRect(x: 0, y: 0, width: coverWidth, height: coverHeight)
         imageLayer.masksToBounds = true
+        imageLayer.backgroundColor = NSColor.clear.cgColor
 
         if let thumbnail = thumbnail {
             // Convert NSImage to CGImage for CALayer
@@ -632,7 +707,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             } else {
                 imageLayer.contents = thumbnail
             }
-            imageLayer.contentsGravity = .resizeAspectFill
+            imageLayer.contentsGravity = .resizeAspect
         } else {
             // Always show file icon as placeholder
             let icon = item.icon
@@ -641,19 +716,25 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             } else {
                 imageLayer.contents = icon
             }
-            imageLayer.contentsGravity = .center
+            imageLayer.contentsGravity = .resizeAspect
         }
         container.addSublayer(imageLayer)
 
-        // Reflection
+        // Reflection - only show when we have a real thumbnail
         let reflectionHeight = coverHeight * 0.4
         let reflectionContainer = CALayer()
+        reflectionContainer.name = "reflectionContainer"
         reflectionContainer.frame = CGRect(x: 0, y: -reflectionHeight - 4, width: coverWidth, height: reflectionHeight)
         reflectionContainer.masksToBounds = true
+        reflectionContainer.backgroundColor = NSColor.clear.cgColor
+        // Hide reflection until thumbnail is loaded to avoid flash
+        reflectionContainer.opacity = hasThumbnail ? 1.0 : 0.0
 
         let reflectionImage = CALayer()
+        reflectionImage.name = "reflectionImage"
         reflectionImage.frame = CGRect(x: 0, y: reflectionHeight - coverHeight, width: coverWidth, height: coverHeight)
         reflectionImage.masksToBounds = true
+        reflectionImage.backgroundColor = NSColor.clear.cgColor
         reflectionImage.transform = CATransform3DMakeScale(1, -1, 1)
 
         if let thumbnail = thumbnail {
@@ -662,15 +743,10 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             } else {
                 reflectionImage.contents = thumbnail
             }
-            reflectionImage.contentsGravity = .resizeAspectFill
+            reflectionImage.contentsGravity = .resizeAspect
         } else {
-            let icon = item.icon
-            if let cgImage = icon.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-                reflectionImage.contents = cgImage
-            } else {
-                reflectionImage.contents = icon
-            }
-            reflectionImage.contentsGravity = .center
+            // Don't show icon in reflection - leave empty
+            reflectionImage.contents = nil
         }
         reflectionContainer.addSublayer(reflectionImage)
 
@@ -678,11 +754,11 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         let reflectionMask = CAGradientLayer()
         reflectionMask.frame = reflectionContainer.bounds
         reflectionMask.colors = [
-            NSColor.white.withAlphaComponent(0.3).cgColor,
+            NSColor.white.withAlphaComponent(0.25).cgColor,
             NSColor.clear.cgColor
         ]
         reflectionMask.startPoint = CGPoint(x: 0.5, y: 1)
-        reflectionMask.endPoint = CGPoint(x: 0.5, y: 0.3)
+        reflectionMask.endPoint = CGPoint(x: 0.5, y: 0.2)
         reflectionContainer.mask = reflectionMask
 
         container.addSublayer(reflectionContainer)
@@ -1062,13 +1138,53 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             onOpen?(selectedIndex)
         case 49: // Space - Quick Look
             toggleQuickLook()
+        case 51: // Delete/Backspace - remove last character from type-ahead buffer
+            if !typeAheadBuffer.isEmpty {
+                typeAheadBuffer.removeLast()
+                resetTypeAheadTimer()
+                if !typeAheadBuffer.isEmpty {
+                    jumpToMatch()
+                }
+            }
+        case 53: // Escape - clear type-ahead buffer
+            typeAheadBuffer = ""
+            typeAheadTimer?.invalidate()
         default:
+            // Handle type-ahead search for printable characters
+            if let characters = event.characters, !characters.isEmpty {
+                let char = characters.first!
+                if char.isLetter || char.isNumber || char == " " || char == "." || char == "-" || char == "_" {
+                    typeAheadBuffer.append(char)
+                    resetTypeAheadTimer()
+                    jumpToMatch()
+                    return
+                }
+            }
             super.keyDown(with: event)
+        }
+    }
+
+    private func resetTypeAheadTimer() {
+        typeAheadTimer?.invalidate()
+        typeAheadTimer = Timer.scheduledTimer(withTimeInterval: typeAheadTimeout, repeats: false) { [weak self] _ in
+            self?.typeAheadBuffer = ""
+        }
+    }
+
+    private func jumpToMatch() {
+        guard !typeAheadBuffer.isEmpty else { return }
+
+        let searchString = typeAheadBuffer.lowercased()
+
+        // Find the first item that starts with the typed string
+        if let matchIndex = items.firstIndex(where: { $0.name.lowercased().hasPrefix(searchString) }) {
+            onSelect?(matchIndex)
         }
     }
 
     deinit {
         momentumTimer?.invalidate()
+        typeAheadTimer?.invalidate()
     }
 }
 

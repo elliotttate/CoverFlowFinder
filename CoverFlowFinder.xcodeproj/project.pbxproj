@@ -17,6 +17,7 @@
 		2A0000010000000000000008 /* FileItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000008 /* FileItem.swift */; };
 		2A0000010000000000000009 /* FileBrowserViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000009 /* FileBrowserViewModel.swift */; };
 		2A0000010000000000000010 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000010 /* Assets.xcassets */; };
+		2A0000010000000000000013 /* DualPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* DualPaneView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -32,6 +33,7 @@
 		2A0000020000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		2A0000020000000000000011 /* CoverFlowFinder.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CoverFlowFinder.entitlements; sourceTree = "<group>"; };
 		2A0000020000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		2A0000020000000000000013 /* DualPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DualPaneView.swift; sourceTree = "<group>"; };
 		2A0000030000000000000001 /* CoverFlowFinder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoverFlowFinder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -85,6 +87,7 @@
 				2A0000020000000000000005 /* IconGridView.swift */,
 				2A0000020000000000000006 /* FileListView.swift */,
 				2A0000020000000000000007 /* ColumnView.swift */,
+				2A0000020000000000000013 /* DualPaneView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -183,6 +186,7 @@
 				2A0000010000000000000007 /* ColumnView.swift in Sources */,
 				2A0000010000000000000008 /* FileItem.swift in Sources */,
 				2A0000010000000000000009 /* FileBrowserViewModel.swift in Sources */,
+				2A0000010000000000000013 /* DualPaneView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

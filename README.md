@@ -9,11 +9,15 @@ https://github.com/elliotttate/CoverFlowFinder/releases/download/v1.0.0/CoverFlo
 ## Features
 
 - **Cover Flow View** - Browse your files with the iconic 3D carousel effect, complete with smooth animations and reflections
-- **Multiple View Modes** - Switch between Cover Flow, Icons, List, and Column views just like classic Finder
+- **Multiple View Modes** - Switch between Cover Flow, Icons, List, Columns, and Dual Pane views
+- **Dual Pane Mode** - Two independent file browsers side by side for easy file management
 - **Quick Look Integration** - Press Space to preview any file with Quick Look
 - **Full File Browser** - Navigate your entire file system with a familiar Finder-like interface
 - **Sidebar Navigation** - Quick access to Favorites, iCloud, and mounted volumes
 - **Sorting & Search** - Sort files by name, date, size, or kind; search to filter files instantly
+- **Clipboard Operations** - Copy, Cut, Paste, and Duplicate files with keyboard shortcuts
+- **Context Menus** - Right-click for quick access to file operations
+- **Type-Ahead Search** - Start typing to jump to matching files instantly
 
 ## Requirements
 
@@ -46,9 +50,16 @@ Download the latest DMG from the [Releases](https://github.com/elliotttate/Cover
 |----------|--------|
 | Space | Quick Look preview |
 | Return | Open selected item |
-| ← → | Navigate covers |
+| ← → ↑ ↓ | Navigate items |
+| ⌘C | Copy |
+| ⌘X | Cut |
+| ⌘V | Paste |
+| ⌘D | Duplicate |
+| ⌘⌫ | Move to Trash |
 | ⌘[ | Go back |
 | ⌘] | Go forward |
+| ⌘⇧N | New Folder |
+| A-Z, 0-9 | Type-ahead search |
 
 ### View Modes
 Use the toolbar buttons or View menu to switch between:
@@ -56,6 +67,7 @@ Use the toolbar buttons or View menu to switch between:
 - Icons
 - List
 - Columns
+- Dual Pane
 
 ## Technical Details
 

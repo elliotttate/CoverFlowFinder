@@ -133,6 +133,14 @@ struct CoverFlowFinderApp: App {
                 }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
             }
+
+            // Help menu
+            CommandGroup(replacing: .help) {
+                Button("Toggle Debug Overlay") {
+                    viewModel?.showDebug.toggle()
+                }
+                .keyboardShortcut("d", modifiers: [.command, .option])
+            }
         }
     }
 }
