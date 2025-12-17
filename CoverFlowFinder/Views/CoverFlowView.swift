@@ -12,6 +12,8 @@ struct CoverFlowView: View {
     @State private var pendingStartTimes: [URL: Date] = [:]
     @State private var retryTimer: Timer?
     @State private var debugLog: [String] = []
+    @State private var renamingItem: FileItem?
+    @State private var rightClickedIndex: Int?
 
     private let visibleRange = 12
     private let maxConcurrentThumbnails = 8
@@ -67,6 +69,9 @@ struct CoverFlowView: View {
                         if index < items.count {
                             viewModel.openItem(items[index])
                         }
+                    },
+                    onRightClick: { index in
+                        rightClickedIndex = index
                     }
                 )
                 .frame(height: max(250, geometry.size.height * 0.45))
@@ -105,7 +110,8 @@ struct CoverFlowView: View {
                     },
                     onOpen: { item in
                         viewModel.openItem(item)
-                    }
+                    },
+                    viewModel: viewModel
                 )
             }
 
@@ -163,6 +169,9 @@ struct CoverFlowView: View {
         }
         .onChange(of: viewModel.coverFlowSelectedIndex) { _, _ in
             loadVisibleThumbnails()
+        }
+        .sheet(item: $renamingItem) { item in
+            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
         }
     }
 
@@ -294,11 +303,15 @@ struct CoverFlowContainer: NSViewRepresentable {
     let thumbnailCount: Int  // Explicit count to force SwiftUI updates
     let onSelect: (Int) -> Void
     let onOpen: (Int) -> Void
+    let onRightClick: (Int) -> Void
 
     func makeNSView(context: Context) -> CoverFlowNSView {
         let view = CoverFlowNSView()
         view.onSelect = onSelect
         view.onOpen = onOpen
+        view.onRightClick = { index, _ in
+            onRightClick(index)
+        }
         view.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
         return view
     }
@@ -306,13 +319,20 @@ struct CoverFlowContainer: NSViewRepresentable {
     func updateNSView(_ nsView: CoverFlowNSView, context: Context) {
         nsView.onSelect = onSelect
         nsView.onOpen = onOpen
+        nsView.onRightClick = { index, _ in
+            onRightClick(index)
+        }
         nsView.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
+
+        // Request focus when view updates
+        nsView.requestFocus()
     }
 }
 
 class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     var onSelect: ((Int) -> Void)?
     var onOpen: ((Int) -> Void)?
+    var onRightClick: ((Int, NSPoint) -> Void)?
 
     private var items: [FileItem] = []
     private var thumbnails: [URL: NSImage] = [:]
@@ -416,6 +436,22 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         gradientLayer.frame = bounds
         gradientLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         layer?.addSublayer(gradientLayer)
+
+        // Add right-click gesture recognizer as backup
+        let rightClickGesture = NSClickGestureRecognizer(target: self, action: #selector(handleRightClick(_:)))
+        rightClickGesture.buttonMask = 0x2 // Right mouse button
+        addGestureRecognizer(rightClickGesture)
+    }
+
+    @objc private func handleRightClick(_ gesture: NSClickGestureRecognizer) {
+        nativeLog("Right-click gesture triggered!")
+        let location = gesture.location(in: self)
+        let index = hitTestCover(at: location) ?? selectedIndex
+        onSelect?(index)
+
+        // Create and show menu
+        let menu = createContextMenu(for: index)
+        menu.popUp(positioning: nil, at: location, in: self)
     }
 
     func updateItems(_ items: [FileItem], thumbnails: [URL: NSImage], selectedIndex: Int) {
@@ -719,6 +755,13 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
 
+        // Check for control+click (right-click equivalent)
+        if event.modifierFlags.contains(.control) {
+            nativeLog("Control+click detected, showing context menu")
+            handleContextClick(with: event)
+            return
+        }
+
         let location = convert(event.locationInWindow, from: nil)
         if let index = hitTestCover(at: location) {
             let now = Date()
@@ -733,6 +776,127 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
                 lastClickIndex = index
             }
         }
+    }
+
+    override func rightMouseDown(with event: NSEvent) {
+        nativeLog("rightMouseDown called!")
+        window?.makeFirstResponder(self)
+        handleContextClick(with: event)
+    }
+
+    private func handleContextClick(with event: NSEvent) {
+        let location = convert(event.locationInWindow, from: nil)
+        let index = hitTestCover(at: location) ?? selectedIndex
+        nativeLog("Context click at index \(index)")
+
+        // Select the item first
+        onSelect?(index)
+
+        // Show native context menu
+        showContextMenu(for: index, with: event)
+    }
+
+    override func menu(for event: NSEvent) -> NSMenu? {
+        let location = convert(event.locationInWindow, from: nil)
+        let index = hitTestCover(at: location) ?? selectedIndex
+        return createContextMenu(for: index)
+    }
+
+    private func showContextMenu(for index: Int, with event: NSEvent) {
+        guard index < items.count else { return }
+
+        let menu = createContextMenu(for: index)
+        let location = convert(event.locationInWindow, from: nil)
+        menu.popUp(positioning: nil, at: location, in: self)
+    }
+
+    private func createContextMenu(for index: Int) -> NSMenu {
+        let menu = NSMenu()
+
+        let openItem = NSMenuItem(title: "Open", action: #selector(menuOpen(_:)), keyEquivalent: "")
+        openItem.target = self
+        openItem.representedObject = index
+        menu.addItem(openItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let copyItem = NSMenuItem(title: "Copy", action: #selector(menuCopy(_:)), keyEquivalent: "")
+        copyItem.target = self
+        menu.addItem(copyItem)
+
+        let cutItem = NSMenuItem(title: "Cut", action: #selector(menuCut(_:)), keyEquivalent: "")
+        cutItem.target = self
+        menu.addItem(cutItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let trashItem = NSMenuItem(title: "Move to Trash", action: #selector(menuTrash(_:)), keyEquivalent: "")
+        trashItem.target = self
+        menu.addItem(trashItem)
+
+        let finderItem = NSMenuItem(title: "Show in Finder", action: #selector(menuShowInFinder(_:)), keyEquivalent: "")
+        finderItem.target = self
+        menu.addItem(finderItem)
+
+        return menu
+    }
+
+    @objc private func menuOpen(_ sender: NSMenuItem) {
+        onOpen?(selectedIndex)
+    }
+
+    @objc private func menuCopy(_ sender: NSMenuItem) {
+        if selectedIndex < items.count {
+            let item = items[selectedIndex]
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
+            pasteboard.writeObjects([item.url as NSURL])
+        }
+    }
+
+    @objc private func menuCut(_ sender: NSMenuItem) {
+        // Cut is copy + mark for move (handled by paste)
+        menuCopy(sender)
+    }
+
+    @objc private func menuTrash(_ sender: NSMenuItem) {
+        if selectedIndex < items.count {
+            let item = items[selectedIndex]
+            try? FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
+        }
+    }
+
+    @objc private func menuShowInFinder(_ sender: NSMenuItem) {
+        if selectedIndex < items.count {
+            let item = items[selectedIndex]
+            NSWorkspace.shared.activateFileViewerSelecting([item.url])
+        }
+    }
+
+    // Make sure we become first responder when view appears and on any click
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        requestFocus()
+    }
+
+    func requestFocus() {
+        guard let window = window else { return }
+        // Only request focus if we're not already the first responder
+        if window.firstResponder !== self {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                guard let self = self, let window = self.window else { return }
+                window.makeFirstResponder(self)
+            }
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        // Capture all clicks in this view
+        let result = super.hitTest(point)
+        if result == self || result?.isDescendant(of: self) == true {
+            return self
+        }
+        return result
     }
 
     private func hitTestCover(at point: NSPoint) -> Int? {
@@ -915,6 +1079,8 @@ struct FileListSection: View {
     let selectedItems: Set<FileItem>
     let onSelect: (FileItem, Int) -> Void
     let onOpen: (FileItem) -> Void
+    @ObservedObject var viewModel: FileBrowserViewModel
+    @State private var renamingItem: FileItem?
 
     var body: some View {
         List(Array(items.enumerated()), id: \.element.id) { index, item in
@@ -935,8 +1101,16 @@ struct FileListSection: View {
                         onSelect(item, index)
                     }
                 )
+                .contextMenu {
+                    FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                        renamingItem = item
+                    }
+                }
         }
         .listStyle(.inset)
+        .sheet(item: $renamingItem) { item in
+            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
+        }
     }
 }
 
