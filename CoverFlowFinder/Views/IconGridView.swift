@@ -14,39 +14,49 @@ struct IconGridView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            ScrollView {
-                LazyVGrid(columns: columns, spacing: 24) {
-                    ForEach(items) { item in
-                        IconGridItem(
-                            item: item,
-                            isSelected: viewModel.selectedItems.contains(item)
-                        )
-                        .onDrag {
-                            NSItemProvider(object: item.url as NSURL)
-                        }
-                        .instantTap(
-                            id: item.id,
-                            onSingleClick: {
-                                viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
-                            },
-                            onDoubleClick: {
-                                viewModel.openItem(item)
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 24) {
+                        ForEach(items) { item in
+                            IconGridItem(
+                                item: item,
+                                isSelected: viewModel.selectedItems.contains(item)
+                            )
+                            .id(item.id)
+                            .onDrag {
+                                NSItemProvider(object: item.url as NSURL)
                             }
-                        )
-                        .contextMenu {
-                            FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                                renamingItem = item
+                            .instantTap(
+                                id: item.id,
+                                onSingleClick: {
+                                    viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                                },
+                                onDoubleClick: {
+                                    viewModel.openItem(item)
+                                }
+                            )
+                            .contextMenu {
+                                FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                                    renamingItem = item
+                                }
                             }
                         }
                     }
+                    .padding(20)
                 }
-                .padding(20)
-            }
-            .onAppear {
-                updateColumnCount(width: geometry.size.width)
-            }
-            .onChange(of: geometry.size.width) { _, newWidth in
-                updateColumnCount(width: newWidth)
+                .onAppear {
+                    updateColumnCount(width: geometry.size.width)
+                }
+                .onChange(of: geometry.size.width) { _, newWidth in
+                    updateColumnCount(width: newWidth)
+                }
+                .onChange(of: viewModel.selectedItems) { _, newSelection in
+                    if let firstSelected = newSelection.first {
+                        withAnimation {
+                            scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                        }
+                    }
+                }
             }
         }
         .background(QuickLookHost())

@@ -19,45 +19,55 @@ struct FileListView: View {
             Divider()
 
             // File list - fills remaining space
-            List(selection: Binding(
-                get: { Set(viewModel.selectedItems.map { $0.id }) },
-                set: { ids in
-                    viewModel.selectedItems = Set(sortedItems.filter { ids.contains($0.id) })
-                }
-            )) {
-                ForEach(sortedItems) { item in
-                    FileListRowView(
-                        item: item,
-                        isSelected: viewModel.selectedItems.contains(item),
-                        columnConfig: columnConfig
-                    )
-                    .tag(item.id)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                    .onDrag {
-                        NSItemProvider(object: item.url as NSURL)
+            ScrollViewReader { scrollProxy in
+                List(selection: Binding(
+                    get: { Set(viewModel.selectedItems.map { $0.id }) },
+                    set: { ids in
+                        viewModel.selectedItems = Set(sortedItems.filter { ids.contains($0.id) })
                     }
-                    .instantTap(
-                        id: item.id,
-                        onSingleClick: {
-                            viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
-                        },
-                        onDoubleClick: {
-                            viewModel.openItem(item)
+                )) {
+                    ForEach(sortedItems) { item in
+                        FileListRowView(
+                            item: item,
+                            isSelected: viewModel.selectedItems.contains(item),
+                            columnConfig: columnConfig
+                        )
+                        .tag(item.id)
+                        .id(item.id)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                        .onDrag {
+                            NSItemProvider(object: item.url as NSURL)
                         }
-                    )
-                    .contextMenu {
-                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                            renamingItem = item
+                        .instantTap(
+                            id: item.id,
+                            onSingleClick: {
+                                viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                            },
+                            onDoubleClick: {
+                                viewModel.openItem(item)
+                            }
+                        )
+                        .contextMenu {
+                            FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                                renamingItem = item
+                            }
+                        }
+                    }
+                }
+                .listStyle(.inset(alternatesRowBackgrounds: true))
+                .scrollContentBackground(.visible)
+                .frame(maxHeight: .infinity)
+                .layoutPriority(1)
+                .onChange(of: viewModel.selectedItems) { _, newSelection in
+                    if let firstSelected = newSelection.first {
+                        withAnimation {
+                            scrollProxy.scrollTo(firstSelected.id, anchor: .center)
                         }
                     }
                 }
             }
-            .listStyle(.inset(alternatesRowBackgrounds: true))
-            .scrollContentBackground(.visible)
-            .frame(maxHeight: .infinity)
-            .layoutPriority(1)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(QuickLookHost())

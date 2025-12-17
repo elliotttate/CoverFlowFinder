@@ -51,6 +51,11 @@ class FileBrowserViewModel: ObservableObject {
     @Published var historyIndex: Int = -1
     @Published var coverFlowSelectedIndex: Int = 0
 
+    // Track the folder we entered so we can select it when going back
+    private var enteredFolderURL: URL?
+    // URL to select after loading (used when going back)
+    private var pendingSelectionURL: URL?
+
     // Clipboard state
     @Published var clipboardItems: [URL] = []
     @Published var clipboardOperation: ClipboardOperation = .copy
@@ -117,7 +122,18 @@ class FileBrowserViewModel: ObservableObject {
                 DispatchQueue.main.async {
                     self.items = fileItems
                     self.isLoading = false
-                    self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, fileItems.count - 1))
+
+                    // If we have a pending selection (from going back), select that item
+                    if let pendingURL = self.pendingSelectionURL,
+                       let item = fileItems.first(where: { $0.url == pendingURL }) {
+                        self.selectedItems = [item]
+                        if let index = fileItems.firstIndex(of: item) {
+                            self.coverFlowSelectedIndex = index
+                        }
+                        self.pendingSelectionURL = nil
+                    } else {
+                        self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, fileItems.count - 1))
+                    }
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -146,6 +162,9 @@ class FileBrowserViewModel: ObservableObject {
 
     func goBack() {
         guard canGoBack else { return }
+        // Remember the folder we're leaving so we can select it after going back
+        pendingSelectionURL = enteredFolderURL
+        enteredFolderURL = nil
         historyIndex -= 1
         currentPath = navigationHistory[historyIndex]
         selectedItems.removeAll()
@@ -164,6 +183,7 @@ class FileBrowserViewModel: ObservableObject {
 
     func openItem(_ item: FileItem) {
         if item.isDirectory {
+            enteredFolderURL = item.url
             navigateTo(item.url)
         } else {
             NSWorkspace.shared.open(item.url)
