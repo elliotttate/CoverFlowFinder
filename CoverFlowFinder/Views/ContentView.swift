@@ -84,41 +84,8 @@ struct ContentView: View {
                         .frame(minWidth: 700, minHeight: 400)
                         .id("dualpane-\(viewModel.currentPath.path)-\(selectedTabId)")
                 } else {
-                    VStack(spacing: 0) {
-                        // Path bar
-                        PathBarView(viewModel: viewModel)
-
-                        Divider()
-
-                        // Main content area
-                        if viewModel.isLoading {
-                            ProgressView()
-                                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        } else if viewModel.filteredItems.isEmpty {
-                            EmptyFolderView()
-                        } else {
-                            switch viewModel.viewMode {
-                            case .coverFlow:
-                                CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
-                                    .id("coverflow-\(viewModel.currentPath.path)-\(selectedTabId)")
-                            case .icons:
-                                IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
-                                    .id("icons-\(viewModel.currentPath.path)-\(selectedTabId)")
-                            case .list:
-                                FileListView(viewModel: viewModel, items: viewModel.filteredItems)
-                                    .id("list-\(viewModel.currentPath.path)-\(selectedTabId)")
-                            case .columns:
-                                ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
-                                    .id("columns-\(viewModel.currentPath.path)-\(selectedTabId)")
-                            case .dualPane:
-                                EmptyView() // Handled above
-                            }
-                        }
-
-                        // Status bar
-                        StatusBarView(viewModel: viewModel)
-                    }
-                    .frame(minWidth: 500, minHeight: 400)
+                    // Use wrapper view to properly observe viewModel changes
+                    TabContentWrapper(viewModel: viewModel, selectedTabId: selectedTabId)
                 }
             }
         }
@@ -474,6 +441,50 @@ struct EmptyFolderView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
+    }
+}
+
+// Wrapper view that properly observes the viewModel via @ObservedObject
+struct TabContentWrapper: View {
+    @ObservedObject var viewModel: FileBrowserViewModel
+    let selectedTabId: UUID
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Path bar
+            PathBarView(viewModel: viewModel)
+
+            Divider()
+
+            // Main content area
+            if viewModel.isLoading {
+                ProgressView()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else if viewModel.filteredItems.isEmpty {
+                EmptyFolderView()
+            } else {
+                switch viewModel.viewMode {
+                case .coverFlow:
+                    CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
+                        .id("coverflow-\(viewModel.currentPath.path)-\(selectedTabId)")
+                case .icons:
+                    IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
+                        .id("icons-\(viewModel.currentPath.path)-\(selectedTabId)")
+                case .list:
+                    FileListView(viewModel: viewModel, items: viewModel.filteredItems)
+                        .id("list-\(viewModel.currentPath.path)-\(selectedTabId)")
+                case .columns:
+                    ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
+                        .id("columns-\(viewModel.currentPath.path)-\(selectedTabId)")
+                case .dualPane:
+                    EmptyView() // Handled in parent
+                }
+            }
+
+            // Status bar
+            StatusBarView(viewModel: viewModel)
+        }
+        .frame(minWidth: 500, minHeight: 400)
     }
 }
 
