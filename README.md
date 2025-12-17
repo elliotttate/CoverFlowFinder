@@ -2,6 +2,8 @@
 
 A beautiful macOS file browser that brings back the classic Cover Flow view from older versions of Finder.
 
+https://github.com/elliotttate/CoverFlowFinder/releases/download/v1.0.0/CoverFlowFinder-demo.mp4
+
 ![CoverFlowFinder Screenshot](screenshots/coverflow-apps.png)
 
 ## Features
