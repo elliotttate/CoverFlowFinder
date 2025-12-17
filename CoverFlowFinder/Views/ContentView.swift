@@ -1,17 +1,50 @@
 import SwiftUI
 
 struct ContentView: View {
-    @StateObject private var viewModel = FileBrowserViewModel()
+    // Tab management
+    @State private var tabs: [BrowserTab] = [BrowserTab()]
+    @State private var selectedTabId: UUID = UUID()
+
+    // Right pane for dual pane mode (shared across tabs for simplicity)
     @StateObject private var rightPaneViewModel: FileBrowserViewModel = {
-        // Start right pane at Desktop for variety
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser
         return FileBrowserViewModel(initialPath: desktop)
     }()
+
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var renamingItem: FileItem?
     @State private var renameText: String = ""
     @State private var activePane: DualPaneView.Pane = .left
+
+    // Current tab's viewModel
+    private var viewModel: FileBrowserViewModel {
+        tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
+    }
+
+    // Binding to current viewModel's viewMode
+    private var viewModeBinding: Binding<ViewMode> {
+        Binding(
+            get: { viewModel.viewMode },
+            set: { viewModel.viewMode = $0 }
+        )
+    }
+
+    // Binding to current viewModel's searchText
+    private var searchTextBinding: Binding<String> {
+        Binding(
+            get: { viewModel.searchText },
+            set: { viewModel.searchText = $0 }
+        )
+    }
+
+    // Binding to current viewModel's infoItem
+    private var infoItemBinding: Binding<FileItem?> {
+        Binding(
+            get: { viewModel.infoItem },
+            set: { viewModel.infoItem = $0 }
+        )
+    }
 
     // The viewModel to navigate based on active pane in dual mode
     private var activeViewModel: FileBrowserViewModel {
@@ -21,52 +54,72 @@ struct ContentView: View {
         return viewModel
     }
 
+    // Initialize selectedTabId to first tab
+    init() {
+        let initialTab = BrowserTab()
+        _tabs = State(initialValue: [initialTab])
+        _selectedTabId = State(initialValue: initialTab.id)
+    }
+
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView(viewModel: activeViewModel, isDualPane: viewModel.viewMode == .dualPane)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 300)
         } detail: {
-            if viewModel.viewMode == .dualPane {
-                // Dual pane mode - full width without path bar/status bar
-                DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel, activePane: $activePane)
-                    .frame(minWidth: 700, minHeight: 400)
-                    .id("dualpane-\(viewModel.currentPath.path)")
-            } else {
-                VStack(spacing: 0) {
-                    // Path bar
-                    PathBarView(viewModel: viewModel)
-
+            VStack(spacing: 0) {
+                // Tab bar (show when more than 1 tab or always for discoverability)
+                if tabs.count > 1 {
+                    TabBarView(
+                        tabs: $tabs,
+                        selectedTabId: $selectedTabId,
+                        onNewTab: addNewTab,
+                        onCloseTab: closeTab
+                    )
                     Divider()
-
-                    // Main content area
-                    if viewModel.isLoading {
-                        ProgressView()
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else if viewModel.filteredItems.isEmpty {
-                        EmptyFolderView()
-                    } else {
-                        switch viewModel.viewMode {
-                        case .coverFlow:
-                            CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
-                                .id("coverflow-\(viewModel.currentPath.path)")
-                        case .icons:
-                            IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
-                                .id("icons-\(viewModel.currentPath.path)")
-                        case .list:
-                            FileListView(viewModel: viewModel, items: viewModel.filteredItems)
-                                .id("list-\(viewModel.currentPath.path)")
-                        case .columns:
-                            ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
-                                .id("columns-\(viewModel.currentPath.path)")
-                        case .dualPane:
-                            EmptyView() // Handled above
-                        }
-                    }
-
-                    // Status bar
-                    StatusBarView(viewModel: viewModel)
                 }
-                .frame(minWidth: 500, minHeight: 400)
+
+                if viewModel.viewMode == .dualPane {
+                    // Dual pane mode - full width without path bar/status bar
+                    DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel, activePane: $activePane)
+                        .frame(minWidth: 700, minHeight: 400)
+                        .id("dualpane-\(viewModel.currentPath.path)-\(selectedTabId)")
+                } else {
+                    VStack(spacing: 0) {
+                        // Path bar
+                        PathBarView(viewModel: viewModel)
+
+                        Divider()
+
+                        // Main content area
+                        if viewModel.isLoading {
+                            ProgressView()
+                                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        } else if viewModel.filteredItems.isEmpty {
+                            EmptyFolderView()
+                        } else {
+                            switch viewModel.viewMode {
+                            case .coverFlow:
+                                CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
+                                    .id("coverflow-\(viewModel.currentPath.path)-\(selectedTabId)")
+                            case .icons:
+                                IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
+                                    .id("icons-\(viewModel.currentPath.path)-\(selectedTabId)")
+                            case .list:
+                                FileListView(viewModel: viewModel, items: viewModel.filteredItems)
+                                    .id("list-\(viewModel.currentPath.path)-\(selectedTabId)")
+                            case .columns:
+                                ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
+                                    .id("columns-\(viewModel.currentPath.path)-\(selectedTabId)")
+                            case .dualPane:
+                                EmptyView() // Handled above
+                            }
+                        }
+
+                        // Status bar
+                        StatusBarView(viewModel: viewModel)
+                    }
+                    .frame(minWidth: 500, minHeight: 400)
+                }
             }
         }
         .toolbar {
@@ -87,7 +140,7 @@ struct ContentView: View {
 
             ToolbarItem(placement: .principal) {
                 // View mode picker
-                Picker("View", selection: $viewModel.viewMode) {
+                Picker("View", selection: viewModeBinding) {
                     ForEach(ViewMode.allCases, id: \.self) { mode in
                         Image(systemName: mode.systemImage)
                             .tag(mode)
@@ -149,7 +202,7 @@ struct ContentView: View {
                 .help("Actions")
 
                 // Search field
-                TextField("Search", text: $viewModel.searchText)
+                TextField("Search", text: searchTextBinding)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 180)
             }
@@ -163,9 +216,56 @@ struct ContentView: View {
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
         }
-        .sheet(item: $viewModel.infoItem) { item in
+        .sheet(item: infoItemBinding) { (item: FileItem) in
             FileInfoView(item: item)
         }
+        // Tab notifications from menu commands
+        .onReceive(NotificationCenter.default.publisher(for: .newTab)) { _ in
+            addNewTab()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .closeTab)) { _ in
+            closeTab(selectedTabId)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .nextTab)) { _ in
+            selectNextTab()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .previousTab)) { _ in
+            selectPreviousTab()
+        }
+    }
+
+    // MARK: - Tab Management
+
+    private func addNewTab() {
+        let newTab = BrowserTab(initialPath: viewModel.currentPath)
+        tabs.append(newTab)
+        selectedTabId = newTab.id
+    }
+
+    private func closeTab(_ tabId: UUID) {
+        guard tabs.count > 1 else { return }
+
+        if let index = tabs.firstIndex(where: { $0.id == tabId }) {
+            tabs.remove(at: index)
+
+            // If we closed the selected tab, select an adjacent one
+            if selectedTabId == tabId {
+                let newIndex = min(index, tabs.count - 1)
+                selectedTabId = tabs[newIndex].id
+            }
+        }
+    }
+
+    private func selectNextTab() {
+        guard let currentIndex = tabs.firstIndex(where: { $0.id == selectedTabId }) else { return }
+        let nextIndex = (currentIndex + 1) % tabs.count
+        selectedTabId = tabs[nextIndex].id
+    }
+
+    private func selectPreviousTab() {
+        guard let currentIndex = tabs.firstIndex(where: { $0.id == selectedTabId }) else { return }
+        let prevIndex = currentIndex == 0 ? tabs.count - 1 : currentIndex - 1
+        selectedTabId = tabs[prevIndex].id
     }
 }
 
@@ -387,6 +487,14 @@ extension FocusedValues {
         get { self[ViewModelKey.self] }
         set { self[ViewModelKey.self] = newValue }
     }
+}
+
+// Tab notification names
+extension Notification.Name {
+    static let newTab = Notification.Name("newTab")
+    static let closeTab = Notification.Name("closeTab")
+    static let nextTab = Notification.Name("nextTab")
+    static let previousTab = Notification.Name("previousTab")
 }
 
 #Preview {

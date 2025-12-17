@@ -16,12 +16,37 @@ struct CoverFlowFinderApp: App {
 
             // File menu commands
             CommandGroup(after: .newItem) {
+                Button("New Tab") {
+                    NotificationCenter.default.post(name: .newTab, object: nil)
+                }
+                .keyboardShortcut("t", modifiers: .command)
+
+                Button("Close Tab") {
+                    NotificationCenter.default.post(name: .closeTab, object: nil)
+                }
+                .keyboardShortcut("w", modifiers: .command)
+
+                Divider()
+
                 Button("New Folder") {
                     viewModel?.createNewFolder()
                 }
                 .keyboardShortcut("n", modifiers: [.command, .shift])
 
                 Divider()
+            }
+
+            // Window menu - tab switching
+            CommandGroup(after: .windowList) {
+                Button("Show Next Tab") {
+                    NotificationCenter.default.post(name: .nextTab, object: nil)
+                }
+                .keyboardShortcut("]", modifiers: [.command, .shift])
+
+                Button("Show Previous Tab") {
+                    NotificationCenter.default.post(name: .previousTab, object: nil)
+                }
+                .keyboardShortcut("[", modifiers: [.command, .shift])
             }
 
             // Edit menu commands
