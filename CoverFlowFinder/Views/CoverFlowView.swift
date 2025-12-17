@@ -228,9 +228,10 @@ struct CoverFlowView: View {
 
     private func loadVisibleThumbnails() {
         guard !items.isEmpty else { return }
-        let selected = viewModel.coverFlowSelectedIndex
+        let selected = min(max(0, viewModel.coverFlowSelectedIndex), items.count - 1)
         let start = max(0, selected - visibleRange)
         let end = min(items.count - 1, selected + visibleRange)
+        guard start <= end else { return }
 
         // Check for timed out requests and clear them
         let now = Date()
@@ -413,9 +414,6 @@ struct CoverFlowContainer: NSViewRepresentable {
         }
         nsView.onDrop = onDrop
         nsView.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
-
-        // Request focus when view updates
-        nsView.requestFocus()
     }
 }
 
@@ -638,11 +636,16 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 
         guard !items.isEmpty else { return }
 
+        // Ensure selectedIndex is within bounds
+        let safeSelectedIndex = min(max(0, selectedIndex), items.count - 1)
+
         let centerX = bounds.width / 2
         let centerY = bounds.height / 2
 
-        let start = max(0, selectedIndex - visibleRange)
-        let end = min(items.count - 1, selectedIndex + visibleRange)
+        let start = max(0, safeSelectedIndex - visibleRange)
+        let end = min(items.count - 1, safeSelectedIndex + visibleRange)
+
+        guard start <= end else { return }
 
         for index in start...end {
             let item = items[index]
@@ -656,12 +659,17 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     private func animateToSelection() {
         guard !items.isEmpty else { return }
 
+        // Ensure selectedIndex is within bounds
+        let safeSelectedIndex = min(max(0, selectedIndex), items.count - 1)
+
         let centerX = bounds.width / 2
         let centerY = bounds.height / 2
 
         // Determine visible range
-        let start = max(0, selectedIndex - visibleRange)
-        let end = min(items.count - 1, selectedIndex + visibleRange)
+        let start = max(0, safeSelectedIndex - visibleRange)
+        let end = min(items.count - 1, safeSelectedIndex + visibleRange)
+
+        guard start <= end else { return }
         let visibleIndices = Set(start...end)
 
         // Remove layers outside visible range

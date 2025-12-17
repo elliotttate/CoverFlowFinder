@@ -20,6 +20,9 @@ struct ContentView: View {
     // Track viewMode changes to force re-render (workaround for computed viewModel)
     @State private var currentViewMode: ViewMode = .coverFlow
 
+    // Focus state for search field
+    @FocusState private var isSearchFocused: Bool
+
     // Current tab's viewModel
     private var viewModel: FileBrowserViewModel {
         tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
@@ -180,6 +183,7 @@ struct ContentView: View {
                 TextField("Search", text: searchTextBinding)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 180)
+                    .focused($isSearchFocused)
             }
         }
         .navigationTitle(viewModel.currentPath.lastPathComponent)
