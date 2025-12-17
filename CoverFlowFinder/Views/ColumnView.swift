@@ -7,6 +7,7 @@ struct ColumnView: View {
 
     @State private var columnSelections: [URL: FileItem] = [:]
     @State private var columns: [ColumnData] = []
+    @State private var renamingItem: FileItem?
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: true) {
@@ -15,6 +16,8 @@ struct ColumnView: View {
                 SingleColumnView(
                     items: items,
                     selectedItem: columnSelections[viewModel.currentPath],
+                    viewModel: viewModel,
+                    onRename: { item in renamingItem = item },
                     onSelect: { item in
                         columnSelections[viewModel.currentPath] = item
                         viewModel.selectItem(item)
@@ -36,6 +39,8 @@ struct ColumnView: View {
                     SingleColumnView(
                         items: column.items,
                         selectedItem: columnSelections[column.url],
+                        viewModel: viewModel,
+                        onRename: { item in renamingItem = item },
                         onSelect: { item in
                             columnSelections[column.url] = item
                             viewModel.selectItem(item)
@@ -59,6 +64,9 @@ struct ColumnView: View {
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
+        .sheet(item: $renamingItem) { item in
+            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
+        }
     }
 
     private var lastSelectedItem: FileItem? {
@@ -120,6 +128,8 @@ struct ColumnData: Identifiable {
 struct SingleColumnView: View {
     let items: [FileItem]
     let selectedItem: FileItem?
+    @ObservedObject var viewModel: FileBrowserViewModel
+    let onRename: (FileItem) -> Void
     let onSelect: (FileItem) -> Void
     let onDoubleClick: (FileItem) -> Void
 
@@ -135,6 +145,11 @@ struct SingleColumnView: View {
             }
             .onTapGesture(count: 1) {
                 onSelect(item)
+            }
+            .contextMenu {
+                FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                    onRename(item)
+                }
             }
             .listRowBackground(
                 selectedItem?.id == item.id

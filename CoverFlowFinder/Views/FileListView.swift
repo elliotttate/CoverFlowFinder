@@ -3,6 +3,7 @@ import SwiftUI
 struct FileListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
+    @State private var renamingItem: FileItem?
 
     var body: some View {
         List(selection: Binding(
@@ -49,28 +50,16 @@ struct FileListView: View {
                         viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
                     }
                     .contextMenu {
-                        Button("Open") {
-                            viewModel.openItem(item)
-                        }
-                        Button("Open With...") {
-                            // Open with picker
-                        }
-                        Divider()
-                        Button("Get Info") {
-                            NSWorkspace.shared.activateFileViewerSelecting([item.url])
-                        }
-                        Button("Quick Look") {
-                            viewModel.quickLook(item)
-                        }
-                        Divider()
-                        Button("Move to Trash", role: .destructive) {
-                            try? FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
-                            viewModel.refresh()
+                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                            renamingItem = item
                         }
                     }
             }
         }
         .listStyle(.inset(alternatesRowBackgrounds: true))
+        .sheet(item: $renamingItem) { item in
+            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
+        }
     }
 }
 

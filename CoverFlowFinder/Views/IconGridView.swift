@@ -3,6 +3,7 @@ import SwiftUI
 struct IconGridView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
+    @State private var renamingItem: FileItem?
 
     private let columns = [
         GridItem(.adaptive(minimum: 100, maximum: 120), spacing: 20)
@@ -22,11 +23,41 @@ struct IconGridView: View {
                     .onTapGesture(count: 1) {
                         viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
                     }
+                    .contextMenu {
+                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                            renamingItem = item
+                        }
+                    }
                 }
             }
             .padding(20)
         }
         .background(Color(nsColor: .controlBackgroundColor))
+        .contextMenu {
+            Button("New Folder") {
+                viewModel.createNewFolder()
+            }
+
+            if viewModel.canPaste {
+                Divider()
+                Button("Paste") {
+                    viewModel.paste()
+                }
+            }
+
+            Divider()
+
+            Button("Refresh") {
+                viewModel.refresh()
+            }
+
+            Button("Show in Finder") {
+                viewModel.showInFinder()
+            }
+        }
+        .sheet(item: $renamingItem) { item in
+            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
+        }
     }
 }
 

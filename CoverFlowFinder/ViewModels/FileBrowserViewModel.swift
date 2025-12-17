@@ -26,6 +26,11 @@ enum SortOption: String, CaseIterable {
     case kind = "Kind"
 }
 
+enum ClipboardOperation {
+    case copy
+    case cut
+}
+
 @MainActor
 class FileBrowserViewModel: ObservableObject {
     @Published var currentPath: URL
@@ -39,6 +44,10 @@ class FileBrowserViewModel: ObservableObject {
     @Published var navigationHistory: [URL] = []
     @Published var historyIndex: Int = -1
     @Published var coverFlowSelectedIndex: Int = 0
+
+    // Clipboard state
+    @Published var clipboardItems: [URL] = []
+    @Published var clipboardOperation: ClipboardOperation = .copy
 
     private var cancellables = Set<AnyCancellable>()
 
@@ -200,5 +209,180 @@ class FileBrowserViewModel: ObservableObject {
 
     func refresh() {
         loadContents()
+    }
+
+    // MARK: - Clipboard Operations
+
+    var canPaste: Bool {
+        !clipboardItems.isEmpty
+    }
+
+    func copySelectedItems() {
+        guard !selectedItems.isEmpty else { return }
+        clipboardItems = selectedItems.map { $0.url }
+        clipboardOperation = .copy
+
+        // Also copy to system pasteboard
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects(clipboardItems as [NSURL])
+    }
+
+    func cutSelectedItems() {
+        guard !selectedItems.isEmpty else { return }
+        clipboardItems = selectedItems.map { $0.url }
+        clipboardOperation = .cut
+
+        // Also copy to system pasteboard
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.writeObjects(clipboardItems as [NSURL])
+    }
+
+    func paste() {
+        guard !clipboardItems.isEmpty else { return }
+
+        let fileManager = FileManager.default
+        var pastedAny = false
+
+        for sourceURL in clipboardItems {
+            let destinationURL = currentPath.appendingPathComponent(sourceURL.lastPathComponent)
+
+            // Handle name conflicts
+            let finalDestination = uniqueDestinationURL(for: destinationURL)
+
+            do {
+                if clipboardOperation == .cut {
+                    try fileManager.moveItem(at: sourceURL, to: finalDestination)
+                } else {
+                    try fileManager.copyItem(at: sourceURL, to: finalDestination)
+                }
+                pastedAny = true
+            } catch {
+                print("Failed to paste \(sourceURL.lastPathComponent): \(error.localizedDescription)")
+            }
+        }
+
+        if clipboardOperation == .cut && pastedAny {
+            clipboardItems.removeAll()
+        }
+
+        refresh()
+    }
+
+    func deleteSelectedItems() {
+        guard !selectedItems.isEmpty else { return }
+
+        let fileManager = FileManager.default
+
+        for item in selectedItems {
+            do {
+                try fileManager.trashItem(at: item.url, resultingItemURL: nil)
+            } catch {
+                print("Failed to delete \(item.name): \(error.localizedDescription)")
+            }
+        }
+
+        selectedItems.removeAll()
+        refresh()
+    }
+
+    func duplicateSelectedItems() {
+        guard !selectedItems.isEmpty else { return }
+
+        let fileManager = FileManager.default
+
+        for item in selectedItems {
+            let baseName = item.url.deletingPathExtension().lastPathComponent
+            let ext = item.url.pathExtension
+            var copyName = ext.isEmpty ? "\(baseName) copy" : "\(baseName) copy.\(ext)"
+            var destinationURL = currentPath.appendingPathComponent(copyName)
+
+            // Handle existing copies
+            var copyNumber = 2
+            while fileManager.fileExists(atPath: destinationURL.path) {
+                copyName = ext.isEmpty ? "\(baseName) copy \(copyNumber)" : "\(baseName) copy \(copyNumber).\(ext)"
+                destinationURL = currentPath.appendingPathComponent(copyName)
+                copyNumber += 1
+            }
+
+            do {
+                try fileManager.copyItem(at: item.url, to: destinationURL)
+            } catch {
+                print("Failed to duplicate \(item.name): \(error.localizedDescription)")
+            }
+        }
+
+        refresh()
+    }
+
+    func renameItem(_ item: FileItem, to newName: String) {
+        let newURL = item.url.deletingLastPathComponent().appendingPathComponent(newName)
+
+        guard newURL != item.url else { return }
+
+        do {
+            try FileManager.default.moveItem(at: item.url, to: newURL)
+            refresh()
+        } catch {
+            print("Failed to rename \(item.name): \(error.localizedDescription)")
+        }
+    }
+
+    func moveSelectedItemsToTrash() {
+        deleteSelectedItems()
+    }
+
+    func getInfo() {
+        guard let item = selectedItems.first else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([item.url])
+    }
+
+    func showInFinder() {
+        let urls = selectedItems.isEmpty ? [currentPath] : selectedItems.map { $0.url }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
+    func createNewFolder() {
+        let fileManager = FileManager.default
+        var folderName = "untitled folder"
+        var folderURL = currentPath.appendingPathComponent(folderName)
+
+        var counter = 2
+        while fileManager.fileExists(atPath: folderURL.path) {
+            folderName = "untitled folder \(counter)"
+            folderURL = currentPath.appendingPathComponent(folderName)
+            counter += 1
+        }
+
+        do {
+            try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
+            refresh()
+        } catch {
+            print("Failed to create folder: \(error.localizedDescription)")
+        }
+    }
+
+    func selectAll() {
+        selectedItems = Set(items)
+    }
+
+    private func uniqueDestinationURL(for url: URL) -> URL {
+        let fileManager = FileManager.default
+        var destinationURL = url
+
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            let baseName = url.deletingPathExtension().lastPathComponent
+            let ext = url.pathExtension
+            var counter = 2
+
+            repeat {
+                let newName = ext.isEmpty ? "\(baseName) \(counter)" : "\(baseName) \(counter).\(ext)"
+                destinationURL = url.deletingLastPathComponent().appendingPathComponent(newName)
+                counter += 1
+            } while fileManager.fileExists(atPath: destinationURL.path)
+        }
+
+        return destinationURL
     }
 }

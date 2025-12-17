@@ -3,6 +3,8 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var viewModel = FileBrowserViewModel()
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
+    @State private var renamingItem: FileItem?
+    @State private var renameText: String = ""
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
@@ -96,16 +98,14 @@ struct ContentView: View {
                 // Action menu
                 Menu {
                     Button("New Folder") {
-                        createNewFolder()
+                        viewModel.createNewFolder()
                     }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
 
                     Divider()
 
                     Button("Get Info") {
-                        if let selected = viewModel.selectedItems.first {
-                            showInfo(for: selected)
-                        }
+                        viewModel.getInfo()
                     }
                     .keyboardShortcut("i", modifiers: .command)
                     .disabled(viewModel.selectedItems.isEmpty)
@@ -113,7 +113,7 @@ struct ContentView: View {
                     Divider()
 
                     Button("Show in Finder") {
-                        showInFinder()
+                        viewModel.showInFinder()
                     }
                 } label: {
                     Image(systemName: "ellipsis.circle")
@@ -128,24 +128,113 @@ struct ContentView: View {
         }
         .navigationTitle(viewModel.currentPath.lastPathComponent)
         .focusedSceneValue(\.viewModel, viewModel)
-    }
-
-    private func createNewFolder() {
-        let newFolderURL = viewModel.currentPath.appendingPathComponent("untitled folder")
-        do {
-            try FileManager.default.createDirectory(at: newFolderURL, withIntermediateDirectories: false)
-            viewModel.refresh()
-        } catch {
-            // Handle error
+        .onKeyPress(.delete) {
+            viewModel.deleteSelectedItems()
+            return .handled
+        }
+        .sheet(item: $renamingItem) { item in
+            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
         }
     }
+}
 
-    private func showInfo(for item: FileItem) {
-        NSWorkspace.shared.activateFileViewerSelecting([item.url])
+// MARK: - Context Menu for File Items
+
+struct FileItemContextMenu: View {
+    let item: FileItem
+    @ObservedObject var viewModel: FileBrowserViewModel
+    var onRename: (FileItem) -> Void
+
+    var body: some View {
+        Group {
+            Button("Open") {
+                viewModel.openItem(item)
+            }
+
+            Button("Open With...") {
+                NSWorkspace.shared.activateFileViewerSelecting([item.url])
+            }
+
+            Divider()
+
+            Button("Get Info") {
+                viewModel.selectItem(item)
+                viewModel.getInfo()
+            }
+
+            Divider()
+
+            Button("Copy") {
+                viewModel.selectItem(item)
+                viewModel.copySelectedItems()
+            }
+
+            Button("Cut") {
+                viewModel.selectItem(item)
+                viewModel.cutSelectedItems()
+            }
+
+            Button("Duplicate") {
+                viewModel.selectItem(item)
+                viewModel.duplicateSelectedItems()
+            }
+
+            Divider()
+
+            Button("Rename") {
+                onRename(item)
+            }
+
+            Button("Move to Trash") {
+                viewModel.selectItem(item)
+                viewModel.deleteSelectedItems()
+            }
+
+            Divider()
+
+            Button("Show in Finder") {
+                viewModel.selectItem(item)
+                viewModel.showInFinder()
+            }
+        }
     }
+}
 
-    private func showInFinder() {
-        NSWorkspace.shared.activateFileViewerSelecting([viewModel.currentPath])
+// MARK: - Rename Sheet
+
+struct RenameSheet: View {
+    let item: FileItem
+    @ObservedObject var viewModel: FileBrowserViewModel
+    @Binding var isPresented: FileItem?
+    @State private var newName: String = ""
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Text("Rename \"\(item.name)\"")
+                .font(.headline)
+
+            TextField("New name", text: $newName)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 300)
+
+            HStack {
+                Button("Cancel") {
+                    isPresented = nil
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Button("Rename") {
+                    viewModel.renameItem(item, to: newName)
+                    isPresented = nil
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(newName.isEmpty || newName == item.name)
+            }
+        }
+        .padding(20)
+        .onAppear {
+            newName = item.name
+        }
     }
 }
 
