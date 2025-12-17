@@ -32,16 +32,21 @@ struct FileListView: View {
                         columnConfig: columnConfig
                     )
                     .tag(item.id)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
                     .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                     .onDrag {
                         NSItemProvider(object: item.url as NSURL)
                     }
-                    .onTapGesture(count: 2) {
-                        viewModel.openItem(item)
-                    }
-                    .onTapGesture(count: 1) {
-                        viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
-                    }
+                    .instantTap(
+                        id: item.id,
+                        onSingleClick: {
+                            viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                        },
+                        onDoubleClick: {
+                            viewModel.openItem(item)
+                        }
+                    )
                     .contextMenu {
                         FileItemContextMenu(item: item, viewModel: viewModel) { item in
                             renamingItem = item
@@ -55,6 +60,7 @@ struct FileListView: View {
             .layoutPriority(1)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(QuickLookHost())
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
             return true
@@ -89,6 +95,9 @@ struct FileListView: View {
         let newIndex = max(0, min(sortedItems.count - 1, currentIndex + offset))
         let newItem = sortedItems[newIndex]
         viewModel.selectItem(newItem)
+
+        // Refresh Quick Look if visible
+        QuickLookControllerView.shared.updatePreview(for: newItem.url)
     }
 
     private func openSelectedItem() {
@@ -98,15 +107,11 @@ struct FileListView: View {
     }
 
     private func toggleQuickLook() {
-        guard viewModel.selectedItems.first != nil else { return }
+        guard let selectedItem = viewModel.selectedItems.first else { return }
 
-        if let panel = QLPreviewPanel.shared() {
-            if panel.isVisible {
-                panel.orderOut(nil)
-            } else {
-                panel.makeKeyAndOrderFront(nil)
-                panel.reloadData()
-            }
+        QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { [self] offset in
+            // List: up/down navigation (offset is 1 or -1)
+            navigateSelection(by: offset)
         }
     }
 

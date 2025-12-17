@@ -112,3 +112,61 @@ extension View {
         ))
     }
 }
+
+// MARK: - Instant Click Handler
+// Provides instant single-click with time-based double-click detection
+// This avoids SwiftUI's ~300ms delay when both single and double tap gestures are present
+
+class ClickState: ObservableObject {
+    var lastClickTime: Date?
+    var lastClickId: AnyHashable?
+}
+
+struct InstantTapModifier<ID: Hashable>: ViewModifier {
+    let id: ID
+    let onSingleClick: () -> Void
+    let onDoubleClick: () -> Void
+
+    @StateObject private var clickState = ClickState()
+    private let doubleClickThreshold: TimeInterval = 0.3
+
+    func body(content: Content) -> some View {
+        content
+            .contentShape(Rectangle())
+            .onTapGesture {
+                let now = Date()
+
+                // Check if this is a double-click
+                if let lastTime = clickState.lastClickTime,
+                   let lastId = clickState.lastClickId,
+                   lastId == AnyHashable(id),
+                   now.timeIntervalSince(lastTime) < doubleClickThreshold {
+                    // Double-click detected
+                    clickState.lastClickTime = nil
+                    clickState.lastClickId = nil
+                    onDoubleClick()
+                } else {
+                    // Single click - fire immediately
+                    clickState.lastClickTime = now
+                    clickState.lastClickId = AnyHashable(id)
+                    onSingleClick()
+                }
+            }
+    }
+}
+
+extension View {
+    /// Instant tap gesture that fires single-click immediately and detects double-click via timing.
+    /// This avoids SwiftUI's gesture disambiguation delay.
+    func instantTap<ID: Hashable>(
+        id: ID,
+        onSingleClick: @escaping () -> Void,
+        onDoubleClick: @escaping () -> Void
+    ) -> some View {
+        modifier(InstantTapModifier(
+            id: id,
+            onSingleClick: onSingleClick,
+            onDoubleClick: onDoubleClick
+        ))
+    }
+}

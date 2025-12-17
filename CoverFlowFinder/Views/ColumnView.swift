@@ -69,6 +69,7 @@ struct ColumnView: View {
                 }
             }
         }
+        .background(QuickLookHost())
         .background(Color(nsColor: .controlBackgroundColor))
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
@@ -166,6 +167,9 @@ struct ColumnView: View {
                 removeColumnsAfter(column)
             }
         }
+
+        // Refresh Quick Look if visible
+        QuickLookControllerView.shared.updatePreview(for: newItem.url)
     }
 
     private func navigateToParentColumn() {
@@ -206,15 +210,11 @@ struct ColumnView: View {
     }
 
     private func toggleQuickLook() {
-        guard viewModel.selectedItems.first != nil else { return }
+        guard let selectedItem = viewModel.selectedItems.first else { return }
 
-        if let panel = QLPreviewPanel.shared() {
-            if panel.isVisible {
-                panel.orderOut(nil)
-            } else {
-                panel.makeKeyAndOrderFront(nil)
-                panel.reloadData()
-            }
+        QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { [self] offset in
+            // Column view: up/down navigation within column
+            navigateInActiveColumn(by: offset)
         }
     }
 }
@@ -241,21 +241,27 @@ struct SingleColumnView: View {
                 item: item,
                 isSelected: selectedItem?.id == item.id
             )
+            .frame(maxWidth: .infinity, alignment: .leading)
             .contentShape(Rectangle())
             .onDrag {
                 NSItemProvider(object: item.url as NSURL)
             }
-            .onTapGesture(count: 2) {
-                onDoubleClick(item)
-            }
-            .onTapGesture(count: 1) {
-                onSelect(item)
-            }
+            .instantTap(
+                id: item.id,
+                onSingleClick: {
+                    onSelect(item)
+                },
+                onDoubleClick: {
+                    onDoubleClick(item)
+                }
+            )
             .contextMenu {
                 FileItemContextMenu(item: item, viewModel: viewModel) { item in
                     onRename(item)
                 }
             }
+            .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+            .listRowSeparator(.hidden)
             .listRowBackground(
                 selectedItem?.id == item.id
                     ? Color.accentColor.opacity(0.3)

@@ -20,6 +20,9 @@ struct ContentView: View {
     // Track viewMode changes to force re-render (workaround for computed viewModel)
     @State private var currentViewMode: ViewMode = .coverFlow
 
+    // Track infoItem for Get Info sheet (needs to observe both viewModel and rightPaneViewModel)
+    @State private var showingInfoItem: FileItem?
+
     // Focus state for search field
     @FocusState private var isSearchFocused: Bool
 
@@ -47,13 +50,6 @@ struct ContentView: View {
         )
     }
 
-    // Binding to current viewModel's infoItem
-    private var infoItemBinding: Binding<FileItem?> {
-        Binding(
-            get: { viewModel.infoItem },
-            set: { viewModel.infoItem = $0 }
-        )
-    }
 
     // The viewModel to navigate based on active pane in dual mode
     private var activeViewModel: FileBrowserViewModel {
@@ -195,8 +191,13 @@ struct ContentView: View {
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
         }
-        .sheet(item: infoItemBinding) { (item: FileItem) in
+        .sheet(item: $showingInfoItem) { item in
             FileInfoView(item: item)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .showGetInfo)) { notification in
+            if let item = notification.object as? FileItem {
+                showingInfoItem = item
+            }
         }
         // Tab notifications from menu commands
         .onReceive(NotificationCenter.default.publisher(for: .newTab)) { _ in
@@ -218,6 +219,7 @@ struct ContentView: View {
         .onAppear {
             currentViewMode = viewModel.viewMode
         }
+        .background(QuickLookWindowController())
     }
 
     // MARK: - Tab Management

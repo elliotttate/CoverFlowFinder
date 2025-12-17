@@ -22,6 +22,8 @@
 		2A0000010000000000000016 /* KeyboardHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000016 /* KeyboardHandler.swift */; };
 		2A0000010000000000000017 /* TabBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000017 /* TabBarView.swift */; };
 		2A0000010000000000000018 /* ListColumnConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000018 /* ListColumnConfig.swift */; };
+		2A0000010000000000000019 /* QuickLookManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000019 /* QuickLookManager.swift */; };
+		2A0000010000000000000020 /* QuickLookController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000020 /* QuickLookController.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -42,6 +44,8 @@
 		2A0000020000000000000016 /* KeyboardHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardHandler.swift; sourceTree = "<group>"; };
 		2A0000020000000000000017 /* TabBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabBarView.swift; sourceTree = "<group>"; };
 		2A0000020000000000000018 /* ListColumnConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListColumnConfig.swift; sourceTree = "<group>"; };
+		2A0000020000000000000019 /* QuickLookManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookManager.swift; sourceTree = "<group>"; };
+		2A0000020000000000000020 /* QuickLookController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookController.swift; sourceTree = "<group>"; };
 		2A0000030000000000000001 /* CoverFlowFinder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoverFlowFinder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -99,6 +103,8 @@
 				2A0000020000000000000014 /* FileInfoView.swift */,
 				2A0000020000000000000016 /* KeyboardHandler.swift */,
 				2A0000020000000000000017 /* TabBarView.swift */,
+				2A0000020000000000000019 /* QuickLookManager.swift */,
+				2A0000020000000000000020 /* QuickLookController.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -203,6 +209,8 @@
 				2A0000010000000000000016 /* KeyboardHandler.swift in Sources */,
 				2A0000010000000000000017 /* TabBarView.swift in Sources */,
 				2A0000010000000000000018 /* ListColumnConfig.swift in Sources */,
+				2A0000010000000000000019 /* QuickLookManager.swift in Sources */,
+				2A0000010000000000000020 /* QuickLookController.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

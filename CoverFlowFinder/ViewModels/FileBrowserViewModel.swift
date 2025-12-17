@@ -2,6 +2,10 @@ import Foundation
 import SwiftUI
 import Combine
 
+extension Notification.Name {
+    static let showGetInfo = Notification.Name("showGetInfo")
+}
+
 enum ViewMode: String, CaseIterable {
     case coverFlow = "Cover Flow"
     case icons = "Icons"
@@ -344,6 +348,7 @@ class FileBrowserViewModel: ObservableObject {
     func getInfo() {
         guard let item = selectedItems.first else { return }
         infoItem = item
+        NotificationCenter.default.post(name: .showGetInfo, object: item)
     }
 
     func showInFinder() {

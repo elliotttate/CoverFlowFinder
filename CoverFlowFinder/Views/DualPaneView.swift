@@ -8,6 +8,8 @@ struct DualPaneView: View {
     @Binding var activePane: Pane
     @State private var leftPaneViewMode: PaneViewMode = .list
     @State private var rightPaneViewMode: PaneViewMode = .list
+    @State private var leftPaneColumns: Int = 4
+    @State private var rightPaneColumns: Int = 4
 
     enum Pane {
         case left, right
@@ -33,7 +35,10 @@ struct DualPaneView: View {
     // Column count for active pane's view mode
     private var activeColumnsCount: Int {
         let mode = activePane == .left ? leftPaneViewMode : rightPaneViewMode
-        return mode == .icons ? 4 : 1
+        if mode == .icons {
+            return activePane == .left ? leftPaneColumns : rightPaneColumns
+        }
+        return 1
     }
 
     var body: some View {
@@ -45,7 +50,8 @@ struct DualPaneView: View {
                     otherViewModel: rightViewModel,
                     isActive: activePane == .left,
                     paneViewMode: $leftPaneViewMode,
-                    onActivate: { activePane = .left }
+                    onActivate: { activePane = .left },
+                    onColumnsCalculated: { cols in leftPaneColumns = cols }
                 )
 
                 // Right pane
@@ -54,10 +60,12 @@ struct DualPaneView: View {
                     otherViewModel: leftViewModel,
                     isActive: activePane == .right,
                     paneViewMode: $rightPaneViewMode,
-                    onActivate: { activePane = .right }
+                    onActivate: { activePane = .right },
+                    onColumnsCalculated: { cols in rightPaneColumns = cols }
                 )
             }
         }
+        .background(QuickLookHost())
         .onAppear {
             // Select first item in left pane if nothing selected
             if leftViewModel.selectedItems.isEmpty && !leftViewModel.items.isEmpty {
@@ -74,6 +82,16 @@ struct DualPaneView: View {
         .onChange(of: rightPaneViewMode) { _, _ in
             registerKeyboardHandler(forPane: activePane)
         }
+        .onChange(of: leftPaneColumns) { _, _ in
+            if activePane == .left {
+                registerKeyboardHandler(forPane: activePane)
+            }
+        }
+        .onChange(of: rightPaneColumns) { _, _ in
+            if activePane == .right {
+                registerKeyboardHandler(forPane: activePane)
+            }
+        }
     }
 
     private func registerKeyboardHandler(forPane pane: Pane) {
@@ -82,6 +100,8 @@ struct DualPaneView: View {
         let rightMode = rightPaneViewMode
         let leftVM = leftViewModel
         let rightVM = rightViewModel
+        let leftCols = leftPaneColumns
+        let rightCols = rightPaneColumns
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             KeyboardManager.shared.setHandler {
@@ -89,7 +109,7 @@ struct DualPaneView: View {
 
                 let vm = pane == .left ? leftVM : rightVM
                 let mode = pane == .left ? leftMode : rightMode
-                let columnsCount = mode == .icons ? 4 : 1
+                let columnsCount = mode == .icons ? (pane == .left ? leftCols : rightCols) : 1
 
                 switch event.keyCode {
                 case 126: // Up arrow
@@ -110,13 +130,17 @@ struct DualPaneView: View {
                     }
                     return true
                 case 49: // Space
-                    if vm.selectedItems.first != nil {
-                        if let panel = QLPreviewPanel.shared() {
-                            if panel.isVisible {
-                                panel.orderOut(nil)
+                    if let selectedItem = vm.selectedItems.first {
+                        let paneViewMode = self.activePane == .left ? self.leftPaneViewMode : self.rightPaneViewMode
+                        let columnsCount = self.activePane == .left ? self.leftPaneColumns : self.rightPaneColumns
+
+                        QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { offset in
+                            if paneViewMode == .icons {
+                                // Grid: left/right = ±1, up/down = ±columns
+                                self.navigateInViewModel(vm, by: offset)
                             } else {
-                                panel.makeKeyAndOrderFront(nil)
-                                panel.reloadData()
+                                // List: up/down only
+                                self.navigateInViewModel(vm, by: offset)
                             }
                         }
                     }
@@ -142,6 +166,9 @@ struct DualPaneView: View {
         let newIndex = max(0, min(vm.items.count - 1, currentIndex + offset))
         let newItem = vm.items[newIndex]
         vm.selectItem(newItem)
+
+        // Refresh Quick Look if visible
+        QuickLookControllerView.shared.updatePreview(for: newItem.url)
     }
 
 }
@@ -152,6 +179,7 @@ struct PaneView: View {
     let isActive: Bool
     @Binding var paneViewMode: DualPaneView.PaneViewMode
     let onActivate: () -> Void
+    let onColumnsCalculated: (Int) -> Void
     @State private var isDropTargeted = false
 
     // Cache path components
@@ -244,7 +272,7 @@ struct PaneView: View {
                 case .list:
                     PaneListView(viewModel: viewModel, onActivate: onActivate)
                 case .icons:
-                    PaneIconView(viewModel: viewModel, onActivate: onActivate)
+                    PaneIconView(viewModel: viewModel, onActivate: onActivate, onColumnsCalculated: onColumnsCalculated)
                 }
             }
             .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
@@ -367,25 +395,30 @@ struct PaneListView: View {
                         .foregroundColor(.secondary)
                         .frame(width: 100, alignment: .trailing)
                 }
-                .padding(.vertical, 2)
+                .padding(.vertical, 4)
                 .padding(.horizontal, 4)
+                .frame(maxWidth: .infinity, alignment: .leading)
                 .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
-                .cornerRadius(4)
                 .contentShape(Rectangle())
                 .onDrag {
                     NSItemProvider(object: item.url as NSURL)
                 }
-                .onTapGesture(count: 2) {
-                    onActivate()
-                    viewModel.openItem(item)
-                }
-                .onTapGesture(count: 1) {
-                    onActivate()
-                    viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
-                }
+                .instantTap(
+                    id: item.id,
+                    onSingleClick: {
+                        onActivate()
+                        viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                    },
+                    onDoubleClick: {
+                        onActivate()
+                        viewModel.openItem(item)
+                    }
+                )
                 .contextMenu {
                     FileItemContextMenu(item: item, viewModel: viewModel) { _ in }
                 }
+                .listRowInsets(EdgeInsets())
+                .listRowSeparator(.hidden)
             }
         }
         .listStyle(.plain)
@@ -395,14 +428,25 @@ struct PaneListView: View {
 struct PaneIconView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
+    let onColumnsCalculated: (Int) -> Void
 
     private let columns = [
         GridItem(.adaptive(minimum: 80, maximum: 100), spacing: 16)
     ]
 
+    private func calculateColumns(width: CGFloat) -> Int {
+        // Grid uses adaptive(minimum: 80, maximum: 100) with spacing: 16
+        // Plus padding of 16 on each side (from .padding())
+        let availableWidth = width - 32 // Subtract padding (16 each side)
+        // Each column needs minimum 80px + 16px spacing = 96px
+        let cols = Int((availableWidth + 16) / 96)
+        return max(1, cols)
+    }
+
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: 16) {
+        GeometryReader { geometry in
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 16) {
                 ForEach(viewModel.items) { item in
                     VStack(spacing: 4) {
                         Image(nsImage: item.icon)
@@ -427,20 +471,30 @@ struct PaneIconView: View {
                     .onDrag {
                         NSItemProvider(object: item.url as NSURL)
                     }
-                    .onTapGesture(count: 2) {
-                        onActivate()
-                        viewModel.openItem(item)
-                    }
-                    .onTapGesture(count: 1) {
-                        onActivate()
-                        viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
-                    }
+                    .instantTap(
+                        id: item.id,
+                        onSingleClick: {
+                            onActivate()
+                            viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                        },
+                        onDoubleClick: {
+                            onActivate()
+                            viewModel.openItem(item)
+                        }
+                    )
                     .contextMenu {
                         FileItemContextMenu(item: item, viewModel: viewModel) { _ in }
                     }
                 }
             }
             .padding()
+            }
+            .onAppear {
+                onColumnsCalculated(calculateColumns(width: geometry.size.width))
+            }
+            .onChange(of: geometry.size.width) { _, newWidth in
+                onColumnsCalculated(calculateColumns(width: newWidth))
+            }
         }
     }
 }

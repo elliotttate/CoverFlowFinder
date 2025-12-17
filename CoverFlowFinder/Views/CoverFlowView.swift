@@ -6,6 +6,12 @@ import Quartz
 struct CoverFlowView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
+    @ObservedObject private var columnConfig = ListColumnConfigManager.shared
+
+    // Use sorted items for consistent ordering between covers and file list
+    private var sortedItems: [FileItem] {
+        columnConfig.sortedItems(items)
+    }
 
     @State private var thumbnails: [URL: NSImage] = [:]
     @State private var pendingThumbnails: Set<URL> = []
@@ -54,17 +60,21 @@ struct CoverFlowView: View {
             VStack(spacing: 0) {
                 // Cover Flow area - takes proportional space
                 CoverFlowContainer(
-                    items: items,
+                    items: sortedItems,
                     selectedIndex: $viewModel.coverFlowSelectedIndex,
                     thumbnails: thumbnails,
                     thumbnailCount: thumbnails.count,
                     onSelect: { index in
                         viewModel.coverFlowSelectedIndex = index
                         syncSelection()
+                        // Refresh Quick Look if visible
+                        if index < sortedItems.count {
+                            QuickLookControllerView.shared.updatePreview(for: sortedItems[index].url)
+                        }
                     },
                     onOpen: { index in
-                        if index < items.count {
-                            viewModel.openItem(items[index])
+                        if index < sortedItems.count {
+                            viewModel.openItem(sortedItems[index])
                         }
                     },
                     onRightClick: { index in
@@ -77,8 +87,8 @@ struct CoverFlowView: View {
                 .frame(height: max(250, geometry.size.height * 0.45))
 
                 // Selected item info
-                if !items.isEmpty && viewModel.coverFlowSelectedIndex < items.count {
-                    let selectedItem = items[viewModel.coverFlowSelectedIndex]
+                if !sortedItems.isEmpty && viewModel.coverFlowSelectedIndex < sortedItems.count {
+                    let selectedItem = sortedItems[viewModel.coverFlowSelectedIndex]
                     VStack(spacing: 4) {
                         Text(selectedItem.name)
                             .font(.headline)
@@ -102,7 +112,7 @@ struct CoverFlowView: View {
 
                 // File list
                 FileListSection(
-                    items: items,
+                    items: sortedItems,
                     selectedItems: viewModel.selectedItems,
                     onSelect: { item, index in
                         viewModel.coverFlowSelectedIndex = index
@@ -184,8 +194,8 @@ struct CoverFlowView: View {
     }
 
     private func syncSelection() {
-        guard !items.isEmpty && viewModel.coverFlowSelectedIndex < items.count else { return }
-        viewModel.selectedItems = [items[viewModel.coverFlowSelectedIndex]]
+        guard !sortedItems.isEmpty && viewModel.coverFlowSelectedIndex < sortedItems.count else { return }
+        viewModel.selectedItems = [sortedItems[viewModel.coverFlowSelectedIndex]]
     }
 
     private func handleDrop(urls: [URL]) {
@@ -227,10 +237,10 @@ struct CoverFlowView: View {
     }
 
     private func loadVisibleThumbnails() {
-        guard !items.isEmpty else { return }
-        let selected = min(max(0, viewModel.coverFlowSelectedIndex), items.count - 1)
+        guard !sortedItems.isEmpty else { return }
+        let selected = min(max(0, viewModel.coverFlowSelectedIndex), sortedItems.count - 1)
         let start = max(0, selected - visibleRange)
-        let end = min(items.count - 1, selected + visibleRange)
+        let end = min(sortedItems.count - 1, selected + visibleRange)
         guard start <= end else { return }
 
         // Check for timed out requests and clear them
@@ -253,7 +263,7 @@ struct CoverFlowView: View {
         var currentlyPending = 0
 
         for index in start...end {
-            let item = items[index]
+            let item = sortedItems[index]
             if thumbnails[item.url] != nil {
                 alreadyLoaded += 1
             } else if pendingThumbnails.contains(item.url) {
@@ -267,7 +277,7 @@ struct CoverFlowView: View {
         var itemsToLoad: [(item: FileItem, distance: Int)] = []
 
         for index in start...end {
-            let item = items[index]
+            let item = sortedItems[index]
             let distance = abs(index - selected)
 
             if thumbnails[item.url] == nil && !pendingThumbnails.contains(item.url) {
@@ -450,6 +460,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     private var coverLayers: [CALayer] = []
     private var lastClickTime: Date = .distantPast
     private var lastClickIndex: Int = -1
+    private var lastClickLocation: CGPoint = .zero
 
     // Momentum scrolling
     private var scrollVelocity: CGFloat = 0
@@ -461,6 +472,9 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     private var typeAheadBuffer: String = ""
     private var typeAheadTimer: Timer?
     private let typeAheadTimeout: TimeInterval = 1.0
+
+    // Quick Look keyboard monitor
+    private var quickLookKeyMonitor: Any?
 
     // Dynamic sizing based on view bounds
     private var baseCoverSize: CGFloat { min(bounds.height * 0.6, bounds.width * 0.22, 280) }
@@ -490,19 +504,75 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        guard selectedIndex < items.count else { return nil }
+        guard selectedIndex >= 0 && selectedIndex < items.count else { return nil }
         return items[selectedIndex].url as QLPreviewItem
     }
 
     func toggleQuickLook() {
-        guard selectedIndex < items.count else { return }
+        guard selectedIndex >= 0 && selectedIndex < items.count else { return }
 
         if let panel = QLPreviewPanel.shared() {
             if panel.isVisible {
                 panel.orderOut(nil)
+                stopQuickLookKeyMonitor()
             } else {
-                panel.makeKeyAndOrderFront(nil)
+                panel.orderFront(nil)
+                startQuickLookKeyMonitor()
             }
+        }
+    }
+
+    private func startQuickLookKeyMonitor() {
+        // Remove any existing monitor
+        stopQuickLookKeyMonitor()
+
+        // Add local monitor to capture arrow keys even when Quick Look has focus
+        quickLookKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self = self,
+                  let panel = QLPreviewPanel.shared(),
+                  panel.isVisible else {
+                return event
+            }
+
+            switch event.keyCode {
+            case 123: // Left arrow - previous
+                if self.selectedIndex > 0 {
+                    self.onSelect?(self.selectedIndex - 1)
+                }
+                return nil // Consume the event
+            case 124: // Right arrow - next
+                if self.selectedIndex < self.items.count - 1 {
+                    self.onSelect?(self.selectedIndex + 1)
+                }
+                return nil // Consume the event
+            case 125: // Down arrow - next (down in list = higher index)
+                if self.selectedIndex < self.items.count - 1 {
+                    self.onSelect?(self.selectedIndex + 1)
+                }
+                return nil // Consume the event
+            case 126: // Up arrow - previous (up in list = lower index)
+                if self.selectedIndex > 0 {
+                    self.onSelect?(self.selectedIndex - 1)
+                }
+                return nil // Consume the event
+            case 49: // Space - close Quick Look
+                panel.orderOut(nil)
+                self.stopQuickLookKeyMonitor()
+                return nil
+            case 53: // Escape - close Quick Look
+                panel.orderOut(nil)
+                self.stopQuickLookKeyMonitor()
+                return nil
+            default:
+                return event
+            }
+        }
+    }
+
+    private func stopQuickLookKeyMonitor() {
+        if let monitor = quickLookKeyMonitor {
+            NSEvent.removeMonitor(monitor)
+            quickLookKeyMonitor = nil
         }
     }
 
@@ -902,25 +972,33 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         }
 
         let location = convert(event.locationInWindow, from: nil)
+        let now = Date()
+
+        // Check for double-click: within time window AND within distance of last click
+        let isWithinDoubleClickTime = now.timeIntervalSince(lastClickTime) < 0.4
+        let clickDistance = hypot(location.x - lastClickLocation.x, location.y - lastClickLocation.y)
+        let isNearLastClick = clickDistance < 50 // pixels
+
+        // If this is a double-click (by location proximity), open the previously clicked item
+        if isWithinDoubleClickTime && isNearLastClick && lastClickIndex >= 0 && lastClickIndex < items.count {
+            onOpen?(lastClickIndex)
+            lastClickTime = .distantPast
+            lastClickIndex = -1
+            lastClickLocation = .zero
+            dragStartLocation = nil
+            dragStartIndex = nil
+            return
+        }
 
         // Track for potential drag
         dragStartLocation = location
         dragStartIndex = hitTestCover(at: location)
 
         if let index = dragStartIndex {
-            let now = Date()
-            let isDoubleClick = (now.timeIntervalSince(lastClickTime) < 0.3) && (index == lastClickIndex)
-
-            if isDoubleClick {
-                onOpen?(index)
-                lastClickTime = .distantPast
-                dragStartLocation = nil
-                dragStartIndex = nil
-            } else {
-                onSelect?(index)
-                lastClickTime = now
-                lastClickIndex = index
-            }
+            onSelect?(index)
+            lastClickTime = now
+            lastClickIndex = index
+            lastClickLocation = location
         }
     }
 
@@ -1022,7 +1100,9 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
 
     @objc private func menuOpen(_ sender: NSMenuItem) {
-        onOpen?(selectedIndex)
+        if selectedIndex >= 0 && selectedIndex < items.count {
+            onOpen?(selectedIndex)
+        }
     }
 
     @objc private func menuCopy(_ sender: NSMenuItem) {
@@ -1230,16 +1310,18 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             if selectedIndex < items.count - 1 {
                 onSelect?(selectedIndex + 1)
             }
-        case 126: // Up arrow
+        case 126: // Up arrow - previous (up in list = lower index)
             if selectedIndex > 0 {
                 onSelect?(selectedIndex - 1)
             }
-        case 125: // Down arrow
+        case 125: // Down arrow - next (down in list = higher index)
             if selectedIndex < items.count - 1 {
                 onSelect?(selectedIndex + 1)
             }
         case 36: // Return
-            onOpen?(selectedIndex)
+            if selectedIndex >= 0 && selectedIndex < items.count {
+                onOpen?(selectedIndex)
+            }
         case 49: // Space - Quick Look
             toggleQuickLook()
         case 51: // Delete/Backspace - remove last character from type-ahead buffer
@@ -1289,6 +1371,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     deinit {
         momentumTimer?.invalidate()
         typeAheadTimer?.invalidate()
+        stopQuickLookKeyMonitor()
     }
 
     // MARK: - NSDraggingSource

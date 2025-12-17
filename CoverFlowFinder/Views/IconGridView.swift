@@ -24,12 +24,15 @@ struct IconGridView: View {
                         .onDrag {
                             NSItemProvider(object: item.url as NSURL)
                         }
-                        .onTapGesture(count: 2) {
-                            viewModel.openItem(item)
-                        }
-                        .onTapGesture(count: 1) {
-                            viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
-                        }
+                        .instantTap(
+                            id: item.id,
+                            onSingleClick: {
+                                viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                            },
+                            onDoubleClick: {
+                                viewModel.openItem(item)
+                            }
+                        )
                         .contextMenu {
                             FileItemContextMenu(item: item, viewModel: viewModel) { item in
                                 renamingItem = item
@@ -46,6 +49,7 @@ struct IconGridView: View {
                 updateColumnCount(width: newWidth)
             }
         }
+        .background(QuickLookHost())
         .background(Color(nsColor: .controlBackgroundColor))
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
@@ -117,6 +121,9 @@ struct IconGridView: View {
         let newIndex = max(0, min(items.count - 1, currentIndex + offset))
         let newItem = items[newIndex]
         viewModel.selectItem(newItem)
+
+        // Refresh Quick Look if visible
+        QuickLookControllerView.shared.updatePreview(for: newItem.url)
     }
 
     private func openSelectedItem() {
@@ -126,15 +133,12 @@ struct IconGridView: View {
     }
 
     private func toggleQuickLook() {
-        guard viewModel.selectedItems.first != nil else { return }
+        guard let selectedItem = viewModel.selectedItems.first else { return }
 
-        if let panel = QLPreviewPanel.shared() {
-            if panel.isVisible {
-                panel.orderOut(nil)
-            } else {
-                panel.makeKeyAndOrderFront(nil)
-                panel.reloadData()
-            }
+        let cols = calculatedColumns
+        QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { [self] offset in
+            // Map offset for grid: 1/-1 for horizontal, cols/-cols for vertical
+            navigateSelection(by: offset)
         }
     }
 
