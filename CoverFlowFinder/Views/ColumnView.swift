@@ -1,5 +1,6 @@
 import SwiftUI
 import QuickLookThumbnailing
+import Quartz
 
 struct ColumnView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
@@ -8,6 +9,7 @@ struct ColumnView: View {
     @State private var columnSelections: [URL: FileItem] = [:]
     @State private var columns: [ColumnData] = []
     @State private var renamingItem: FileItem?
+    @State private var activeColumnIndex: Int = 0
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: true) {
@@ -22,6 +24,7 @@ struct ColumnView: View {
                     onSelect: { item in
                         columnSelections[viewModel.currentPath] = item
                         viewModel.selectItem(item)
+                        activeColumnIndex = 0
                         if item.isDirectory {
                             updateColumns(from: item)
                         } else {
@@ -35,7 +38,7 @@ struct ColumnView: View {
                 )
 
                 // Additional columns for subdirectories
-                ForEach(columns) { column in
+                ForEach(Array(columns.enumerated()), id: \.element.id) { index, column in
                     Divider()
                     SingleColumnView(
                         items: column.items,
@@ -46,6 +49,7 @@ struct ColumnView: View {
                         onSelect: { item in
                             columnSelections[column.url] = item
                             viewModel.selectItem(item)
+                            activeColumnIndex = index + 1
                             if item.isDirectory {
                                 updateColumnsFrom(column: column, selectedItem: item)
                             } else {
@@ -69,6 +73,14 @@ struct ColumnView: View {
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
         }
+        .keyboardNavigable(
+            onUpArrow: { navigateInActiveColumn(by: -1) },
+            onDownArrow: { navigateInActiveColumn(by: 1) },
+            onLeftArrow: { navigateToParentColumn() },
+            onRightArrow: { navigateToChildColumn() },
+            onReturn: { openSelectedItem() },
+            onSpace: { toggleQuickLook() }
+        )
     }
 
     private var lastSelectedItem: FileItem? {
@@ -116,6 +128,92 @@ struct ColumnView: View {
                 }
             } catch {
                 // Handle error silently
+            }
+        }
+    }
+
+    // MARK: - Keyboard Navigation
+
+    private func navigateInActiveColumn(by offset: Int) {
+        let (columnItems, columnURL) = getActiveColumnData()
+        guard !columnItems.isEmpty else { return }
+
+        let currentIndex: Int
+        if let selected = columnSelections[columnURL],
+           let index = columnItems.firstIndex(of: selected) {
+            currentIndex = index
+        } else {
+            currentIndex = -1
+        }
+
+        let newIndex = max(0, min(columnItems.count - 1, currentIndex + offset))
+        let newItem = columnItems[newIndex]
+        columnSelections[columnURL] = newItem
+        viewModel.selectItem(newItem)
+
+        // Update subsequent columns if directory
+        if activeColumnIndex == 0 {
+            if newItem.isDirectory {
+                updateColumns(from: newItem)
+            } else {
+                columns = []
+            }
+        } else if activeColumnIndex <= columns.count {
+            let column = columns[activeColumnIndex - 1]
+            if newItem.isDirectory {
+                updateColumnsFrom(column: column, selectedItem: newItem)
+            } else {
+                removeColumnsAfter(column)
+            }
+        }
+    }
+
+    private func navigateToParentColumn() {
+        if activeColumnIndex > 0 {
+            activeColumnIndex -= 1
+        }
+    }
+
+    private func navigateToChildColumn() {
+        let (_, columnURL) = getActiveColumnData()
+        if let selected = columnSelections[columnURL], selected.isDirectory {
+            if activeColumnIndex < columns.count {
+                activeColumnIndex += 1
+                // Select first item in new column if nothing selected
+                let newColumnURL = columns[activeColumnIndex - 1].url
+                if columnSelections[newColumnURL] == nil, let firstItem = columns[activeColumnIndex - 1].items.first {
+                    columnSelections[newColumnURL] = firstItem
+                    viewModel.selectItem(firstItem)
+                }
+            }
+        }
+    }
+
+    private func getActiveColumnData() -> ([FileItem], URL) {
+        if activeColumnIndex == 0 {
+            return (items, viewModel.currentPath)
+        } else if activeColumnIndex <= columns.count {
+            let column = columns[activeColumnIndex - 1]
+            return (column.items, column.url)
+        }
+        return ([], viewModel.currentPath)
+    }
+
+    private func openSelectedItem() {
+        if let selectedItem = viewModel.selectedItems.first {
+            viewModel.openItem(selectedItem)
+        }
+    }
+
+    private func toggleQuickLook() {
+        guard viewModel.selectedItems.first != nil else { return }
+
+        if let panel = QLPreviewPanel.shared() {
+            if panel.isVisible {
+                panel.orderOut(nil)
+            } else {
+                panel.makeKeyAndOrderFront(nil)
+                panel.reloadData()
             }
         }
     }

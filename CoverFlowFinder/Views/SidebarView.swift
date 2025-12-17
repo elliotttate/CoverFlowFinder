@@ -15,6 +15,20 @@ struct SidebarView: View {
                 get: { expandedSections.contains("Favorites") },
                 set: { if $0 { expandedSections.insert("Favorites") } else { expandedSections.remove("Favorites") } }
             )) {
+                // AirDrop - special handling (opens Finder's AirDrop window)
+                Button(action: {
+                    openAirDrop()
+                }) {
+                    Label {
+                        Text("AirDrop")
+                            .lineLimit(1)
+                    } icon: {
+                        Image(systemName: "antenna.radiowaves.left.and.right")
+                            .foregroundColor(.accentColor)
+                    }
+                }
+                .buttonStyle(.plain)
+
                 ForEach(favoriteLocations, id: \.url) { location in
                     SidebarRow(icon: location.icon, title: location.name, url: location.url)
                         .tag(location.url)
@@ -75,12 +89,9 @@ struct SidebarView: View {
         var locations: [SidebarLocation] = []
         let fm = FileManager.default
 
-        // AirDrop (placeholder)
-        locations.append(SidebarLocation(name: "AirDrop", icon: "antenna.radiowaves.left.and.right", url: fm.homeDirectoryForCurrentUser))
-
-        // Recents
-        if let recentsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
-            locations.append(SidebarLocation(name: "Recents", icon: "clock", url: recentsURL))
+        // Documents (moved before Applications to match Finder order)
+        if let docsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
+            locations.append(SidebarLocation(name: "Documents", icon: "doc", url: docsURL))
         }
 
         // Applications
@@ -91,11 +102,6 @@ struct SidebarView: View {
         // Desktop
         if let desktopURL = fm.urls(for: .desktopDirectory, in: .userDomainMask).first {
             locations.append(SidebarLocation(name: "Desktop", icon: "menubar.dock.rectangle", url: desktopURL))
-        }
-
-        // Documents
-        if let docsURL = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
-            locations.append(SidebarLocation(name: "Documents", icon: "doc", url: docsURL))
         }
 
         // Downloads
@@ -118,10 +124,33 @@ struct SidebarView: View {
             locations.append(SidebarLocation(name: "Pictures", icon: "photo", url: picturesURL))
         }
 
-        // Home
-        locations.append(SidebarLocation(name: NSUserName(), icon: "house", url: fm.homeDirectoryForCurrentUser))
-
         return locations
+    }
+
+    private func openAirDrop() {
+        // Open Finder's AirDrop window using AppleScript
+        let script = """
+        tell application "Finder"
+            activate
+            if exists window "AirDrop" then
+                set index of window "AirDrop" to 1
+            else
+                make new Finder window
+                set target of Finder window 1 to (POSIX file "/System/Library/CoreServices/Finder.app/Contents/Applications/AirDrop.app")
+            end if
+        end tell
+        """
+
+        if let appleScript = NSAppleScript(source: script) {
+            var error: NSDictionary?
+            appleScript.executeAndReturnError(&error)
+            if error != nil {
+                // Fallback: try opening via URL scheme
+                if let url = URL(string: "nwnode://domain-AirDrop") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        }
     }
 
     private var volumeLocations: [SidebarLocation] {

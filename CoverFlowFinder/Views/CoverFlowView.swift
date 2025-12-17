@@ -148,6 +148,8 @@ struct CoverFlowView: View {
             }
         }
         .onAppear {
+            // Clear KeyboardManager so events pass through to native keyDown handler
+            KeyboardManager.shared.clearHandler()
             loadVisibleThumbnails()
             syncSelection()
             startRetryTimer()

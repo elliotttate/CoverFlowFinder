@@ -30,6 +30,7 @@ struct ContentView: View {
                 // Dual pane mode - full width without path bar/status bar
                 DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel, activePane: $activePane)
                     .frame(minWidth: 700, minHeight: 400)
+                    .id("dualpane-\(viewModel.currentPath.path)")
             } else {
                 VStack(spacing: 0) {
                     // Path bar
@@ -47,12 +48,16 @@ struct ContentView: View {
                         switch viewModel.viewMode {
                         case .coverFlow:
                             CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
+                                .id("coverflow-\(viewModel.currentPath.path)")
                         case .icons:
                             IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
+                                .id("icons-\(viewModel.currentPath.path)")
                         case .list:
                             FileListView(viewModel: viewModel, items: viewModel.filteredItems)
+                                .id("list-\(viewModel.currentPath.path)")
                         case .columns:
                             ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
+                                .id("columns-\(viewModel.currentPath.path)")
                         case .dualPane:
                             EmptyView() // Handled above
                         }

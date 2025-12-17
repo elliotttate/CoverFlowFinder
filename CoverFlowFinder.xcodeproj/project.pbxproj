@@ -19,6 +19,7 @@
 		2A0000010000000000000010 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000010 /* Assets.xcassets */; };
 		2A0000010000000000000013 /* DualPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* DualPaneView.swift */; };
 		2A0000010000000000000014 /* FileInfoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000014 /* FileInfoView.swift */; };
+		2A0000010000000000000016 /* KeyboardHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000016 /* KeyboardHandler.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -36,6 +37,7 @@
 		2A0000020000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		2A0000020000000000000013 /* DualPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DualPaneView.swift; sourceTree = "<group>"; };
 		2A0000020000000000000014 /* FileInfoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileInfoView.swift; sourceTree = "<group>"; };
+		2A0000020000000000000016 /* KeyboardHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardHandler.swift; sourceTree = "<group>"; };
 		2A0000030000000000000001 /* CoverFlowFinder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoverFlowFinder.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
@@ -91,6 +93,7 @@
 				2A0000020000000000000007 /* ColumnView.swift */,
 				2A0000020000000000000013 /* DualPaneView.swift */,
 				2A0000020000000000000014 /* FileInfoView.swift */,
+				2A0000020000000000000016 /* KeyboardHandler.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -191,6 +194,7 @@
 				2A0000010000000000000009 /* FileBrowserViewModel.swift in Sources */,
 				2A0000010000000000000013 /* DualPaneView.swift in Sources */,
 				2A0000010000000000000014 /* FileInfoView.swift in Sources */,
+				2A0000010000000000000016 /* KeyboardHandler.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

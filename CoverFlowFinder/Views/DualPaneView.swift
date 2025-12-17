@@ -1,43 +1,17 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import Quartz
 
 struct DualPaneView: View {
     @ObservedObject var leftViewModel: FileBrowserViewModel
     @ObservedObject var rightViewModel: FileBrowserViewModel
     @Binding var activePane: Pane
+    @State private var leftPaneViewMode: PaneViewMode = .list
+    @State private var rightPaneViewMode: PaneViewMode = .list
 
     enum Pane {
         case left, right
     }
-
-    var body: some View {
-        HSplitView {
-            // Left pane
-            PaneView(
-                viewModel: leftViewModel,
-                otherViewModel: rightViewModel,
-                isActive: activePane == .left,
-                onActivate: { activePane = .left }
-            )
-
-            // Right pane
-            PaneView(
-                viewModel: rightViewModel,
-                otherViewModel: leftViewModel,
-                isActive: activePane == .right,
-                onActivate: { activePane = .right }
-            )
-        }
-    }
-}
-
-struct PaneView: View {
-    @ObservedObject var viewModel: FileBrowserViewModel
-    @ObservedObject var otherViewModel: FileBrowserViewModel
-    let isActive: Bool
-    let onActivate: () -> Void
-    @State private var paneViewMode: PaneViewMode = .list
-    @State private var isDropTargeted = false
 
     enum PaneViewMode: String, CaseIterable {
         case list = "List"
@@ -50,6 +24,135 @@ struct PaneView: View {
             }
         }
     }
+
+    // The active viewModel based on current pane
+    private var activeViewModel: FileBrowserViewModel {
+        activePane == .left ? leftViewModel : rightViewModel
+    }
+
+    // Column count for active pane's view mode
+    private var activeColumnsCount: Int {
+        let mode = activePane == .left ? leftPaneViewMode : rightPaneViewMode
+        return mode == .icons ? 4 : 1
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HSplitView {
+                // Left pane
+                PaneView(
+                    viewModel: leftViewModel,
+                    otherViewModel: rightViewModel,
+                    isActive: activePane == .left,
+                    paneViewMode: $leftPaneViewMode,
+                    onActivate: { activePane = .left }
+                )
+
+                // Right pane
+                PaneView(
+                    viewModel: rightViewModel,
+                    otherViewModel: leftViewModel,
+                    isActive: activePane == .right,
+                    paneViewMode: $rightPaneViewMode,
+                    onActivate: { activePane = .right }
+                )
+            }
+        }
+        .onAppear {
+            // Select first item in left pane if nothing selected
+            if leftViewModel.selectedItems.isEmpty && !leftViewModel.items.isEmpty {
+                leftViewModel.selectItem(leftViewModel.items[0])
+            }
+            registerKeyboardHandler(forPane: activePane)
+        }
+        .onChange(of: activePane) { _, newPane in
+            registerKeyboardHandler(forPane: newPane)
+        }
+        .onChange(of: leftPaneViewMode) { _, _ in
+            registerKeyboardHandler(forPane: activePane)
+        }
+        .onChange(of: rightPaneViewMode) { _, _ in
+            registerKeyboardHandler(forPane: activePane)
+        }
+    }
+
+    private func registerKeyboardHandler(forPane pane: Pane) {
+        // Use explicit pane parameter to avoid race conditions
+        let leftMode = leftPaneViewMode
+        let rightMode = rightPaneViewMode
+        let leftVM = leftViewModel
+        let rightVM = rightViewModel
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+            KeyboardManager.shared.setHandler {
+                guard let event = NSApp.currentEvent else { return false }
+
+                let vm = pane == .left ? leftVM : rightVM
+                let mode = pane == .left ? leftMode : rightMode
+                let columnsCount = mode == .icons ? 4 : 1
+
+                switch event.keyCode {
+                case 126: // Up arrow
+                    navigateInViewModel(vm, by: -columnsCount)
+                    return true
+                case 125: // Down arrow
+                    navigateInViewModel(vm, by: columnsCount)
+                    return true
+                case 123: // Left arrow
+                    if mode == .icons { navigateInViewModel(vm, by: -1) }
+                    return true
+                case 124: // Right arrow
+                    if mode == .icons { navigateInViewModel(vm, by: 1) }
+                    return true
+                case 36: // Return
+                    if let item = vm.selectedItems.first {
+                        vm.openItem(item)
+                    }
+                    return true
+                case 49: // Space
+                    if vm.selectedItems.first != nil {
+                        if let panel = QLPreviewPanel.shared() {
+                            if panel.isVisible {
+                                panel.orderOut(nil)
+                            } else {
+                                panel.makeKeyAndOrderFront(nil)
+                                panel.reloadData()
+                            }
+                        }
+                    }
+                    return true
+                default:
+                    return false
+                }
+            }
+        }
+    }
+
+    private func navigateInViewModel(_ vm: FileBrowserViewModel, by offset: Int) {
+        guard !vm.items.isEmpty else { return }
+
+        let currentIndex: Int
+        if let selectedItem = vm.selectedItems.first,
+           let index = vm.items.firstIndex(of: selectedItem) {
+            currentIndex = index
+        } else {
+            currentIndex = -1
+        }
+
+        let newIndex = max(0, min(vm.items.count - 1, currentIndex + offset))
+        let newItem = vm.items[newIndex]
+        vm.selectItem(newItem)
+    }
+
+}
+
+struct PaneView: View {
+    @ObservedObject var viewModel: FileBrowserViewModel
+    @ObservedObject var otherViewModel: FileBrowserViewModel
+    let isActive: Bool
+    @Binding var paneViewMode: DualPaneView.PaneViewMode
+    let onActivate: () -> Void
+    @State private var isDropTargeted = false
 
     // Cache path components
     private var pathComponents: [URL] {
@@ -92,7 +195,7 @@ struct PaneView: View {
 
                 // View mode picker
                 Picker("", selection: $paneViewMode) {
-                    ForEach(PaneViewMode.allCases, id: \.self) { mode in
+                    ForEach(DualPaneView.PaneViewMode.allCases, id: \.self) { mode in
                         Image(systemName: mode.systemImage)
                             .tag(mode)
                     }
@@ -139,9 +242,9 @@ struct PaneView: View {
             Group {
                 switch paneViewMode {
                 case .list:
-                    PaneListView(viewModel: viewModel)
+                    PaneListView(viewModel: viewModel, onActivate: onActivate)
                 case .icons:
-                    PaneIconView(viewModel: viewModel)
+                    PaneIconView(viewModel: viewModel, onActivate: onActivate)
                 }
             }
             .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
@@ -179,6 +282,7 @@ struct PaneView: View {
             RoundedRectangle(cornerRadius: 0)
                 .stroke(isActive ? Color.accentColor : Color.clear, lineWidth: 2)
         )
+        .contentShape(Rectangle())
         .onTapGesture {
             onActivate()
         }
@@ -236,6 +340,7 @@ struct PaneView: View {
 
 struct PaneListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
+    let onActivate: () -> Void
 
     var body: some View {
         List {
@@ -271,9 +376,11 @@ struct PaneListView: View {
                     NSItemProvider(object: item.url as NSURL)
                 }
                 .onTapGesture(count: 2) {
+                    onActivate()
                     viewModel.openItem(item)
                 }
                 .onTapGesture(count: 1) {
+                    onActivate()
                     viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
                 }
                 .contextMenu {
@@ -287,6 +394,7 @@ struct PaneListView: View {
 
 struct PaneIconView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
+    let onActivate: () -> Void
 
     private let columns = [
         GridItem(.adaptive(minimum: 80, maximum: 100), spacing: 16)
@@ -320,9 +428,11 @@ struct PaneIconView: View {
                         NSItemProvider(object: item.url as NSURL)
                     }
                     .onTapGesture(count: 2) {
+                        onActivate()
                         viewModel.openItem(item)
                     }
                     .onTapGesture(count: 1) {
+                        onActivate()
                         viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
                     }
                     .contextMenu {

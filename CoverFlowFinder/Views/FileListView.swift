@@ -1,4 +1,5 @@
 import SwiftUI
+import Quartz
 
 struct FileListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
@@ -72,6 +73,47 @@ struct FileListView: View {
         )
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
+        }
+        .keyboardNavigable(
+            onUpArrow: { navigateSelection(by: -1) },
+            onDownArrow: { navigateSelection(by: 1) },
+            onReturn: { openSelectedItem() },
+            onSpace: { toggleQuickLook() }
+        )
+    }
+
+    private func navigateSelection(by offset: Int) {
+        guard !items.isEmpty else { return }
+
+        let currentIndex: Int
+        if let selectedItem = viewModel.selectedItems.first,
+           let index = items.firstIndex(of: selectedItem) {
+            currentIndex = index
+        } else {
+            currentIndex = -1
+        }
+
+        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
+        let newItem = items[newIndex]
+        viewModel.selectItem(newItem)
+    }
+
+    private func openSelectedItem() {
+        if let selectedItem = viewModel.selectedItems.first {
+            viewModel.openItem(selectedItem)
+        }
+    }
+
+    private func toggleQuickLook() {
+        guard viewModel.selectedItems.first != nil else { return }
+
+        if let panel = QLPreviewPanel.shared() {
+            if panel.isVisible {
+                panel.orderOut(nil)
+            } else {
+                panel.makeKeyAndOrderFront(nil)
+                panel.reloadData()
+            }
         }
     }
 

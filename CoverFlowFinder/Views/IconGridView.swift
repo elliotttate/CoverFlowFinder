@@ -1,40 +1,50 @@
 import SwiftUI
+import Quartz
 
 struct IconGridView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
     @State private var renamingItem: FileItem?
     @State private var isDropTargeted = false
+    @State private var calculatedColumns: Int = 6
 
     private let columns = [
         GridItem(.adaptive(minimum: 100, maximum: 120), spacing: 20)
     ]
 
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: columns, spacing: 24) {
-                ForEach(items) { item in
-                    IconGridItem(
-                        item: item,
-                        isSelected: viewModel.selectedItems.contains(item)
-                    )
-                    .onDrag {
-                        NSItemProvider(object: item.url as NSURL)
-                    }
-                    .onTapGesture(count: 2) {
-                        viewModel.openItem(item)
-                    }
-                    .onTapGesture(count: 1) {
-                        viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
-                    }
-                    .contextMenu {
-                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                            renamingItem = item
+        GeometryReader { geometry in
+            ScrollView {
+                LazyVGrid(columns: columns, spacing: 24) {
+                    ForEach(items) { item in
+                        IconGridItem(
+                            item: item,
+                            isSelected: viewModel.selectedItems.contains(item)
+                        )
+                        .onDrag {
+                            NSItemProvider(object: item.url as NSURL)
+                        }
+                        .onTapGesture(count: 2) {
+                            viewModel.openItem(item)
+                        }
+                        .onTapGesture(count: 1) {
+                            viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                        }
+                        .contextMenu {
+                            FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                                renamingItem = item
+                            }
                         }
                     }
                 }
+                .padding(20)
             }
-            .padding(20)
+            .onAppear {
+                updateColumnCount(width: geometry.size.width)
+            }
+            .onChange(of: geometry.size.width) { _, newWidth in
+                updateColumnCount(width: newWidth)
+            }
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
@@ -70,6 +80,61 @@ struct IconGridView: View {
         }
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
+        }
+        .keyboardNavigable(
+            onUpArrow: { navigateSelection(by: -calculatedColumns) },
+            onDownArrow: { navigateSelection(by: calculatedColumns) },
+            onLeftArrow: { navigateSelection(by: -1) },
+            onRightArrow: { navigateSelection(by: 1) },
+            onReturn: { openSelectedItem() },
+            onSpace: { toggleQuickLook() }
+        )
+    }
+
+    // Calculate columns based on actual available width
+    // Grid uses adaptive(minimum: 100, maximum: 120) with spacing: 20
+    private func updateColumnCount(width: CGFloat) {
+        let availableWidth = width - 40 // Subtract padding (20 each side)
+        // Each column needs minimum 100px + spacing
+        // Formula: how many 100px items fit with 20px spacing between them
+        // N items need: N * 100 + (N-1) * 20 = N * 120 - 20 pixels
+        // So N = (availableWidth + 20) / 120
+        let cols = Int((availableWidth + 20) / 120)
+        calculatedColumns = max(1, cols)
+    }
+
+    private func navigateSelection(by offset: Int) {
+        guard !items.isEmpty else { return }
+
+        let currentIndex: Int
+        if let selectedItem = viewModel.selectedItems.first,
+           let index = items.firstIndex(of: selectedItem) {
+            currentIndex = index
+        } else {
+            currentIndex = -1
+        }
+
+        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
+        let newItem = items[newIndex]
+        viewModel.selectItem(newItem)
+    }
+
+    private func openSelectedItem() {
+        if let selectedItem = viewModel.selectedItems.first {
+            viewModel.openItem(selectedItem)
+        }
+    }
+
+    private func toggleQuickLook() {
+        guard viewModel.selectedItems.first != nil else { return }
+
+        if let panel = QLPreviewPanel.shared() {
+            if panel.isVisible {
+                panel.orderOut(nil)
+            } else {
+                panel.makeKeyAndOrderFront(nil)
+                panel.reloadData()
+            }
         }
     }
 
@@ -129,11 +194,10 @@ struct IconGridItem: View {
     var body: some View {
         VStack(spacing: 8) {
             ZStack {
-                if isSelected {
-                    RoundedRectangle(cornerRadius: 8)
-                        .fill(Color.accentColor.opacity(0.2))
-                        .frame(width: 90, height: 90)
-                }
+                // Always have the background frame to prevent size changes on selection
+                RoundedRectangle(cornerRadius: 8)
+                    .fill(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
+                    .frame(width: 90, height: 90)
 
                 Image(nsImage: item.icon)
                     .resizable()
