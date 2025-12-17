@@ -51,7 +51,6 @@ struct CoverFlowView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            ZStack(alignment: .topLeading) {
             VStack(spacing: 0) {
                 // Cover Flow area - takes proportional space
                 CoverFlowContainer(
@@ -115,36 +114,37 @@ struct CoverFlowView: View {
                     viewModel: viewModel
                 )
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .overlay(alignment: .topLeading) {
+                // Debug overlay
+                if viewModel.showDebug {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("DEBUG LOG")
+                                .font(.system(size: 10, weight: .bold))
+                            Spacer()
+                            Text("Loaded: \(thumbnails.count) | Pending: \(pendingThumbnails.count)")
+                                .font(.system(size: 10))
+                        }
+                        .padding(.bottom, 4)
 
-            // Debug overlay
-            if viewModel.showDebug {
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text("DEBUG LOG")
-                            .font(.system(size: 10, weight: .bold))
-                        Spacer()
-                        Text("Loaded: \(thumbnails.count) | Pending: \(pendingThumbnails.count)")
-                            .font(.system(size: 10))
-                    }
-                    .padding(.bottom, 4)
-
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 1) {
-                            ForEach(debugLog.suffix(20), id: \.self) { entry in
-                                Text(entry)
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .foregroundColor(.green)
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 1) {
+                                ForEach(debugLog.suffix(20), id: \.self) { entry in
+                                    Text(entry)
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundColor(.green)
+                                }
                             }
                         }
                     }
+                    .padding(8)
+                    .background(Color.black.opacity(0.85))
+                    .foregroundColor(.white)
+                    .cornerRadius(8)
+                    .frame(maxWidth: 400, maxHeight: 200)
+                    .padding(10)
                 }
-                .padding(8)
-                .background(Color.black.opacity(0.85))
-                .foregroundColor(.white)
-                .cornerRadius(8)
-                .frame(maxWidth: 400, maxHeight: 200)
-                .padding(10)
-            }
             }
         }
         .onAppear {
@@ -1349,39 +1349,54 @@ struct FileListSection: View {
     let onSelect: (FileItem, Int) -> Void
     let onOpen: (FileItem) -> Void
     @ObservedObject var viewModel: FileBrowserViewModel
+    @ObservedObject private var columnConfig = ListColumnConfigManager.shared
     @State private var renamingItem: FileItem?
-
     @State private var isDropTargeted = false
 
+    private var sortedItems: [FileItem] {
+        columnConfig.sortedItems(items)
+    }
+
     var body: some View {
-        List(Array(items.enumerated()), id: \.element.id) { index, item in
-            FileListRow(item: item)
-                .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                .listRowBackground(
-                    selectedItems.contains(item)
-                        ? Color.accentColor.opacity(0.2)
-                        : Color.clear
-                )
-                .onDrag {
-                    NSItemProvider(object: item.url as NSURL)
-                }
-                .gesture(
-                    TapGesture(count: 2).onEnded {
-                        onOpen(item)
+        VStack(spacing: 0) {
+            // Column header
+            CoverFlowColumnHeader(columnConfig: columnConfig)
+
+            Divider()
+
+            // File list
+            List(Array(sortedItems.enumerated()), id: \.element.id) { index, item in
+                CoverFlowFileRow(item: item, columnConfig: columnConfig)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                    .listRowBackground(
+                        selectedItems.contains(item)
+                            ? Color.accentColor.opacity(0.2)
+                            : Color.clear
+                    )
+                    .onDrag {
+                        NSItemProvider(object: item.url as NSURL)
                     }
-                )
-                .simultaneousGesture(
-                    TapGesture(count: 1).onEnded {
-                        onSelect(item, index)
+                    .gesture(
+                        TapGesture(count: 2).onEnded {
+                            onOpen(item)
+                        }
+                    )
+                    .simultaneousGesture(
+                        TapGesture(count: 1).onEnded {
+                            // Find original index in unsorted items for selection sync
+                            if let originalIndex = items.firstIndex(of: item) {
+                                onSelect(item, originalIndex)
+                            }
+                        }
+                    )
+                    .contextMenu {
+                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                            renamingItem = item
+                        }
                     }
-                )
-                .contextMenu {
-                    FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                        renamingItem = item
-                    }
-                }
+            }
+            .listStyle(.plain)
         }
-        .listStyle(.plain)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
             return true
@@ -1442,34 +1457,165 @@ struct FileListSection: View {
     }
 }
 
-struct FileListRow: View {
-    let item: FileItem
+// Column header for CoverFlow file list
+struct CoverFlowColumnHeader: View {
+    @ObservedObject var columnConfig: ListColumnConfigManager
 
     var body: some View {
-        HStack(spacing: 12) {
-            Image(nsImage: item.icon)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: 20, height: 20)
+        HStack(spacing: 0) {
+            ForEach(columnConfig.visibleColumns) { settings in
+                Button(action: { columnConfig.setSortColumn(settings.column) }) {
+                    HStack(spacing: 4) {
+                        Text(settings.column.rawValue)
+                            .font(.caption)
+                            .fontWeight(.medium)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
 
-            Text(item.name)
-                .lineLimit(1)
-
+                        if columnConfig.sortColumn == settings.column {
+                            Image(systemName: columnConfig.sortDirection == .ascending ? "chevron.up" : "chevron.down")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .frame(width: settings.width, alignment: settings.column.alignment)
+                }
+                .buttonStyle(.plain)
+                .contextMenu {
+                    columnVisibilityMenu
+                }
+            }
             Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
 
-            Text(item.formattedDate)
-                .foregroundColor(.secondary)
-                .font(.caption)
-                .frame(width: 140, alignment: .trailing)
+    @ViewBuilder
+    private var columnVisibilityMenu: some View {
+        Text("Columns")
+            .font(.caption)
 
-            Text(item.formattedSize)
-                .foregroundColor(.secondary)
-                .font(.caption)
-                .frame(width: 80, alignment: .trailing)
+        Divider()
+
+        ForEach(ListColumn.allCases) { column in
+            let isVisible = columnConfig.columns.first(where: { $0.column == column })?.isVisible ?? false
+            Button {
+                columnConfig.toggleColumnVisibility(column)
+            } label: {
+                HStack {
+                    if isVisible {
+                        Image(systemName: "checkmark")
+                    }
+                    Text(column.rawValue)
+                }
+            }
+            .disabled(column == .name)
+        }
+
+        Divider()
+
+        Button("Reset to Defaults") {
+            columnConfig.resetToDefaults()
+        }
+    }
+}
+
+// File row for CoverFlow file list
+struct CoverFlowFileRow: View {
+    let item: FileItem
+    @ObservedObject var columnConfig: ListColumnConfigManager
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(columnConfig.visibleColumns) { settings in
+                cellContent(for: settings.column)
+                    .frame(width: settings.width, alignment: settings.column.alignment)
+            }
+            Spacer()
         }
         .padding(.vertical, 6)
         .padding(.horizontal, 8)
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
+    }
+
+    @ViewBuilder
+    private func cellContent(for column: ListColumn) -> some View {
+        switch column {
+        case .name:
+            HStack(spacing: 8) {
+                Image(nsImage: item.icon)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+                    .frame(width: 20, height: 20)
+                Text(item.name)
+                    .lineLimit(1)
+            }
+        case .dateModified:
+            Text(item.formattedDate)
+                .foregroundColor(.secondary)
+                .font(.caption)
+        case .dateCreated:
+            Text(formattedCreationDate)
+                .foregroundColor(.secondary)
+                .font(.caption)
+        case .size:
+            Text(item.formattedSize)
+                .foregroundColor(.secondary)
+                .font(.caption)
+        case .kind:
+            Text(kindDescription)
+                .foregroundColor(.secondary)
+                .font(.caption)
+        case .tags:
+            CoverFlowTagsView(url: item.url)
+        }
+    }
+
+    private var formattedCreationDate: String {
+        guard let date = item.creationDate else { return "--" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    private var kindDescription: String {
+        if item.isDirectory { return "Folder" }
+        switch item.fileType {
+        case .image: return "Image"
+        case .video: return "Video"
+        case .audio: return "Audio"
+        case .document: return "Document"
+        case .code: return "Source Code"
+        case .archive: return "Archive"
+        case .application: return "Application"
+        default: return "Document"
+        }
+    }
+}
+
+struct CoverFlowTagsView: View {
+    let url: URL
+    @State private var tags: [String] = []
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(tags.prefix(3), id: \.self) { tag in
+                Text(tag)
+                    .font(.caption2)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 1)
+                    .background(Color.accentColor.opacity(0.3))
+                    .clipShape(Capsule())
+            }
+        }
+        .onAppear {
+            if let tagNames = try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames {
+                tags = tagNames
+            }
+        }
     }
 }

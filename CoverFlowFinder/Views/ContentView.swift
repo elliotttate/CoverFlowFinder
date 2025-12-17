@@ -17,16 +17,22 @@ struct ContentView: View {
     @State private var renameText: String = ""
     @State private var activePane: DualPaneView.Pane = .left
 
+    // Track viewMode changes to force re-render (workaround for computed viewModel)
+    @State private var currentViewMode: ViewMode = .coverFlow
+
     // Current tab's viewModel
     private var viewModel: FileBrowserViewModel {
         tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
     }
 
-    // Binding to current viewModel's viewMode
+    // Binding to current viewModel's viewMode (also updates local state for re-rendering)
     private var viewModeBinding: Binding<ViewMode> {
         Binding(
             get: { viewModel.viewMode },
-            set: { viewModel.viewMode = $0 }
+            set: { newValue in
+                viewModel.viewMode = newValue
+                currentViewMode = newValue
+            }
         )
     }
 
@@ -63,7 +69,7 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(viewModel: activeViewModel, isDualPane: viewModel.viewMode == .dualPane)
+            SidebarView(viewModel: activeViewModel, isDualPane: currentViewMode == .dualPane)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 300)
         } detail: {
             VStack(spacing: 0) {
@@ -78,14 +84,16 @@ struct ContentView: View {
                     Divider()
                 }
 
-                if viewModel.viewMode == .dualPane {
+                if currentViewMode == .dualPane {
                     // Dual pane mode - full width without path bar/status bar
                     DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel, activePane: $activePane)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .frame(minWidth: 700, minHeight: 400)
                         .id("dualpane-\(viewModel.currentPath.path)-\(selectedTabId)")
                 } else {
                     // Use wrapper view to properly observe viewModel changes
                     TabContentWrapper(viewModel: viewModel, selectedTabId: selectedTabId)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }
@@ -198,6 +206,13 @@ struct ContentView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .previousTab)) { _ in
             selectPreviousTab()
+        }
+        // Sync currentViewMode when tab changes
+        .onChange(of: selectedTabId) { _, _ in
+            currentViewMode = viewModel.viewMode
+        }
+        .onAppear {
+            currentViewMode = viewModel.viewMode
         }
     }
 
@@ -457,34 +472,41 @@ struct TabContentWrapper: View {
             Divider()
 
             // Main content area
-            if viewModel.isLoading {
-                ProgressView()
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else if viewModel.filteredItems.isEmpty {
-                EmptyFolderView()
-            } else {
-                switch viewModel.viewMode {
-                case .coverFlow:
-                    CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
-                        .id("coverflow-\(viewModel.currentPath.path)-\(selectedTabId)")
-                case .icons:
-                    IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
-                        .id("icons-\(viewModel.currentPath.path)-\(selectedTabId)")
-                case .list:
-                    FileListView(viewModel: viewModel, items: viewModel.filteredItems)
-                        .id("list-\(viewModel.currentPath.path)-\(selectedTabId)")
-                case .columns:
-                    ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
-                        .id("columns-\(viewModel.currentPath.path)-\(selectedTabId)")
-                case .dualPane:
-                    EmptyView() // Handled in parent
+            Group {
+                if viewModel.isLoading {
+                    ProgressView()
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if viewModel.filteredItems.isEmpty {
+                    EmptyFolderView()
+                } else {
+                    mainContentView
                 }
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             // Status bar
             StatusBarView(viewModel: viewModel)
         }
-        .frame(minWidth: 500, minHeight: 400)
+    }
+
+    @ViewBuilder
+    private var mainContentView: some View {
+        switch viewModel.viewMode {
+        case .coverFlow:
+            CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
+                .id("coverflow-\(viewModel.currentPath.path)-\(selectedTabId)")
+        case .icons:
+            IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
+                .id("icons-\(viewModel.currentPath.path)-\(selectedTabId)")
+        case .list:
+            FileListView(viewModel: viewModel, items: viewModel.filteredItems)
+                .id("list-\(viewModel.currentPath.path)-\(selectedTabId)")
+        case .columns:
+            ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
+                .id("columns-\(viewModel.currentPath.path)-\(selectedTabId)")
+        case .dualPane:
+            EmptyView() // Handled in parent
+        }
     }
 }
 

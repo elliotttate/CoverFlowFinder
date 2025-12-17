@@ -4,47 +4,35 @@ import Quartz
 struct FileListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
+    @ObservedObject private var columnConfig = ListColumnConfigManager.shared
     @State private var renamingItem: FileItem?
     @State private var isDropTargeted = false
 
+    private var sortedItems: [FileItem] {
+        columnConfig.sortedItems(items)
+    }
+
     var body: some View {
-        List(selection: Binding(
-            get: { Set(viewModel.selectedItems.map { $0.id }) },
-            set: { ids in
-                viewModel.selectedItems = Set(items.filter { ids.contains($0.id) })
-            }
-        )) {
-            // Header row
-            HStack(spacing: 0) {
-                Text("Name")
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .frame(minWidth: 200, alignment: .leading)
+        VStack(spacing: 0) {
+            // Column headers - fixed at top
+            ColumnHeaderView(columnConfig: columnConfig)
+            Divider()
 
-                Spacer()
-
-                Text("Date Modified")
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .frame(width: 150, alignment: .trailing)
-
-                Text("Size")
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .frame(width: 80, alignment: .trailing)
-
-                Text("Kind")
-                    .font(.caption)
-                    .fontWeight(.medium)
-                    .frame(width: 100, alignment: .trailing)
-            }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 4)
-            .foregroundColor(.secondary)
-
-            ForEach(items) { item in
-                FileListRowView(item: item, isSelected: viewModel.selectedItems.contains(item))
+            // File list - fills remaining space
+            List(selection: Binding(
+                get: { Set(viewModel.selectedItems.map { $0.id }) },
+                set: { ids in
+                    viewModel.selectedItems = Set(sortedItems.filter { ids.contains($0.id) })
+                }
+            )) {
+                ForEach(sortedItems) { item in
+                    FileListRowView(
+                        item: item,
+                        isSelected: viewModel.selectedItems.contains(item),
+                        columnConfig: columnConfig
+                    )
                     .tag(item.id)
+                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                     .onDrag {
                         NSItemProvider(object: item.url as NSURL)
                     }
@@ -59,9 +47,14 @@ struct FileListView: View {
                             renamingItem = item
                         }
                     }
+                }
             }
+            .listStyle(.inset(alternatesRowBackgrounds: true))
+            .scrollContentBackground(.visible)
+            .frame(maxHeight: .infinity)
+            .layoutPriority(1)
         }
-        .listStyle(.inset(alternatesRowBackgrounds: true))
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
             return true
@@ -83,18 +76,18 @@ struct FileListView: View {
     }
 
     private func navigateSelection(by offset: Int) {
-        guard !items.isEmpty else { return }
+        guard !sortedItems.isEmpty else { return }
 
         let currentIndex: Int
         if let selectedItem = viewModel.selectedItems.first,
-           let index = items.firstIndex(of: selectedItem) {
+           let index = sortedItems.firstIndex(of: selectedItem) {
             currentIndex = index
         } else {
             currentIndex = -1
         }
 
-        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
-        let newItem = items[newIndex]
+        let newIndex = max(0, min(sortedItems.count - 1, currentIndex + offset))
+        let newItem = sortedItems[newIndex]
         viewModel.selectItem(newItem)
     }
 
@@ -164,12 +157,144 @@ struct FileListView: View {
     }
 }
 
-struct FileListRowView: View {
-    let item: FileItem
-    let isSelected: Bool
+// MARK: - Column Header View
+
+struct ColumnHeaderView: View {
+    @ObservedObject var columnConfig: ListColumnConfigManager
+    @State private var resizingColumn: ListColumn?
+    @State private var initialWidth: CGFloat = 0
 
     var body: some View {
         HStack(spacing: 0) {
+            ForEach(columnConfig.visibleColumns) { settings in
+                ColumnHeaderCell(
+                    settings: settings,
+                    isSortColumn: columnConfig.sortColumn == settings.column,
+                    sortDirection: columnConfig.sortDirection,
+                    onSort: { columnConfig.setSortColumn(settings.column) },
+                    onResize: { delta in
+                        columnConfig.setColumnWidth(settings.column, width: settings.width + delta)
+                    }
+                )
+                .contextMenu {
+                    columnVisibilityMenu
+                }
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    @ViewBuilder
+    private var columnVisibilityMenu: some View {
+        Text("Columns")
+            .font(.caption)
+
+        Divider()
+
+        ForEach(ListColumn.allCases) { column in
+            let isVisible = columnConfig.columns.first(where: { $0.column == column })?.isVisible ?? false
+            Button {
+                columnConfig.toggleColumnVisibility(column)
+            } label: {
+                HStack {
+                    if isVisible {
+                        Image(systemName: "checkmark")
+                    }
+                    Text(column.rawValue)
+                }
+            }
+            .disabled(column == .name) // Name column always visible
+        }
+
+        Divider()
+
+        Button("Reset to Defaults") {
+            columnConfig.resetToDefaults()
+        }
+    }
+}
+
+// MARK: - Column Header Cell
+
+struct ColumnHeaderCell: View {
+    let settings: ColumnSettings
+    let isSortColumn: Bool
+    let sortDirection: SortDirection
+    let onSort: () -> Void
+    let onResize: (CGFloat) -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button(action: onSort) {
+                HStack(spacing: 4) {
+                    Text(settings.column.rawValue)
+                        .font(.caption)
+                        .fontWeight(.medium)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
+
+                    if isSortColumn {
+                        Image(systemName: sortDirection == .ascending ? "chevron.up" : "chevron.down")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: settings.column.alignment)
+            }
+            .buttonStyle(.plain)
+
+            // Resize handle
+            Rectangle()
+                .fill(isHovering ? Color.accentColor : Color.clear)
+                .frame(width: 4)
+                .contentShape(Rectangle().inset(by: -4))
+                .gesture(
+                    DragGesture()
+                        .onChanged { value in
+                            onResize(value.translation.width)
+                        }
+                )
+                .onHover { hovering in
+                    isHovering = hovering
+                    if hovering {
+                        NSCursor.resizeLeftRight.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+        }
+        .frame(width: settings.width)
+    }
+}
+
+// MARK: - File List Row View
+
+struct FileListRowView: View {
+    let item: FileItem
+    let isSelected: Bool
+    @ObservedObject var columnConfig: ListColumnConfigManager
+
+    var body: some View {
+        HStack(spacing: 0) {
+            ForEach(columnConfig.visibleColumns) { settings in
+                cellContent(for: settings.column)
+                    .frame(width: settings.width, alignment: settings.column.alignment)
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+    }
+
+    @ViewBuilder
+    private func cellContent(for column: ListColumn) -> some View {
+        switch column {
+        case .name:
             HStack(spacing: 8) {
                 Image(nsImage: item.icon)
                     .resizable()
@@ -178,27 +303,33 @@ struct FileListRowView: View {
                 Text(item.name)
                     .lineLimit(1)
             }
-            .frame(minWidth: 200, alignment: .leading)
-
-            Spacer()
-
+        case .dateModified:
             Text(item.formattedDate)
                 .foregroundColor(.secondary)
                 .font(.caption)
-                .frame(width: 150, alignment: .trailing)
-
+        case .dateCreated:
+            Text(formattedCreationDate)
+                .foregroundColor(.secondary)
+                .font(.caption)
+        case .size:
             Text(item.formattedSize)
                 .foregroundColor(.secondary)
                 .font(.caption)
-                .frame(width: 80, alignment: .trailing)
-
+        case .kind:
             Text(kindDescription(for: item))
                 .foregroundColor(.secondary)
                 .font(.caption)
-                .frame(width: 100, alignment: .trailing)
+        case .tags:
+            TagsView(url: item.url)
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
+    }
+
+    private var formattedCreationDate: String {
+        guard let date = item.creationDate else { return "--" }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 
     private func kindDescription(for item: FileItem) -> String {
@@ -214,6 +345,66 @@ struct FileListRowView: View {
         case .archive: return "Archive"
         case .application: return "Application"
         default: return "Document"
+        }
+    }
+}
+
+// MARK: - Tags View
+
+struct TagsView: View {
+    let url: URL
+    @State private var tags: [String] = []
+
+    var body: some View {
+        HStack(spacing: 4) {
+            ForEach(tags.prefix(3), id: \.self) { tag in
+                TagBadge(name: tag)
+            }
+            if tags.count > 3 {
+                Text("+\(tags.count - 3)")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .onAppear {
+            loadTags()
+        }
+    }
+
+    private func loadTags() {
+        do {
+            let resourceValues = try url.resourceValues(forKeys: [.tagNamesKey])
+            tags = resourceValues.tagNames ?? []
+        } catch {
+            tags = []
+        }
+    }
+}
+
+struct TagBadge: View {
+    let name: String
+
+    var body: some View {
+        Text(name)
+            .font(.caption2)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(tagColor.opacity(0.3))
+            .foregroundColor(tagColor)
+            .clipShape(Capsule())
+    }
+
+    private var tagColor: Color {
+        // Map common Finder tag colors
+        switch name.lowercased() {
+        case "red": return .red
+        case "orange": return .orange
+        case "yellow": return .yellow
+        case "green": return .green
+        case "blue": return .blue
+        case "purple": return .purple
+        case "gray", "grey": return .gray
+        default: return .accentColor
         }
     }
 }
