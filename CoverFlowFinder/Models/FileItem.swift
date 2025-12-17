@@ -1,8 +1,15 @@
 import Foundation
 import AppKit
 import UniformTypeIdentifiers
+import SwiftUI
 
-struct FileItem: Identifiable, Hashable {
+struct FileItem: Identifiable, Hashable, Transferable {
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .fileURL) { item in
+            SentTransferredFile(item.url)
+        }
+        ProxyRepresentation(exporting: \.url)
+    }
     let id = UUID()
     let url: URL
     let name: String

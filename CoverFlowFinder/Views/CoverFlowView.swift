@@ -70,6 +70,9 @@ struct CoverFlowView: View {
                     },
                     onRightClick: { index in
                         rightClickedIndex = index
+                    },
+                    onDrop: { urls in
+                        handleDrop(urls: urls)
                     }
                 )
                 .frame(height: max(250, geometry.size.height * 0.45))
@@ -181,6 +184,44 @@ struct CoverFlowView: View {
     private func syncSelection() {
         guard !items.isEmpty && viewModel.coverFlowSelectedIndex < items.count else { return }
         viewModel.selectedItems = [items[viewModel.coverFlowSelectedIndex]]
+    }
+
+    private func handleDrop(urls: [URL]) {
+        let destPath = viewModel.currentPath
+        let shouldMove = NSEvent.modifierFlags.contains(.option)
+
+        for sourceURL in urls {
+            if sourceURL.deletingLastPathComponent() == destPath {
+                continue
+            }
+
+            let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
+
+            var finalURL = destURL
+            var counter = 1
+            while FileManager.default.fileExists(atPath: finalURL.path) {
+                let name = sourceURL.deletingPathExtension().lastPathComponent
+                let ext = sourceURL.pathExtension
+                if ext.isEmpty {
+                    finalURL = destPath.appendingPathComponent("\(name) \(counter)")
+                } else {
+                    finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
+                }
+                counter += 1
+            }
+
+            do {
+                if shouldMove {
+                    try FileManager.default.moveItem(at: sourceURL, to: finalURL)
+                } else {
+                    try FileManager.default.copyItem(at: sourceURL, to: finalURL)
+                }
+            } catch {
+                print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+            }
+        }
+
+        viewModel.refresh()
     }
 
     private func loadVisibleThumbnails() {
@@ -348,6 +389,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onSelect: (Int) -> Void
     let onOpen: (Int) -> Void
     let onRightClick: (Int) -> Void
+    let onDrop: ([URL]) -> Void
 
     func makeNSView(context: Context) -> CoverFlowNSView {
         let view = CoverFlowNSView()
@@ -356,6 +398,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.onRightClick = { index, _ in
             onRightClick(index)
         }
+        view.onDrop = onDrop
         view.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
         return view
     }
@@ -366,6 +409,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         nsView.onRightClick = { index, _ in
             onRightClick(index)
         }
+        nsView.onDrop = onDrop
         nsView.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
 
         // Request focus when view updates
@@ -471,6 +515,12 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         fatalError("init(coder:) has not been implemented")
     }
 
+    // Drag and drop
+    var onDrop: (([URL]) -> Void)?
+    private var dragStartLocation: NSPoint?
+    private var dragStartIndex: Int?
+    private var isDropTargeted = false
+
     private func setupView() {
         wantsLayer = true
 
@@ -490,6 +540,9 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         let rightClickGesture = NSClickGestureRecognizer(target: self, action: #selector(handleRightClick(_:)))
         rightClickGesture.buttonMask = 0x2 // Right mouse button
         addGestureRecognizer(rightClickGesture)
+
+        // Register for drag and drop
+        registerForDraggedTypes([.fileURL])
     }
 
     @objc private func handleRightClick(_ gesture: NSClickGestureRecognizer) {
@@ -839,19 +892,60 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         }
 
         let location = convert(event.locationInWindow, from: nil)
-        if let index = hitTestCover(at: location) {
+
+        // Track for potential drag
+        dragStartLocation = location
+        dragStartIndex = hitTestCover(at: location)
+
+        if let index = dragStartIndex {
             let now = Date()
             let isDoubleClick = (now.timeIntervalSince(lastClickTime) < 0.3) && (index == lastClickIndex)
 
             if isDoubleClick {
                 onOpen?(index)
                 lastClickTime = .distantPast
+                dragStartLocation = nil
+                dragStartIndex = nil
             } else {
                 onSelect?(index)
                 lastClickTime = now
                 lastClickIndex = index
             }
         }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let startLocation = dragStartLocation,
+              let index = dragStartIndex,
+              index < items.count else { return }
+
+        let location = convert(event.locationInWindow, from: nil)
+        let distance = hypot(location.x - startLocation.x, location.y - startLocation.y)
+
+        // Start drag if moved enough
+        if distance > 5 {
+            let item = items[index]
+            let pasteboardItem = NSPasteboardItem()
+            pasteboardItem.setString(item.url.absoluteString, forType: .fileURL)
+
+            let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
+
+            // Use the item's icon for the drag image
+            let iconSize = NSSize(width: 64, height: 64)
+            let dragImage = item.icon
+            dragImage.size = iconSize
+            draggingItem.setDraggingFrame(NSRect(origin: location, size: iconSize), contents: dragImage)
+
+            beginDraggingSession(with: [draggingItem], event: event, source: self)
+
+            dragStartLocation = nil
+            dragStartIndex = nil
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        dragStartLocation = nil
+        dragStartIndex = nil
     }
 
     override func rightMouseDown(with event: NSEvent) {
@@ -1186,7 +1280,64 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         momentumTimer?.invalidate()
         typeAheadTimer?.invalidate()
     }
+
+    // MARK: - NSDraggingSource
+
+    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
+        return context == .outsideApplication ? .copy : .copy
+    }
+
+    // MARK: - NSDraggingDestination
+
+    override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
+        isDropTargeted = true
+        needsDisplay = true
+        return .copy
+    }
+
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        return .copy
+    }
+
+    override func draggingExited(_ sender: NSDraggingInfo?) {
+        isDropTargeted = false
+        needsDisplay = true
+    }
+
+    override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        return true
+    }
+
+    override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        isDropTargeted = false
+        needsDisplay = true
+
+        guard let pasteboard = sender.draggingPasteboard.propertyList(forType: .fileURL) as? String,
+              let url = URL(string: pasteboard) else {
+            // Try reading multiple URLs
+            var urls: [URL] = []
+            if let items = sender.draggingPasteboard.pasteboardItems {
+                for item in items {
+                    if let urlString = item.string(forType: .fileURL),
+                       let url = URL(string: urlString) {
+                        urls.append(url)
+                    }
+                }
+            }
+
+            if !urls.isEmpty {
+                onDrop?(urls)
+                return true
+            }
+            return false
+        }
+
+        onDrop?([url])
+        return true
+    }
 }
+
+extension CoverFlowNSView: NSDraggingSource {}
 
 // MARK: - File List Section
 
@@ -1198,6 +1349,8 @@ struct FileListSection: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     @State private var renamingItem: FileItem?
 
+    @State private var isDropTargeted = false
+
     var body: some View {
         List(Array(items.enumerated()), id: \.element.id) { index, item in
             FileListRow(item: item)
@@ -1207,6 +1360,9 @@ struct FileListSection: View {
                         : Color.clear
                 )
                 .contentShape(Rectangle())
+                .onDrag {
+                    NSItemProvider(object: item.url as NSURL)
+                }
                 .gesture(
                     TapGesture(count: 2).onEnded {
                         onOpen(item)
@@ -1224,8 +1380,62 @@ struct FileListSection: View {
                 }
         }
         .listStyle(.inset)
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            handleDrop(providers: providers)
+            return true
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 2)
+        )
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
+        }
+    }
+
+    private func handleDrop(providers: [NSItemProvider]) {
+        let destPath = viewModel.currentPath
+        let shouldMove = NSEvent.modifierFlags.contains(.option)
+
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, error in
+                guard let data = data as? Data,
+                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else {
+                    return
+                }
+
+                if sourceURL.deletingLastPathComponent() == destPath {
+                    return
+                }
+
+                let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
+
+                var finalURL = destURL
+                var counter = 1
+                while FileManager.default.fileExists(atPath: finalURL.path) {
+                    let name = sourceURL.deletingPathExtension().lastPathComponent
+                    let ext = sourceURL.pathExtension
+                    if ext.isEmpty {
+                        finalURL = destPath.appendingPathComponent("\(name) \(counter)")
+                    } else {
+                        finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
+                    }
+                    counter += 1
+                }
+
+                do {
+                    if shouldMove {
+                        try FileManager.default.moveItem(at: sourceURL, to: finalURL)
+                    } else {
+                        try FileManager.default.copyItem(at: sourceURL, to: finalURL)
+                    }
+                    DispatchQueue.main.async {
+                        viewModel.refresh()
+                    }
+                } catch {
+                    print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+                }
+            }
         }
     }
 }

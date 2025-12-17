@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 struct DualPaneView: View {
     @ObservedObject var leftViewModel: FileBrowserViewModel
@@ -14,6 +15,7 @@ struct DualPaneView: View {
             // Left pane
             PaneView(
                 viewModel: leftViewModel,
+                otherViewModel: rightViewModel,
                 isActive: activePane == .left,
                 onActivate: { activePane = .left }
             )
@@ -21,6 +23,7 @@ struct DualPaneView: View {
             // Right pane
             PaneView(
                 viewModel: rightViewModel,
+                otherViewModel: leftViewModel,
                 isActive: activePane == .right,
                 onActivate: { activePane = .right }
             )
@@ -30,9 +33,11 @@ struct DualPaneView: View {
 
 struct PaneView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
+    @ObservedObject var otherViewModel: FileBrowserViewModel
     let isActive: Bool
     let onActivate: () -> Void
     @State private var paneViewMode: PaneViewMode = .list
+    @State private var isDropTargeted = false
 
     enum PaneViewMode: String, CaseIterable {
         case list = "List"
@@ -44,6 +49,20 @@ struct PaneView: View {
             case .icons: return "square.grid.2x2"
             }
         }
+    }
+
+    // Cache path components
+    private var pathComponents: [URL] {
+        var components: [URL] = []
+        var current = viewModel.currentPath
+
+        while current.path != "/" {
+            components.insert(current, at: 0)
+            current = current.deletingLastPathComponent()
+        }
+        components.insert(URL(fileURLWithPath: "/"), at: 0)
+
+        return components
     }
 
     var body: some View {
@@ -90,11 +109,12 @@ struct PaneView: View {
             // Path bar
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 4) {
-                    ForEach(pathComponents(), id: \.self) { component in
+                    ForEach(pathComponents, id: \.self) { component in
                         Button(action: {
-                            navigateToComponent(component)
+                            viewModel.navigateTo(component)
+                            onActivate()
                         }) {
-                            Text(component.lastPathComponent)
+                            Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
                                 .font(.caption)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
@@ -115,7 +135,7 @@ struct PaneView: View {
 
             Divider()
 
-            // Content
+            // Content with drop support
             Group {
                 switch paneViewMode {
                 case .list:
@@ -124,10 +144,15 @@ struct PaneView: View {
                     PaneIconView(viewModel: viewModel)
                 }
             }
-            .contentShape(Rectangle())
-            .onTapGesture {
-                onActivate()
+            .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+                handleDrop(providers: providers)
+                return true
             }
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 3)
+                    .padding(4)
+            )
 
             Divider()
 
@@ -154,24 +179,58 @@ struct PaneView: View {
             RoundedRectangle(cornerRadius: 0)
                 .stroke(isActive ? Color.accentColor : Color.clear, lineWidth: 2)
         )
-    }
-
-    private func pathComponents() -> [URL] {
-        var components: [URL] = []
-        var current = viewModel.currentPath
-
-        while current.path != "/" {
-            components.insert(current, at: 0)
-            current = current.deletingLastPathComponent()
+        .onTapGesture {
+            onActivate()
         }
-        components.insert(URL(fileURLWithPath: "/"), at: 0)
-
-        return components
     }
 
-    private func navigateToComponent(_ url: URL) {
-        viewModel.navigateTo(url)
-        onActivate()
+    private func handleDrop(providers: [NSItemProvider]) {
+        let destPath = viewModel.currentPath
+        let shouldMove = NSEvent.modifierFlags.contains(.option)
+
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, error in
+                guard let data = data as? Data,
+                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else {
+                    return
+                }
+
+                // Skip if dropping onto the same directory
+                if sourceURL.deletingLastPathComponent() == destPath {
+                    return
+                }
+
+                let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
+
+                // Check if we need to make a unique name
+                var finalURL = destURL
+                var counter = 1
+                while FileManager.default.fileExists(atPath: finalURL.path) {
+                    let name = sourceURL.deletingPathExtension().lastPathComponent
+                    let ext = sourceURL.pathExtension
+                    if ext.isEmpty {
+                        finalURL = destPath.appendingPathComponent("\(name) \(counter)")
+                    } else {
+                        finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
+                    }
+                    counter += 1
+                }
+
+                do {
+                    if shouldMove {
+                        try FileManager.default.moveItem(at: sourceURL, to: finalURL)
+                    } else {
+                        try FileManager.default.copyItem(at: sourceURL, to: finalURL)
+                    }
+                    DispatchQueue.main.async {
+                        viewModel.refresh()
+                        otherViewModel.refresh()
+                    }
+                } catch {
+                    print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+                }
+            }
+        }
     }
 }
 
@@ -179,13 +238,9 @@ struct PaneListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
 
     var body: some View {
-        List(selection: Binding(
-            get: { Set(viewModel.selectedItems.map { $0.id }) },
-            set: { ids in
-                viewModel.selectedItems = Set(viewModel.items.filter { ids.contains($0.id) })
-            }
-        )) {
+        List {
             ForEach(viewModel.items) { item in
+                let isSelected = viewModel.selectedItems.contains(item)
                 HStack(spacing: 8) {
                     Image(nsImage: item.icon)
                         .resizable()
@@ -207,8 +262,14 @@ struct PaneListView: View {
                         .foregroundColor(.secondary)
                         .frame(width: 100, alignment: .trailing)
                 }
-                .tag(item.id)
+                .padding(.vertical, 2)
+                .padding(.horizontal, 4)
+                .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+                .cornerRadius(4)
                 .contentShape(Rectangle())
+                .onDrag {
+                    NSItemProvider(object: item.url as NSURL)
+                }
                 .onTapGesture(count: 2) {
                     viewModel.openItem(item)
                 }
@@ -220,7 +281,7 @@ struct PaneListView: View {
                 }
             }
         }
-        .listStyle(.inset(alternatesRowBackgrounds: true))
+        .listStyle(.plain)
     }
 }
 
@@ -255,6 +316,9 @@ struct PaneIconView: View {
                     )
                     .cornerRadius(8)
                     .contentShape(Rectangle())
+                    .onDrag {
+                        NSItemProvider(object: item.url as NSURL)
+                    }
                     .onTapGesture(count: 2) {
                         viewModel.openItem(item)
                     }

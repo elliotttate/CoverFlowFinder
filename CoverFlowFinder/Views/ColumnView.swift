@@ -16,6 +16,7 @@ struct ColumnView: View {
                 SingleColumnView(
                     items: items,
                     selectedItem: columnSelections[viewModel.currentPath],
+                    columnURL: viewModel.currentPath,
                     viewModel: viewModel,
                     onRename: { item in renamingItem = item },
                     onSelect: { item in
@@ -39,6 +40,7 @@ struct ColumnView: View {
                     SingleColumnView(
                         items: column.items,
                         selectedItem: columnSelections[column.url],
+                        columnURL: column.url,
                         viewModel: viewModel,
                         onRename: { item in renamingItem = item },
                         onSelect: { item in
@@ -128,10 +130,12 @@ struct ColumnData: Identifiable {
 struct SingleColumnView: View {
     let items: [FileItem]
     let selectedItem: FileItem?
+    let columnURL: URL
     @ObservedObject var viewModel: FileBrowserViewModel
     let onRename: (FileItem) -> Void
     let onSelect: (FileItem) -> Void
     let onDoubleClick: (FileItem) -> Void
+    @State private var isDropTargeted = false
 
     var body: some View {
         List(items, id: \.id) { item in
@@ -140,6 +144,9 @@ struct SingleColumnView: View {
                 isSelected: selectedItem?.id == item.id
             )
             .contentShape(Rectangle())
+            .onDrag {
+                NSItemProvider(object: item.url as NSURL)
+            }
             .onTapGesture(count: 2) {
                 onDoubleClick(item)
             }
@@ -159,6 +166,59 @@ struct SingleColumnView: View {
         }
         .listStyle(.plain)
         .frame(width: 220)
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            handleDrop(providers: providers, destPath: columnURL)
+            return true
+        }
+        .overlay(
+            RoundedRectangle(cornerRadius: 4)
+                .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 2)
+        )
+    }
+
+    private func handleDrop(providers: [NSItemProvider], destPath: URL) {
+        let shouldMove = NSEvent.modifierFlags.contains(.option)
+
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, error in
+                guard let data = data as? Data,
+                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else {
+                    return
+                }
+
+                if sourceURL.deletingLastPathComponent() == destPath {
+                    return
+                }
+
+                let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
+
+                var finalURL = destURL
+                var counter = 1
+                while FileManager.default.fileExists(atPath: finalURL.path) {
+                    let name = sourceURL.deletingPathExtension().lastPathComponent
+                    let ext = sourceURL.pathExtension
+                    if ext.isEmpty {
+                        finalURL = destPath.appendingPathComponent("\(name) \(counter)")
+                    } else {
+                        finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
+                    }
+                    counter += 1
+                }
+
+                do {
+                    if shouldMove {
+                        try FileManager.default.moveItem(at: sourceURL, to: finalURL)
+                    } else {
+                        try FileManager.default.copyItem(at: sourceURL, to: finalURL)
+                    }
+                    DispatchQueue.main.async {
+                        viewModel.refresh()
+                    }
+                } catch {
+                    print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+                }
+            }
+        }
     }
 }
 

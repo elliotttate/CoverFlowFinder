@@ -2,7 +2,12 @@ import SwiftUI
 
 struct ContentView: View {
     @StateObject private var viewModel = FileBrowserViewModel()
-    @StateObject private var rightPaneViewModel = FileBrowserViewModel()
+    @StateObject private var rightPaneViewModel: FileBrowserViewModel = {
+        // Start right pane at Desktop for variety
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        return FileBrowserViewModel(initialPath: desktop)
+    }()
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var renamingItem: FileItem?
     @State private var renameText: String = ""
