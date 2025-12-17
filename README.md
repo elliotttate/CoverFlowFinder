@@ -21,12 +21,12 @@ A beautiful macOS file browser that brings back the classic Cover Flow view from
 ## Installation
 
 ### Download
-Download the latest DMG from the [Releases](https://github.com/briantate/CoverFlowFinder/releases) page.
+Download the latest DMG from the [Releases](https://github.com/elliotttate/CoverFlowFinder/releases) page.
 
 ### Build from Source
 1. Clone the repository:
    ```bash
-   git clone https://github.com/briantate/CoverFlowFinder.git
+   git clone https://github.com/elliotttate/CoverFlowFinder.git
    ```
 2. Open `CoverFlowFinder.xcodeproj` in Xcode
 3. Build and run (⌘R)
