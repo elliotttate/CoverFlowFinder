@@ -8,10 +8,11 @@ struct CoverFlowView: View {
     let items: [FileItem]
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
 
-    // Use sorted items for consistent ordering between covers and file list
-    private var sortedItems: [FileItem] {
-        columnConfig.sortedItems(items)
-    }
+    // Toggle verbose logging to Desktop file
+    private let loggingEnabled = false
+
+    // Cache sorted items to avoid re-sorting on every selection change
+    @State private var sortedItemsCache: [FileItem] = []
 
     @State private var thumbnails: [URL: NSImage] = [:]
     @State private var pendingThumbnails: Set<URL> = []
@@ -20,6 +21,11 @@ struct CoverFlowView: View {
     @State private var debugLog: [String] = []
     @State private var renamingItem: FileItem?
     @State private var rightClickedIndex: Int?
+
+    // Thumbnail throttling
+    @State private var lastThumbnailLoadTime: Date = .distantPast
+    @State private var thumbnailLoadTimer: Timer?
+    private let thumbnailLoadThrottle: TimeInterval = 0.1  // Max 10 loads/sec during scroll
 
     private let visibleRange = 12
     private let maxConcurrentThumbnails = 8
@@ -31,6 +37,7 @@ struct CoverFlowView: View {
     }()
 
     private func log(_ message: String) {
+        guard loggingEnabled else { return }
         let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
         let entry = "[\(timestamp)] \(message)"
         print(entry)
@@ -60,7 +67,7 @@ struct CoverFlowView: View {
             VStack(spacing: 0) {
                 // Cover Flow area - takes proportional space
                 CoverFlowContainer(
-                    items: sortedItems,
+                    items: sortedItemsCache,
                     selectedIndex: $viewModel.coverFlowSelectedIndex,
                     thumbnails: thumbnails,
                     thumbnailCount: thumbnails.count,
@@ -69,13 +76,13 @@ struct CoverFlowView: View {
                         viewModel.coverFlowSelectedIndex = index
                         syncSelection()
                         // Refresh Quick Look if visible
-                        if index < sortedItems.count {
-                            QuickLookControllerView.shared.updatePreview(for: sortedItems[index].url)
+                        if index < sortedItemsCache.count {
+                            QuickLookControllerView.shared.updatePreview(for: sortedItemsCache[index].url)
                         }
                     },
                     onOpen: { index in
-                        if index < sortedItems.count {
-                            viewModel.openItem(sortedItems[index])
+                        if index < sortedItemsCache.count {
+                            viewModel.openItem(sortedItemsCache[index])
                         }
                     },
                     onRightClick: { index in
@@ -88,8 +95,8 @@ struct CoverFlowView: View {
                 .frame(height: max(250, geometry.size.height * 0.45))
 
                 // Selected item info
-                if !sortedItems.isEmpty && viewModel.coverFlowSelectedIndex < sortedItems.count {
-                    let selectedItem = sortedItems[viewModel.coverFlowSelectedIndex]
+                if !sortedItemsCache.isEmpty && viewModel.coverFlowSelectedIndex < sortedItemsCache.count {
+                    let selectedItem = sortedItemsCache[viewModel.coverFlowSelectedIndex]
                     VStack(spacing: 4) {
                         Text(selectedItem.name)
                             .font(.headline)
@@ -113,7 +120,7 @@ struct CoverFlowView: View {
 
                 // File list
                 FileListSection(
-                    items: sortedItems,
+                    items: sortedItemsCache,
                     selectedItems: viewModel.selectedItems,
                     onSelect: { item, index in
                         viewModel.coverFlowSelectedIndex = index
@@ -161,6 +168,7 @@ struct CoverFlowView: View {
         .onAppear {
             // Clear KeyboardManager so events pass through to native keyDown handler
             KeyboardManager.shared.clearHandler()
+            updateSortedItems()
             loadVisibleThumbnails()
             syncSelection()
             startRetryTimer()
@@ -168,17 +176,28 @@ struct CoverFlowView: View {
         .onDisappear {
             retryTimer?.invalidate()
             retryTimer = nil
+            thumbnailLoadTimer?.invalidate()
+            thumbnailLoadTimer = nil
         }
         .onChange(of: items) { _ in
             thumbnails.removeAll()
             pendingThumbnails.removeAll()
             pendingStartTimes.removeAll()
             log("Items changed - cleared \(items.count) items")
+            updateSortedItems()
             loadVisibleThumbnails()
             syncSelection()
         }
-        .onChange(of: viewModel.coverFlowSelectedIndex) { _ in
+        .onChange(of: columnConfig.sortColumn) { _ in
+            updateSortedItems()
             loadVisibleThumbnails()
+        }
+        .onChange(of: columnConfig.sortDirection) { _ in
+            updateSortedItems()
+            loadVisibleThumbnails()
+        }
+        .onChange(of: viewModel.coverFlowSelectedIndex) { _ in
+            throttledLoadThumbnails()
         }
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
@@ -194,9 +213,37 @@ struct CoverFlowView: View {
         }
     }
 
+    // Throttled thumbnail loading - skip rapid calls during scrolling
+    private func throttledLoadThumbnails() {
+        let now = Date()
+        let timeSinceLastLoad = now.timeIntervalSince(lastThumbnailLoadTime)
+
+        // If enough time has passed, load immediately
+        if timeSinceLastLoad >= thumbnailLoadThrottle {
+            lastThumbnailLoadTime = now
+            loadVisibleThumbnails()
+        } else {
+            // Schedule a deferred load if not already scheduled
+            thumbnailLoadTimer?.invalidate()
+            let delay = thumbnailLoadThrottle - timeSinceLastLoad
+            thumbnailLoadTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
+                DispatchQueue.main.async {
+                    self.lastThumbnailLoadTime = Date()
+                    self.loadVisibleThumbnails()
+                }
+            }
+        }
+    }
+
+    private func updateSortedItems() {
+        sortedItemsCache = columnConfig.sortedItems(items)
+        // Clamp selection to new bounds
+        viewModel.coverFlowSelectedIndex = min(viewModel.coverFlowSelectedIndex, max(0, sortedItemsCache.count - 1))
+    }
+
     private func syncSelection() {
-        guard !sortedItems.isEmpty && viewModel.coverFlowSelectedIndex < sortedItems.count else { return }
-        viewModel.selectedItems = [sortedItems[viewModel.coverFlowSelectedIndex]]
+        guard !sortedItemsCache.isEmpty && viewModel.coverFlowSelectedIndex < sortedItemsCache.count else { return }
+        viewModel.selectedItems = [sortedItemsCache[viewModel.coverFlowSelectedIndex]]
     }
 
     private func handleDrop(urls: [URL]) {
@@ -238,10 +285,10 @@ struct CoverFlowView: View {
     }
 
     private func loadVisibleThumbnails() {
-        guard !sortedItems.isEmpty else { return }
-        let selected = min(max(0, viewModel.coverFlowSelectedIndex), sortedItems.count - 1)
+        guard !sortedItemsCache.isEmpty else { return }
+        let selected = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
         let start = max(0, selected - visibleRange)
-        let end = min(sortedItems.count - 1, selected + visibleRange)
+        let end = min(sortedItemsCache.count - 1, selected + visibleRange)
         guard start <= end else { return }
 
         // Check for timed out requests and clear them
@@ -264,7 +311,7 @@ struct CoverFlowView: View {
         var currentlyPending = 0
 
         for index in start...end {
-            let item = sortedItems[index]
+            let item = sortedItemsCache[index]
             if thumbnails[item.url] != nil {
                 alreadyLoaded += 1
             } else if pendingThumbnails.contains(item.url) {
@@ -278,7 +325,7 @@ struct CoverFlowView: View {
         var itemsToLoad: [(item: FileItem, distance: Int)] = []
 
         for index in start...end {
-            let item = sortedItems[index]
+            let item = sortedItemsCache[index]
             let distance = abs(index - selected)
 
             if thumbnails[item.url] == nil && !pendingThumbnails.contains(item.url) {
@@ -442,7 +489,10 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         return desktop.appendingPathComponent("CoverFlowDebug.log")
     }()
 
+    private let nativeLoggingEnabled = false
+
     private func nativeLog(_ message: String) {
+        guard nativeLoggingEnabled else { return }
         let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
         let entry = "[\(timestamp)] 🔷 \(message)\n"
         print(entry)
@@ -460,7 +510,12 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
     private var selectedIndex: Int = 0
     private var coverLayers: [CALayer] = []
+    private var layerPool: [CALayer] = []  // Reusable layer pool
     private var lastClickTime: Date = .distantPast
+
+    // Fast scroll detection
+    private var isScrolling = false
+    private var scrollSettleTimer: Timer?
     private var lastClickIndex: Int = -1
     private var lastClickLocation: CGPoint = .zero
 
@@ -760,44 +815,112 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         guard start <= end else { return }
         let visibleIndices = Set(start...end)
 
-        // Remove layers outside visible range
-        var layersToRemove: [CALayer] = []
+        // Find layers to recycle (outside visible range)
+        var layersToRecycle: [CALayer] = []
+        var existingIndices = Set<Int>()
+
         for coverLayer in coverLayers {
-            if let index = coverLayer.value(forKey: "itemIndex") as? Int,
-               !visibleIndices.contains(index) {
-                layersToRemove.append(coverLayer)
+            if let index = coverLayer.value(forKey: "itemIndex") as? Int {
+                if visibleIndices.contains(index) {
+                    existingIndices.insert(index)
+                } else {
+                    layersToRecycle.append(coverLayer)
+                }
             }
         }
-        for coverLayer in layersToRemove {
-            coverLayer.removeFromSuperlayer()
-            coverLayers.removeAll { $0 === coverLayer }
-        }
 
-        // Add new layers for missing indices
-        let existingIndices = Set(coverLayers.compactMap { $0.value(forKey: "itemIndex") as? Int })
-        for index in visibleIndices where !existingIndices.contains(index) {
+        // Find indices that need layers
+        let missingIndices = visibleIndices.subtracting(existingIndices).sorted()
+
+        // Recycle layers for missing indices (or create new if pool empty)
+        for index in missingIndices {
             guard index < items.count else { continue }
             let item = items[index]
-            let coverLayer = createCoverLayer(for: item, at: index)
-            coverLayer.opacity = 1  // Start visible
+
+            let coverLayer: CALayer
+            if let recycled = layersToRecycle.popLast() {
+                // Reuse existing layer
+                coverLayer = recycled
+                updateCoverLayer(coverLayer, for: item, at: index)
+            } else if let pooled = layerPool.popLast() {
+                // Get from pool
+                coverLayer = pooled
+                layer?.addSublayer(coverLayer)
+                coverLayers.append(coverLayer)
+                updateCoverLayer(coverLayer, for: item, at: index)
+            } else {
+                // Create new layer
+                coverLayer = createCoverLayer(for: item, at: index)
+                coverLayer.opacity = 1
+                layer?.addSublayer(coverLayer)
+                coverLayers.append(coverLayer)
+            }
             positionCover(coverLayer, at: index, centerX: centerX, centerY: centerY, animated: false)
-            layer?.addSublayer(coverLayer)
-            coverLayers.append(coverLayer)
+        }
+
+        // Return unused recycled layers to pool (hide them)
+        for unusedLayer in layersToRecycle {
+            unusedLayer.removeFromSuperlayer()
+            coverLayers.removeAll { $0 === unusedLayer }
+            if layerPool.count < visibleRange * 3 {
+                layerPool.append(unusedLayer)
+            }
         }
 
         // Animate all covers to new positions
+        let animDuration = isScrolling ? 0.15 : 0.35
         CATransaction.begin()
-        CATransaction.setAnimationDuration(0.35)
+        CATransaction.setAnimationDuration(animDuration)
         CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
 
         for coverLayer in coverLayers {
             if let index = coverLayer.value(forKey: "itemIndex") as? Int {
                 positionCover(coverLayer, at: index, centerX: centerX, centerY: centerY, animated: true)
-                coverLayer.opacity = 1  // Ensure visible
+                coverLayer.opacity = 1
             }
         }
 
         CATransaction.commit()
+    }
+
+    // Update existing layer with new item data (for recycling)
+    private func updateCoverLayer(_ coverLayer: CALayer, for item: FileItem, at index: Int) {
+        let thumbnail = thumbnails[item.url]
+        let hasThumbnail = thumbnail != nil
+        let coverSize = getCoverSize(for: thumbnail)
+
+        coverLayer.setValue(index, forKey: "itemIndex")
+        coverLayer.setValue(coverSize.width, forKey: "coverWidth")
+        coverLayer.setValue(coverSize.height, forKey: "coverHeight")
+        // Match createCoverLayer - bounds should NOT include reflection height
+        coverLayer.bounds = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
+
+        // Get image content (reuse existing icon to avoid slow NSWorkspace lookups)
+        let imageContent: Any
+        if let thumb = thumbnail {
+            imageContent = thumb.cgImage(forProposedRect: nil, context: nil, hints: nil) ?? thumb
+        } else {
+            imageContent = item.icon.cgImage(forProposedRect: nil, context: nil, hints: nil) ?? item.icon
+        }
+
+        // Update image layer - match createCoverLayer (y: 0, not offset)
+        if let imageLayer = coverLayer.sublayers?.first(where: { $0.name == "imageLayer" }) {
+            imageLayer.frame = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
+            imageLayer.contents = imageContent
+            imageLayer.contentsGravity = .resizeAspect
+        }
+
+        // Update reflection (hide during scroll for performance)
+        // Match createCoverLayer - reflection is BELOW the image (negative y)
+        let reflectionHeight = coverSize.height * 0.4
+        if let reflectionContainer = coverLayer.sublayers?.first(where: { $0.name == "reflectionContainer" }) {
+            reflectionContainer.opacity = (hasThumbnail && !isScrolling) ? 1.0 : 0.0
+            reflectionContainer.frame = CGRect(x: 0, y: -reflectionHeight - 4, width: coverSize.width, height: reflectionHeight)
+            if let reflectionImage = reflectionContainer.sublayers?.first(where: { $0.name == "reflectionImage" }) {
+                reflectionImage.frame = CGRect(x: 0, y: reflectionHeight - coverSize.height, width: coverSize.width, height: coverSize.height)
+                reflectionImage.contents = hasThumbnail ? imageContent : nil
+            }
+        }
     }
 
     private func getCoverSize(for thumbnail: NSImage?) -> CGSize {
@@ -1013,7 +1136,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         dragStartIndex = hitTestCover(at: location)
 
         if let index = dragStartIndex {
-            onSelect?(index)
+            selectIndexLocally(index)
             lastClickTime = now
             lastClickIndex = index
             lastClickLocation = location
@@ -1228,6 +1351,9 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         // Cancel any existing momentum
         momentumTimer?.invalidate()
 
+        // Mark as scrolling and reset settle timer
+        setScrolling(true)
+
         // Determine scroll delta (horizontal preferred, vertical as fallback)
         let delta: CGFloat
         if abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY) {
@@ -1256,14 +1382,14 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             let steps = Int(accumulatedScroll / threshold)
             let newIndex = max(0, selectedIndex - steps)
             if newIndex != selectedIndex {
-                onSelect?(newIndex)
+                selectIndexLocally(newIndex)
             }
             accumulatedScroll = accumulatedScroll.truncatingRemainder(dividingBy: threshold)
         } else if accumulatedScroll < -threshold {
             let steps = Int(-accumulatedScroll / threshold)
             let newIndex = min(items.count - 1, selectedIndex + steps)
             if newIndex != selectedIndex {
-                onSelect?(newIndex)
+                selectIndexLocally(newIndex)
             }
             accumulatedScroll = accumulatedScroll.truncatingRemainder(dividingBy: threshold)
         }
@@ -1274,9 +1400,48 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         }
     }
 
+    // Local-first selection: animate immediately, notify SwiftUI async
+    private func selectIndexLocally(_ newIndex: Int) {
+        guard newIndex != selectedIndex && newIndex >= 0 && newIndex < items.count else { return }
+        selectedIndex = newIndex
+        animateToSelection()
+        // Notify SwiftUI asynchronously to avoid blocking
+        DispatchQueue.main.async { [weak self] in
+            self?.onSelect?(newIndex)
+        }
+    }
+
+    private func setScrolling(_ scrolling: Bool) {
+        isScrolling = scrolling
+        scrollSettleTimer?.invalidate()
+        if scrolling {
+            scrollSettleTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
+                self?.onScrollSettled()
+            }
+        }
+    }
+
+    private func onScrollSettled() {
+        isScrolling = false
+        // Re-enable reflections on all visible covers
+        for coverLayer in coverLayers {
+            if let reflectionContainer = coverLayer.sublayers?.first(where: { $0.name == "reflectionContainer" }),
+               let index = coverLayer.value(forKey: "itemIndex") as? Int,
+               index < items.count {
+                let item = items[index]
+                let hasThumbnail = thumbnails[item.url] != nil
+                CATransaction.begin()
+                CATransaction.setAnimationDuration(0.3)
+                reflectionContainer.opacity = hasThumbnail ? 1.0 : 0.0
+                CATransaction.commit()
+            }
+        }
+    }
+
     private func startMomentumScroll() {
         guard abs(scrollVelocity) > 100 else {
             accumulatedScroll = 0
+            setScrolling(false)
             return
         }
 
@@ -1286,6 +1451,9 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
                 timer.invalidate()
                 return
             }
+
+            // Keep scroll state active
+            self.setScrolling(true)
 
             // Apply friction
             self.scrollVelocity *= 0.92
@@ -1299,13 +1467,13 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             if self.accumulatedScroll > threshold {
                 let newIndex = max(0, self.selectedIndex - 1)
                 if newIndex != self.selectedIndex {
-                    self.onSelect?(newIndex)
+                    self.selectIndexLocally(newIndex)
                 }
                 self.accumulatedScroll -= threshold
             } else if self.accumulatedScroll < -threshold {
                 let newIndex = min(self.items.count - 1, self.selectedIndex + 1)
                 if newIndex != self.selectedIndex {
-                    self.onSelect?(newIndex)
+                    self.selectIndexLocally(newIndex)
                 }
                 self.accumulatedScroll += threshold
             }
@@ -1314,6 +1482,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             if abs(self.scrollVelocity) < 50 {
                 timer.invalidate()
                 self.accumulatedScroll = 0
+                self.setScrolling(false)
             }
         }
     }
@@ -1322,19 +1491,19 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         switch event.keyCode {
         case 123: // Left arrow
             if selectedIndex > 0 {
-                onSelect?(selectedIndex - 1)
+                selectIndexLocally(selectedIndex - 1)
             }
         case 124: // Right arrow
             if selectedIndex < items.count - 1 {
-                onSelect?(selectedIndex + 1)
+                selectIndexLocally(selectedIndex + 1)
             }
         case 126: // Up arrow - previous (up in list = lower index)
             if selectedIndex > 0 {
-                onSelect?(selectedIndex - 1)
+                selectIndexLocally(selectedIndex - 1)
             }
         case 125: // Down arrow - next (down in list = higher index)
             if selectedIndex < items.count - 1 {
-                onSelect?(selectedIndex + 1)
+                selectIndexLocally(selectedIndex + 1)
             }
         case 36: // Return
             if selectedIndex >= 0 && selectedIndex < items.count {
@@ -1389,6 +1558,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     deinit {
         momentumTimer?.invalidate()
         typeAheadTimer?.invalidate()
+        scrollSettleTimer?.invalidate()
         stopQuickLookKeyMonitor()
     }
 
@@ -1453,7 +1623,7 @@ extension CoverFlowNSView: NSDraggingSource {}
 // MARK: - File List Section
 
 struct FileListSection: View {
-    let items: [FileItem]
+    let items: [FileItem]  // Already sorted by parent
     let selectedItems: Set<FileItem>
     let onSelect: (FileItem, Int) -> Void
     let onOpen: (FileItem) -> Void
@@ -1462,10 +1632,6 @@ struct FileListSection: View {
     @State private var renamingItem: FileItem?
     @State private var isDropTargeted = false
 
-    private var sortedItems: [FileItem] {
-        columnConfig.sortedItems(items)
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             // Column header
@@ -1473,9 +1639,9 @@ struct FileListSection: View {
 
             Divider()
 
-            // File list
+            // File list - use items directly (already sorted by parent)
             ScrollViewReader { scrollProxy in
-                List(Array(sortedItems.enumerated()), id: \.element.id) { index, item in
+                List(Array(items.enumerated()), id: \.element.id) { index, item in
                     CoverFlowFileRow(item: item, columnConfig: columnConfig)
                         .id(item.id)
                         .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
@@ -1714,6 +1880,7 @@ struct CoverFlowFileRow: View {
         default: return "Document"
         }
     }
+
 }
 
 struct CoverFlowTagsView: View {

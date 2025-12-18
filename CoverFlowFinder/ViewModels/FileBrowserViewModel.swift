@@ -6,8 +6,10 @@ extension Notification.Name {
     static let showGetInfo = Notification.Name("showGetInfo")
 }
 
-// Debug logging to Desktop file
+// Debug logging to Desktop file (disabled unless explicitly toggled)
+private let debugLoggingEnabled = false
 private func debugLog(_ message: String) {
+    guard debugLoggingEnabled else { return }
     let logURL = FileManager.default.homeDirectoryForCurrentUser
         .appendingPathComponent("Desktop")
         .appendingPathComponent("CoverFlowDebug.log")
