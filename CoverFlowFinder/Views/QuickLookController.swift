@@ -51,7 +51,16 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
     }
 
     func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        return previewURL as QLPreviewItem?
+        guard let url = previewURL else { return nil }
+        return url as QLPreviewItem
+    }
+
+    // MARK: - QLPreviewPanelDelegate
+
+    func previewPanel(_ panel: QLPreviewPanel!, transitionImageFor item: QLPreviewItem!, contentRect: UnsafeMutablePointer<NSRect>!) -> Any! {
+        // Provide the file icon as transition image
+        guard let url = item.previewItemURL else { return nil }
+        return NSWorkspace.shared.icon(forFile: url.path)
     }
 
     // MARK: - Public API
