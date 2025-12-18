@@ -14,10 +14,10 @@ struct CoverFlowView: View {
     // Cache sorted items to avoid re-sorting on every selection change
     @State private var sortedItemsCache: [FileItem] = []
 
+    // Thumbnails loaded for current view (triggers SwiftUI updates)
     @State private var thumbnails: [URL: NSImage] = [:]
-    @State private var pendingThumbnails: Set<URL> = []
-    @State private var pendingStartTimes: [URL: Date] = [:]
-    @State private var retryTimer: Timer?
+    @State private var iconPlaceholders: Set<URL> = []  // Track URLs showing only icon (real thumbnail pending)
+    @State private var thumbnailLoadGeneration: Int = 0
     @State private var debugLog: [String] = []
     @State private var renamingItem: FileItem?
     @State private var rightClickedIndex: Int?
@@ -25,11 +25,11 @@ struct CoverFlowView: View {
     // Thumbnail throttling
     @State private var lastThumbnailLoadTime: Date = .distantPast
     @State private var thumbnailLoadTimer: Timer?
-    private let thumbnailLoadThrottle: TimeInterval = 0.1  // Max 10 loads/sec during scroll
+    private let thumbnailLoadThrottle: TimeInterval = 0.005  // 200 loads/sec
 
-    private let visibleRange = 12
-    private let maxConcurrentThumbnails = 8
-    private let thumbnailTimeout: TimeInterval = 2.0
+    private let visibleRange = 40  // Prefetch far ahead
+    private let maxConcurrentThumbnails = 50  // Aggressive parallel loads
+    private let thumbnailCache = ThumbnailCacheManager.shared
 
     private static let logFileURL: URL = {
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first!
@@ -141,7 +141,7 @@ struct CoverFlowView: View {
                             Text("DEBUG LOG")
                                 .font(.system(size: 10, weight: .bold))
                             Spacer()
-                            Text("Loaded: \(thumbnails.count) | Pending: \(pendingThumbnails.count)")
+                            Text("Loaded: \(thumbnails.count)")
                                 .font(.system(size: 10))
                         }
                         .padding(.bottom, 4)
@@ -171,18 +171,17 @@ struct CoverFlowView: View {
             updateSortedItems()
             loadVisibleThumbnails()
             syncSelection()
-            startRetryTimer()
         }
         .onDisappear {
-            retryTimer?.invalidate()
-            retryTimer = nil
             thumbnailLoadTimer?.invalidate()
             thumbnailLoadTimer = nil
         }
         .onChange(of: items) { _ in
+            // Clear local thumbnails and tell cache manager about new folder
             thumbnails.removeAll()
-            pendingThumbnails.removeAll()
-            pendingStartTimes.removeAll()
+            iconPlaceholders.removeAll()
+            thumbnailLoadGeneration += 1
+            thumbnailCache.clearForNewFolder()
             log("Items changed - cleared \(items.count) items")
             updateSortedItems()
             loadVisibleThumbnails()
@@ -204,15 +203,6 @@ struct CoverFlowView: View {
         }
     }
 
-    private func startRetryTimer() {
-        retryTimer?.invalidate()
-        retryTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            DispatchQueue.main.async {
-                self.loadVisibleThumbnails()
-            }
-        }
-    }
-
     // Throttled thumbnail loading - skip rapid calls during scrolling
     private func throttledLoadThumbnails() {
         let now = Date()
@@ -221,6 +211,7 @@ struct CoverFlowView: View {
         // If enough time has passed, load immediately
         if timeSinceLastLoad >= thumbnailLoadThrottle {
             lastThumbnailLoadTime = now
+            thumbnailCache.incrementGeneration()  // Invalidate old requests
             loadVisibleThumbnails()
         } else {
             // Schedule a deferred load if not already scheduled
@@ -229,6 +220,7 @@ struct CoverFlowView: View {
             thumbnailLoadTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
                 DispatchQueue.main.async {
                     self.lastThumbnailLoadTime = Date()
+                    self.thumbnailCache.incrementGeneration()
                     self.loadVisibleThumbnails()
                 }
             }
@@ -284,6 +276,9 @@ struct CoverFlowView: View {
         viewModel.refresh()
     }
 
+    // Window size for keeping thumbnails in memory (larger than visibleRange for smooth scrolling)
+    private let thumbnailWindowSize = 100
+
     private func loadVisibleThumbnails() {
         guard !sortedItemsCache.isEmpty else { return }
         let selected = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
@@ -291,35 +286,15 @@ struct CoverFlowView: View {
         let end = min(sortedItemsCache.count - 1, selected + visibleRange)
         guard start <= end else { return }
 
-        // Check for timed out requests and clear them
-        let now = Date()
-        var timedOut = 0
-        for (url, startTime) in pendingStartTimes {
-            if now.timeIntervalSince(startTime) > thumbnailTimeout {
-                pendingThumbnails.remove(url)
-                pendingStartTimes.removeValue(forKey: url)
-                timedOut += 1
-            }
-        }
-        if timedOut > 0 {
-            log("⏰ Timed out \(timedOut) requests")
-        }
+        // Evict thumbnails outside the window to keep state small
+        evictDistantThumbnails(currentIndex: selected)
 
-        // Count how many visible items need thumbnails
+        // Count stats for logging
         var needsLoading = 0
         var alreadyLoaded = 0
-        var currentlyPending = 0
-
-        for index in start...end {
-            let item = sortedItemsCache[index]
-            if thumbnails[item.url] != nil {
-                alreadyLoaded += 1
-            } else if pendingThumbnails.contains(item.url) {
-                currentlyPending += 1
-            } else {
-                needsLoading += 1
-            }
-        }
+        var pending = 0
+        var failed = 0
+        var showedIcon = 0
 
         // Build list of items to load, sorted by distance from selection
         var itemsToLoad: [(item: FileItem, distance: Int)] = []
@@ -328,8 +303,36 @@ struct CoverFlowView: View {
             let item = sortedItemsCache[index]
             let distance = abs(index - selected)
 
-            if thumbnails[item.url] == nil && !pendingThumbnails.contains(item.url) {
+            // Check if we have a REAL thumbnail (not just icon placeholder)
+            let hasRealThumbnail = thumbnails[item.url] != nil && !iconPlaceholders.contains(item.url)
+
+            if hasRealThumbnail {
+                alreadyLoaded += 1
+            } else if thumbnailCache.hasFailed(url: item.url) {
+                // Use icon for failed items (no retry storm)
+                thumbnails[item.url] = item.icon
+                iconPlaceholders.remove(item.url)  // Final state, not a placeholder
+                failed += 1
+            } else if thumbnailCache.isPending(url: item.url) {
+                // Already loading - show icon immediately while waiting
+                if thumbnails[item.url] == nil {
+                    thumbnails[item.url] = item.icon
+                    iconPlaceholders.insert(item.url)
+                    showedIcon += 1
+                }
+                pending += 1
+            } else if let cached = thumbnailCache.getCachedThumbnail(for: item.url) {
+                // Found in cache (memory or disk)
+                thumbnails[item.url] = cached
+                iconPlaceholders.remove(item.url)
+                alreadyLoaded += 1
+            } else {
+                // Show icon immediately while thumbnail loads
+                thumbnails[item.url] = item.icon
+                iconPlaceholders.insert(item.url)
+                showedIcon += 1
                 itemsToLoad.append((item, distance))
+                needsLoading += 1
             }
         }
 
@@ -339,7 +342,7 @@ struct CoverFlowView: View {
         // Load up to maxConcurrentThumbnails
         var started = 0
         for (item, _) in itemsToLoad {
-            if pendingThumbnails.count >= maxConcurrentThumbnails {
+            if started >= maxConcurrentThumbnails {
                 break
             }
             generateThumbnail(for: item)
@@ -347,95 +350,56 @@ struct CoverFlowView: View {
         }
 
         if started > 0 || needsLoading > 0 {
-            log("📊 Visible: \(end-start+1), Loaded: \(alreadyLoaded), Pending: \(currentlyPending), Need: \(needsLoading), Started: \(started)")
+            log("📊 Visible: \(end-start+1), Loaded: \(alreadyLoaded), Pending: \(pending), Failed: \(failed), Need: \(needsLoading), Started: \(started), Icons: \(showedIcon)")
+        }
+    }
+
+    /// Remove thumbnails that are far from current position to keep SwiftUI state small
+    private func evictDistantThumbnails(currentIndex: Int) {
+        let windowStart = max(0, currentIndex - thumbnailWindowSize)
+        let windowEnd = min(sortedItemsCache.count - 1, currentIndex + thumbnailWindowSize)
+
+        // Build set of URLs that should be kept
+        var keepURLs = Set<URL>()
+        for i in windowStart...windowEnd {
+            keepURLs.insert(sortedItemsCache[i].url)
+        }
+
+        // Remove thumbnails outside window
+        var evicted = 0
+        for url in thumbnails.keys {
+            if !keepURLs.contains(url) {
+                thumbnails.removeValue(forKey: url)
+                iconPlaceholders.remove(url)
+                evicted += 1
+            }
+        }
+
+        if evicted > 0 {
+            log("🗑️ Evicted \(evicted) distant thumbnails, keeping \(thumbnails.count)")
         }
     }
 
     private func generateThumbnail(for item: FileItem) {
-        guard !pendingThumbnails.contains(item.url) else { return }
-
-        pendingThumbnails.insert(item.url)
-        pendingStartTimes[item.url] = Date()
-
+        let currentGen = thumbnailLoadGeneration
         log("🔄 Start: \(item.name)")
 
-        // For image files, load directly for better quality and reliability
-        let imageExtensions = ["png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp"]
-        let ext = item.url.pathExtension.lowercased()
+        thumbnailCache.generateThumbnail(for: item) { [self] url, image in
+            // Check if we're still on the same generation (folder)
+            guard currentGen == thumbnailLoadGeneration else { return }
 
-        if imageExtensions.contains(ext) {
-            // Load image directly on background thread
-            DispatchQueue.global(qos: .userInitiated).async {
-                var resultImage: NSImage? = nil
-
-                if let image = NSImage(contentsOf: item.url) {
-                    // Resize to reasonable thumbnail size while maintaining aspect ratio
-                    let maxSize: CGFloat = 400
-                    let originalSize = image.size
-
-                    if originalSize.width > 0 && originalSize.height > 0 {
-                        let scale = min(maxSize / originalSize.width, maxSize / originalSize.height, 1.0)
-                        let newSize = NSSize(width: originalSize.width * scale, height: originalSize.height * scale)
-
-                        let resizedImage = NSImage(size: newSize)
-                        resizedImage.lockFocus()
-                        image.draw(in: NSRect(origin: .zero, size: newSize),
-                                   from: NSRect(origin: .zero, size: originalSize),
-                                   operation: .copy,
-                                   fraction: 1.0)
-                        resizedImage.unlockFocus()
-                        resultImage = resizedImage
-                    } else {
-                        resultImage = image
-                    }
-                }
-
-                DispatchQueue.main.async {
-                    self.pendingThumbnails.remove(item.url)
-                    self.pendingStartTimes.removeValue(forKey: item.url)
-
-                    if let image = resultImage {
-                        self.thumbnails[item.url] = image
-                        self.log("✅ Image: \(item.name)")
-                    } else {
-                        self.log("❌ ImageFail: \(item.name)")
-                        self.thumbnails[item.url] = item.icon
-                    }
-
-                    self.loadVisibleThumbnails()
-                }
+            if let image = image {
+                thumbnails[url] = image
+                iconPlaceholders.remove(url)  // Real thumbnail loaded
+                log("✅ Done: \(item.name)")
+            } else {
+                thumbnails[url] = item.icon
+                iconPlaceholders.remove(url)  // Failed, icon is final state
+                log("❌ Failed: \(item.name)")
             }
-            return
-        }
 
-        // For non-image files, use QuickLook
-        let size = CGSize(width: 400, height: 400)
-        let request = QLThumbnailGenerator.Request(
-            fileAt: item.url,
-            size: size,
-            scale: 2.0,
-            representationTypes: [.thumbnail, .icon]
-        )
-
-        QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { thumbnail, error in
-            DispatchQueue.main.async {
-                self.pendingThumbnails.remove(item.url)
-                self.pendingStartTimes.removeValue(forKey: item.url)
-
-                if let thumbnail = thumbnail {
-                    self.thumbnails[item.url] = thumbnail.nsImage
-                    self.log("✅ Done: \(item.name)")
-                } else if let error = error {
-                    self.log("❌ Error: \(item.name) - \(error.localizedDescription)")
-                    self.thumbnails[item.url] = item.icon
-                } else {
-                    self.log("⚠️ NoThumb: \(item.name)")
-                    self.thumbnails[item.url] = item.icon
-                }
-
-                // Trigger more loading
-                self.loadVisibleThumbnails()
-            }
+            // Continue loading more
+            loadVisibleThumbnails()
         }
     }
 }
@@ -868,10 +832,16 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         }
 
         // Animate all covers to new positions
-        let animDuration = isScrolling ? 0.15 : 0.35
         CATransaction.begin()
-        CATransaction.setAnimationDuration(animDuration)
-        CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+        if isScrolling {
+            // During scroll: very fast, snappy animations
+            CATransaction.setAnimationDuration(0.08)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
+        } else {
+            // When stopped: smooth, elegant animation
+            CATransaction.setAnimationDuration(0.3)
+            CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .easeOut))
+        }
 
         for coverLayer in coverLayers {
             if let index = coverLayer.value(forKey: "itemIndex") as? Int {
@@ -895,12 +865,14 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         // Match createCoverLayer - bounds should NOT include reflection height
         coverLayer.bounds = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
 
-        // Get image content (reuse existing icon to avoid slow NSWorkspace lookups)
+        // Get image content - use NSImage directly for icons to preserve transparency
         let imageContent: Any
         if let thumb = thumbnail {
+            // For thumbnails, CGImage is fine
             imageContent = thumb.cgImage(forProposedRect: nil, context: nil, hints: nil) ?? thumb
         } else {
-            imageContent = item.icon.cgImage(forProposedRect: nil, context: nil, hints: nil) ?? item.icon
+            // For icons, use NSImage directly (CGImage loses transparency)
+            imageContent = item.icon
         }
 
         // Update image layer - match createCoverLayer (y: 0, not offset)
@@ -908,6 +880,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             imageLayer.frame = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
             imageLayer.contents = imageContent
             imageLayer.contentsGravity = .resizeAspect
+            imageLayer.isOpaque = false
         }
 
         // Update reflection (hide during scroll for performance)
@@ -973,25 +946,21 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         imageLayer.frame = CGRect(x: 0, y: 0, width: coverWidth, height: coverHeight)
         imageLayer.masksToBounds = true
         imageLayer.backgroundColor = NSColor.clear.cgColor
+        imageLayer.isOpaque = false  // Ensure transparency is rendered
 
         if let thumbnail = thumbnail {
-            // Convert NSImage to CGImage for CALayer
+            // For thumbnails (actual images), CGImage conversion is fine
             if let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil) {
                 imageLayer.contents = cgImage
             } else {
                 imageLayer.contents = thumbnail
             }
-            imageLayer.contentsGravity = .resizeAspect
         } else {
-            // Always show file icon as placeholder
-            let icon = item.icon
-            if let cgImage = icon.cgImage(forProposedRect: nil, context: nil, hints: nil) {
-                imageLayer.contents = cgImage
-            } else {
-                imageLayer.contents = icon
-            }
-            imageLayer.contentsGravity = .resizeAspect
+            // For icons, use NSImage directly to preserve transparency
+            // CGImage conversion can lose alpha channel for system icons
+            imageLayer.contents = item.icon
         }
+        imageLayer.contentsGravity = .resizeAspect
         container.addSublayer(imageLayer)
 
         // Reflection - only show when we have a real thumbnail
@@ -1375,8 +1344,8 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         }
         lastScrollTime = now
 
-        // Threshold for changing selection
-        let threshold: CGFloat = 30
+        // Threshold for changing selection (lower = more responsive)
+        let threshold: CGFloat = 20
 
         if accumulatedScroll > threshold {
             let steps = Int(accumulatedScroll / threshold)
@@ -1400,29 +1369,47 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         }
     }
 
-    // Local-first selection: animate immediately, notify SwiftUI async
+    // Local-first selection: animate immediately, defer SwiftUI notification until scroll stops
     private func selectIndexLocally(_ newIndex: Int) {
         guard newIndex != selectedIndex && newIndex >= 0 && newIndex < items.count else { return }
         selectedIndex = newIndex
         animateToSelection()
-        // Notify SwiftUI asynchronously to avoid blocking
-        DispatchQueue.main.async { [weak self] in
-            self?.onSelect?(newIndex)
+
+        // Only notify SwiftUI immediately if NOT scrolling
+        // If scrolling, we'll notify when scroll settles
+        if !isScrolling {
+            DispatchQueue.main.async { [weak self] in
+                self?.onSelect?(newIndex)
+            }
         }
     }
 
     private func setScrolling(_ scrolling: Bool) {
+        let wasScrolling = isScrolling
         isScrolling = scrolling
         scrollSettleTimer?.invalidate()
+        scrollSettleTimer = nil
+
         if scrolling {
-            scrollSettleTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [weak self] _ in
+            // Reset settle timer (100ms after last scroll event)
+            scrollSettleTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [weak self] _ in
                 self?.onScrollSettled()
             }
+        } else if wasScrolling {
+            // Immediately settle when explicitly stopped
+            onScrollSettled()
         }
     }
 
     private func onScrollSettled() {
         isScrolling = false
+
+        // NOW notify SwiftUI of the final position
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            self.onSelect?(self.selectedIndex)
+        }
+
         // Re-enable reflections on all visible covers
         for coverLayer in coverLayers {
             if let reflectionContainer = coverLayer.sublayers?.first(where: { $0.name == "reflectionContainer" }),
@@ -1455,14 +1442,14 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             // Keep scroll state active
             self.setScrolling(true)
 
-            // Apply friction
-            self.scrollVelocity *= 0.92
+            // Apply friction (lower = longer momentum)
+            self.scrollVelocity *= 0.94
 
             // Accumulate based on velocity
             let delta = self.scrollVelocity / 60.0
             self.accumulatedScroll += delta
 
-            let threshold: CGFloat = 30
+            let threshold: CGFloat = 20
 
             if self.accumulatedScroll > threshold {
                 let newIndex = max(0, self.selectedIndex - 1)

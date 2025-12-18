@@ -3,6 +3,66 @@ import AppKit
 import UniformTypeIdentifiers
 import SwiftUI
 
+/// Cache for file icons to avoid repeated NSWorkspace lookups
+private class IconCache {
+    static let shared = IconCache()
+    private let cache = NSCache<NSString, NSImage>()
+
+    // Pre-cached generic icons for fast display
+    private let genericImageIcon: NSImage
+    private let genericVideoIcon: NSImage
+    private let genericAudioIcon: NSImage
+    private let genericFolderIcon: NSImage
+
+    // File extensions that should use generic icons for speed
+    private let imageExtensions: Set<String> = ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp", "raw", "cr2", "nef", "arw", "dng"]
+    private let videoExtensions: Set<String> = ["mp4", "mov", "avi", "mkv", "wmv", "flv", "webm", "m4v", "mpg", "mpeg"]
+    private let audioExtensions: Set<String> = ["mp3", "m4a", "wav", "aac", "flac", "ogg", "wma", "aiff"]
+
+    private init() {
+        cache.countLimit = 500
+
+        // Pre-load generic icons (these are instant)
+        genericImageIcon = NSWorkspace.shared.icon(forFileType: UTType.image.identifier)
+        genericVideoIcon = NSWorkspace.shared.icon(forFileType: UTType.movie.identifier)
+        genericAudioIcon = NSWorkspace.shared.icon(forFileType: UTType.audio.identifier)
+        genericFolderIcon = NSWorkspace.shared.icon(forFileType: UTType.folder.identifier)
+    }
+
+    func icon(for url: URL) -> NSImage {
+        let key = url.path as NSString
+        if let cached = cache.object(forKey: key) {
+            return cached
+        }
+
+        // For media files, use pre-cached generic icons (instant)
+        // The actual thumbnail will load later and replace this
+        let ext = url.pathExtension.lowercased()
+        if imageExtensions.contains(ext) {
+            return genericImageIcon
+        } else if videoExtensions.contains(ext) {
+            return genericVideoIcon
+        } else if audioExtensions.contains(ext) {
+            return genericAudioIcon
+        }
+
+        // For other files, get the actual icon (usually fast for non-media)
+        let icon = NSWorkspace.shared.icon(forFile: url.path)
+        cache.setObject(icon, forKey: key)
+        return icon
+    }
+
+    func genericIcon(for fileType: FileItem.FileType) -> NSImage {
+        switch fileType {
+        case .image: return genericImageIcon
+        case .video: return genericVideoIcon
+        case .audio: return genericAudioIcon
+        case .folder: return genericFolderIcon
+        default: return NSWorkspace.shared.icon(forFileType: UTType.data.identifier)
+        }
+    }
+}
+
 struct FileItem: Identifiable, Hashable, Transferable {
     static var transferRepresentation: some TransferRepresentation {
         FileRepresentation(exportedContentType: .fileURL) { item in
@@ -17,8 +77,12 @@ struct FileItem: Identifiable, Hashable, Transferable {
     let size: Int64
     let modificationDate: Date?
     let creationDate: Date?
-    let icon: NSImage
     let fileType: FileType
+
+    // Lazy icon lookup - only loads when accessed
+    var icon: NSImage {
+        IconCache.shared.icon(for: url)
+    }
 
     enum FileType {
         case folder
@@ -48,7 +112,6 @@ struct FileItem: Identifiable, Hashable, Transferable {
         self.size = Int64(resourceValues?.fileSize ?? 0)
         self.modificationDate = resourceValues?.contentModificationDate
         self.creationDate = resourceValues?.creationDate
-        self.icon = NSWorkspace.shared.icon(forFile: url.path)
 
         // Determine file type
         if self.isDirectory {

@@ -8,6 +8,10 @@ struct IconGridView: View {
     @State private var isDropTargeted = false
     @State private var currentWidth: CGFloat = 800
 
+    // Thumbnail loading
+    @State private var thumbnails: [URL: NSImage] = [:]
+    private let thumbnailCache = ThumbnailCacheManager.shared
+
     private let columns = [
         GridItem(.adaptive(minimum: 100, maximum: 120), spacing: 20)
     ]
@@ -30,9 +34,13 @@ struct IconGridView: View {
                         ForEach(items) { item in
                             IconGridItem(
                                 item: item,
-                                isSelected: viewModel.selectedItems.contains(item)
+                                isSelected: viewModel.selectedItems.contains(item),
+                                thumbnail: thumbnails[item.url]
                             )
                             .id(item.id)
+                            .onAppear {
+                                loadThumbnail(for: item)
+                            }
                             .onDrag {
                                 NSItemProvider(object: item.url as NSURL)
                             }
@@ -105,6 +113,10 @@ struct IconGridView: View {
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
         }
+        .onChange(of: items) { _ in
+            thumbnails.removeAll()
+            thumbnailCache.clearForNewFolder()
+        }
         .keyboardNavigable(
             onUpArrow: { navigateSelection(by: -calculatedColumns) },
             onDownArrow: { navigateSelection(by: calculatedColumns) },
@@ -147,6 +159,33 @@ struct IconGridView: View {
         QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { [self] offset in
             // Map offset for grid: 1/-1 for horizontal, cols/-cols for vertical
             navigateSelection(by: offset)
+        }
+    }
+
+    private func loadThumbnail(for item: FileItem) {
+        let url = item.url
+
+        // Already loaded or loading
+        if thumbnails[url] != nil { return }
+        if thumbnailCache.isPending(url: url) { return }
+        if thumbnailCache.hasFailed(url: url) {
+            thumbnails[url] = item.icon
+            return
+        }
+
+        // Check cache first
+        if let cached = thumbnailCache.getCachedThumbnail(for: url) {
+            thumbnails[url] = cached
+            return
+        }
+
+        // Generate thumbnail
+        thumbnailCache.generateThumbnail(for: item) { [self] url, image in
+            if let image = image {
+                thumbnails[url] = image
+            } else {
+                thumbnails[url] = item.icon
+            }
         }
     }
 
@@ -200,8 +239,13 @@ struct IconGridView: View {
 struct IconGridItem: View {
     let item: FileItem
     let isSelected: Bool
+    let thumbnail: NSImage?
 
     @State private var isHovering = false
+
+    private var displayImage: NSImage {
+        thumbnail ?? item.icon
+    }
 
     var body: some View {
         VStack(spacing: 8) {
@@ -211,10 +255,11 @@ struct IconGridItem: View {
                     .fill(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
                     .frame(width: 90, height: 90)
 
-                Image(nsImage: item.icon)
+                Image(nsImage: displayImage)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 64, height: 64)
+                    .frame(width: 80, height: 80)
+                    .cornerRadius(4)
             }
 
             Text(item.name)

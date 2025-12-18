@@ -375,37 +375,75 @@ struct RenameSheet: View {
 
 struct PathBarView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
+    @State private var isEditing = false
+    @State private var editText = ""
+    @FocusState private var isTextFieldFocused: Bool
 
     var body: some View {
         HStack(spacing: 4) {
-            ForEach(Array(pathComponents.enumerated()), id: \.offset) { index, component in
-                if index > 0 {
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-
-                Button(action: {
-                    navigateToComponent(at: index)
-                }) {
-                    HStack(spacing: 4) {
-                        if index == 0 {
-                            Image(systemName: "desktopcomputer")
-                                .font(.caption)
-                        }
-                        Text(component.name)
-                            .lineLimit(1)
+            if isEditing {
+                // Editable text field
+                TextField("Path", text: $editText)
+                    .textFieldStyle(.plain)
+                    .font(.system(size: 12))
+                    .focused($isTextFieldFocused)
+                    .onSubmit {
+                        navigateToPath(editText)
                     }
+                    .onExitCommand {
+                        cancelEditing()
+                    }
+                    .onAppear {
+                        editText = viewModel.currentPath.path
+                        isTextFieldFocused = true
+                    }
+
+                Button(action: { navigateToPath(editText) }) {
+                    Image(systemName: "arrow.right.circle.fill")
+                        .foregroundColor(.accentColor)
                 }
                 .buttonStyle(.plain)
-                .foregroundColor(index == pathComponents.count - 1 ? .primary : .secondary)
-            }
 
-            Spacer()
+                Button(action: { cancelEditing() }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            } else {
+                // Breadcrumb path display
+                ForEach(Array(pathComponents.enumerated()), id: \.offset) { index, component in
+                    if index > 0 {
+                        Image(systemName: "chevron.right")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    Button(action: {
+                        navigateToComponent(at: index)
+                    }) {
+                        HStack(spacing: 4) {
+                            if index == 0 {
+                                Image(systemName: "desktopcomputer")
+                                    .font(.caption)
+                            }
+                            Text(component.name)
+                                .lineLimit(1)
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundColor(index == pathComponents.count - 1 ? .primary : .secondary)
+                }
+
+                Spacer()
+            }
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) {
+            startEditing()
+        }
     }
 
     private var pathComponents: [(name: String, url: URL)] {
@@ -423,8 +461,49 @@ struct PathBarView: View {
 
     private func navigateToComponent(at index: Int) {
         let url = pathComponents[index].url
-        // Use navigateToAndSelectCurrent to select the folder we came from
         viewModel.navigateToAndSelectCurrent(url)
+    }
+
+    private func startEditing() {
+        editText = viewModel.currentPath.path
+        isEditing = true
+    }
+
+    private func cancelEditing() {
+        isEditing = false
+        isTextFieldFocused = false
+    }
+
+    private func navigateToPath(_ path: String) {
+        var expandedPath = path.trimmingCharacters(in: .whitespaces)
+
+        // Expand ~ to home directory
+        if expandedPath.hasPrefix("~") {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            expandedPath = home + expandedPath.dropFirst()
+        }
+
+        let url = URL(fileURLWithPath: expandedPath)
+
+        // Validate path exists and is a directory
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            if isDirectory.boolValue {
+                viewModel.navigateTo(url)
+                isEditing = false
+                isTextFieldFocused = false
+            } else {
+                // It's a file - navigate to its parent and select it
+                let parentURL = url.deletingLastPathComponent()
+                viewModel.navigateTo(parentURL)
+                // TODO: Could select the file after navigation
+                isEditing = false
+                isTextFieldFocused = false
+            }
+        } else {
+            // Invalid path - shake or show error? For now just beep
+            NSSound.beep()
+        }
     }
 }
 

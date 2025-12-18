@@ -8,6 +8,10 @@ struct FileListView: View {
     @State private var renamingItem: FileItem?
     @State private var isDropTargeted = false
 
+    // Thumbnail loading
+    @State private var thumbnails: [URL: NSImage] = [:]
+    private let thumbnailCache = ThumbnailCacheManager.shared
+
     private var sortedItems: [FileItem] {
         columnConfig.sortedItems(items)
     }
@@ -30,13 +34,17 @@ struct FileListView: View {
                         FileListRowView(
                             item: item,
                             isSelected: viewModel.selectedItems.contains(item),
-                            columnConfig: columnConfig
+                            columnConfig: columnConfig,
+                            thumbnail: thumbnails[item.url]
                         )
                         .tag(item.id)
                         .id(item.id)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                         .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                        .onAppear {
+                            loadThumbnail(for: item)
+                        }
                         .onDrag {
                             NSItemProvider(object: item.url as NSURL)
                         }
@@ -83,6 +91,10 @@ struct FileListView: View {
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
         }
+        .onChange(of: items) { _ in
+            thumbnails.removeAll()
+            thumbnailCache.clearForNewFolder()
+        }
         .keyboardNavigable(
             onUpArrow: { navigateSelection(by: -1) },
             onDownArrow: { navigateSelection(by: 1) },
@@ -122,6 +134,33 @@ struct FileListView: View {
         QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { [self] offset in
             // List: up/down navigation (offset is 1 or -1)
             navigateSelection(by: offset)
+        }
+    }
+
+    private func loadThumbnail(for item: FileItem) {
+        let url = item.url
+
+        // Already loaded or loading
+        if thumbnails[url] != nil { return }
+        if thumbnailCache.isPending(url: url) { return }
+        if thumbnailCache.hasFailed(url: url) {
+            thumbnails[url] = item.icon
+            return
+        }
+
+        // Check cache first
+        if let cached = thumbnailCache.getCachedThumbnail(for: url) {
+            thumbnails[url] = cached
+            return
+        }
+
+        // Generate thumbnail
+        thumbnailCache.generateThumbnail(for: item) { [self] url, image in
+            if let image = image {
+                thumbnails[url] = image
+            } else {
+                thumbnails[url] = item.icon
+            }
         }
     }
 
@@ -293,6 +332,11 @@ struct FileListRowView: View {
     let item: FileItem
     let isSelected: Bool
     @ObservedObject var columnConfig: ListColumnConfigManager
+    let thumbnail: NSImage?
+
+    private var displayImage: NSImage {
+        thumbnail ?? item.icon
+    }
 
     var body: some View {
         HStack(spacing: 0) {
@@ -311,10 +355,11 @@ struct FileListRowView: View {
         switch column {
         case .name:
             HStack(spacing: 8) {
-                Image(nsImage: item.icon)
+                Image(nsImage: displayImage)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 16, height: 16)
+                    .frame(width: 20, height: 20)
+                    .cornerRadius(2)
                 Text(item.name)
                     .lineLimit(1)
             }
