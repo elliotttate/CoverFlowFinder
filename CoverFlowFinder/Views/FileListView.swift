@@ -5,7 +5,6 @@ struct FileListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
-    @State private var renamingItem: FileItem?
     @State private var isDropTargeted = false
 
     // Thumbnail loading
@@ -33,6 +32,7 @@ struct FileListView: View {
                     ForEach(sortedItems) { item in
                         FileListRowView(
                             item: item,
+                            viewModel: viewModel,
                             isSelected: viewModel.selectedItems.contains(item),
                             columnConfig: columnConfig,
                             thumbnail: thumbnails[item.url]
@@ -68,7 +68,7 @@ struct FileListView: View {
                         )
                         .contextMenu {
                             FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                                renamingItem = item
+                                viewModel.renamingURL = item.url
                             }
                         }
                     }
@@ -97,9 +97,6 @@ struct FileListView: View {
                 .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 3)
                 .padding(4)
         )
-        .sheet(item: $renamingItem) { item in
-            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
-        }
         .onChange(of: items) { _ in
             DispatchQueue.main.async {
                 thumbnails.removeAll()
@@ -183,46 +180,12 @@ struct FileListView: View {
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        let destPath = viewModel.currentPath
-        let shouldMove = NSEvent.modifierFlags.contains(.option)
-
         for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, error in
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
                 guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else {
-                    return
-                }
-
-                if sourceURL.deletingLastPathComponent() == destPath {
-                    return
-                }
-
-                let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
-
-                var finalURL = destURL
-                var counter = 1
-                while FileManager.default.fileExists(atPath: finalURL.path) {
-                    let name = sourceURL.deletingPathExtension().lastPathComponent
-                    let ext = sourceURL.pathExtension
-                    if ext.isEmpty {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter)")
-                    } else {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
-                    }
-                    counter += 1
-                }
-
-                do {
-                    if shouldMove {
-                        try FileManager.default.moveItem(at: sourceURL, to: finalURL)
-                    } else {
-                        try FileManager.default.copyItem(at: sourceURL, to: finalURL)
-                    }
-                    DispatchQueue.main.async {
-                        viewModel.refresh()
-                    }
-                } catch {
-                    print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [sourceURL])
                 }
             }
         }
@@ -348,6 +311,7 @@ struct ColumnHeaderCell: View {
 
 struct FileListRowView: View {
     let item: FileItem
+    @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
     @ObservedObject var columnConfig: ListColumnConfigManager
     let thumbnail: NSImage?
@@ -378,8 +342,7 @@ struct FileListRowView: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 20, height: 20)
                     .cornerRadius(2)
-                Text(item.name)
-                    .lineLimit(1)
+                InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
             }
         case .dateModified:
             Text(item.formattedDate)

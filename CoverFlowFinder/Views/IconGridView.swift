@@ -4,7 +4,6 @@ import Quartz
 struct IconGridView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
-    @State private var renamingItem: FileItem?
     @State private var isDropTargeted = false
     @State private var currentWidth: CGFloat = 800
 
@@ -34,6 +33,7 @@ struct IconGridView: View {
                         ForEach(items) { item in
                             IconGridItem(
                                 item: item,
+                                viewModel: viewModel,
                                 isSelected: viewModel.selectedItems.contains(item),
                                 thumbnail: thumbnails[item.url]
                             )
@@ -64,7 +64,7 @@ struct IconGridView: View {
                             )
                             .contextMenu {
                                 FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                                    renamingItem = item
+                                    viewModel.renamingURL = item.url
                                 }
                             }
                         }
@@ -119,9 +119,6 @@ struct IconGridView: View {
                 viewModel.showInFinder()
             }
         }
-        .sheet(item: $renamingItem) { item in
-            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
-        }
         .onChange(of: items) { _ in
             DispatchQueue.main.async {
                 thumbnails.removeAll()
@@ -166,9 +163,7 @@ struct IconGridView: View {
     private func toggleQuickLook() {
         guard let selectedItem = viewModel.selectedItems.first else { return }
 
-        let cols = calculatedColumns
         QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { [self] offset in
-            // Map offset for grid: 1/-1 for horizontal, cols/-cols for vertical
             navigateSelection(by: offset)
         }
     }
@@ -208,46 +203,12 @@ struct IconGridView: View {
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        let destPath = viewModel.currentPath
-        let shouldMove = NSEvent.modifierFlags.contains(.option)
-
         for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, error in
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
                 guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else {
-                    return
-                }
-
-                if sourceURL.deletingLastPathComponent() == destPath {
-                    return
-                }
-
-                let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
-
-                var finalURL = destURL
-                var counter = 1
-                while FileManager.default.fileExists(atPath: finalURL.path) {
-                    let name = sourceURL.deletingPathExtension().lastPathComponent
-                    let ext = sourceURL.pathExtension
-                    if ext.isEmpty {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter)")
-                    } else {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
-                    }
-                    counter += 1
-                }
-
-                do {
-                    if shouldMove {
-                        try FileManager.default.moveItem(at: sourceURL, to: finalURL)
-                    } else {
-                        try FileManager.default.copyItem(at: sourceURL, to: finalURL)
-                    }
-                    DispatchQueue.main.async {
-                        viewModel.refresh()
-                    }
-                } catch {
-                    print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [sourceURL])
                 }
             }
         }
@@ -256,6 +217,7 @@ struct IconGridView: View {
 
 struct IconGridItem: View {
     let item: FileItem
+    @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
     let thumbnail: NSImage?
 
@@ -268,7 +230,6 @@ struct IconGridItem: View {
     var body: some View {
         VStack(spacing: 8) {
             ZStack {
-                // Always have the background frame to prevent size changes on selection
                 RoundedRectangle(cornerRadius: 8)
                     .fill(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
                     .frame(width: 90, height: 90)
@@ -280,18 +241,15 @@ struct IconGridItem: View {
                     .cornerRadius(4)
             }
 
-            Text(item.name)
-                .font(.caption)
-                .lineLimit(2)
-                .multilineTextAlignment(.center)
+            InlineRenameField(item: item, viewModel: viewModel, font: .caption, alignment: .center, lineLimit: 2)
                 .frame(width: 100)
                 .padding(.horizontal, 4)
                 .padding(.vertical, 2)
                 .background(
                     RoundedRectangle(cornerRadius: 4)
-                        .fill(isSelected ? Color.accentColor : Color.clear)
+                        .fill(isSelected && viewModel.renamingURL != item.url ? Color.accentColor : Color.clear)
                 )
-                .foregroundColor(isSelected ? .white : .primary)
+                .foregroundColor(isSelected && viewModel.renamingURL != item.url ? .white : .primary)
         }
         .padding(8)
         .background(

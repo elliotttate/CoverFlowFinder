@@ -8,65 +8,24 @@ struct CoverFlowView: View {
     let items: [FileItem]
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
 
-    // Toggle verbose logging to Desktop file
-    private let loggingEnabled = false
-
-    // Cache sorted items to avoid re-sorting on every selection change
     @State private var sortedItemsCache: [FileItem] = []
-
-    // Thumbnails loaded for current view (triggers SwiftUI updates)
     @State private var thumbnails: [URL: NSImage] = [:]
-    @State private var iconPlaceholders: Set<URL> = []  // Track URLs showing only icon (real thumbnail pending)
+    @State private var iconPlaceholders: Set<URL> = []
     @State private var thumbnailLoadGeneration: Int = 0
-    @State private var debugLog: [String] = []
-    @State private var renamingItem: FileItem?
     @State private var rightClickedIndex: Int?
     @State private var isCoverFlowScrolling: Bool = false
 
-    // Thumbnail throttling
     @State private var lastThumbnailLoadTime: Date = .distantPast
     @State private var thumbnailLoadTimer: Timer?
-    private let thumbnailLoadThrottle: TimeInterval = 0.016  // ~60fps throttle
+    private let thumbnailLoadThrottle: TimeInterval = 0.016
 
-    private let visibleRange = 12  // Prefetch modestly ahead
-    private let maxConcurrentThumbnails = 8  // Limit parallel work
+    private let visibleRange = 12
+    private let maxConcurrentThumbnails = 8
     private let thumbnailCache = ThumbnailCacheManager.shared
-
-    private static let logFileURL: URL = {
-        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first!
-        return desktop.appendingPathComponent("CoverFlowDebug.log")
-    }()
-
-    private func log(_ message: String) {
-        guard loggingEnabled else { return }
-        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        let entry = "[\(timestamp)] \(message)"
-        print(entry)
-
-        // Write to file
-        let line = entry + "\n"
-        if let data = line.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: Self.logFileURL.path) {
-                if let handle = try? FileHandle(forWritingTo: Self.logFileURL) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: Self.logFileURL)
-            }
-        }
-
-        DispatchQueue.main.async {
-            debugLog.append(entry)
-            if debugLog.count > 100 { debugLog.removeFirst() }
-        }
-    }
 
     var body: some View {
         GeometryReader { geometry in
             VStack(spacing: 0) {
-                // Cover Flow area - takes proportional space
                 CoverFlowContainer(
                     items: sortedItemsCache,
                     selectedIndex: $viewModel.coverFlowSelectedIndex,
@@ -76,7 +35,6 @@ struct CoverFlowView: View {
                     selectedItems: viewModel.selectedItems,
                     onSelect: { index in
                         viewModel.coverFlowSelectedIndex = index
-                        // Handle selection with Cmd+click and Shift+click support
                         if index < sortedItemsCache.count {
                             let item = sortedItemsCache[index]
                             let modifiers = NSEvent.modifierFlags
@@ -87,7 +45,6 @@ struct CoverFlowView: View {
                                 withShift: modifiers.contains(.shift),
                                 withCommand: modifiers.contains(.command)
                             )
-                            // Refresh Quick Look if visible
                             QuickLookControllerView.shared.updatePreview(for: item.url)
                         }
                     },
@@ -103,7 +60,6 @@ struct CoverFlowView: View {
                         handleDrop(urls: urls)
                     },
                     onScrollStateChange: { scrolling in
-                        // Defer state change to avoid publishing during view updates
                         DispatchQueue.main.async {
                             isCoverFlowScrolling = scrolling
                             if !scrolling {
@@ -126,7 +82,6 @@ struct CoverFlowView: View {
                 )
                 .frame(height: max(250, geometry.size.height * 0.45))
 
-                // Selected item info
                 if !sortedItemsCache.isEmpty && viewModel.coverFlowSelectedIndex < sortedItemsCache.count {
                     let selectedItem = sortedItemsCache[viewModel.coverFlowSelectedIndex]
                     VStack(spacing: 4) {
@@ -150,14 +105,11 @@ struct CoverFlowView: View {
 
                 Divider()
 
-                // File list
                 FileListSection(
                     items: sortedItemsCache,
                     selectedItems: viewModel.selectedItems,
                     onSelect: { item, index in
-                        // Only update cover flow index - selection is handled by instantTap in FileListSection
                         viewModel.coverFlowSelectedIndex = index
-                        // DON'T call syncSelection() here - it would overwrite multi-selection
                     },
                     onOpen: { item in
                         viewModel.openItem(item)
@@ -166,40 +118,8 @@ struct CoverFlowView: View {
                 )
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .overlay(alignment: .topLeading) {
-                // Debug overlay
-                if viewModel.showDebug {
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack {
-                            Text("DEBUG LOG")
-                                .font(.system(size: 10, weight: .bold))
-                            Spacer()
-                            Text("Loaded: \(thumbnails.count)")
-                                .font(.system(size: 10))
-                        }
-                        .padding(.bottom, 4)
-
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 1) {
-                                ForEach(debugLog.suffix(20), id: \.self) { entry in
-                                    Text(entry)
-                                        .font(.system(size: 9, design: .monospaced))
-                                        .foregroundColor(.green)
-                                }
-                            }
-                        }
-                    }
-                    .padding(8)
-                    .background(Color.black.opacity(0.85))
-                    .foregroundColor(.white)
-                    .cornerRadius(8)
-                    .frame(maxWidth: 400, maxHeight: 200)
-                    .padding(10)
-                }
-            }
         }
         .onAppear {
-            // Clear KeyboardManager so events pass through to native keyDown handler
             KeyboardManager.shared.clearHandler()
             updateSortedItems()
             loadVisibleThumbnails()
@@ -210,14 +130,11 @@ struct CoverFlowView: View {
             thumbnailLoadTimer = nil
         }
         .onChange(of: items) { _ in
-            // Defer state changes to avoid publishing during view updates
             DispatchQueue.main.async {
-                // Clear local thumbnails and tell cache manager about new folder
                 thumbnails.removeAll()
                 iconPlaceholders.removeAll()
                 thumbnailLoadGeneration += 1
                 thumbnailCache.clearForNewFolder()
-                log("Items changed - cleared \(items.count) items")
                 updateSortedItems()
                 loadVisibleThumbnails()
                 syncSelection()
@@ -241,22 +158,16 @@ struct CoverFlowView: View {
                 viewModel.hydrateMetadataAroundSelection()
             }
         }
-        .sheet(item: $renamingItem) { item in
-            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
-        }
     }
 
-    // Throttled thumbnail loading - skip rapid calls during scrolling
     private func throttledLoadThumbnails() {
         let now = Date()
         let timeSinceLastLoad = now.timeIntervalSince(lastThumbnailLoadTime)
 
-        // If enough time has passed, load immediately
         if timeSinceLastLoad >= thumbnailLoadThrottle {
             lastThumbnailLoadTime = now
             loadVisibleThumbnails()
         } else {
-            // Schedule a deferred load if not already scheduled
             thumbnailLoadTimer?.invalidate()
             let delay = thumbnailLoadThrottle - timeSinceLastLoad
             thumbnailLoadTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
@@ -270,7 +181,6 @@ struct CoverFlowView: View {
 
     private func updateSortedItems() {
         sortedItemsCache = columnConfig.sortedItems(items)
-        // Clamp selection to new bounds
         viewModel.coverFlowSelectedIndex = min(viewModel.coverFlowSelectedIndex, max(0, sortedItemsCache.count - 1))
     }
 
@@ -280,44 +190,9 @@ struct CoverFlowView: View {
     }
 
     private func handleDrop(urls: [URL]) {
-        let destPath = viewModel.currentPath
-        let shouldMove = NSEvent.modifierFlags.contains(.option)
-
-        for sourceURL in urls {
-            if sourceURL.deletingLastPathComponent() == destPath {
-                continue
-            }
-
-            let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
-
-            var finalURL = destURL
-            var counter = 1
-            while FileManager.default.fileExists(atPath: finalURL.path) {
-                let name = sourceURL.deletingPathExtension().lastPathComponent
-                let ext = sourceURL.pathExtension
-                if ext.isEmpty {
-                    finalURL = destPath.appendingPathComponent("\(name) \(counter)")
-                } else {
-                    finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
-                }
-                counter += 1
-            }
-
-            do {
-                if shouldMove {
-                    try FileManager.default.moveItem(at: sourceURL, to: finalURL)
-                } else {
-                    try FileManager.default.copyItem(at: sourceURL, to: finalURL)
-                }
-            } catch {
-                print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
-            }
-        }
-
-        viewModel.refresh()
+        viewModel.handleDrop(urls: urls)
     }
 
-    // Window size for keeping thumbnails in memory (larger than visibleRange for smooth scrolling)
     private let thumbnailWindowSize = 100
 
     private func loadVisibleThumbnails() {
@@ -328,13 +203,11 @@ struct CoverFlowView: View {
         let end = min(sortedItemsCache.count - 1, selected + visibleRange)
         guard start <= end else { return }
 
-        // Collect all state changes to apply later
         var thumbnailUpdates: [URL: NSImage] = [:]
         var placeholdersToAdd: Set<URL> = []
         var placeholdersToRemove: Set<URL> = []
         var itemsToLoad: [(item: FileItem, distance: Int)] = []
 
-        // Evict distant thumbnails first
         let windowStart = max(0, selected - thumbnailWindowSize)
         let windowEnd = min(sortedItemsCache.count - 1, selected + thumbnailWindowSize)
         var keepURLs = Set<URL>()
@@ -354,7 +227,7 @@ struct CoverFlowView: View {
             let hasRealThumbnail = thumbnails[item.url] != nil && !iconPlaceholders.contains(item.url)
 
             if hasRealThumbnail {
-                // Already loaded
+                continue
             } else if thumbnailCache.hasFailed(url: item.url) {
                 thumbnailUpdates[item.url] = item.icon
                 placeholdersToRemove.insert(item.url)
@@ -373,18 +246,14 @@ struct CoverFlowView: View {
             }
         }
 
-        // Sort by distance (closest first)
         itemsToLoad.sort { $0.distance < $1.distance }
         let loadItems = Array(itemsToLoad.prefix(maxConcurrentThumbnails))
 
-        // Apply all state changes in a deferred block
         DispatchQueue.main.async { [self] in
-            // Evict distant
             for url in urlsToEvict {
                 thumbnails.removeValue(forKey: url)
                 iconPlaceholders.remove(url)
             }
-            // Apply updates
             for (url, image) in thumbnailUpdates {
                 thumbnails[url] = image
             }
@@ -394,7 +263,6 @@ struct CoverFlowView: View {
             for url in placeholdersToRemove {
                 iconPlaceholders.remove(url)
             }
-            // Start loading
             for (item, _) in loadItems {
                 generateThumbnail(for: item)
             }
@@ -403,25 +271,19 @@ struct CoverFlowView: View {
 
     private func generateThumbnail(for item: FileItem) {
         let currentGen = thumbnailLoadGeneration
-        log("🔄 Start: \(item.name)")
 
         thumbnailCache.generateThumbnail(for: item) { url, image in
-            // Defer to next run loop to avoid publishing during view updates
             DispatchQueue.main.async { [self] in
-                // Check if we're still on the same generation (folder)
                 guard currentGen == thumbnailLoadGeneration else { return }
 
                 if let image = image {
                     thumbnails[url] = image
-                    iconPlaceholders.remove(url)  // Real thumbnail loaded
-                    log("✅ Done: \(item.name)")
+                    iconPlaceholders.remove(url)
                 } else {
                     thumbnails[url] = item.icon
-                    iconPlaceholders.remove(url)  // Failed, icon is final state
-                    log("❌ Failed: \(item.name)")
+                    iconPlaceholders.remove(url)
                 }
 
-                // Continue loading more
                 loadVisibleThumbnails()
             }
         }
@@ -495,31 +357,6 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 
     private var items: [FileItem] = []
     private var thumbnails: [URL: NSImage] = [:]
-
-    private static let logFileURL: URL = {
-        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first!
-        return desktop.appendingPathComponent("CoverFlowDebug.log")
-    }()
-
-    private let nativeLoggingEnabled = false
-
-    private func nativeLog(_ message: String) {
-        guard nativeLoggingEnabled else { return }
-        let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-        let entry = "[\(timestamp)] 🔷 \(message)\n"
-        print(entry)
-        if let data = entry.data(using: .utf8) {
-            if FileManager.default.fileExists(atPath: Self.logFileURL.path) {
-                if let handle = try? FileHandle(forWritingTo: Self.logFileURL) {
-                    handle.seekToEndOfFile()
-                    handle.write(data)
-                    handle.closeFile()
-                }
-            } else {
-                try? data.write(to: Self.logFileURL)
-            }
-        }
-    }
     private var selectedIndex: Int = 0
     private var coverLayers: [CALayer] = []
     private var layerPool: [CALayer] = []  // Reusable layer pool
@@ -685,12 +522,9 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
 
     @objc private func handleRightClick(_ gesture: NSClickGestureRecognizer) {
-        nativeLog("Right-click gesture triggered!")
         let location = gesture.location(in: self)
         let index = hitTestCover(at: location) ?? selectedIndex
         onSelect?(index)
-
-        // Create and show menu
         let menu = createContextMenu(for: index)
         menu.popUp(positioning: nil, at: location, in: self)
     }
@@ -709,8 +543,6 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             return false
         }()
 
-        let thumbCount = thumbnails.count
-        let oldIndex = self.selectedIndex
         self.items = items
         self.thumbnails = thumbnails
 
@@ -718,19 +550,15 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         self.selectedIndex = selectedIndex
 
         if itemsChanged {
-            nativeLog("itemsChanged - rebuild, thumbs=\(thumbCount), oldIdx=\(oldIndex), newIdx=\(selectedIndex)")
             rebuildCovers()
-            // Force layout update after rebuild
             layer?.setNeedsLayout()
             layer?.layoutIfNeeded()
         } else if indexChanged {
-            nativeLog("indexChanged to \(selectedIndex), thumbs=\(thumbCount), covers=\(coverLayers.count)")
             animateToSelection()
             DispatchQueue.main.async {
                 self.updateCoverImages()
             }
         } else {
-            nativeLog("thumbsOnly changed, thumbs=\(thumbCount), covers=\(coverLayers.count)")
             updateCoverImages()
         }
     }
@@ -1122,9 +950,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
 
-        // Check for control+click (right-click equivalent)
         if event.modifierFlags.contains(.control) {
-            nativeLog("Control+click detected, showing context menu")
             handleContextClick(with: event)
             return
         }
@@ -1216,7 +1042,6 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
 
     override func rightMouseDown(with event: NSEvent) {
-        nativeLog("rightMouseDown called!")
         window?.makeFirstResponder(self)
         handleContextClick(with: event)
     }
@@ -1224,12 +1049,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     private func handleContextClick(with event: NSEvent) {
         let location = convert(event.locationInWindow, from: nil)
         let index = hitTestCover(at: location) ?? selectedIndex
-        nativeLog("Context click at index \(index)")
-
-        // Select the item first
         onSelect?(index)
-
-        // Show native context menu
         showContextMenu(for: index, with: event)
     }
 
@@ -1702,7 +1522,6 @@ struct FileListSection: View {
     let onOpen: (FileItem) -> Void
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
-    @State private var renamingItem: FileItem?
     @State private var isDropTargeted = false
 
     var body: some View {
@@ -1721,7 +1540,7 @@ struct FileListSection: View {
                     }
                 )) {
                     ForEach(items) { item in
-                        CoverFlowFileRow(item: item, columnConfig: columnConfig)
+                        CoverFlowFileRow(item: item, viewModel: viewModel, isSelected: selectedItems.contains(item), columnConfig: columnConfig)
                             .tag(item.id)
                             .id(item.id)
                             .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
@@ -1731,7 +1550,6 @@ struct FileListSection: View {
                                     : Color.clear
                             )
                             .onDrag {
-                                // Drag all selected items if this item is selected, otherwise just this item
                                 if viewModel.selectedItems.contains(item) && viewModel.selectedItems.count > 1 {
                                     let urls = viewModel.selectedItems.map { $0.url as NSURL }
                                     let provider = NSItemProvider()
@@ -1746,7 +1564,6 @@ struct FileListSection: View {
                             .instantTap(
                                 id: item.id,
                                 onSingleClick: {
-                                    // Support Cmd+click and Shift+click for multi-selection
                                     if let index = items.firstIndex(of: item) {
                                         let modifiers = NSEvent.modifierFlags
                                         viewModel.handleSelection(
@@ -1756,7 +1573,6 @@ struct FileListSection: View {
                                             withShift: modifiers.contains(.shift),
                                             withCommand: modifiers.contains(.command)
                                         )
-                                        // Update cover flow index
                                         onSelect(item, index)
                                     }
                                 },
@@ -1766,7 +1582,7 @@ struct FileListSection: View {
                             )
                             .contextMenu {
                                 FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                                    renamingItem = item
+                                    viewModel.renamingURL = item.url
                                 }
                             }
                     }
@@ -1789,52 +1605,15 @@ struct FileListSection: View {
             RoundedRectangle(cornerRadius: 4)
                 .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 2)
         )
-        .sheet(item: $renamingItem) { item in
-            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
-        }
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        let destPath = viewModel.currentPath
-        let shouldMove = NSEvent.modifierFlags.contains(.option)
-
         for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, error in
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
                 guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else {
-                    return
-                }
-
-                if sourceURL.deletingLastPathComponent() == destPath {
-                    return
-                }
-
-                let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
-
-                var finalURL = destURL
-                var counter = 1
-                while FileManager.default.fileExists(atPath: finalURL.path) {
-                    let name = sourceURL.deletingPathExtension().lastPathComponent
-                    let ext = sourceURL.pathExtension
-                    if ext.isEmpty {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter)")
-                    } else {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
-                    }
-                    counter += 1
-                }
-
-                do {
-                    if shouldMove {
-                        try FileManager.default.moveItem(at: sourceURL, to: finalURL)
-                    } else {
-                        try FileManager.default.copyItem(at: sourceURL, to: finalURL)
-                    }
-                    DispatchQueue.main.async {
-                        viewModel.refresh()
-                    }
-                } catch {
-                    print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [sourceURL])
                 }
             }
         }
@@ -1977,6 +1756,8 @@ struct CoverFlowColumnHeaderCell: View {
 // File row for CoverFlow file list
 struct CoverFlowFileRow: View {
     let item: FileItem
+    @ObservedObject var viewModel: FileBrowserViewModel
+    let isSelected: Bool
     @ObservedObject var columnConfig: ListColumnConfigManager
 
     var body: some View {
@@ -1989,20 +1770,20 @@ struct CoverFlowFileRow: View {
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity)
-        .contentShape(Rectangle()) // Make entire row clickable
+        .contentShape(Rectangle())
     }
 
     @ViewBuilder
     private func alignedCell(for column: ListColumn, width: CGFloat, alignment: Alignment) -> some View {
         HStack(spacing: 0) {
             if alignment == .leading {
-                Color.clear.frame(width: 8) // Fixed left padding
+                Color.clear.frame(width: 8)
                 cellContent(for: column)
                 Spacer(minLength: 0)
             } else if alignment == .trailing {
                 Spacer(minLength: 0)
                 cellContent(for: column)
-                Color.clear.frame(width: 8) // Fixed right padding
+                Color.clear.frame(width: 8)
             } else {
                 Spacer(minLength: 0)
                 cellContent(for: column)
@@ -2021,8 +1802,7 @@ struct CoverFlowFileRow: View {
                     .resizable()
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 20, height: 20)
-                Text(item.name)
-                    .lineLimit(1)
+                InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
             }
         case .dateModified:
             Text(item.formattedDate)

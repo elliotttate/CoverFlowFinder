@@ -131,17 +131,8 @@ struct DualPaneView: View {
                     return true
                 case 49: // Space
                     if let selectedItem = vm.selectedItems.first {
-                        let paneViewMode = self.activePane == .left ? self.leftPaneViewMode : self.rightPaneViewMode
-                        let columnsCount = self.activePane == .left ? self.leftPaneColumns : self.rightPaneColumns
-
                         QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { offset in
-                            if paneViewMode == .icons {
-                                // Grid: left/right = ±1, up/down = ±columns
-                                self.navigateInViewModel(vm, by: offset)
-                            } else {
-                                // List: up/down only
-                                self.navigateInViewModel(vm, by: offset)
-                            }
+                            self.navigateInViewModel(vm, by: offset)
                         }
                     }
                     return true
@@ -317,49 +308,13 @@ struct PaneView: View {
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        let destPath = viewModel.currentPath
-        let shouldMove = NSEvent.modifierFlags.contains(.option)
-
         for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, error in
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
                 guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else {
-                    return
-                }
-
-                // Skip if dropping onto the same directory
-                if sourceURL.deletingLastPathComponent() == destPath {
-                    return
-                }
-
-                let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
-
-                // Check if we need to make a unique name
-                var finalURL = destURL
-                var counter = 1
-                while FileManager.default.fileExists(atPath: finalURL.path) {
-                    let name = sourceURL.deletingPathExtension().lastPathComponent
-                    let ext = sourceURL.pathExtension
-                    if ext.isEmpty {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter)")
-                    } else {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
-                    }
-                    counter += 1
-                }
-
-                do {
-                    if shouldMove {
-                        try FileManager.default.moveItem(at: sourceURL, to: finalURL)
-                    } else {
-                        try FileManager.default.copyItem(at: sourceURL, to: finalURL)
-                    }
-                    DispatchQueue.main.async {
-                        viewModel.refresh()
-                        otherViewModel.refresh()
-                    }
-                } catch {
-                    print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [sourceURL])
+                    otherViewModel.refresh()
                 }
             }
         }
@@ -381,8 +336,7 @@ struct PaneListView: View {
                             .aspectRatio(contentMode: .fit)
                             .frame(width: 16, height: 16)
 
-                        Text(item.name)
-                            .lineLimit(1)
+                        InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
 
                         Spacer()
 
@@ -426,7 +380,9 @@ struct PaneListView: View {
                         }
                     )
                     .contextMenu {
-                        FileItemContextMenu(item: item, viewModel: viewModel) { _ in }
+                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                            viewModel.renamingURL = item.url
+                        }
                     }
                     .listRowInsets(EdgeInsets())
                     .listRowSeparator(.hidden)
@@ -449,17 +405,38 @@ struct PaneIconView: View {
     let onActivate: () -> Void
     let onColumnsCalculated: (Int) -> Void
 
+    @State private var thumbnails: [URL: NSImage] = [:]
+    private let thumbnailCache = ThumbnailCacheManager.shared
+
     private let columns = [
         GridItem(.adaptive(minimum: 80, maximum: 100), spacing: 16)
     ]
 
     private func calculateColumns(width: CGFloat) -> Int {
-        // Grid uses adaptive(minimum: 80, maximum: 100) with spacing: 16
-        // Plus padding of 16 on each side (from .padding())
-        let availableWidth = width - 32 // Subtract padding (16 each side)
-        // Each column needs minimum 80px + 16px spacing = 96px
+        let availableWidth = width - 32
         let cols = Int((availableWidth + 16) / 96)
         return max(1, cols)
+    }
+
+    private func loadThumbnail(for item: FileItem) {
+        let url = item.url
+        guard thumbnails[url] == nil else { return }
+
+        if thumbnailCache.hasFailed(url: url) {
+            DispatchQueue.main.async { thumbnails[url] = item.icon }
+            return
+        }
+
+        if let cached = thumbnailCache.getCachedThumbnail(for: url) {
+            DispatchQueue.main.async { thumbnails[url] = cached }
+            return
+        }
+
+        thumbnailCache.generateThumbnail(for: item) { url, image in
+            DispatchQueue.main.async {
+                thumbnails[url] = image ?? item.icon
+            }
+        }
     }
 
     var body: some View {
@@ -468,25 +445,20 @@ struct PaneIconView: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: 16) {
                         ForEach(viewModel.items) { item in
+                            let isSelected = viewModel.selectedItems.contains(item)
                             VStack(spacing: 4) {
-                                Image(nsImage: item.icon)
+                                Image(nsImage: thumbnails[item.url] ?? item.icon)
                                     .resizable()
                                     .aspectRatio(contentMode: .fit)
                                     .frame(width: 48, height: 48)
 
-                                Text(item.name)
-                                    .font(.caption)
-                                    .lineLimit(2)
-                                    .multilineTextAlignment(.center)
+                                InlineRenameField(item: item, viewModel: viewModel, font: .caption, alignment: .center, lineLimit: 2)
                                     .frame(width: 80)
                             }
                             .id(item.id)
+                            .onAppear { loadThumbnail(for: item) }
                             .padding(8)
-                            .background(
-                                viewModel.selectedItems.contains(item)
-                                    ? Color.accentColor.opacity(0.2)
-                                    : Color.clear
-                            )
+                            .background(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
                             .cornerRadius(8)
                             .contentShape(Rectangle())
                             .onDrag {
@@ -513,7 +485,9 @@ struct PaneIconView: View {
                                 }
                             )
                             .contextMenu {
-                                FileItemContextMenu(item: item, viewModel: viewModel) { _ in }
+                                FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                                    viewModel.renamingURL = item.url
+                                }
                             }
                         }
                     }

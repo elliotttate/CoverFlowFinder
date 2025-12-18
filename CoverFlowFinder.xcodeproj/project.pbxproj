@@ -19,6 +19,7 @@
 		A1000009001 /* ColumnView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000009000 /* ColumnView.swift */; };
 		A100000A001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A100000A000 /* Assets.xcassets */; };
 		A100001E001 /* DualPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100001E000 /* DualPaneView.swift */; };
+		A1000025001 /* QuadPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000025000 /* QuadPaneView.swift */; };
 		A100001F001 /* FileInfoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100001F000 /* FileInfoView.swift */; };
 		A1000020001 /* KeyboardHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000020000 /* KeyboardHandler.swift */; };
 		A1000021001 /* QuickLookController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000021000 /* QuickLookController.swift */; };
@@ -43,6 +44,7 @@
 		A100000B000 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A100000C000 /* CoverFlowFinder.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CoverFlowFinder.entitlements; sourceTree = "<group>"; };
 		A100001E000 /* DualPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DualPaneView.swift; sourceTree = "<group>"; };
+		A1000025000 /* QuadPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuadPaneView.swift; sourceTree = "<group>"; };
 		A100001F000 /* FileInfoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileInfoView.swift; sourceTree = "<group>"; };
 		A1000020000 /* KeyboardHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardHandler.swift; sourceTree = "<group>"; };
 		A1000021000 /* QuickLookController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookController.swift; sourceTree = "<group>"; };
@@ -120,6 +122,7 @@
 				A1000008000 /* FileListView.swift */,
 				A1000009000 /* ColumnView.swift */,
 				A100001E000 /* DualPaneView.swift */,
+				A1000025000 /* QuadPaneView.swift */,
 				A100001F000 /* FileInfoView.swift */,
 				A1000020000 /* KeyboardHandler.swift */,
 				A1000021000 /* QuickLookController.swift */,
@@ -209,6 +212,7 @@
 				A1000008001 /* FileListView.swift in Sources */,
 				A1000009001 /* ColumnView.swift in Sources */,
 				A100001E001 /* DualPaneView.swift in Sources */,
+				A1000025001 /* QuadPaneView.swift in Sources */,
 				A100001F001 /* FileInfoView.swift in Sources */,
 				A1000020001 /* KeyboardHandler.swift in Sources */,
 				A1000021001 /* QuickLookController.swift in Sources */,

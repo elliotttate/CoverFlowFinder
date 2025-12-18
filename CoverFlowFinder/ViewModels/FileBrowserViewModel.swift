@@ -6,34 +6,13 @@ extension Notification.Name {
     static let showGetInfo = Notification.Name("showGetInfo")
 }
 
-// Debug logging to Desktop file (disabled unless explicitly toggled)
-private let debugLoggingEnabled = false
-private func debugLog(_ message: String) {
-    guard debugLoggingEnabled else { return }
-    let logURL = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Desktop")
-        .appendingPathComponent("CoverFlowDebug.log")
-    let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
-    let entry = "[\(timestamp)] 🔶 \(message)\n"
-    if let data = entry.data(using: .utf8) {
-        if FileManager.default.fileExists(atPath: logURL.path) {
-            if let handle = try? FileHandle(forWritingTo: logURL) {
-                try? handle.seekToEnd()
-                try? handle.write(contentsOf: data)
-                try? handle.close()
-            }
-        } else {
-            try? data.write(to: logURL)
-        }
-    }
-}
-
 enum ViewMode: String, CaseIterable {
     case coverFlow = "Cover Flow"
     case icons = "Icons"
     case list = "List"
     case columns = "Columns"
     case dualPane = "Dual Pane"
+    case quadPane = "Quad Pane"
 
     var systemImage: String {
         switch self {
@@ -42,6 +21,7 @@ enum ViewMode: String, CaseIterable {
         case .list: return "list.bullet"
         case .columns: return "rectangle.split.3x1"
         case .dualPane: return "rectangle.split.2x1"
+        case .quadPane: return "rectangle.grid.2x2"
         }
     }
 }
@@ -99,8 +79,13 @@ class FileBrowserViewModel: ObservableObject {
     @Published var navigationHistory: [URL] = []
     @Published var historyIndex: Int = -1
     @Published var coverFlowSelectedIndex: Int = 0
+    @Published var renamingURL: URL? = nil
     // Navigation generation counter - forces SwiftUI to update on navigation
     @Published var navigationGeneration: Int = 0
+
+    // Track click timing for Finder-style rename triggering
+    private var lastClickedURL: URL?
+    private var lastClickTime: Date = .distantPast
 
     // Track the folder we entered so we can select it when going back
     private var enteredFolderURL: URL?
@@ -113,10 +98,6 @@ class FileBrowserViewModel: ObservableObject {
     @Published var clipboardItems: [URL] = []
     @Published var clipboardOperation: ClipboardOperation = .copy
 
-    // Debug state
-    @Published var showDebug: Bool = false
-
-    // Info window state
     @Published var infoItem: FileItem?
 
     private var cancellables = Set<AnyCancellable>()
@@ -198,15 +179,12 @@ class FileBrowserViewModel: ObservableObject {
                 }
 
                 DispatchQueue.main.async {
-                    // Minimal work on main thread - just assign values
                     if let item = selectedItem {
-                        debugLog("📍 loadContents: setting coverFlowSelectedIndex=\(selectedIndex) for \(item.name)")
                         self.coverFlowSelectedIndex = selectedIndex
                         self.selectedItems = [item]
                         self.pendingSelectionURL = nil
                     } else {
                         let clamped = min(self.coverFlowSelectedIndex, max(0, fileItems.count - 1))
-                        debugLog("📍 loadContents: no pendingSelection, clamping to \(clamped)")
                         self.coverFlowSelectedIndex = clamped
                     }
 
@@ -229,7 +207,6 @@ class FileBrowserViewModel: ObservableObject {
 
     func navigateTo(_ url: URL) {
         guard url != currentPath else { return }
-        debugLog("➡️ navigateTo called - setting coverFlowSelectedIndex=0")
         currentPath = url
         selectedItems.removeAll()
         coverFlowSelectedIndex = 0
@@ -258,9 +235,6 @@ class FileBrowserViewModel: ObservableObject {
 
     func goBack() {
         guard canGoBack else { return }
-        debugLog("🔙 goBack called - keeping coverFlowSelectedIndex=\(coverFlowSelectedIndex)")
-        // Remember the folder we're leaving so we can select it after going back
-        // Use enteredFolderURL if available, otherwise use current path
         pendingSelectionURL = enteredFolderURL ?? currentPath
         enteredFolderURL = nil
         historyIndex -= 1
@@ -320,9 +294,17 @@ class FileBrowserViewModel: ObservableObject {
 
     /// Handle selection with all modifier combinations
     func handleSelection(item: FileItem, index: Int, in items: [FileItem], withShift: Bool, withCommand: Bool) {
+        let now = Date()
+
+        // Cancel any active rename when clicking on a different item
+        if renamingURL != nil && renamingURL != item.url {
+            renamingURL = nil
+        }
+
         if withShift {
             // Shift+click: select range from anchor to clicked item
             selectRange(to: index, in: items)
+            lastClickedURL = nil
         } else if withCommand {
             // Cmd+click: toggle selection
             if selectedItems.contains(item) {
@@ -331,11 +313,27 @@ class FileBrowserViewModel: ObservableObject {
                 selectedItems.insert(item)
             }
             lastSelectedIndex = index
+            lastClickedURL = nil
         } else {
-            // Normal click: select only this item and set as anchor
-            selectedItems = [item]
-            lastSelectedIndex = index
+            // Normal click: check for Finder-style rename trigger
+            let wasOnlySelected = selectedItems.count == 1 && selectedItems.contains(item)
+            let timeSinceLastClick = now.timeIntervalSince(lastClickTime)
+            let isSameItem = lastClickedURL == item.url
+
+            // If clicking on the only selected item again after 0.8-3 seconds, trigger rename
+            // (0.8s minimum prevents accidental activation during double-click)
+            if wasOnlySelected && isSameItem && timeSinceLastClick > 0.8 && timeSinceLastClick < 3.0 && renamingURL == nil {
+                renamingURL = item.url
+                lastClickedURL = nil
+            } else {
+                // Normal selection
+                selectedItems = [item]
+                lastSelectedIndex = index
+                lastClickedURL = item.url
+            }
         }
+
+        lastClickTime = now
     }
 
     func quickLook(_ item: FileItem) {
@@ -497,6 +495,30 @@ class FileBrowserViewModel: ObservableObject {
         refresh()
     }
 
+    func handleDrop(urls: [URL], to destPath: URL? = nil) {
+        let destination = destPath ?? currentPath
+        let shouldMove = NSEvent.modifierFlags.contains(.option)
+
+        for sourceURL in urls {
+            if sourceURL.deletingLastPathComponent() == destination { continue }
+
+            let destURL = destination.appendingPathComponent(sourceURL.lastPathComponent)
+            let finalURL = uniqueDestinationURL(for: destURL)
+
+            do {
+                if shouldMove {
+                    try FileManager.default.moveItem(at: sourceURL, to: finalURL)
+                } else {
+                    try FileManager.default.copyItem(at: sourceURL, to: finalURL)
+                }
+            } catch {
+                print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+            }
+        }
+
+        refresh()
+    }
+
     func duplicateSelectedItems() {
         guard !selectedItems.isEmpty else { return }
 
@@ -578,7 +600,7 @@ class FileBrowserViewModel: ObservableObject {
         selectedItems = Set(items)
     }
 
-    private func uniqueDestinationURL(for url: URL) -> URL {
+    func uniqueDestinationURL(for url: URL) -> URL {
         let fileManager = FileManager.default
         var destinationURL = url
 

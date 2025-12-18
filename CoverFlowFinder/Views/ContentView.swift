@@ -1,41 +1,40 @@
 import SwiftUI
 
 struct ContentView: View {
-    // Tab management
     @State private var tabs: [BrowserTab] = [BrowserTab()]
     @State private var selectedTabId: UUID = UUID()
 
-    // Right pane for dual pane mode (shared across tabs for simplicity)
     @StateObject private var rightPaneViewModel: FileBrowserViewModel = {
         let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
             ?? FileManager.default.homeDirectoryForCurrentUser
         return FileBrowserViewModel(initialPath: desktop)
     }()
 
+    @StateObject private var bottomLeftPaneViewModel: FileBrowserViewModel = {
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        return FileBrowserViewModel(initialPath: downloads)
+    }()
+
+    @StateObject private var bottomRightPaneViewModel: FileBrowserViewModel = {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        return FileBrowserViewModel(initialPath: documents)
+    }()
+
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
-    @State private var renamingItem: FileItem?
-    @State private var renameText: String = ""
     @State private var activePane: DualPaneView.Pane = .left
-
-    // Track viewMode changes to force re-render (workaround for computed viewModel)
+    @State private var activeQuadPane: QuadPaneView.Pane = .topLeft
     @State private var currentViewMode: ViewMode = .coverFlow
-
-    // Track infoItem for Get Info sheet (needs to observe both viewModel and rightPaneViewModel)
     @State private var showingInfoItem: FileItem?
-
-    // Focus state for search field
     @FocusState private var isSearchFocused: Bool
-
-    // Track navigation state to force toolbar updates (workaround for computed viewModel)
     @State private var navHistoryIndex: Int = 0
     @State private var navHistoryCount: Int = 1
 
-    // Current tab's viewModel
     private var viewModel: FileBrowserViewModel {
         tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
     }
 
-    // Binding to current viewModel's viewMode (also updates local state for re-rendering)
     private var viewModeBinding: Binding<ViewMode> {
         Binding(
             get: { viewModel.viewMode },
@@ -46,7 +45,6 @@ struct ContentView: View {
         )
     }
 
-    // Binding to current viewModel's searchText
     private var searchTextBinding: Binding<String> {
         Binding(
             get: { viewModel.searchText },
@@ -54,16 +52,20 @@ struct ContentView: View {
         )
     }
 
-
-    // The viewModel to navigate based on active pane in dual mode
     private var activeViewModel: FileBrowserViewModel {
         if viewModel.viewMode == .dualPane && activePane == .right {
             return rightPaneViewModel
+        } else if viewModel.viewMode == .quadPane {
+            switch activeQuadPane {
+            case .topLeft: return viewModel
+            case .topRight: return rightPaneViewModel
+            case .bottomLeft: return bottomLeftPaneViewModel
+            case .bottomRight: return bottomRightPaneViewModel
+            }
         }
         return viewModel
     }
 
-    // Initialize selectedTabId to first tab
     init() {
         let initialTab = BrowserTab()
         _tabs = State(initialValue: [initialTab])
@@ -72,11 +74,10 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(viewModel: activeViewModel, isDualPane: currentViewMode == .dualPane)
+            SidebarView(viewModel: activeViewModel, isDualPane: currentViewMode == .dualPane || currentViewMode == .quadPane)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 300)
         } detail: {
             VStack(spacing: 0) {
-                // Tab bar (show when more than 1 tab or always for discoverability)
                 if tabs.count > 1 {
                     TabBarView(
                         tabs: $tabs,
@@ -88,20 +89,28 @@ struct ContentView: View {
                 }
 
                 if currentViewMode == .dualPane {
-                    // Dual pane mode - full width without path bar/status bar
                     DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel, activePane: $activePane)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .frame(minWidth: 700, minHeight: 400)
                         .id("dualpane-\(viewModel.currentPath.path)-\(selectedTabId)")
+                } else if currentViewMode == .quadPane {
+                    QuadPaneView(
+                        topLeftViewModel: viewModel,
+                        topRightViewModel: rightPaneViewModel,
+                        bottomLeftViewModel: bottomLeftPaneViewModel,
+                        bottomRightViewModel: bottomRightPaneViewModel,
+                        activePane: $activeQuadPane
+                    )
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .frame(minWidth: 800, minHeight: 600)
+                    .id("quadpane-\(viewModel.currentPath.path)-\(selectedTabId)")
                 } else {
-                    // Use wrapper view to properly observe viewModel changes
                     TabContentWrapper(viewModel: viewModel, selectedTabId: selectedTabId)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
         }
         .toolbar {
-            // Back/Forward buttons - placed in navigation area (left side)
             ToolbarItem(placement: .navigation) {
                 Button(action: { viewModel.goBack() }) {
                     Image(systemName: "chevron.left")
@@ -119,7 +128,6 @@ struct ContentView: View {
             }
 
             ToolbarItem(placement: .principal) {
-                // View mode picker
                 Picker("View", selection: viewModeBinding) {
                     ForEach(ViewMode.allCases, id: \.self) { mode in
                         Image(systemName: mode.systemImage)
@@ -190,9 +198,6 @@ struct ContentView: View {
         }
         .navigationTitle(viewModel.currentPath.lastPathComponent)
         .focusedSceneValue(\.viewModel, viewModel)
-        .sheet(item: $renamingItem) { item in
-            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
-        }
         .sheet(item: $showingInfoItem) { item in
             FileInfoView(item: item)
         }
@@ -335,44 +340,6 @@ struct FileItemContextMenu: View {
     }
 }
 
-// MARK: - Rename Sheet
-
-struct RenameSheet: View {
-    let item: FileItem
-    @ObservedObject var viewModel: FileBrowserViewModel
-    @Binding var isPresented: FileItem?
-    @State private var newName: String = ""
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Text("Rename \"\(item.name)\"")
-                .font(.headline)
-
-            TextField("New name", text: $newName)
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 300)
-
-            HStack {
-                Button("Cancel") {
-                    isPresented = nil
-                }
-                .keyboardShortcut(.cancelAction)
-
-                Button("Rename") {
-                    viewModel.renameItem(item, to: newName)
-                    isPresented = nil
-                }
-                .keyboardShortcut(.defaultAction)
-                .disabled(newName.isEmpty || newName == item.name)
-            }
-        }
-        .padding(20)
-        .onAppear {
-            newName = item.name
-        }
-    }
-}
-
 struct PathBarView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     @State private var isEditing = false
@@ -493,15 +460,12 @@ struct PathBarView: View {
                 isEditing = false
                 isTextFieldFocused = false
             } else {
-                // It's a file - navigate to its parent and select it
                 let parentURL = url.deletingLastPathComponent()
                 viewModel.navigateTo(parentURL)
-                // TODO: Could select the file after navigation
                 isEditing = false
                 isTextFieldFocused = false
             }
         } else {
-            // Invalid path - shake or show error? For now just beep
             NSSound.beep()
         }
     }
@@ -606,8 +570,8 @@ struct TabContentWrapper: View {
         case .columns:
             ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
                 .id("columns-\(viewModel.currentPath.path)-\(selectedTabId)")
-        case .dualPane:
-            EmptyView() // Handled in parent
+        case .dualPane, .quadPane:
+            EmptyView()
         }
     }
 }

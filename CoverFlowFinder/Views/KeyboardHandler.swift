@@ -170,3 +170,122 @@ extension View {
         ))
     }
 }
+
+struct InlineRenameField: View {
+    let item: FileItem
+    @ObservedObject var viewModel: FileBrowserViewModel
+    let font: Font
+    let alignment: TextAlignment
+    let lineLimit: Int
+
+    @State private var editText: String = ""
+    @FocusState private var isFocused: Bool
+    @State private var hasCommitted: Bool = false
+    @State private var clickMonitor: Any?
+
+    init(item: FileItem, viewModel: FileBrowserViewModel, font: Font = .body, alignment: TextAlignment = .leading, lineLimit: Int = 1) {
+        self.item = item
+        self.viewModel = viewModel
+        self.font = font
+        self.alignment = alignment
+        self.lineLimit = lineLimit
+    }
+
+    var body: some View {
+        if viewModel.renamingURL == item.url {
+            TextField("", text: $editText)
+                .textFieldStyle(.plain)
+                .font(font)
+                .multilineTextAlignment(alignment)
+                .focused($isFocused)
+                .onSubmit { commitRename() }
+                .onExitCommand { cancelRename() }
+                .onAppear {
+                    hasCommitted = false
+                    editText = item.nameWithoutExtension
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        isFocused = true
+                        selectAllText()
+                        setupClickMonitor()
+                    }
+                }
+                .onDisappear {
+                    removeClickMonitor()
+                    if !hasCommitted {
+                        commitRename()
+                    }
+                }
+                .onChange(of: isFocused) { focused in
+                    if !focused && !hasCommitted {
+                        commitRename()
+                    }
+                }
+        } else {
+            Text(item.name)
+                .font(font)
+                .lineLimit(lineLimit)
+                .multilineTextAlignment(alignment)
+        }
+    }
+
+    private func setupClickMonitor() {
+        // Monitor for clicks outside the text field to commit rename
+        clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { event in
+            // Check if click is outside our text field by checking if the first responder changed
+            DispatchQueue.main.async {
+                if let window = NSApp.keyWindow,
+                   let firstResponder = window.firstResponder,
+                   !(firstResponder is NSTextView) {
+                    // Click was outside text field
+                    if !hasCommitted {
+                        commitRename()
+                    }
+                }
+            }
+            return event
+        }
+    }
+
+    private func removeClickMonitor() {
+        if let monitor = clickMonitor {
+            NSEvent.removeMonitor(monitor)
+            clickMonitor = nil
+        }
+    }
+
+    private func commitRename() {
+        guard !hasCommitted else { return }
+        hasCommitted = true
+        removeClickMonitor()
+
+        let trimmed = editText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && trimmed != item.nameWithoutExtension {
+            let ext = item.url.pathExtension
+            let newName = ext.isEmpty ? trimmed : "\(trimmed).\(ext)"
+            viewModel.renameItem(item, to: newName)
+        }
+        viewModel.renamingURL = nil
+    }
+
+    private func cancelRename() {
+        hasCommitted = true
+        removeClickMonitor()
+        viewModel.renamingURL = nil
+    }
+
+    private func selectAllText() {
+        if let window = NSApp.keyWindow,
+           let fieldEditor = window.fieldEditor(false, for: nil) as? NSTextView {
+            fieldEditor.selectAll(nil)
+        }
+    }
+}
+
+extension FileItem {
+    var nameWithoutExtension: String {
+        if isDirectory { return name }
+        let ext = url.pathExtension
+        if ext.isEmpty { return name }
+        return String(name.dropLast(ext.count + 1))
+    }
+}

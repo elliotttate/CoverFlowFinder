@@ -8,7 +8,6 @@ struct ColumnView: View {
 
     @State private var columnSelections: [URL: FileItem] = [:]
     @State private var columns: [ColumnData] = []
-    @State private var renamingItem: FileItem?
     @State private var activeColumnIndex: Int = 0
 
     var body: some View {
@@ -20,15 +19,12 @@ struct ColumnView: View {
                     selectedItem: columnSelections[viewModel.currentPath],
                     columnURL: viewModel.currentPath,
                     viewModel: viewModel,
-                    onRename: { item in renamingItem = item },
                     onSelect: { item in
                         columnSelections[viewModel.currentPath] = item
-                        // Selection is handled by handleSelection in SingleColumnView
                         activeColumnIndex = 0
                         if item.isDirectory {
                             updateColumns(from: item)
                         } else {
-                            // Clear subsequent columns for files
                             columns = []
                         }
                     },
@@ -45,10 +41,8 @@ struct ColumnView: View {
                         selectedItem: columnSelections[column.url],
                         columnURL: column.url,
                         viewModel: viewModel,
-                        onRename: { item in renamingItem = item },
                         onSelect: { item in
                             columnSelections[column.url] = item
-                            // Selection is handled by handleSelection in SingleColumnView
                             activeColumnIndex = index + 1
                             if item.isDirectory {
                                 updateColumnsFrom(column: column, selectedItem: item)
@@ -71,9 +65,6 @@ struct ColumnView: View {
         }
         .background(QuickLookHost())
         .background(Color(nsColor: .controlBackgroundColor))
-        .sheet(item: $renamingItem) { item in
-            RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
-        }
         .keyboardNavigable(
             onUpArrow: { navigateInActiveColumn(by: -1) },
             onDownArrow: { navigateInActiveColumn(by: 1) },
@@ -230,7 +221,6 @@ struct SingleColumnView: View {
     let selectedItem: FileItem?
     let columnURL: URL
     @ObservedObject var viewModel: FileBrowserViewModel
-    let onRename: (FileItem) -> Void
     let onSelect: (FileItem) -> Void
     let onDoubleClick: (FileItem) -> Void
     @State private var isDropTargeted = false
@@ -240,6 +230,7 @@ struct SingleColumnView: View {
             List(items, id: \.id) { item in
                 ColumnRowView(
                     item: item,
+                    viewModel: viewModel,
                     isSelected: viewModel.selectedItems.contains(item)
                 )
                 .id(item.id)
@@ -269,7 +260,7 @@ struct SingleColumnView: View {
                 )
                 .contextMenu {
                     FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                        onRename(item)
+                        viewModel.renamingURL = item.url
                     }
                 }
                 .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
@@ -301,45 +292,12 @@ struct SingleColumnView: View {
     }
 
     private func handleDrop(providers: [NSItemProvider], destPath: URL) {
-        let shouldMove = NSEvent.modifierFlags.contains(.option)
-
         for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, error in
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
                 guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else {
-                    return
-                }
-
-                if sourceURL.deletingLastPathComponent() == destPath {
-                    return
-                }
-
-                let destURL = destPath.appendingPathComponent(sourceURL.lastPathComponent)
-
-                var finalURL = destURL
-                var counter = 1
-                while FileManager.default.fileExists(atPath: finalURL.path) {
-                    let name = sourceURL.deletingPathExtension().lastPathComponent
-                    let ext = sourceURL.pathExtension
-                    if ext.isEmpty {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter)")
-                    } else {
-                        finalURL = destPath.appendingPathComponent("\(name) \(counter).\(ext)")
-                    }
-                    counter += 1
-                }
-
-                do {
-                    if shouldMove {
-                        try FileManager.default.moveItem(at: sourceURL, to: finalURL)
-                    } else {
-                        try FileManager.default.copyItem(at: sourceURL, to: finalURL)
-                    }
-                    DispatchQueue.main.async {
-                        viewModel.refresh()
-                    }
-                } catch {
-                    print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [sourceURL], to: destPath)
                 }
             }
         }
@@ -348,6 +306,7 @@ struct SingleColumnView: View {
 
 struct ColumnRowView: View {
     let item: FileItem
+    @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
 
     var body: some View {
@@ -357,9 +316,7 @@ struct ColumnRowView: View {
                 .aspectRatio(contentMode: .fit)
                 .frame(width: 16, height: 16)
 
-            Text(item.name)
-                .lineLimit(1)
-                .foregroundColor(isSelected ? .primary : .primary)
+            InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
 
             Spacer()
 
