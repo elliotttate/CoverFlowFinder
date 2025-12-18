@@ -112,13 +112,13 @@ struct CoverFlowFinderApp: App {
                     viewModel?.goBack()
                 }
                 .keyboardShortcut("[", modifiers: .command)
-                .disabled(!(viewModel?.canGoBack ?? false))
+                .disabled((viewModel?.historyIndex ?? 0) <= 0)
 
                 Button("Forward") {
                     viewModel?.goForward()
                 }
                 .keyboardShortcut("]", modifiers: .command)
-                .disabled(!(viewModel?.canGoForward ?? false))
+                .disabled((viewModel?.historyIndex ?? 0) >= (viewModel?.navigationHistory.count ?? 1) - 1)
 
                 Button("Enclosing Folder") {
                     viewModel?.navigateToParent()

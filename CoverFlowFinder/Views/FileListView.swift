@@ -60,10 +60,10 @@ struct FileListView: View {
                 .scrollContentBackground(.visible)
                 .frame(maxHeight: .infinity)
                 .layoutPriority(1)
-                .onChange(of: viewModel.selectedItems) { _, newSelection in
+                .onChange(of: viewModel.selectedItems) { newSelection in
                     if let firstSelected = newSelection.first {
                         withAnimation {
-                            scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                            scrollProxy.scrollTo(firstSelected.id)
                         }
                     }
                 }

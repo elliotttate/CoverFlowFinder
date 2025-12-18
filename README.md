@@ -21,7 +21,7 @@ https://github.com/elliotttate/CoverFlowFinder/releases/download/v1.0.0/CoverFlo
 
 ## Requirements
 
-- macOS 14.0 (Sonoma) or later
+- macOS 13.0 (Ventura) or later
 - Apple Silicon or Intel Mac
 
 ## Installation

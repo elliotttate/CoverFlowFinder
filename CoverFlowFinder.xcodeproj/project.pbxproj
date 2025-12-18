@@ -7,50 +7,50 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		2A0000010000000000000001 /* CoverFlowFinderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000001 /* CoverFlowFinderApp.swift */; };
-		2A0000010000000000000002 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000002 /* ContentView.swift */; };
-		2A0000010000000000000003 /* CoverFlowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000003 /* CoverFlowView.swift */; };
-		2A0000010000000000000004 /* SidebarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000004 /* SidebarView.swift */; };
-		2A0000010000000000000005 /* IconGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000005 /* IconGridView.swift */; };
-		2A0000010000000000000006 /* FileListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000006 /* FileListView.swift */; };
-		2A0000010000000000000007 /* ColumnView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000007 /* ColumnView.swift */; };
-		2A0000010000000000000008 /* FileItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000008 /* FileItem.swift */; };
-		2A0000010000000000000009 /* FileBrowserViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000009 /* FileBrowserViewModel.swift */; };
-		2A0000010000000000000010 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000010 /* Assets.xcassets */; };
-		2A0000010000000000000013 /* DualPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000013 /* DualPaneView.swift */; };
-		2A0000010000000000000014 /* FileInfoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000014 /* FileInfoView.swift */; };
-		2A0000010000000000000016 /* KeyboardHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000016 /* KeyboardHandler.swift */; };
-		2A0000010000000000000017 /* TabBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000017 /* TabBarView.swift */; };
-		2A0000010000000000000018 /* ListColumnConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000018 /* ListColumnConfig.swift */; };
-		2A0000010000000000000019 /* QuickLookManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000019 /* QuickLookManager.swift */; };
-		2A0000010000000000000020 /* QuickLookController.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2A0000020000000000000020 /* QuickLookController.swift */; };
+		A1000001001 /* CoverFlowFinderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000001000 /* CoverFlowFinderApp.swift */; };
+		A1000002001 /* FileItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002000 /* FileItem.swift */; };
+		A1000002003 /* ListColumnConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002002 /* ListColumnConfig.swift */; };
+		A1000003001 /* FileBrowserViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000003000 /* FileBrowserViewModel.swift */; };
+		A1000004001 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000004000 /* ContentView.swift */; };
+		A1000005001 /* CoverFlowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000005000 /* CoverFlowView.swift */; };
+		A1000006001 /* SidebarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000006000 /* SidebarView.swift */; };
+		A1000007001 /* IconGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000007000 /* IconGridView.swift */; };
+		A1000008001 /* FileListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000008000 /* FileListView.swift */; };
+		A1000009001 /* ColumnView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000009000 /* ColumnView.swift */; };
+		A100000A001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A100000A000 /* Assets.xcassets */; };
+		A100001E001 /* DualPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100001E000 /* DualPaneView.swift */; };
+		A100001F001 /* FileInfoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100001F000 /* FileInfoView.swift */; };
+		A1000020001 /* KeyboardHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000020000 /* KeyboardHandler.swift */; };
+		A1000021001 /* QuickLookController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000021000 /* QuickLookController.swift */; };
+		A1000022001 /* QuickLookManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000022000 /* QuickLookManager.swift */; };
+		A1000023001 /* TabBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000023000 /* TabBarView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		2A0000020000000000000001 /* CoverFlowFinderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoverFlowFinderApp.swift; sourceTree = "<group>"; };
-		2A0000020000000000000002 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
-		2A0000020000000000000003 /* CoverFlowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoverFlowView.swift; sourceTree = "<group>"; };
-		2A0000020000000000000004 /* SidebarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarView.swift; sourceTree = "<group>"; };
-		2A0000020000000000000005 /* IconGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IconGridView.swift; sourceTree = "<group>"; };
-		2A0000020000000000000006 /* FileListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileListView.swift; sourceTree = "<group>"; };
-		2A0000020000000000000007 /* ColumnView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ColumnView.swift; sourceTree = "<group>"; };
-		2A0000020000000000000008 /* FileItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileItem.swift; sourceTree = "<group>"; };
-		2A0000020000000000000009 /* FileBrowserViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserViewModel.swift; sourceTree = "<group>"; };
-		2A0000020000000000000010 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
-		2A0000020000000000000011 /* CoverFlowFinder.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CoverFlowFinder.entitlements; sourceTree = "<group>"; };
-		2A0000020000000000000012 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
-		2A0000020000000000000013 /* DualPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DualPaneView.swift; sourceTree = "<group>"; };
-		2A0000020000000000000014 /* FileInfoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileInfoView.swift; sourceTree = "<group>"; };
-		2A0000020000000000000016 /* KeyboardHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardHandler.swift; sourceTree = "<group>"; };
-		2A0000020000000000000017 /* TabBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabBarView.swift; sourceTree = "<group>"; };
-		2A0000020000000000000018 /* ListColumnConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListColumnConfig.swift; sourceTree = "<group>"; };
-		2A0000020000000000000019 /* QuickLookManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookManager.swift; sourceTree = "<group>"; };
-		2A0000020000000000000020 /* QuickLookController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookController.swift; sourceTree = "<group>"; };
-		2A0000030000000000000001 /* CoverFlowFinder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoverFlowFinder.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1000000000 /* CoverFlowFinder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = CoverFlowFinder.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1000001000 /* CoverFlowFinderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoverFlowFinderApp.swift; sourceTree = "<group>"; };
+		A1000002000 /* FileItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileItem.swift; sourceTree = "<group>"; };
+		A1000002002 /* ListColumnConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListColumnConfig.swift; sourceTree = "<group>"; };
+		A1000003000 /* FileBrowserViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserViewModel.swift; sourceTree = "<group>"; };
+		A1000004000 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A1000005000 /* CoverFlowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoverFlowView.swift; sourceTree = "<group>"; };
+		A1000006000 /* SidebarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarView.swift; sourceTree = "<group>"; };
+		A1000007000 /* IconGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IconGridView.swift; sourceTree = "<group>"; };
+		A1000008000 /* FileListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileListView.swift; sourceTree = "<group>"; };
+		A1000009000 /* ColumnView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ColumnView.swift; sourceTree = "<group>"; };
+		A100000A000 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A100000B000 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A100000C000 /* CoverFlowFinder.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CoverFlowFinder.entitlements; sourceTree = "<group>"; };
+		A100001E000 /* DualPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DualPaneView.swift; sourceTree = "<group>"; };
+		A100001F000 /* FileInfoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileInfoView.swift; sourceTree = "<group>"; };
+		A1000020000 /* KeyboardHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardHandler.swift; sourceTree = "<group>"; };
+		A1000021000 /* QuickLookController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookController.swift; sourceTree = "<group>"; };
+		A1000022000 /* QuickLookManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookManager.swift; sourceTree = "<group>"; };
+		A1000023000 /* TabBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabBarView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
-		2A0000040000000000000001 /* Frameworks */ = {
+		A100000D000 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -60,82 +60,82 @@
 /* End PBXFrameworksBuildPhase section */
 
 /* Begin PBXGroup section */
-		2A0000050000000000000001 = {
+		A100000E000 = {
 			isa = PBXGroup;
 			children = (
-				2A0000050000000000000002 /* CoverFlowFinder */,
-				2A0000050000000000000003 /* Products */,
+				A100000F000 /* CoverFlowFinder */,
+				A1000010000 /* Products */,
 			);
 			sourceTree = "<group>";
 		};
-		2A0000050000000000000002 /* CoverFlowFinder */ = {
+		A100000F000 /* CoverFlowFinder */ = {
 			isa = PBXGroup;
 			children = (
-				2A0000020000000000000001 /* CoverFlowFinderApp.swift */,
-				2A0000050000000000000004 /* Views */,
-				2A0000050000000000000005 /* Models */,
-				2A0000050000000000000006 /* ViewModels */,
-				2A0000020000000000000010 /* Assets.xcassets */,
-				2A0000020000000000000011 /* CoverFlowFinder.entitlements */,
-				2A0000020000000000000012 /* Info.plist */,
+				A1000001000 /* CoverFlowFinderApp.swift */,
+				A1000011000 /* Models */,
+				A1000012000 /* ViewModels */,
+				A1000013000 /* Views */,
+				A100000A000 /* Assets.xcassets */,
+				A100000B000 /* Info.plist */,
+				A100000C000 /* CoverFlowFinder.entitlements */,
 			);
 			path = CoverFlowFinder;
 			sourceTree = "<group>";
 		};
-		2A0000050000000000000003 /* Products */ = {
+		A1000010000 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				2A0000030000000000000001 /* CoverFlowFinder.app */,
+				A1000000000 /* CoverFlowFinder.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
 		};
-		2A0000050000000000000004 /* Views */ = {
+		A1000011000 /* Models */ = {
 			isa = PBXGroup;
 			children = (
-				2A0000020000000000000002 /* ContentView.swift */,
-				2A0000020000000000000003 /* CoverFlowView.swift */,
-				2A0000020000000000000004 /* SidebarView.swift */,
-				2A0000020000000000000005 /* IconGridView.swift */,
-				2A0000020000000000000006 /* FileListView.swift */,
-				2A0000020000000000000007 /* ColumnView.swift */,
-				2A0000020000000000000013 /* DualPaneView.swift */,
-				2A0000020000000000000014 /* FileInfoView.swift */,
-				2A0000020000000000000016 /* KeyboardHandler.swift */,
-				2A0000020000000000000017 /* TabBarView.swift */,
-				2A0000020000000000000019 /* QuickLookManager.swift */,
-				2A0000020000000000000020 /* QuickLookController.swift */,
-			);
-			path = Views;
-			sourceTree = "<group>";
-		};
-		2A0000050000000000000005 /* Models */ = {
-			isa = PBXGroup;
-			children = (
-				2A0000020000000000000008 /* FileItem.swift */,
-				2A0000020000000000000018 /* ListColumnConfig.swift */,
+				A1000002000 /* FileItem.swift */,
+				A1000002002 /* ListColumnConfig.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
 		};
-		2A0000050000000000000006 /* ViewModels */ = {
+		A1000012000 /* ViewModels */ = {
 			isa = PBXGroup;
 			children = (
-				2A0000020000000000000009 /* FileBrowserViewModel.swift */,
+				A1000003000 /* FileBrowserViewModel.swift */,
 			);
 			path = ViewModels;
+			sourceTree = "<group>";
+		};
+		A1000013000 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				A1000004000 /* ContentView.swift */,
+				A1000005000 /* CoverFlowView.swift */,
+				A1000006000 /* SidebarView.swift */,
+				A1000007000 /* IconGridView.swift */,
+				A1000008000 /* FileListView.swift */,
+				A1000009000 /* ColumnView.swift */,
+				A100001E000 /* DualPaneView.swift */,
+				A100001F000 /* FileInfoView.swift */,
+				A1000020000 /* KeyboardHandler.swift */,
+				A1000021000 /* QuickLookController.swift */,
+				A1000022000 /* QuickLookManager.swift */,
+				A1000023000 /* TabBarView.swift */,
+			);
+			path = Views;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		2A0000060000000000000001 /* CoverFlowFinder */ = {
+		A1000014000 /* CoverFlowFinder */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = 2A0000080000000000000001 /* Build configuration list for PBXNativeTarget "CoverFlowFinder" */;
+			buildConfigurationList = A1000015000 /* Build configuration list for PBXNativeTarget "CoverFlowFinder" */;
 			buildPhases = (
-				2A0000070000000000000001 /* Sources */,
-				2A0000040000000000000001 /* Frameworks */,
-				2A0000070000000000000002 /* Resources */,
+				A1000016000 /* Sources */,
+				A100000D000 /* Frameworks */,
+				A1000017000 /* Resources */,
 			);
 			buildRules = (
 			);
@@ -143,25 +143,25 @@
 			);
 			name = CoverFlowFinder;
 			productName = CoverFlowFinder;
-			productReference = 2A0000030000000000000001 /* CoverFlowFinder.app */;
+			productReference = A1000000000 /* CoverFlowFinder.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
-		2A0000090000000000000001 /* Project object */ = {
+		A1000018000 /* Project object */ = {
 			isa = PBXProject;
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1500;
 				LastUpgradeCheck = 1500;
 				TargetAttributes = {
-					2A0000060000000000000001 = {
+					A1000014000 = {
 						CreatedOnToolsVersion = 15.0;
 					};
 				};
 			};
-			buildConfigurationList = 2A0000080000000000000002 /* Build configuration list for PBXProject "CoverFlowFinder" */;
+			buildConfigurationList = A1000019000 /* Build configuration list for PBXProject "CoverFlowFinder" */;
 			compatibilityVersion = "Xcode 14.0";
 			developmentRegion = en;
 			hasScannedForEncodings = 0;
@@ -169,55 +169,55 @@
 				en,
 				Base,
 			);
-			mainGroup = 2A0000050000000000000001;
-			productRefGroup = 2A0000050000000000000003 /* Products */;
+			mainGroup = A100000E000;
+			productRefGroup = A1000010000 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				2A0000060000000000000001 /* CoverFlowFinder */,
+				A1000014000 /* CoverFlowFinder */,
 			);
 		};
 /* End PBXProject section */
 
 /* Begin PBXResourcesBuildPhase section */
-		2A0000070000000000000002 /* Resources */ = {
+		A1000017000 /* Resources */ = {
 			isa = PBXResourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				2A0000010000000000000010 /* Assets.xcassets in Resources */,
+				A100000A001 /* Assets.xcassets in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
-		2A0000070000000000000001 /* Sources */ = {
+		A1000016000 /* Sources */ = {
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				2A0000010000000000000001 /* CoverFlowFinderApp.swift in Sources */,
-				2A0000010000000000000002 /* ContentView.swift in Sources */,
-				2A0000010000000000000003 /* CoverFlowView.swift in Sources */,
-				2A0000010000000000000004 /* SidebarView.swift in Sources */,
-				2A0000010000000000000005 /* IconGridView.swift in Sources */,
-				2A0000010000000000000006 /* FileListView.swift in Sources */,
-				2A0000010000000000000007 /* ColumnView.swift in Sources */,
-				2A0000010000000000000008 /* FileItem.swift in Sources */,
-				2A0000010000000000000009 /* FileBrowserViewModel.swift in Sources */,
-				2A0000010000000000000013 /* DualPaneView.swift in Sources */,
-				2A0000010000000000000014 /* FileInfoView.swift in Sources */,
-				2A0000010000000000000016 /* KeyboardHandler.swift in Sources */,
-				2A0000010000000000000017 /* TabBarView.swift in Sources */,
-				2A0000010000000000000018 /* ListColumnConfig.swift in Sources */,
-				2A0000010000000000000019 /* QuickLookManager.swift in Sources */,
-				2A0000010000000000000020 /* QuickLookController.swift in Sources */,
+				A1000001001 /* CoverFlowFinderApp.swift in Sources */,
+				A1000002001 /* FileItem.swift in Sources */,
+				A1000002003 /* ListColumnConfig.swift in Sources */,
+				A1000003001 /* FileBrowserViewModel.swift in Sources */,
+				A1000004001 /* ContentView.swift in Sources */,
+				A1000005001 /* CoverFlowView.swift in Sources */,
+				A1000006001 /* SidebarView.swift in Sources */,
+				A1000007001 /* IconGridView.swift in Sources */,
+				A1000008001 /* FileListView.swift in Sources */,
+				A1000009001 /* ColumnView.swift in Sources */,
+				A100001E001 /* DualPaneView.swift in Sources */,
+				A100001F001 /* FileInfoView.swift in Sources */,
+				A1000020001 /* KeyboardHandler.swift in Sources */,
+				A1000021001 /* QuickLookController.swift in Sources */,
+				A1000022001 /* QuickLookManager.swift in Sources */,
+				A1000023001 /* TabBarView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXSourcesBuildPhase section */
 
 /* Begin XCBuildConfiguration section */
-		2A00000A0000000000000001 /* Debug */ = {
+		A100001A000 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -269,8 +269,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
@@ -280,7 +279,7 @@
 			};
 			name = Debug;
 		};
-		2A00000A0000000000000002 /* Release */ = {
+		A100001B000 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ALWAYS_SEARCH_USER_PATHS = NO;
@@ -326,8 +325,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				LOCALIZATION_PREFERS_STRING_CATALOGS = YES;
-				MACOSX_DEPLOYMENT_TARGET = 14.0;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = macosx;
@@ -335,7 +333,7 @@
 			};
 			name = Release;
 		};
-		2A00000A0000000000000003 /* Debug */ = {
+		A100001C000 /* Debug */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -344,24 +342,26 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_ASSET_PATHS = "";
-				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CoverFlowFinder/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "CoverFlow Finder";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.CoverFlowFinder;
+				PRODUCT_BUNDLE_IDENTIFIER = com.coverflowfinder.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 			};
 			name = Debug;
 		};
-		2A00000A0000000000000004 /* Release */ = {
+		A100001D000 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
@@ -370,17 +370,19 @@
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 1;
-				DEVELOPMENT_ASSET_PATHS = "";
-				ENABLE_PREVIEWS = YES;
-				GENERATE_INFOPLIST_FILE = YES;
+				DEVELOPMENT_TEAM = "";
+				ENABLE_HARDENED_RUNTIME = YES;
+				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CoverFlowFinder/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "CoverFlow Finder";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "";
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
 				MARKETING_VERSION = 1.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.example.CoverFlowFinder;
+				PRODUCT_BUNDLE_IDENTIFIER = com.coverflowfinder.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
@@ -390,25 +392,25 @@
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
-		2A0000080000000000000001 /* Build configuration list for PBXNativeTarget "CoverFlowFinder" */ = {
+		A1000015000 /* Build configuration list for PBXNativeTarget "CoverFlowFinder" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				2A00000A0000000000000003 /* Debug */,
-				2A00000A0000000000000004 /* Release */,
+				A100001C000 /* Debug */,
+				A100001D000 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		2A0000080000000000000002 /* Build configuration list for PBXProject "CoverFlowFinder" */ = {
+		A1000019000 /* Build configuration list for PBXProject "CoverFlowFinder" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
-				2A00000A0000000000000001 /* Debug */,
-				2A00000A0000000000000002 /* Release */,
+				A100001A000 /* Debug */,
+				A100001B000 /* Release */,
 			);
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
 	};
-	rootObject = 2A0000090000000000000001 /* Project object */;
+	rootObject = A1000018000 /* Project object */;
 }

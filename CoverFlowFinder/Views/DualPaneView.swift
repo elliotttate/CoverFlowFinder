@@ -73,21 +73,21 @@ struct DualPaneView: View {
             }
             registerKeyboardHandler(forPane: activePane)
         }
-        .onChange(of: activePane) { _, newPane in
+        .onChange(of: activePane) { newPane in
             registerKeyboardHandler(forPane: newPane)
         }
-        .onChange(of: leftPaneViewMode) { _, _ in
+        .onChange(of: leftPaneViewMode) { _ in
             registerKeyboardHandler(forPane: activePane)
         }
-        .onChange(of: rightPaneViewMode) { _, _ in
+        .onChange(of: rightPaneViewMode) { _ in
             registerKeyboardHandler(forPane: activePane)
         }
-        .onChange(of: leftPaneColumns) { _, _ in
+        .onChange(of: leftPaneColumns) { _ in
             if activePane == .left {
                 registerKeyboardHandler(forPane: activePane)
             }
         }
-        .onChange(of: rightPaneColumns) { _, _ in
+        .onChange(of: rightPaneColumns) { _ in
             if activePane == .right {
                 registerKeyboardHandler(forPane: activePane)
             }
@@ -204,13 +204,13 @@ struct PaneView: View {
                 Button(action: { viewModel.goBack() }) {
                     Image(systemName: "chevron.left")
                 }
-                .disabled(!viewModel.canGoBack)
+                .disabled(viewModel.historyIndex <= 0)
                 .buttonStyle(.borderless)
 
                 Button(action: { viewModel.goForward() }) {
                     Image(systemName: "chevron.right")
                 }
-                .disabled(!viewModel.canGoForward)
+                .disabled(viewModel.historyIndex >= viewModel.navigationHistory.count - 1)
                 .buttonStyle(.borderless)
 
                 // Path display
@@ -242,7 +242,7 @@ struct PaneView: View {
                 HStack(spacing: 4) {
                     ForEach(pathComponents, id: \.self) { component in
                         Button(action: {
-                            viewModel.navigateTo(component)
+                            viewModel.navigateToAndSelectCurrent(component)
                             onActivate()
                         }) {
                             Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
@@ -371,57 +371,67 @@ struct PaneListView: View {
     let onActivate: () -> Void
 
     var body: some View {
-        List {
-            ForEach(viewModel.items) { item in
-                let isSelected = viewModel.selectedItems.contains(item)
-                HStack(spacing: 8) {
-                    Image(nsImage: item.icon)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .frame(width: 16, height: 16)
+        ScrollViewReader { scrollProxy in
+            List {
+                ForEach(viewModel.items) { item in
+                    let isSelected = viewModel.selectedItems.contains(item)
+                    HStack(spacing: 8) {
+                        Image(nsImage: item.icon)
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                            .frame(width: 16, height: 16)
 
-                    Text(item.name)
-                        .lineLimit(1)
+                        Text(item.name)
+                            .lineLimit(1)
 
-                    Spacer()
+                        Spacer()
 
-                    Text(item.formattedSize)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(width: 60, alignment: .trailing)
+                        Text(item.formattedSize)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(width: 60, alignment: .trailing)
 
-                    Text(item.formattedDate)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                        .frame(width: 100, alignment: .trailing)
-                }
-                .padding(.vertical, 4)
-                .padding(.horizontal, 4)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
-                .contentShape(Rectangle())
-                .onDrag {
-                    NSItemProvider(object: item.url as NSURL)
-                }
-                .instantTap(
-                    id: item.id,
-                    onSingleClick: {
-                        onActivate()
-                        viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
-                    },
-                    onDoubleClick: {
-                        onActivate()
-                        viewModel.openItem(item)
+                        Text(item.formattedDate)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .frame(width: 100, alignment: .trailing)
                     }
-                )
-                .contextMenu {
-                    FileItemContextMenu(item: item, viewModel: viewModel) { _ in }
+                    .id(item.id)
+                    .padding(.vertical, 4)
+                    .padding(.horizontal, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+                    .contentShape(Rectangle())
+                    .onDrag {
+                        NSItemProvider(object: item.url as NSURL)
+                    }
+                    .instantTap(
+                        id: item.id,
+                        onSingleClick: {
+                            onActivate()
+                            viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                        },
+                        onDoubleClick: {
+                            onActivate()
+                            viewModel.openItem(item)
+                        }
+                    )
+                    .contextMenu {
+                        FileItemContextMenu(item: item, viewModel: viewModel) { _ in }
+                    }
+                    .listRowInsets(EdgeInsets())
+                    .listRowSeparator(.hidden)
                 }
-                .listRowInsets(EdgeInsets())
-                .listRowSeparator(.hidden)
+            }
+            .listStyle(.plain)
+            .onChange(of: viewModel.selectedItems) { newSelection in
+                if let firstSelected = newSelection.first {
+                    withAnimation {
+                        scrollProxy.scrollTo(firstSelected.id)
+                    }
+                }
             }
         }
-        .listStyle(.plain)
     }
 }
 
@@ -445,55 +455,65 @@ struct PaneIconView: View {
 
     var body: some View {
         GeometryReader { geometry in
-            ScrollView {
-                LazyVGrid(columns: columns, spacing: 16) {
-                ForEach(viewModel.items) { item in
-                    VStack(spacing: 4) {
-                        Image(nsImage: item.icon)
-                            .resizable()
-                            .aspectRatio(contentMode: .fit)
-                            .frame(width: 48, height: 48)
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: 16) {
+                        ForEach(viewModel.items) { item in
+                            VStack(spacing: 4) {
+                                Image(nsImage: item.icon)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(width: 48, height: 48)
 
-                        Text(item.name)
-                            .font(.caption)
-                            .lineLimit(2)
-                            .multilineTextAlignment(.center)
-                            .frame(width: 80)
-                    }
-                    .padding(8)
-                    .background(
-                        viewModel.selectedItems.contains(item)
-                            ? Color.accentColor.opacity(0.2)
-                            : Color.clear
-                    )
-                    .cornerRadius(8)
-                    .contentShape(Rectangle())
-                    .onDrag {
-                        NSItemProvider(object: item.url as NSURL)
-                    }
-                    .instantTap(
-                        id: item.id,
-                        onSingleClick: {
-                            onActivate()
-                            viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
-                        },
-                        onDoubleClick: {
-                            onActivate()
-                            viewModel.openItem(item)
+                                Text(item.name)
+                                    .font(.caption)
+                                    .lineLimit(2)
+                                    .multilineTextAlignment(.center)
+                                    .frame(width: 80)
+                            }
+                            .id(item.id)
+                            .padding(8)
+                            .background(
+                                viewModel.selectedItems.contains(item)
+                                    ? Color.accentColor.opacity(0.2)
+                                    : Color.clear
+                            )
+                            .cornerRadius(8)
+                            .contentShape(Rectangle())
+                            .onDrag {
+                                NSItemProvider(object: item.url as NSURL)
+                            }
+                            .instantTap(
+                                id: item.id,
+                                onSingleClick: {
+                                    onActivate()
+                                    viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                                },
+                                onDoubleClick: {
+                                    onActivate()
+                                    viewModel.openItem(item)
+                                }
+                            )
+                            .contextMenu {
+                                FileItemContextMenu(item: item, viewModel: viewModel) { _ in }
+                            }
                         }
-                    )
-                    .contextMenu {
-                        FileItemContextMenu(item: item, viewModel: viewModel) { _ in }
+                    }
+                    .padding()
+                }
+                .onAppear {
+                    onColumnsCalculated(calculateColumns(width: geometry.size.width))
+                }
+                .onChange(of: geometry.size.width) { newWidth in
+                    onColumnsCalculated(calculateColumns(width: newWidth))
+                }
+                .onChange(of: viewModel.selectedItems) { newSelection in
+                    if let firstSelected = newSelection.first {
+                        withAnimation {
+                            scrollProxy.scrollTo(firstSelected.id)
+                        }
                     }
                 }
-            }
-            .padding()
-            }
-            .onAppear {
-                onColumnsCalculated(calculateColumns(width: geometry.size.width))
-            }
-            .onChange(of: geometry.size.width) { _, newWidth in
-                onColumnsCalculated(calculateColumns(width: newWidth))
             }
         }
     }

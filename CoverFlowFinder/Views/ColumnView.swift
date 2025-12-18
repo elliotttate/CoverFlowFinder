@@ -236,40 +236,50 @@ struct SingleColumnView: View {
     @State private var isDropTargeted = false
 
     var body: some View {
-        List(items, id: \.id) { item in
-            ColumnRowView(
-                item: item,
-                isSelected: selectedItem?.id == item.id
-            )
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .contentShape(Rectangle())
-            .onDrag {
-                NSItemProvider(object: item.url as NSURL)
-            }
-            .instantTap(
-                id: item.id,
-                onSingleClick: {
-                    onSelect(item)
-                },
-                onDoubleClick: {
-                    onDoubleClick(item)
+        ScrollViewReader { scrollProxy in
+            List(items, id: \.id) { item in
+                ColumnRowView(
+                    item: item,
+                    isSelected: selectedItem?.id == item.id
+                )
+                .id(item.id)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+                .onDrag {
+                    NSItemProvider(object: item.url as NSURL)
                 }
-            )
-            .contextMenu {
-                FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                    onRename(item)
+                .instantTap(
+                    id: item.id,
+                    onSingleClick: {
+                        onSelect(item)
+                    },
+                    onDoubleClick: {
+                        onDoubleClick(item)
+                    }
+                )
+                .contextMenu {
+                    FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                        onRename(item)
+                    }
+                }
+                .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+                .listRowSeparator(.hidden)
+                .listRowBackground(
+                    selectedItem?.id == item.id
+                        ? Color.accentColor.opacity(0.3)
+                        : Color.clear
+                )
+            }
+            .listStyle(.plain)
+            .frame(width: 220)
+            .onChange(of: selectedItem) { newSelection in
+                if let selected = newSelection {
+                    withAnimation {
+                        scrollProxy.scrollTo(selected.id)
+                    }
                 }
             }
-            .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
-            .listRowSeparator(.hidden)
-            .listRowBackground(
-                selectedItem?.id == item.id
-                    ? Color.accentColor.opacity(0.3)
-                    : Color.clear
-            )
         }
-        .listStyle(.plain)
-        .frame(width: 220)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers, destPath: columnURL)
             return true

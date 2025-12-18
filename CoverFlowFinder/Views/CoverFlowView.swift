@@ -64,6 +64,7 @@ struct CoverFlowView: View {
                     selectedIndex: $viewModel.coverFlowSelectedIndex,
                     thumbnails: thumbnails,
                     thumbnailCount: thumbnails.count,
+                    navigationGeneration: viewModel.navigationGeneration,
                     onSelect: { index in
                         viewModel.coverFlowSelectedIndex = index
                         syncSelection()
@@ -168,7 +169,7 @@ struct CoverFlowView: View {
             retryTimer?.invalidate()
             retryTimer = nil
         }
-        .onChange(of: items) { _, _ in
+        .onChange(of: items) { _ in
             thumbnails.removeAll()
             pendingThumbnails.removeAll()
             pendingStartTimes.removeAll()
@@ -176,7 +177,7 @@ struct CoverFlowView: View {
             loadVisibleThumbnails()
             syncSelection()
         }
-        .onChange(of: viewModel.coverFlowSelectedIndex) { _, _ in
+        .onChange(of: viewModel.coverFlowSelectedIndex) { _ in
             loadVisibleThumbnails()
         }
         .sheet(item: $renamingItem) { item in
@@ -399,6 +400,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     @Binding var selectedIndex: Int
     let thumbnails: [URL: NSImage]
     let thumbnailCount: Int  // Explicit count to force SwiftUI updates
+    let navigationGeneration: Int  // Forces update on every navigation
     let onSelect: (Int) -> Void
     let onOpen: (Int) -> Void
     let onRightClick: (Int) -> Void
@@ -627,8 +629,21 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
 
     func updateItems(_ items: [FileItem], thumbnails: [URL: NSImage], selectedIndex: Int) {
-        let itemsChanged = self.items.count != items.count || self.items.first?.id != items.first?.id
+        // More robust items comparison - check first, last, and a sample from middle
+        let itemsChanged: Bool = {
+            if self.items.count != items.count { return true }
+            if self.items.first?.id != items.first?.id { return true }
+            if self.items.last?.id != items.last?.id { return true }
+            // Also check a middle element if there are enough items
+            if items.count > 2 {
+                let midIdx = items.count / 2
+                if self.items[midIdx].id != items[midIdx].id { return true }
+            }
+            return false
+        }()
+
         let thumbCount = thumbnails.count
+        let oldIndex = self.selectedIndex
         self.items = items
         self.thumbnails = thumbnails
 
@@ -636,8 +651,11 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         self.selectedIndex = selectedIndex
 
         if itemsChanged {
-            nativeLog("itemsChanged - rebuild, thumbs=\(thumbCount)")
+            nativeLog("itemsChanged - rebuild, thumbs=\(thumbCount), oldIdx=\(oldIndex), newIdx=\(selectedIndex)")
             rebuildCovers()
+            // Force layout update after rebuild
+            layer?.setNeedsLayout()
+            layer?.layoutIfNeeded()
         } else if indexChanged {
             nativeLog("indexChanged to \(selectedIndex), thumbs=\(thumbCount), covers=\(coverLayers.count)")
             animateToSelection()
@@ -1456,37 +1474,47 @@ struct FileListSection: View {
             Divider()
 
             // File list
-            List(Array(sortedItems.enumerated()), id: \.element.id) { index, item in
-                CoverFlowFileRow(item: item, columnConfig: columnConfig)
-                    .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                    .listRowBackground(
-                        selectedItems.contains(item)
-                            ? Color.accentColor.opacity(0.2)
-                            : Color.clear
-                    )
-                    .onDrag {
-                        NSItemProvider(object: item.url as NSURL)
-                    }
-                    .gesture(
-                        TapGesture(count: 2).onEnded {
-                            onOpen(item)
+            ScrollViewReader { scrollProxy in
+                List(Array(sortedItems.enumerated()), id: \.element.id) { index, item in
+                    CoverFlowFileRow(item: item, columnConfig: columnConfig)
+                        .id(item.id)
+                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                        .listRowBackground(
+                            selectedItems.contains(item)
+                                ? Color.accentColor.opacity(0.2)
+                                : Color.clear
+                        )
+                        .onDrag {
+                            NSItemProvider(object: item.url as NSURL)
                         }
-                    )
-                    .simultaneousGesture(
-                        TapGesture(count: 1).onEnded {
-                            // Find original index in unsorted items for selection sync
-                            if let originalIndex = items.firstIndex(of: item) {
-                                onSelect(item, originalIndex)
+                        .gesture(
+                            TapGesture(count: 2).onEnded {
+                                onOpen(item)
+                            }
+                        )
+                        .simultaneousGesture(
+                            TapGesture(count: 1).onEnded {
+                                // Find original index in unsorted items for selection sync
+                                if let originalIndex = items.firstIndex(of: item) {
+                                    onSelect(item, originalIndex)
+                                }
+                            }
+                        )
+                        .contextMenu {
+                            FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                                renamingItem = item
                             }
                         }
-                    )
-                    .contextMenu {
-                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                            renamingItem = item
+                }
+                .listStyle(.plain)
+                .onChange(of: selectedItems) { newSelection in
+                    if let firstSelected = newSelection.first {
+                        withAnimation {
+                            scrollProxy.scrollTo(firstSelected.id)
                         }
                     }
+                }
             }
-            .listStyle(.plain)
         }
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)

@@ -6,11 +6,21 @@ struct IconGridView: View {
     let items: [FileItem]
     @State private var renamingItem: FileItem?
     @State private var isDropTargeted = false
-    @State private var calculatedColumns: Int = 6
+    @State private var currentWidth: CGFloat = 800
 
     private let columns = [
         GridItem(.adaptive(minimum: 100, maximum: 120), spacing: 20)
     ]
+
+    // Calculate columns based on current width - called at navigation time
+    private var calculatedColumns: Int {
+        let availableWidth = currentWidth - 40 // Subtract padding (20 each side)
+        // Use the actual item width that SwiftUI uses (closer to max in most cases)
+        // Formula: availableWidth / (itemWidth + spacing)
+        // Be conservative - use ceiling of spacing to avoid overcount
+        let cols = Int(availableWidth / 120)  // Simplified: just divide by item+spacing
+        return max(1, cols)
+    }
 
     var body: some View {
         GeometryReader { geometry in
@@ -45,15 +55,15 @@ struct IconGridView: View {
                     .padding(20)
                 }
                 .onAppear {
-                    updateColumnCount(width: geometry.size.width)
+                    currentWidth = geometry.size.width
                 }
-                .onChange(of: geometry.size.width) { _, newWidth in
-                    updateColumnCount(width: newWidth)
+                .onChange(of: geometry.size.width) { newWidth in
+                    currentWidth = newWidth
                 }
-                .onChange(of: viewModel.selectedItems) { _, newSelection in
+                .onChange(of: viewModel.selectedItems) { newSelection in
                     if let firstSelected = newSelection.first {
                         withAnimation {
-                            scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                            scrollProxy.scrollTo(firstSelected.id)
                         }
                     }
                 }
@@ -103,18 +113,6 @@ struct IconGridView: View {
             onReturn: { openSelectedItem() },
             onSpace: { toggleQuickLook() }
         )
-    }
-
-    // Calculate columns based on actual available width
-    // Grid uses adaptive(minimum: 100, maximum: 120) with spacing: 20
-    private func updateColumnCount(width: CGFloat) {
-        let availableWidth = width - 40 // Subtract padding (20 each side)
-        // Each column needs minimum 100px + spacing
-        // Formula: how many 100px items fit with 20px spacing between them
-        // N items need: N * 100 + (N-1) * 20 = N * 120 - 20 pixels
-        // So N = (availableWidth + 20) / 120
-        let cols = Int((availableWidth + 20) / 120)
-        calculatedColumns = max(1, cols)
     }
 
     private func navigateSelection(by offset: Int) {

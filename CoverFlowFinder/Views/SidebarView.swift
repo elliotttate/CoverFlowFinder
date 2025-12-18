@@ -3,7 +3,6 @@ import SwiftUI
 struct SidebarView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     var isDualPane: Bool = false
-    @State private var expandedSections: Set<String> = ["Favorites", "iCloud", "Locations"]
 
     var body: some View {
         List(selection: Binding(
@@ -11,10 +10,7 @@ struct SidebarView: View {
             set: { if let url = $0 { viewModel.navigateTo(url) } }
         )) {
             // Favorites Section
-            Section(isExpanded: Binding(
-                get: { expandedSections.contains("Favorites") },
-                set: { if $0 { expandedSections.insert("Favorites") } else { expandedSections.remove("Favorites") } }
-            )) {
+            Section(header: Text("Favorites").font(.caption).foregroundColor(.secondary)) {
                 // AirDrop - special handling (opens Finder's AirDrop window)
                 Button(action: {
                     openAirDrop()
@@ -33,17 +29,10 @@ struct SidebarView: View {
                     SidebarRow(icon: location.icon, title: location.name, url: location.url)
                         .tag(location.url)
                 }
-            } header: {
-                Text("Favorites")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             }
 
             // iCloud Section
-            Section(isExpanded: Binding(
-                get: { expandedSections.contains("iCloud") },
-                set: { if $0 { expandedSections.insert("iCloud") } else { expandedSections.remove("iCloud") } }
-            )) {
+            Section(header: Text("iCloud").font(.caption).foregroundColor(.secondary)) {
                 if let iCloudURL = FileManager.default.url(forUbiquityContainerIdentifier: nil)?.appendingPathComponent("Documents") {
                     SidebarRow(icon: "icloud", title: "iCloud Drive", url: iCloudURL)
                         .tag(iCloudURL)
@@ -51,34 +40,19 @@ struct SidebarView: View {
                     SidebarRow(icon: "icloud", title: "iCloud Drive", url: FileManager.default.homeDirectoryForCurrentUser)
                         .disabled(true)
                 }
-            } header: {
-                Text("iCloud")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             }
 
             // Locations Section
-            Section(isExpanded: Binding(
-                get: { expandedSections.contains("Locations") },
-                set: { if $0 { expandedSections.insert("Locations") } else { expandedSections.remove("Locations") } }
-            )) {
+            Section(header: Text("Locations").font(.caption).foregroundColor(.secondary)) {
                 ForEach(volumeLocations, id: \.url) { location in
                     SidebarRow(icon: location.icon, title: location.name, url: location.url)
                         .tag(location.url)
                 }
-            } header: {
-                Text("Locations")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             }
 
             // Tags Section (placeholder)
-            Section(isExpanded: .constant(false)) {
+            Section(header: Text("Tags").font(.caption).foregroundColor(.secondary)) {
                 EmptyView()
-            } header: {
-                Text("Tags")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
             }
         }
         .listStyle(.sidebar)

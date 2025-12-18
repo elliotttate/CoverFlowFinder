@@ -53,7 +53,7 @@ struct KeyboardNavigable: ViewModifier {
                     }
                 }
             }
-            .onChange(of: isActive) { _, newValue in
+            .onChange(of: isActive) { newValue in
                 if newValue {
                     registerHandler()
                 }

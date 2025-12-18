@@ -6,6 +6,26 @@ extension Notification.Name {
     static let showGetInfo = Notification.Name("showGetInfo")
 }
 
+// Debug logging to Desktop file
+private func debugLog(_ message: String) {
+    let logURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Desktop")
+        .appendingPathComponent("CoverFlowDebug.log")
+    let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+    let entry = "[\(timestamp)] 🔶 \(message)\n"
+    if let data = entry.data(using: .utf8) {
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            if let handle = try? FileHandle(forWritingTo: logURL) {
+                try? handle.seekToEnd()
+                try? handle.write(contentsOf: data)
+                try? handle.close()
+            }
+        } else {
+            try? data.write(to: logURL)
+        }
+    }
+}
+
 enum ViewMode: String, CaseIterable {
     case coverFlow = "Cover Flow"
     case icons = "Icons"
@@ -50,6 +70,8 @@ class FileBrowserViewModel: ObservableObject {
     @Published var navigationHistory: [URL] = []
     @Published var historyIndex: Int = -1
     @Published var coverFlowSelectedIndex: Int = 0
+    // Navigation generation counter - forces SwiftUI to update on navigation
+    @Published var navigationGeneration: Int = 0
 
     // Track the folder we entered so we can select it when going back
     private var enteredFolderURL: URL?
@@ -120,20 +142,34 @@ class FileBrowserViewModel: ObservableObject {
                 let fileItems = contents.map { FileItem(url: $0) }
 
                 DispatchQueue.main.async {
-                    self.items = fileItems
-                    self.isLoading = false
-
-                    // If we have a pending selection (from going back), select that item
+                    // IMPORTANT: Set coverFlowSelectedIndex BEFORE items to ensure SwiftUI
+                    // receives the correct index when processing the items change
                     if let pendingURL = self.pendingSelectionURL,
                        let item = fileItems.first(where: { $0.url == pendingURL }) {
-                        self.selectedItems = [item]
-                        if let index = fileItems.firstIndex(of: item) {
+                        // Find index in sorted items - use the same sorting as filteredItems
+                        // CoverFlowView uses columnConfig.sortedItems on top of filteredItems,
+                        // so we need to match that: first sortItems(), then columnConfig.sortedItems()
+                        let viewModelSorted = self.sortItems(fileItems)
+                        let finalSorted = ListColumnConfigManager.shared.sortedItems(viewModelSorted)
+                        if let index = finalSorted.firstIndex(of: item) {
+                            debugLog("📍 loadContents: setting coverFlowSelectedIndex=\(index) for \(item.name)")
                             self.coverFlowSelectedIndex = index
+                        } else {
+                            debugLog("⚠️ loadContents: item \(item.name) not found in sorted items")
                         }
+                        self.selectedItems = [item]
                         self.pendingSelectionURL = nil
                     } else {
-                        self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, fileItems.count - 1))
+                        let clamped = min(self.coverFlowSelectedIndex, max(0, fileItems.count - 1))
+                        debugLog("📍 loadContents: no pendingSelection, clamping to \(clamped)")
+                        self.coverFlowSelectedIndex = clamped
                     }
+
+                    // Set items AFTER index so SwiftUI sees both changes together
+                    self.items = fileItems
+                    self.isLoading = false
+                    // Increment navigation generation to force SwiftUI update
+                    self.navigationGeneration += 1
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -146,9 +182,22 @@ class FileBrowserViewModel: ObservableObject {
 
     func navigateTo(_ url: URL) {
         guard url != currentPath else { return }
+        debugLog("➡️ navigateTo called - setting coverFlowSelectedIndex=0")
         currentPath = url
         selectedItems.removeAll()
         coverFlowSelectedIndex = 0
+        loadContents()
+        addToHistory(url)
+    }
+
+    /// Navigate to a URL and select the folder we came from (for path bar navigation)
+    func navigateToAndSelectCurrent(_ url: URL) {
+        guard url != currentPath else { return }
+        // Remember current path to select it after navigating
+        pendingSelectionURL = currentPath
+        currentPath = url
+        selectedItems.removeAll()
+        // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
         loadContents()
         addToHistory(url)
     }
@@ -162,13 +211,16 @@ class FileBrowserViewModel: ObservableObject {
 
     func goBack() {
         guard canGoBack else { return }
+        debugLog("🔙 goBack called - keeping coverFlowSelectedIndex=\(coverFlowSelectedIndex)")
         // Remember the folder we're leaving so we can select it after going back
-        pendingSelectionURL = enteredFolderURL
+        // Use enteredFolderURL if available, otherwise use current path
+        pendingSelectionURL = enteredFolderURL ?? currentPath
         enteredFolderURL = nil
         historyIndex -= 1
         currentPath = navigationHistory[historyIndex]
         selectedItems.removeAll()
-        coverFlowSelectedIndex = 0
+        // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
+        // Setting it to 0 triggers an unnecessary SwiftUI update before items are loaded
         loadContents()
     }
 

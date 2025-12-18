@@ -26,6 +26,10 @@ struct ContentView: View {
     // Focus state for search field
     @FocusState private var isSearchFocused: Bool
 
+    // Track navigation state to force toolbar updates (workaround for computed viewModel)
+    @State private var navHistoryIndex: Int = 0
+    @State private var navHistoryCount: Int = 1
+
     // Current tab's viewModel
     private var viewModel: FileBrowserViewModel {
         tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
@@ -97,18 +101,20 @@ struct ContentView: View {
             }
         }
         .toolbar {
-            ToolbarItemGroup(placement: .navigation) {
-                // Back/Forward buttons
+            // Back/Forward buttons - placed in navigation area (left side)
+            ToolbarItem(placement: .navigation) {
                 Button(action: { viewModel.goBack() }) {
                     Image(systemName: "chevron.left")
                 }
-                .disabled(!viewModel.canGoBack)
+                .disabled(navHistoryIndex <= 0)
                 .help("Back")
+            }
 
+            ToolbarItem(placement: .navigation) {
                 Button(action: { viewModel.goForward() }) {
                     Image(systemName: "chevron.right")
                 }
-                .disabled(!viewModel.canGoForward)
+                .disabled(navHistoryIndex >= navHistoryCount - 1)
                 .help("Forward")
             }
 
@@ -184,10 +190,6 @@ struct ContentView: View {
         }
         .navigationTitle(viewModel.currentPath.lastPathComponent)
         .focusedSceneValue(\.viewModel, viewModel)
-        .onKeyPress(.delete) {
-            viewModel.deleteSelectedItems()
-            return .handled
-        }
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
         }
@@ -213,11 +215,20 @@ struct ContentView: View {
             selectPreviousTab()
         }
         // Sync currentViewMode when tab changes
-        .onChange(of: selectedTabId) { _, _ in
+        .onChange(of: selectedTabId) { _ in
             currentViewMode = viewModel.viewMode
+            syncNavigationState()
         }
         .onAppear {
             currentViewMode = viewModel.viewMode
+            syncNavigationState()
+        }
+        // Observe navigation changes from the viewModel
+        .onReceive(viewModel.$historyIndex) { newIndex in
+            navHistoryIndex = newIndex
+        }
+        .onReceive(viewModel.$navigationHistory) { newHistory in
+            navHistoryCount = newHistory.count
         }
         .background(QuickLookWindowController())
     }
@@ -254,6 +265,11 @@ struct ContentView: View {
         guard let currentIndex = tabs.firstIndex(where: { $0.id == selectedTabId }) else { return }
         let prevIndex = currentIndex == 0 ? tabs.count - 1 : currentIndex - 1
         selectedTabId = tabs[prevIndex].id
+    }
+
+    private func syncNavigationState() {
+        navHistoryIndex = viewModel.historyIndex
+        navHistoryCount = viewModel.navigationHistory.count
     }
 }
 
@@ -407,7 +423,8 @@ struct PathBarView: View {
 
     private func navigateToComponent(at index: Int) {
         let url = pathComponents[index].url
-        viewModel.navigateTo(url)
+        // Use navigateToAndSelectCurrent to select the folder we came from
+        viewModel.navigateToAndSelectCurrent(url)
     }
 }
 
