@@ -289,6 +289,9 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
+    // Track anchor index for Shift+click range selection
+    var lastSelectedIndex: Int = 0
+
     func selectItem(_ item: FileItem, extend: Bool = false) {
         if extend {
             if selectedItems.contains(item) {
@@ -298,6 +301,40 @@ class FileBrowserViewModel: ObservableObject {
             }
         } else {
             selectedItems = [item]
+        }
+    }
+
+    /// Select a range of items from lastSelectedIndex to the given index (Shift+click behavior)
+    func selectRange(to index: Int, in items: [FileItem]) {
+        guard !items.isEmpty else { return }
+        let start = min(lastSelectedIndex, index)
+        let end = max(lastSelectedIndex, index)
+        let clampedStart = max(0, start)
+        let clampedEnd = min(items.count - 1, end)
+
+        // Select all items in the range
+        for i in clampedStart...clampedEnd {
+            selectedItems.insert(items[i])
+        }
+    }
+
+    /// Handle selection with all modifier combinations
+    func handleSelection(item: FileItem, index: Int, in items: [FileItem], withShift: Bool, withCommand: Bool) {
+        if withShift {
+            // Shift+click: select range from anchor to clicked item
+            selectRange(to: index, in: items)
+        } else if withCommand {
+            // Cmd+click: toggle selection
+            if selectedItems.contains(item) {
+                selectedItems.remove(item)
+            } else {
+                selectedItems.insert(item)
+            }
+            lastSelectedIndex = index
+        } else {
+            // Normal click: select only this item and set as anchor
+            selectedItems = [item]
+            lastSelectedIndex = index
         }
     }
 

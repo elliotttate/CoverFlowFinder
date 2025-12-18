@@ -23,7 +23,7 @@ struct ColumnView: View {
                     onRename: { item in renamingItem = item },
                     onSelect: { item in
                         columnSelections[viewModel.currentPath] = item
-                        viewModel.selectItem(item)
+                        // Selection is handled by handleSelection in SingleColumnView
                         activeColumnIndex = 0
                         if item.isDirectory {
                             updateColumns(from: item)
@@ -48,7 +48,7 @@ struct ColumnView: View {
                         onRename: { item in renamingItem = item },
                         onSelect: { item in
                             columnSelections[column.url] = item
-                            viewModel.selectItem(item)
+                            // Selection is handled by handleSelection in SingleColumnView
                             activeColumnIndex = index + 1
                             if item.isDirectory {
                                 updateColumnsFrom(column: column, selectedItem: item)
@@ -240,7 +240,7 @@ struct SingleColumnView: View {
             List(items, id: \.id) { item in
                 ColumnRowView(
                     item: item,
-                    isSelected: selectedItem?.id == item.id
+                    isSelected: viewModel.selectedItems.contains(item)
                 )
                 .id(item.id)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -251,6 +251,16 @@ struct SingleColumnView: View {
                 .instantTap(
                     id: item.id,
                     onSingleClick: {
+                        if let index = items.firstIndex(of: item) {
+                            let modifiers = NSEvent.modifierFlags
+                            viewModel.handleSelection(
+                                item: item,
+                                index: index,
+                                in: items,
+                                withShift: modifiers.contains(.shift),
+                                withCommand: modifiers.contains(.command)
+                            )
+                        }
                         onSelect(item)
                     },
                     onDoubleClick: {
@@ -265,7 +275,7 @@ struct SingleColumnView: View {
                 .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
                 .listRowSeparator(.hidden)
                 .listRowBackground(
-                    selectedItem?.id == item.id
+                    viewModel.selectedItems.contains(item)
                         ? Color.accentColor.opacity(0.3)
                         : Color.clear
                 )

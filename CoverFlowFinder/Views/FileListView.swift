@@ -51,7 +51,16 @@ struct FileListView: View {
                         .instantTap(
                             id: item.id,
                             onSingleClick: {
-                                viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                                if let index = sortedItems.firstIndex(of: item) {
+                                    let modifiers = NSEvent.modifierFlags
+                                    viewModel.handleSelection(
+                                        item: item,
+                                        index: index,
+                                        in: sortedItems,
+                                        withShift: modifiers.contains(.shift),
+                                        withCommand: modifiers.contains(.command)
+                                    )
+                                }
                             },
                             onDoubleClick: {
                                 viewModel.openItem(item)

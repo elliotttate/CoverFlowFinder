@@ -409,7 +409,16 @@ struct PaneListView: View {
                         id: item.id,
                         onSingleClick: {
                             onActivate()
-                            viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                            if let index = viewModel.items.firstIndex(of: item) {
+                                let modifiers = NSEvent.modifierFlags
+                                viewModel.handleSelection(
+                                    item: item,
+                                    index: index,
+                                    in: viewModel.items,
+                                    withShift: modifiers.contains(.shift),
+                                    withCommand: modifiers.contains(.command)
+                                )
+                            }
                         },
                         onDoubleClick: {
                             onActivate()
@@ -487,7 +496,16 @@ struct PaneIconView: View {
                                 id: item.id,
                                 onSingleClick: {
                                     onActivate()
-                                    viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                                    if let index = viewModel.items.firstIndex(of: item) {
+                                        let modifiers = NSEvent.modifierFlags
+                                        viewModel.handleSelection(
+                                            item: item,
+                                            index: index,
+                                            in: viewModel.items,
+                                            withShift: modifiers.contains(.shift),
+                                            withCommand: modifiers.contains(.command)
+                                        )
+                                    }
                                 },
                                 onDoubleClick: {
                                     onActivate()

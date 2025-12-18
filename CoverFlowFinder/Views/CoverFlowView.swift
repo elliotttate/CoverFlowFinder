@@ -73,12 +73,22 @@ struct CoverFlowView: View {
                     thumbnails: thumbnails,
                     thumbnailCount: thumbnails.count,
                     navigationGeneration: viewModel.navigationGeneration,
+                    selectedItems: viewModel.selectedItems,
                     onSelect: { index in
                         viewModel.coverFlowSelectedIndex = index
-                        syncSelection()
-                        // Refresh Quick Look if visible
+                        // Handle selection with Cmd+click and Shift+click support
                         if index < sortedItemsCache.count {
-                            QuickLookControllerView.shared.updatePreview(for: sortedItemsCache[index].url)
+                            let item = sortedItemsCache[index]
+                            let modifiers = NSEvent.modifierFlags
+                            viewModel.handleSelection(
+                                item: item,
+                                index: index,
+                                in: sortedItemsCache,
+                                withShift: modifiers.contains(.shift),
+                                withCommand: modifiers.contains(.command)
+                            )
+                            // Refresh Quick Look if visible
+                            QuickLookControllerView.shared.updatePreview(for: item.url)
                         }
                     },
                     onOpen: { index in
@@ -100,6 +110,18 @@ struct CoverFlowView: View {
                                 throttledLoadThumbnails()
                             }
                         }
+                    },
+                    onCopy: {
+                        viewModel.copySelectedItems()
+                    },
+                    onCut: {
+                        viewModel.cutSelectedItems()
+                    },
+                    onPaste: {
+                        viewModel.paste()
+                    },
+                    onDelete: {
+                        viewModel.deleteSelectedItems()
                     }
                 )
                 .frame(height: max(250, geometry.size.height * 0.45))
@@ -133,8 +155,9 @@ struct CoverFlowView: View {
                     items: sortedItemsCache,
                     selectedItems: viewModel.selectedItems,
                     onSelect: { item, index in
+                        // Only update cover flow index - selection is handled by instantTap in FileListSection
                         viewModel.coverFlowSelectedIndex = index
-                        syncSelection()
+                        // DON'T call syncSelection() here - it would overwrite multi-selection
                     },
                     onOpen: { item in
                         viewModel.openItem(item)
@@ -413,11 +436,16 @@ struct CoverFlowContainer: NSViewRepresentable {
     let thumbnails: [URL: NSImage]
     let thumbnailCount: Int  // Explicit count to force SwiftUI updates
     let navigationGeneration: Int  // Forces update on every navigation
+    let selectedItems: Set<FileItem>  // Multi-selection for drag
     let onSelect: (Int) -> Void
     let onOpen: (Int) -> Void
     let onRightClick: (Int) -> Void
     let onDrop: ([URL]) -> Void
     let onScrollStateChange: (Bool) -> Void
+    let onCopy: () -> Void
+    let onCut: () -> Void
+    let onPaste: () -> Void
+    let onDelete: () -> Void
 
     func makeNSView(context: Context) -> CoverFlowNSView {
         let view = CoverFlowNSView()
@@ -428,6 +456,11 @@ struct CoverFlowContainer: NSViewRepresentable {
         }
         view.onDrop = onDrop
         view.onScrollStateChange = onScrollStateChange
+        view.onCopy = onCopy
+        view.onCut = onCut
+        view.onPaste = onPaste
+        view.onDelete = onDelete
+        view.selectedItems = selectedItems
         view.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
         return view
     }
@@ -440,6 +473,11 @@ struct CoverFlowContainer: NSViewRepresentable {
         }
         nsView.onDrop = onDrop
         nsView.onScrollStateChange = onScrollStateChange
+        nsView.onCopy = onCopy
+        nsView.onCut = onCut
+        nsView.onPaste = onPaste
+        nsView.onDelete = onDelete
+        nsView.selectedItems = selectedItems
         nsView.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
     }
 }
@@ -449,6 +487,11 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     var onOpen: ((Int) -> Void)?
     var onRightClick: ((Int, NSPoint) -> Void)?
     var onScrollStateChange: ((Bool) -> Void)?
+    var onCopy: (() -> Void)?
+    var onCut: (() -> Void)?
+    var onPaste: (() -> Void)?
+    var onDelete: (() -> Void)?
+    var selectedItems: Set<FileItem> = []  // Track multi-selection for drag
 
     private var items: [FileItem] = []
     private var thumbnails: [URL: NSImage] = [:]
@@ -1127,19 +1170,40 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 
         // Start drag if moved enough
         if distance > 5 {
-            let item = items[index]
-            let pasteboardItem = NSPasteboardItem()
-            pasteboardItem.setString(item.url.absoluteString, forType: .fileURL)
+            let clickedItem = items[index]
 
-            let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
+            // Determine items to drag - all selected items if the clicked item is selected,
+            // otherwise just the clicked item
+            let itemsToDrag: [FileItem]
+            if selectedItems.contains(clickedItem) && selectedItems.count > 1 {
+                itemsToDrag = Array(selectedItems)
+            } else {
+                itemsToDrag = [clickedItem]
+            }
 
-            // Use the item's icon for the drag image
-            let iconSize = NSSize(width: 64, height: 64)
-            let dragImage = item.icon
-            dragImage.size = iconSize
-            draggingItem.setDraggingFrame(NSRect(origin: location, size: iconSize), contents: dragImage)
+            // Create dragging items for each file
+            var draggingItems: [NSDraggingItem] = []
+            for (offset, item) in itemsToDrag.enumerated() {
+                let pasteboardItem = NSPasteboardItem()
+                pasteboardItem.setString(item.url.absoluteString, forType: .fileURL)
 
-            beginDraggingSession(with: [draggingItem], event: event, source: self)
+                let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
+
+                // Use the item's icon for the drag image
+                let iconSize = NSSize(width: 64, height: 64)
+                let dragImage = item.icon
+                dragImage.size = iconSize
+
+                // Offset each subsequent item slightly for a stacked appearance
+                let itemLocation = NSPoint(
+                    x: location.x + CGFloat(offset * 8),
+                    y: location.y - CGFloat(offset * 8)
+                )
+                draggingItem.setDraggingFrame(NSRect(origin: itemLocation, size: iconSize), contents: dragImage)
+                draggingItems.append(draggingItem)
+            }
+
+            beginDraggingSession(with: draggingItems, event: event, source: self)
 
             dragStartLocation = nil
             dragStartIndex = nil
@@ -1221,24 +1285,15 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
 
     @objc private func menuCopy(_ sender: NSMenuItem) {
-        if selectedIndex < items.count {
-            let item = items[selectedIndex]
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-            pasteboard.writeObjects([item.url as NSURL])
-        }
+        onCopy?()
     }
 
     @objc private func menuCut(_ sender: NSMenuItem) {
-        // Cut is copy + mark for move (handled by paste)
-        menuCopy(sender)
+        onCut?()
     }
 
     @objc private func menuTrash(_ sender: NSMenuItem) {
-        if selectedIndex < items.count {
-            let item = items[selectedIndex]
-            try? FileManager.default.trashItem(at: item.url, resultingItemURL: nil)
-        }
+        onDelete?()
     }
 
     @objc private func menuShowInFinder(_ sender: NSMenuItem) {
@@ -1484,6 +1539,28 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
 
     override func keyDown(with event: NSEvent) {
+        let hasCommand = event.modifierFlags.contains(.command)
+
+        // Handle Command key shortcuts first
+        if hasCommand {
+            switch event.keyCode {
+            case 8: // Cmd+C - Copy
+                onCopy?()
+                return
+            case 7: // Cmd+X - Cut
+                onCut?()
+                return
+            case 9: // Cmd+V - Paste
+                onPaste?()
+                return
+            case 51: // Cmd+Backspace - Delete/Move to Trash
+                onDelete?()
+                return
+            default:
+                break
+            }
+        }
+
         switch event.keyCode {
         case 123: // Left arrow
             if selectedIndex > 0 {
@@ -1507,7 +1584,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             }
         case 49: // Space - Quick Look
             toggleQuickLook()
-        case 51: // Delete/Backspace - remove last character from type-ahead buffer
+        case 51: // Delete/Backspace - remove last character from type-ahead buffer (without Cmd)
             if !typeAheadBuffer.isEmpty {
                 typeAheadBuffer.removeLast()
                 resetTypeAheadTimer()
@@ -1635,38 +1712,64 @@ struct FileListSection: View {
 
             Divider()
 
-            // File list - use items directly (already sorted by parent)
+            // File list with native selection support
             ScrollViewReader { scrollProxy in
-                List(Array(items.enumerated()), id: \.element.id) { index, item in
-                    CoverFlowFileRow(item: item, columnConfig: columnConfig)
-                        .id(item.id)
-                        .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                        .listRowBackground(
-                            selectedItems.contains(item)
-                                ? Color.accentColor.opacity(0.2)
-                                : Color.clear
-                        )
-                        .onDrag {
-                            NSItemProvider(object: item.url as NSURL)
-                        }
-                        .gesture(
-                            TapGesture(count: 2).onEnded {
-                                onOpen(item)
+                List(selection: Binding(
+                    get: { Set(viewModel.selectedItems.map { $0.id }) },
+                    set: { ids in
+                        viewModel.selectedItems = Set(items.filter { ids.contains($0.id) })
+                    }
+                )) {
+                    ForEach(items) { item in
+                        CoverFlowFileRow(item: item, columnConfig: columnConfig)
+                            .tag(item.id)
+                            .id(item.id)
+                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                            .listRowBackground(
+                                selectedItems.contains(item)
+                                    ? Color.accentColor.opacity(0.2)
+                                    : Color.clear
+                            )
+                            .onDrag {
+                                // Drag all selected items if this item is selected, otherwise just this item
+                                if viewModel.selectedItems.contains(item) && viewModel.selectedItems.count > 1 {
+                                    let urls = viewModel.selectedItems.map { $0.url as NSURL }
+                                    let provider = NSItemProvider()
+                                    provider.registerFileRepresentation(forTypeIdentifier: "public.file-url", visibility: .all) { completion in
+                                        completion(urls.first as? URL, false, nil)
+                                        return nil
+                                    }
+                                    return provider
+                                }
+                                return NSItemProvider(object: item.url as NSURL)
                             }
-                        )
-                        .simultaneousGesture(
-                            TapGesture(count: 1).onEnded {
-                                // Find original index in unsorted items for selection sync
-                                if let originalIndex = items.firstIndex(of: item) {
-                                    onSelect(item, originalIndex)
+                            .instantTap(
+                                id: item.id,
+                                onSingleClick: {
+                                    // Support Cmd+click and Shift+click for multi-selection
+                                    if let index = items.firstIndex(of: item) {
+                                        let modifiers = NSEvent.modifierFlags
+                                        viewModel.handleSelection(
+                                            item: item,
+                                            index: index,
+                                            in: items,
+                                            withShift: modifiers.contains(.shift),
+                                            withCommand: modifiers.contains(.command)
+                                        )
+                                        // Update cover flow index
+                                        onSelect(item, index)
+                                    }
+                                },
+                                onDoubleClick: {
+                                    onOpen(item)
+                                }
+                            )
+                            .contextMenu {
+                                FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                                    renamingItem = item
                                 }
                             }
-                        )
-                        .contextMenu {
-                            FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                                renamingItem = item
-                            }
-                        }
+                    }
                 }
                 .listStyle(.plain)
                 .onChange(of: selectedItems) { newSelection in

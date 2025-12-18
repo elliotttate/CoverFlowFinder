@@ -47,7 +47,16 @@ struct IconGridView: View {
                             .instantTap(
                                 id: item.id,
                                 onSingleClick: {
-                                    viewModel.selectItem(item, extend: NSEvent.modifierFlags.contains(.command))
+                                    if let index = items.firstIndex(of: item) {
+                                        let modifiers = NSEvent.modifierFlags
+                                        viewModel.handleSelection(
+                                            item: item,
+                                            index: index,
+                                            in: items,
+                                            withShift: modifiers.contains(.shift),
+                                            withCommand: modifiers.contains(.command)
+                                        )
+                                    }
                                 },
                                 onDoubleClick: {
                                     viewModel.openItem(item)
