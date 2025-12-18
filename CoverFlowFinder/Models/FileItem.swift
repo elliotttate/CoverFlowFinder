@@ -70,7 +70,7 @@ struct FileItem: Identifiable, Hashable, Transferable {
         }
         ProxyRepresentation(exporting: \.url)
     }
-    let id = UUID()
+    let id: UUID
     let url: URL
     let name: String
     let isDirectory: Bool
@@ -78,6 +78,7 @@ struct FileItem: Identifiable, Hashable, Transferable {
     let modificationDate: Date?
     let creationDate: Date?
     let fileType: FileType
+    let hasMetadata: Bool
 
     // Lazy icon lookup - only loads when accessed
     var icon: NSImage {
@@ -96,31 +97,44 @@ struct FileItem: Identifiable, Hashable, Transferable {
         case other
     }
 
-    init(url: URL) {
+    init(url: URL, id: UUID = UUID(), loadMetadata: Bool = true) {
+        self.id = id
         self.url = url
         self.name = url.lastPathComponent
 
-        let resourceValues = try? url.resourceValues(forKeys: [
-            .isDirectoryKey,
-            .fileSizeKey,
-            .contentModificationDateKey,
-            .creationDateKey,
-            .contentTypeKey
-        ])
+        let requestedKeys: Set<URLResourceKey> = loadMetadata
+            ? [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey]
+            : [.isDirectoryKey, .contentTypeKey]
+
+        let resourceValues = try? url.resourceValues(forKeys: requestedKeys)
 
         self.isDirectory = resourceValues?.isDirectory ?? false
-        self.size = Int64(resourceValues?.fileSize ?? 0)
-        self.modificationDate = resourceValues?.contentModificationDate
-        self.creationDate = resourceValues?.creationDate
+        if loadMetadata {
+            self.size = Int64(resourceValues?.fileSize ?? 0)
+            self.modificationDate = resourceValues?.contentModificationDate
+            self.creationDate = resourceValues?.creationDate
+        } else {
+            self.size = 0
+            self.modificationDate = nil
+            self.creationDate = nil
+        }
+        self.hasMetadata = loadMetadata
 
-        // Determine file type
+        // Determine file type quickly, falling back to filename extension when metadata is deferred
         if self.isDirectory {
             self.fileType = .folder
         } else if let contentType = resourceValues?.contentType {
             self.fileType = FileItem.determineFileType(from: contentType)
+        } else if let extType = UTType(filenameExtension: url.pathExtension) {
+            self.fileType = FileItem.determineFileType(from: extType)
         } else {
             self.fileType = .other
         }
+    }
+
+    /// Return a copy of this item with full metadata loaded (reuses the same identity).
+    func hydrated() -> FileItem {
+        FileItem(url: url, id: id, loadMetadata: true)
     }
 
     private static func determineFileType(from type: UTType) -> FileType {

@@ -59,6 +59,33 @@ enum ClipboardOperation {
     case cut
 }
 
+/// Thread-safe sort function for background use (non-isolated)
+private func sortItemsForBackground(_ items: [FileItem], sortOption: SortOption, ascending: Bool) -> [FileItem] {
+    return items.sorted { (item1: FileItem, item2: FileItem) -> Bool in
+        // Folders always come first
+        if item1.isDirectory != item2.isDirectory {
+            return item1.isDirectory
+        }
+
+        let result: Bool
+        switch sortOption {
+        case .name:
+            result = item1.name.localizedCaseInsensitiveCompare(item2.name) == .orderedAscending
+        case .dateModified, .dateCreated:
+            let date1 = item1.modificationDate ?? .distantPast
+            let date2 = item2.modificationDate ?? .distantPast
+            result = date1 < date2
+        case .size:
+            result = item1.size < item2.size
+        case .kind:
+            let kind1 = String(describing: item1.fileType)
+            let kind2 = String(describing: item2.fileType)
+            result = kind1 < kind2
+        }
+        return ascending ? result : !result
+    }
+}
+
 @MainActor
 class FileBrowserViewModel: ObservableObject {
     @Published var currentPath: URL
@@ -79,6 +106,8 @@ class FileBrowserViewModel: ObservableObject {
     private var enteredFolderURL: URL?
     // URL to select after loading (used when going back)
     private var pendingSelectionURL: URL?
+    private var metadataHydrationWorkItem: DispatchWorkItem?
+    private let metadataHydrationWindow = 200
 
     // Clipboard state
     @Published var clipboardItems: [URL] = []
@@ -124,41 +153,55 @@ class FileBrowserViewModel: ObservableObject {
         isLoading = true
         items = []
         let pathToLoad = currentPath
+        let pendingURL = pendingSelectionURL  // Capture before async
+        // Capture sort settings for thread-safe access
+        let capturedSortOption = sortOption
+        let capturedSortAscending = sortAscending
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
             do {
-                let contents = try FileManager.default.contentsOfDirectory(
-                    at: pathToLoad,
-                    includingPropertiesForKeys: [
-                        .isDirectoryKey,
-                        .fileSizeKey,
-                        .contentModificationDateKey,
-                        .creationDateKey,
-                        .contentTypeKey
-                    ],
-                    options: [.skipsHiddenFiles]
-                )
+                // Use autoreleasepool to release temporary objects promptly
+                let fileItems: [FileItem] = try autoreleasepool {
+                    let contents = try FileManager.default.contentsOfDirectory(
+                        at: pathToLoad,
+                        includingPropertiesForKeys: [
+                            .isDirectoryKey,
+                            .contentTypeKey
+                        ],
+                        options: [.skipsHiddenFiles]
+                    )
 
-                let fileItems = contents.map { FileItem(url: $0) }
+                    // Build lightweight items - use reserveCapacity for better performance
+                    var items = [FileItem]()
+                    items.reserveCapacity(contents.count)
+                    for url in contents {
+                        items.append(FileItem(url: url, loadMetadata: true))
+                    }
+                    return items
+                }
+
+                // Calculate selection index on background thread to avoid main thread work
+                var selectedIndex = 0
+                var selectedItem: FileItem?
+
+                if let pendingURL = pendingURL,
+                   let item = fileItems.first(where: { $0.url == pendingURL }) {
+                    selectedItem = item
+                    // Pre-sort on background thread using captured sort settings
+                    let viewModelSorted = sortItemsForBackground(fileItems, sortOption: capturedSortOption, ascending: capturedSortAscending)
+                    let finalSorted = ListColumnConfigManager.shared.sortedItems(viewModelSorted)
+                    if let index = finalSorted.firstIndex(of: item) {
+                        selectedIndex = index
+                    }
+                }
 
                 DispatchQueue.main.async {
-                    // IMPORTANT: Set coverFlowSelectedIndex BEFORE items to ensure SwiftUI
-                    // receives the correct index when processing the items change
-                    if let pendingURL = self.pendingSelectionURL,
-                       let item = fileItems.first(where: { $0.url == pendingURL }) {
-                        // Find index in sorted items - use the same sorting as filteredItems
-                        // CoverFlowView uses columnConfig.sortedItems on top of filteredItems,
-                        // so we need to match that: first sortItems(), then columnConfig.sortedItems()
-                        let viewModelSorted = self.sortItems(fileItems)
-                        let finalSorted = ListColumnConfigManager.shared.sortedItems(viewModelSorted)
-                        if let index = finalSorted.firstIndex(of: item) {
-                            debugLog("📍 loadContents: setting coverFlowSelectedIndex=\(index) for \(item.name)")
-                            self.coverFlowSelectedIndex = index
-                        } else {
-                            debugLog("⚠️ loadContents: item \(item.name) not found in sorted items")
-                        }
+                    // Minimal work on main thread - just assign values
+                    if let item = selectedItem {
+                        debugLog("📍 loadContents: setting coverFlowSelectedIndex=\(selectedIndex) for \(item.name)")
+                        self.coverFlowSelectedIndex = selectedIndex
                         self.selectedItems = [item]
                         self.pendingSelectionURL = nil
                     } else {
@@ -172,6 +215,7 @@ class FileBrowserViewModel: ObservableObject {
                     self.isLoading = false
                     // Increment navigation generation to force SwiftUI update
                     self.navigationGeneration += 1
+                    self.hydrateMetadataAroundSelection()
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -181,6 +225,7 @@ class FileBrowserViewModel: ObservableObject {
             }
         }
     }
+
 
     func navigateTo(_ url: URL) {
         guard url != currentPath else { return }
@@ -291,6 +336,48 @@ class FileBrowserViewModel: ObservableObject {
             return sortAscending ? result : !result
         }
         return sorted
+    }
+
+    /// Hydrate heavy metadata (size/dates/type) around the current selection window.
+    func hydrateMetadataAroundSelection() {
+        let currentItems = items
+        guard !currentItems.isEmpty else { return }
+        let targetPath = currentPath
+
+        let sorted = ListColumnConfigManager.shared.sortedItems(sortItems(currentItems))
+        guard !sorted.isEmpty else { return }
+
+        let selected = min(max(0, coverFlowSelectedIndex), sorted.count - 1)
+        let halfWindow = metadataHydrationWindow / 2
+        let start = max(0, selected - halfWindow)
+        let end = min(sorted.count - 1, selected + halfWindow)
+        guard start <= end else { return }
+
+        let slice = sorted[start...end]
+        let targets = slice.filter { !$0.hasMetadata }
+        guard !targets.isEmpty else { return }
+
+        metadataHydrationWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            let hydrated = targets.map { $0.hydrated() }
+            DispatchQueue.main.async {
+                guard let self else { return }
+                guard self.currentPath == targetPath else { return }
+                var updatedItems = self.items
+                var changed = false
+                for item in hydrated {
+                    if let index = updatedItems.firstIndex(where: { $0.url == item.url }) {
+                        updatedItems[index] = item
+                        changed = true
+                    }
+                }
+                if changed {
+                    self.items = updatedItems
+                }
+            }
+        }
+        metadataHydrationWorkItem = workItem
+        DispatchQueue.global(qos: .utility).async(execute: workItem)
     }
 
     func refresh() {

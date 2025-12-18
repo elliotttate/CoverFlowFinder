@@ -21,14 +21,15 @@ struct CoverFlowView: View {
     @State private var debugLog: [String] = []
     @State private var renamingItem: FileItem?
     @State private var rightClickedIndex: Int?
+    @State private var isCoverFlowScrolling: Bool = false
 
     // Thumbnail throttling
     @State private var lastThumbnailLoadTime: Date = .distantPast
     @State private var thumbnailLoadTimer: Timer?
-    private let thumbnailLoadThrottle: TimeInterval = 0.005  // 200 loads/sec
+    private let thumbnailLoadThrottle: TimeInterval = 0.016  // ~60fps throttle
 
-    private let visibleRange = 40  // Prefetch far ahead
-    private let maxConcurrentThumbnails = 50  // Aggressive parallel loads
+    private let visibleRange = 12  // Prefetch modestly ahead
+    private let maxConcurrentThumbnails = 8  // Limit parallel work
     private let thumbnailCache = ThumbnailCacheManager.shared
 
     private static let logFileURL: URL = {
@@ -90,6 +91,15 @@ struct CoverFlowView: View {
                     },
                     onDrop: { urls in
                         handleDrop(urls: urls)
+                    },
+                    onScrollStateChange: { scrolling in
+                        // Defer state change to avoid publishing during view updates
+                        DispatchQueue.main.async {
+                            isCoverFlowScrolling = scrolling
+                            if !scrolling {
+                                throttledLoadThumbnails()
+                            }
+                        }
                     }
                 )
                 .frame(height: max(250, geometry.size.height * 0.45))
@@ -177,26 +187,36 @@ struct CoverFlowView: View {
             thumbnailLoadTimer = nil
         }
         .onChange(of: items) { _ in
-            // Clear local thumbnails and tell cache manager about new folder
-            thumbnails.removeAll()
-            iconPlaceholders.removeAll()
-            thumbnailLoadGeneration += 1
-            thumbnailCache.clearForNewFolder()
-            log("Items changed - cleared \(items.count) items")
-            updateSortedItems()
-            loadVisibleThumbnails()
-            syncSelection()
+            // Defer state changes to avoid publishing during view updates
+            DispatchQueue.main.async {
+                // Clear local thumbnails and tell cache manager about new folder
+                thumbnails.removeAll()
+                iconPlaceholders.removeAll()
+                thumbnailLoadGeneration += 1
+                thumbnailCache.clearForNewFolder()
+                log("Items changed - cleared \(items.count) items")
+                updateSortedItems()
+                loadVisibleThumbnails()
+                syncSelection()
+            }
         }
         .onChange(of: columnConfig.sortColumn) { _ in
-            updateSortedItems()
-            loadVisibleThumbnails()
+            DispatchQueue.main.async {
+                updateSortedItems()
+                loadVisibleThumbnails()
+            }
         }
         .onChange(of: columnConfig.sortDirection) { _ in
-            updateSortedItems()
-            loadVisibleThumbnails()
+            DispatchQueue.main.async {
+                updateSortedItems()
+                loadVisibleThumbnails()
+            }
         }
         .onChange(of: viewModel.coverFlowSelectedIndex) { _ in
-            throttledLoadThumbnails()
+            DispatchQueue.main.async {
+                throttledLoadThumbnails()
+                viewModel.hydrateMetadataAroundSelection()
+            }
         }
         .sheet(item: $renamingItem) { item in
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
@@ -211,7 +231,6 @@ struct CoverFlowView: View {
         // If enough time has passed, load immediately
         if timeSinceLastLoad >= thumbnailLoadThrottle {
             lastThumbnailLoadTime = now
-            thumbnailCache.incrementGeneration()  // Invalidate old requests
             loadVisibleThumbnails()
         } else {
             // Schedule a deferred load if not already scheduled
@@ -220,7 +239,6 @@ struct CoverFlowView: View {
             thumbnailLoadTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
                 DispatchQueue.main.async {
                     self.lastThumbnailLoadTime = Date()
-                    self.thumbnailCache.incrementGeneration()
                     self.loadVisibleThumbnails()
                 }
             }
@@ -281,102 +299,82 @@ struct CoverFlowView: View {
 
     private func loadVisibleThumbnails() {
         guard !sortedItemsCache.isEmpty else { return }
+        guard !isCoverFlowScrolling else { return }
         let selected = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
         let start = max(0, selected - visibleRange)
         let end = min(sortedItemsCache.count - 1, selected + visibleRange)
         guard start <= end else { return }
 
-        // Evict thumbnails outside the window to keep state small
-        evictDistantThumbnails(currentIndex: selected)
-
-        // Count stats for logging
-        var needsLoading = 0
-        var alreadyLoaded = 0
-        var pending = 0
-        var failed = 0
-        var showedIcon = 0
-
-        // Build list of items to load, sorted by distance from selection
+        // Collect all state changes to apply later
+        var thumbnailUpdates: [URL: NSImage] = [:]
+        var placeholdersToAdd: Set<URL> = []
+        var placeholdersToRemove: Set<URL> = []
         var itemsToLoad: [(item: FileItem, distance: Int)] = []
+
+        // Evict distant thumbnails first
+        let windowStart = max(0, selected - thumbnailWindowSize)
+        let windowEnd = min(sortedItemsCache.count - 1, selected + thumbnailWindowSize)
+        var keepURLs = Set<URL>()
+        for i in windowStart...windowEnd {
+            keepURLs.insert(sortedItemsCache[i].url)
+        }
+        var urlsToEvict: [URL] = []
+        for url in thumbnails.keys {
+            if !keepURLs.contains(url) {
+                urlsToEvict.append(url)
+            }
+        }
 
         for index in start...end {
             let item = sortedItemsCache[index]
             let distance = abs(index - selected)
-
-            // Check if we have a REAL thumbnail (not just icon placeholder)
             let hasRealThumbnail = thumbnails[item.url] != nil && !iconPlaceholders.contains(item.url)
 
             if hasRealThumbnail {
-                alreadyLoaded += 1
+                // Already loaded
             } else if thumbnailCache.hasFailed(url: item.url) {
-                // Use icon for failed items (no retry storm)
-                thumbnails[item.url] = item.icon
-                iconPlaceholders.remove(item.url)  // Final state, not a placeholder
-                failed += 1
+                thumbnailUpdates[item.url] = item.icon
+                placeholdersToRemove.insert(item.url)
             } else if thumbnailCache.isPending(url: item.url) {
-                // Already loading - show icon immediately while waiting
                 if thumbnails[item.url] == nil {
-                    thumbnails[item.url] = item.icon
-                    iconPlaceholders.insert(item.url)
-                    showedIcon += 1
+                    thumbnailUpdates[item.url] = item.icon
+                    placeholdersToAdd.insert(item.url)
                 }
-                pending += 1
             } else if let cached = thumbnailCache.getCachedThumbnail(for: item.url) {
-                // Found in cache (memory or disk)
-                thumbnails[item.url] = cached
-                iconPlaceholders.remove(item.url)
-                alreadyLoaded += 1
+                thumbnailUpdates[item.url] = cached
+                placeholdersToRemove.insert(item.url)
             } else {
-                // Show icon immediately while thumbnail loads
-                thumbnails[item.url] = item.icon
-                iconPlaceholders.insert(item.url)
-                showedIcon += 1
+                thumbnailUpdates[item.url] = item.icon
+                placeholdersToAdd.insert(item.url)
                 itemsToLoad.append((item, distance))
-                needsLoading += 1
             }
         }
 
         // Sort by distance (closest first)
         itemsToLoad.sort { $0.distance < $1.distance }
+        let loadItems = Array(itemsToLoad.prefix(maxConcurrentThumbnails))
 
-        // Load up to maxConcurrentThumbnails
-        var started = 0
-        for (item, _) in itemsToLoad {
-            if started >= maxConcurrentThumbnails {
-                break
-            }
-            generateThumbnail(for: item)
-            started += 1
-        }
-
-        if started > 0 || needsLoading > 0 {
-            log("📊 Visible: \(end-start+1), Loaded: \(alreadyLoaded), Pending: \(pending), Failed: \(failed), Need: \(needsLoading), Started: \(started), Icons: \(showedIcon)")
-        }
-    }
-
-    /// Remove thumbnails that are far from current position to keep SwiftUI state small
-    private func evictDistantThumbnails(currentIndex: Int) {
-        let windowStart = max(0, currentIndex - thumbnailWindowSize)
-        let windowEnd = min(sortedItemsCache.count - 1, currentIndex + thumbnailWindowSize)
-
-        // Build set of URLs that should be kept
-        var keepURLs = Set<URL>()
-        for i in windowStart...windowEnd {
-            keepURLs.insert(sortedItemsCache[i].url)
-        }
-
-        // Remove thumbnails outside window
-        var evicted = 0
-        for url in thumbnails.keys {
-            if !keepURLs.contains(url) {
+        // Apply all state changes in a deferred block
+        DispatchQueue.main.async { [self] in
+            // Evict distant
+            for url in urlsToEvict {
                 thumbnails.removeValue(forKey: url)
                 iconPlaceholders.remove(url)
-                evicted += 1
             }
-        }
-
-        if evicted > 0 {
-            log("🗑️ Evicted \(evicted) distant thumbnails, keeping \(thumbnails.count)")
+            // Apply updates
+            for (url, image) in thumbnailUpdates {
+                thumbnails[url] = image
+            }
+            for url in placeholdersToAdd {
+                iconPlaceholders.insert(url)
+            }
+            for url in placeholdersToRemove {
+                iconPlaceholders.remove(url)
+            }
+            // Start loading
+            for (item, _) in loadItems {
+                generateThumbnail(for: item)
+            }
         }
     }
 
@@ -384,22 +382,25 @@ struct CoverFlowView: View {
         let currentGen = thumbnailLoadGeneration
         log("🔄 Start: \(item.name)")
 
-        thumbnailCache.generateThumbnail(for: item) { [self] url, image in
-            // Check if we're still on the same generation (folder)
-            guard currentGen == thumbnailLoadGeneration else { return }
+        thumbnailCache.generateThumbnail(for: item) { url, image in
+            // Defer to next run loop to avoid publishing during view updates
+            DispatchQueue.main.async { [self] in
+                // Check if we're still on the same generation (folder)
+                guard currentGen == thumbnailLoadGeneration else { return }
 
-            if let image = image {
-                thumbnails[url] = image
-                iconPlaceholders.remove(url)  // Real thumbnail loaded
-                log("✅ Done: \(item.name)")
-            } else {
-                thumbnails[url] = item.icon
-                iconPlaceholders.remove(url)  // Failed, icon is final state
-                log("❌ Failed: \(item.name)")
+                if let image = image {
+                    thumbnails[url] = image
+                    iconPlaceholders.remove(url)  // Real thumbnail loaded
+                    log("✅ Done: \(item.name)")
+                } else {
+                    thumbnails[url] = item.icon
+                    iconPlaceholders.remove(url)  // Failed, icon is final state
+                    log("❌ Failed: \(item.name)")
+                }
+
+                // Continue loading more
+                loadVisibleThumbnails()
             }
-
-            // Continue loading more
-            loadVisibleThumbnails()
         }
     }
 }
@@ -416,6 +417,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onOpen: (Int) -> Void
     let onRightClick: (Int) -> Void
     let onDrop: ([URL]) -> Void
+    let onScrollStateChange: (Bool) -> Void
 
     func makeNSView(context: Context) -> CoverFlowNSView {
         let view = CoverFlowNSView()
@@ -425,6 +427,7 @@ struct CoverFlowContainer: NSViewRepresentable {
             onRightClick(index)
         }
         view.onDrop = onDrop
+        view.onScrollStateChange = onScrollStateChange
         view.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
         return view
     }
@@ -436,6 +439,7 @@ struct CoverFlowContainer: NSViewRepresentable {
             onRightClick(index)
         }
         nsView.onDrop = onDrop
+        nsView.onScrollStateChange = onScrollStateChange
         nsView.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
     }
 }
@@ -444,6 +448,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     var onSelect: ((Int) -> Void)?
     var onOpen: ((Int) -> Void)?
     var onRightClick: ((Int, NSPoint) -> Void)?
+    var onScrollStateChange: ((Bool) -> Void)?
 
     private var items: [FileItem] = []
     private var thumbnails: [URL: NSImage] = [:]
@@ -1390,6 +1395,10 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         scrollSettleTimer?.invalidate()
         scrollSettleTimer = nil
 
+        if scrolling != wasScrolling {
+            onScrollStateChange?(scrolling)
+        }
+
         if scrolling {
             // Reset settle timer (100ms after last scroll event)
             scrollSettleTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [weak self] _ in
@@ -1402,7 +1411,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
 
     private func onScrollSettled() {
-        isScrolling = false
+        setScrolling(false)
 
         // NOW notify SwiftUI of the final position
         DispatchQueue.main.async { [weak self] in
@@ -1736,31 +1745,23 @@ struct CoverFlowColumnHeader: View {
     var body: some View {
         HStack(spacing: 0) {
             ForEach(columnConfig.visibleColumns) { settings in
-                Button(action: { columnConfig.setSortColumn(settings.column) }) {
-                    HStack(spacing: 4) {
-                        Text(settings.column.rawValue)
-                            .font(.caption)
-                            .fontWeight(.medium)
-                            .foregroundColor(.secondary)
-                            .lineLimit(1)
-
-                        if columnConfig.sortColumn == settings.column {
-                            Image(systemName: columnConfig.sortDirection == .ascending ? "chevron.up" : "chevron.down")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
+                CoverFlowColumnHeaderCell(
+                    settings: settings,
+                    isSortColumn: columnConfig.sortColumn == settings.column,
+                    sortDirection: columnConfig.sortDirection,
+                    onSort: { columnConfig.setSortColumn(settings.column) },
+                    onResize: { delta in
+                        columnConfig.setColumnWidth(settings.column, width: settings.width + delta)
                     }
-                    .frame(width: settings.width, alignment: settings.column.alignment)
-                }
-                .buttonStyle(.plain)
+                )
                 .contextMenu {
                     columnVisibilityMenu
                 }
             }
             Spacer()
         }
+        .frame(height: 22) // Fixed header height
         .padding(.horizontal, 8)
-        .padding(.vertical, 6)
         .background(Color(nsColor: .controlBackgroundColor))
     }
 
@@ -1794,6 +1795,82 @@ struct CoverFlowColumnHeader: View {
     }
 }
 
+// Column header cell with resize handle for CoverFlow
+struct CoverFlowColumnHeaderCell: View {
+    let settings: ColumnSettings
+    let isSortColumn: Bool
+    let sortDirection: SortDirection
+    let onSort: () -> Void
+    let onResize: (CGFloat) -> Void
+
+    @State private var isHovering = false
+
+    var body: some View {
+        HStack(spacing: 0) {
+            Button(action: onSort) {
+                HStack(spacing: 4) {
+                    // Leading alignment: padding, content, spacer
+                    if settings.column.alignment == .leading {
+                        Color.clear.frame(width: 8) // Fixed left padding
+                        headerContent
+                        Spacer(minLength: 0)
+                    }
+                    // Trailing alignment: spacer, content, padding
+                    else if settings.column.alignment == .trailing {
+                        Spacer(minLength: 0)
+                        headerContent
+                        Color.clear.frame(width: 8) // Fixed right padding
+                    }
+                    // Center: spacers on both sides
+                    else {
+                        Spacer(minLength: 0)
+                        headerContent
+                        Spacer(minLength: 0)
+                    }
+                }
+            }
+            .buttonStyle(.plain)
+            .frame(maxWidth: .infinity)
+
+            // Resize handle
+            Rectangle()
+                .fill(isHovering ? Color.accentColor : Color.clear)
+                .frame(width: 4)
+                .contentShape(Rectangle().inset(by: -4))
+                .gesture(
+                    DragGesture()
+                        .onChanged { value in
+                            onResize(value.translation.width)
+                        }
+                )
+                .onHover { hovering in
+                    isHovering = hovering
+                    if hovering {
+                        NSCursor.resizeLeftRight.push()
+                    } else {
+                        NSCursor.pop()
+                    }
+                }
+        }
+        .frame(width: settings.width)
+    }
+
+    @ViewBuilder
+    private var headerContent: some View {
+        Text(settings.column.rawValue)
+            .font(.caption)
+            .fontWeight(.medium)
+            .foregroundColor(.secondary)
+            .lineLimit(1)
+
+        if isSortColumn {
+            Image(systemName: sortDirection == .ascending ? "chevron.up" : "chevron.down")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+        }
+    }
+}
+
 // File row for CoverFlow file list
 struct CoverFlowFileRow: View {
     let item: FileItem
@@ -1802,15 +1879,34 @@ struct CoverFlowFileRow: View {
     var body: some View {
         HStack(spacing: 0) {
             ForEach(columnConfig.visibleColumns) { settings in
-                cellContent(for: settings.column)
-                    .frame(width: settings.width, alignment: settings.column.alignment)
+                alignedCell(for: settings.column, width: settings.width, alignment: settings.column.alignment)
             }
             Spacer()
         }
-        .padding(.vertical, 6)
         .padding(.horizontal, 8)
+        .padding(.vertical, 4)
         .frame(maxWidth: .infinity)
-        .contentShape(Rectangle())
+        .contentShape(Rectangle()) // Make entire row clickable
+    }
+
+    @ViewBuilder
+    private func alignedCell(for column: ListColumn, width: CGFloat, alignment: Alignment) -> some View {
+        HStack(spacing: 0) {
+            if alignment == .leading {
+                Color.clear.frame(width: 8) // Fixed left padding
+                cellContent(for: column)
+                Spacer(minLength: 0)
+            } else if alignment == .trailing {
+                Spacer(minLength: 0)
+                cellContent(for: column)
+                Color.clear.frame(width: 8) // Fixed right padding
+            } else {
+                Spacer(minLength: 0)
+                cellContent(for: column)
+                Spacer(minLength: 0)
+            }
+        }
+        .frame(width: width)
     }
 
     @ViewBuilder

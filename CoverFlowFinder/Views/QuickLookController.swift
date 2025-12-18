@@ -62,9 +62,12 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
 
         guard let panel = QLPreviewPanel.shared() else { return }
 
-        // Make sure we're added to the window
+        // Make sure we're added to the window (above the hosting view, not as subview)
         if let window = NSApp.mainWindow, superview == nil {
-            window.contentView?.addSubview(self)
+            // Add to the window's themeFrame (parent of contentView) to avoid NSHostingView warning
+            if let themeFrame = window.contentView?.superview {
+                themeFrame.addSubview(self)
+            }
         }
 
         // Only need to set up responder chain if we're not already controlling

@@ -114,8 +114,10 @@ struct IconGridView: View {
             RenameSheet(item: item, viewModel: viewModel, isPresented: $renamingItem)
         }
         .onChange(of: items) { _ in
-            thumbnails.removeAll()
-            thumbnailCache.clearForNewFolder()
+            DispatchQueue.main.async {
+                thumbnails.removeAll()
+                thumbnailCache.clearForNewFolder()
+            }
         }
         .keyboardNavigable(
             onUpArrow: { navigateSelection(by: -calculatedColumns) },
@@ -169,22 +171,29 @@ struct IconGridView: View {
         if thumbnails[url] != nil { return }
         if thumbnailCache.isPending(url: url) { return }
         if thumbnailCache.hasFailed(url: url) {
-            thumbnails[url] = item.icon
+            // Defer state change to avoid publishing during view update
+            DispatchQueue.main.async {
+                thumbnails[url] = item.icon
+            }
             return
         }
 
         // Check cache first
         if let cached = thumbnailCache.getCachedThumbnail(for: url) {
-            thumbnails[url] = cached
+            DispatchQueue.main.async {
+                thumbnails[url] = cached
+            }
             return
         }
 
         // Generate thumbnail
-        thumbnailCache.generateThumbnail(for: item) { [self] url, image in
-            if let image = image {
-                thumbnails[url] = image
-            } else {
-                thumbnails[url] = item.icon
+        thumbnailCache.generateThumbnail(for: item) { url, image in
+            DispatchQueue.main.async { [self] in
+                if let image = image {
+                    thumbnails[url] = image
+                } else {
+                    thumbnails[url] = item.icon
+                }
             }
         }
     }

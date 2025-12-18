@@ -17,8 +17,8 @@ enum ListColumn: String, CaseIterable, Codable, Identifiable {
         case .name: return 250
         case .dateModified: return 150
         case .dateCreated: return 150
-        case .size: return 80
-        case .kind: return 100
+        case .size: return 90
+        case .kind: return 110
         case .tags: return 120
         }
     }
