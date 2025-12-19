@@ -108,6 +108,61 @@ class FileBrowserViewModel: ObservableObject {
 
     @Published var infoItem: FileItem?
 
+    // MARK: - ZIP Archive Browsing State
+    @Published var isInsideArchive: Bool = false
+    @Published var currentArchiveURL: URL? = nil
+    @Published var currentArchivePath: String = ""
+    private var archiveEntries: [ZipEntry] = []
+
+    /// Get a display path for the path bar (shows archive path when inside ZIP)
+    var displayPath: URL {
+        if isInsideArchive, let archiveURL = currentArchiveURL {
+            // Create a virtual URL for display
+            let archiveName = archiveURL.lastPathComponent
+            let virtualPath = currentArchivePath.isEmpty ? archiveName : "\(archiveName)/\(currentArchivePath)"
+            return archiveURL.deletingLastPathComponent().appendingPathComponent(virtualPath)
+        }
+        return currentPath
+    }
+
+    /// Path components for breadcrumb navigation (handles both regular paths and archive paths)
+    var pathComponents: [(name: String, url: URL?, archivePath: String?)] {
+        var components: [(name: String, url: URL?, archivePath: String?)] = []
+
+        // Add regular filesystem path components up to the archive
+        let basePath = isInsideArchive ? (currentArchiveURL?.deletingLastPathComponent() ?? currentPath) : currentPath
+        var url = basePath
+        var pathComps: [(name: String, url: URL)] = []
+
+        while url.path != "/" {
+            pathComps.insert((name: url.lastPathComponent, url: url), at: 0)
+            url = url.deletingLastPathComponent()
+        }
+        pathComps.insert((name: "Macintosh HD", url: URL(fileURLWithPath: "/")), at: 0)
+
+        for comp in pathComps {
+            components.append((name: comp.name, url: comp.url, archivePath: nil))
+        }
+
+        // If inside archive, add archive and its internal path components
+        if isInsideArchive, let archiveURL = currentArchiveURL {
+            // Add the archive itself (clicking navigates to archive root)
+            components.append((name: archiveURL.lastPathComponent, url: nil, archivePath: ""))
+
+            // Add internal path components
+            if !currentArchivePath.isEmpty {
+                let internalComps = currentArchivePath.split(separator: "/")
+                var builtPath = ""
+                for comp in internalComps {
+                    builtPath = builtPath.isEmpty ? String(comp) : "\(builtPath)/\(comp)"
+                    components.append((name: String(comp), url: nil, archivePath: builtPath))
+                }
+            }
+        }
+
+        return components
+    }
+
     private var cancellables = Set<AnyCancellable>()
 
     var canGoBack: Bool {
@@ -139,6 +194,12 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     func loadContents() {
+        // If we're inside an archive, load archive contents instead
+        if isInsideArchive {
+            loadArchiveContents()
+            return
+        }
+
         isLoading = true
         items = []
         let pathToLoad = currentPath
@@ -187,6 +248,12 @@ class FileBrowserViewModel: ObservableObject {
                 }
 
                 DispatchQueue.main.async {
+                    // Don't overwrite items if we've entered an archive while this async load was in progress
+                    guard !self.isInsideArchive else { return }
+
+                    // Don't overwrite if path changed while loading
+                    guard self.currentPath == pathToLoad else { return }
+
                     if let item = selectedItem {
                         self.coverFlowSelectedIndex = selectedIndex
                         self.selectedItems = [item]
@@ -210,6 +277,32 @@ class FileBrowserViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Load contents from within a ZIP archive
+    private func loadArchiveContents() {
+        guard let archiveURL = currentArchiveURL else {
+            exitArchive()
+            return
+        }
+
+        isLoading = true
+        items = []
+
+        // Get entries at the current path within the archive
+        let entriesAtPath = ZipArchiveManager.shared.entriesAtPath(currentArchivePath, in: archiveEntries)
+        let fileItems = ZipArchiveManager.shared.fileItems(from: entriesAtPath, archiveURL: archiveURL)
+
+        // Sort items
+        let sorted = sortItems(fileItems)
+        let finalSorted = ListColumnConfigManager.shared.sortedItems(sorted)
+
+        // Force SwiftUI to recognize the change
+        objectWillChange.send()
+        items = finalSorted
+        coverFlowSelectedIndex = min(coverFlowSelectedIndex, max(0, items.count - 1))
+        isLoading = false
+        navigationGeneration += 1
     }
 
 
@@ -243,10 +336,54 @@ class FileBrowserViewModel: ObservableObject {
 
     func goBack() {
         guard canGoBack else { return }
+
+        // If we're at the archive root, going back should exit the archive
+        if isInsideArchive && currentArchivePath.isEmpty {
+            exitArchive()
+            return
+        }
+
+        // If we're inside an archive subfolder, go up within the archive
+        if isInsideArchive && !currentArchivePath.isEmpty {
+            navigateUp()
+            return
+        }
+
         pendingSelectionURL = enteredFolderURL ?? currentPath
         enteredFolderURL = nil
         historyIndex -= 1
-        currentPath = navigationHistory[historyIndex]
+
+        let historyURL = navigationHistory[historyIndex]
+
+        // Check if this is an archive URL (contains #)
+        if historyURL.path.contains("#") {
+            let components = historyURL.path.components(separatedBy: "#")
+            if components.count == 2 {
+                let archivePath = URL(fileURLWithPath: components[0])
+                let internalPath = String(components[1].dropFirst()) // Remove leading /
+
+                do {
+                    let entries = try ZipArchiveManager.shared.readContents(of: archivePath)
+                    archiveEntries = entries
+                    currentArchiveURL = archivePath
+                    currentArchivePath = internalPath
+                    isInsideArchive = true
+                    selectedItems.removeAll()
+                    loadContents()
+                    return
+                } catch {
+                    print("Failed to restore archive state: \(error)")
+                }
+            }
+        }
+
+        // Regular filesystem navigation
+        isInsideArchive = false
+        currentArchiveURL = nil
+        currentArchivePath = ""
+        archiveEntries = []
+
+        currentPath = historyURL
         selectedItems.removeAll()
         // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
         // Setting it to 0 triggers an unnecessary SwiftUI update before items are loaded
@@ -256,18 +393,180 @@ class FileBrowserViewModel: ObservableObject {
     func goForward() {
         guard canGoForward else { return }
         historyIndex += 1
-        currentPath = navigationHistory[historyIndex]
+
+        let historyURL = navigationHistory[historyIndex]
+
+        // Check if this is an archive URL (contains #)
+        if historyURL.path.contains("#") {
+            let components = historyURL.path.components(separatedBy: "#")
+            if components.count == 2 {
+                let archivePath = URL(fileURLWithPath: components[0])
+                let internalPath = String(components[1].dropFirst()) // Remove leading /
+
+                do {
+                    let entries = try ZipArchiveManager.shared.readContents(of: archivePath)
+                    archiveEntries = entries
+                    currentArchiveURL = archivePath
+                    currentArchivePath = internalPath
+                    isInsideArchive = true
+                    selectedItems.removeAll()
+                    coverFlowSelectedIndex = 0
+                    loadContents()
+                    return
+                } catch {
+                    print("Failed to restore archive state: \(error)")
+                }
+            }
+        }
+
+        // Regular filesystem navigation
+        isInsideArchive = false
+        currentArchiveURL = nil
+        currentArchivePath = ""
+        archiveEntries = []
+
+        currentPath = historyURL
         selectedItems.removeAll()
         coverFlowSelectedIndex = 0
         loadContents()
     }
 
     func openItem(_ item: FileItem) {
+
+        // Handle items inside an archive
+        if item.isFromArchive {
+            if item.isDirectory {
+                // Navigate into the folder within the archive
+                if let archivePath = item.archivePath {
+                    navigateInArchive(to: archivePath)
+                }
+            } else {
+                // Extract and open the file
+                openArchiveItem(item)
+            }
+            return
+        }
+
+        // Check if this is a ZIP file we should browse into
+        if item.isZipArchive {
+            enterArchive(at: item.url)
+            return
+        }
+
         if item.isDirectory {
             enteredFolderURL = item.url
             navigateTo(item.url)
         } else {
             NSWorkspace.shared.open(item.url)
+        }
+    }
+
+    // MARK: - Archive Navigation
+
+    /// Enter a ZIP archive and browse its contents
+    func enterArchive(at url: URL) {
+        do {
+            // Read archive entries
+            let entries = try ZipArchiveManager.shared.readContents(of: url)
+            archiveEntries = entries
+
+            // Store the archive URL and set archive mode
+            currentArchiveURL = url
+            currentArchivePath = ""
+            isInsideArchive = true
+
+            // Remember where we came from for back navigation
+            enteredFolderURL = url
+
+            // Reset selection and load archive contents
+            selectedItems.removeAll()
+            coverFlowSelectedIndex = 0
+            loadContents()
+
+            // Add to history (use a virtual URL)
+            addToHistory(URL(fileURLWithPath: url.path + "#/"))
+        } catch {
+            // Fall back to opening with default app
+            NSWorkspace.shared.open(url)
+        }
+    }
+
+    /// Navigate to a path within the current archive
+    func navigateInArchive(to path: String) {
+        guard isInsideArchive else { return }
+
+        // Ensure path ends with / for directories
+        let normalizedPath = path.hasSuffix("/") ? String(path.dropLast()) : path
+
+        currentArchivePath = normalizedPath
+        selectedItems.removeAll()
+        coverFlowSelectedIndex = 0
+        loadContents()
+
+        // Add to history
+        if let archiveURL = currentArchiveURL {
+            addToHistory(URL(fileURLWithPath: archiveURL.path + "#/" + normalizedPath))
+        }
+    }
+
+    /// Exit the current archive and return to the filesystem
+    func exitArchive() {
+        guard isInsideArchive, let archiveURL = currentArchiveURL else { return }
+
+        isInsideArchive = false
+        currentArchiveURL = nil
+        currentArchivePath = ""
+        archiveEntries = []
+
+        // Navigate to the folder containing the archive
+        currentPath = archiveURL.deletingLastPathComponent()
+        pendingSelectionURL = archiveURL
+        selectedItems.removeAll()
+        loadContents()
+        addToHistory(currentPath)
+    }
+
+    /// Navigate up one level (handles both archive and filesystem)
+    func navigateUp() {
+        if isInsideArchive {
+            if currentArchivePath.isEmpty {
+                // At archive root, exit the archive
+                exitArchive()
+            } else {
+                // Go up one level within the archive
+                let components = currentArchivePath.split(separator: "/")
+                if components.count > 1 {
+                    let parentPath = components.dropLast().joined(separator: "/")
+                    navigateInArchive(to: parentPath)
+                } else {
+                    // Go to archive root
+                    currentArchivePath = ""
+                    selectedItems.removeAll()
+                    coverFlowSelectedIndex = 0
+                    loadContents()
+                }
+            }
+        } else {
+            navigateToParent()
+        }
+    }
+
+    /// Extract and open a file from the archive
+    private func openArchiveItem(_ item: FileItem) {
+        guard let archiveURL = item.archiveURL,
+              let archivePath = item.archivePath else { return }
+
+        // Find the entry
+        guard let entry = archiveEntries.first(where: { $0.path == archivePath }) else {
+            print("Could not find archive entry for path: \(archivePath)")
+            return
+        }
+
+        do {
+            let tempURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
+            NSWorkspace.shared.open(tempURL)
+        } catch {
+            print("Failed to extract file: \(error.localizedDescription)")
         }
     }
 
@@ -440,7 +739,23 @@ class FileBrowserViewModel: ObservableObject {
 
     func copySelectedItems() {
         guard !selectedItems.isEmpty else { return }
-        clipboardItems = selectedItems.map { $0.url }
+
+        var urlsToCopy: [URL] = []
+
+        for item in selectedItems {
+            if item.isFromArchive {
+                // Extract archive item to temp location for copying
+                if let extractedURL = extractArchiveItemForCopy(item) {
+                    urlsToCopy.append(extractedURL)
+                }
+            } else {
+                urlsToCopy.append(item.url)
+            }
+        }
+
+        guard !urlsToCopy.isEmpty else { return }
+
+        clipboardItems = urlsToCopy
         clipboardOperation = .copy
 
         // Also copy to system pasteboard
@@ -449,8 +764,87 @@ class FileBrowserViewModel: ObservableObject {
         pasteboard.writeObjects(clipboardItems as [NSURL])
     }
 
+    /// Extract an archive item to a temp directory for copy/paste operations
+    private func extractArchiveItemForCopy(_ item: FileItem) -> URL? {
+        guard let archiveURL = item.archiveURL,
+              let archivePath = item.archivePath else { return nil }
+
+        // Create temp directory for extractions
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("CoverFlowFinder-Extract")
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+
+        let destURL = tempDir.appendingPathComponent(item.name)
+
+        // Remove existing file if present
+        try? FileManager.default.removeItem(at: destURL)
+
+        if item.isDirectory {
+            // For directories, we need to extract all contents
+            return extractArchiveDirectory(item, from: archiveURL, to: destURL)
+        } else {
+            // For files, extract single file
+            if let entry = archiveEntries.first(where: { $0.path == archivePath || $0.path == archivePath + "/" }) {
+                do {
+                    let extractedURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
+                    // Move from temp extraction location to our desired location
+                    try? FileManager.default.removeItem(at: destURL)
+                    try FileManager.default.copyItem(at: extractedURL, to: destURL)
+                    return destURL
+                } catch {
+                    // Extraction failed
+                }
+            }
+        }
+        return nil
+    }
+
+    /// Extract an entire directory from archive
+    private func extractArchiveDirectory(_ item: FileItem, from archiveURL: URL, to destURL: URL) -> URL? {
+        guard let basePath = item.archivePath else { return nil }
+
+        let normalizedBase = basePath.hasSuffix("/") ? basePath : basePath + "/"
+
+        do {
+            try FileManager.default.createDirectory(at: destURL, withIntermediateDirectories: true)
+
+            // Find all entries under this directory
+            for entry in archiveEntries {
+                guard entry.path.hasPrefix(normalizedBase) else { continue }
+
+                let relativePath = String(entry.path.dropFirst(normalizedBase.count))
+                guard !relativePath.isEmpty else { continue }
+
+                let itemDestURL = destURL.appendingPathComponent(relativePath)
+
+                if entry.isDirectory {
+                    try FileManager.default.createDirectory(at: itemDestURL, withIntermediateDirectories: true)
+                } else {
+                    // Extract file
+                    let extractedURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
+                    // Ensure parent directory exists
+                    try FileManager.default.createDirectory(at: itemDestURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try? FileManager.default.removeItem(at: itemDestURL)
+                    try FileManager.default.copyItem(at: extractedURL, to: itemDestURL)
+                }
+            }
+            return destURL
+        } catch {
+            return nil
+        }
+    }
+
     func cutSelectedItems() {
         guard !selectedItems.isEmpty else { return }
+
+        // Check if any items are from archive - cut from archive acts as copy
+        let hasArchiveItems = selectedItems.contains { $0.isFromArchive }
+
+        if hasArchiveItems {
+            // Can't cut from archive, just copy instead
+            copySelectedItems()
+            return
+        }
+
         clipboardItems = selectedItems.map { $0.url }
         clipboardOperation = .cut
 

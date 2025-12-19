@@ -26,6 +26,7 @@
 		A1000022001 /* QuickLookManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000022000 /* QuickLookManager.swift */; };
 		A1000023001 /* TabBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000023000 /* TabBarView.swift */; };
 		A1000024001 /* ThumbnailCacheManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000024000 /* ThumbnailCacheManager.swift */; };
+		A1000026001 /* ZipArchiveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000026000 /* ZipArchiveManager.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -51,6 +52,7 @@
 		A1000022000 /* QuickLookManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookManager.swift; sourceTree = "<group>"; };
 		A1000023000 /* TabBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabBarView.swift; sourceTree = "<group>"; };
 		A1000024000 /* ThumbnailCacheManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailCacheManager.swift; sourceTree = "<group>"; };
+		A1000026000 /* ZipArchiveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipArchiveManager.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -100,6 +102,7 @@
 				A1000002000 /* FileItem.swift */,
 				A1000002002 /* ListColumnConfig.swift */,
 				A1000024000 /* ThumbnailCacheManager.swift */,
+				A1000026000 /* ZipArchiveManager.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -219,6 +222,7 @@
 				A1000022001 /* QuickLookManager.swift in Sources */,
 				A1000023001 /* TabBarView.swift in Sources */,
 				A1000024001 /* ThumbnailCacheManager.swift in Sources */,
+				A1000026001 /* ZipArchiveManager.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

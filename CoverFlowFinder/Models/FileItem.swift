@@ -80,9 +80,23 @@ struct FileItem: Identifiable, Hashable, Transferable {
     let fileType: FileType
     let hasMetadata: Bool
 
+    // Archive support - for items inside ZIP files
+    let isFromArchive: Bool
+    let archiveURL: URL?
+    let archivePath: String?
+
     // Lazy icon lookup - only loads when accessed
     var icon: NSImage {
-        IconCache.shared.icon(for: url)
+        if isFromArchive {
+            // For archive items, use generic icons based on file type
+            return IconCache.shared.genericIcon(for: fileType)
+        }
+        return IconCache.shared.icon(for: url)
+    }
+
+    /// Check if this item is a ZIP archive that can be browsed
+    var isZipArchive: Bool {
+        !isFromArchive && fileType == .archive && url.pathExtension.lowercased() == "zip"
     }
 
     enum FileType {
@@ -101,6 +115,11 @@ struct FileItem: Identifiable, Hashable, Transferable {
         self.id = id
         self.url = url
         self.name = url.lastPathComponent
+
+        // Not from archive - regular file system item
+        self.isFromArchive = false
+        self.archiveURL = nil
+        self.archivePath = nil
 
         let requestedKeys: Set<URLResourceKey> = loadMetadata
             ? [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey]
@@ -129,6 +148,46 @@ struct FileItem: Identifiable, Hashable, Transferable {
             self.fileType = FileItem.determineFileType(from: extType)
         } else {
             self.fileType = .other
+        }
+    }
+
+    /// Initialize from archive entry data (for ZIP file contents)
+    init(id: UUID = UUID(),
+         url: URL,
+         name: String,
+         isDirectory: Bool,
+         size: Int64,
+         modificationDate: Date?,
+         creationDate: Date?,
+         contentType: UTType?,
+         icon: NSImage? = nil,
+         isFromArchive: Bool = false,
+         archiveURL: URL? = nil,
+         archivePath: String? = nil) {
+        self.id = id
+        self.url = url
+        self.name = name
+        self.isDirectory = isDirectory
+        self.size = size
+        self.modificationDate = modificationDate
+        self.creationDate = creationDate
+        self.hasMetadata = true
+        self.isFromArchive = isFromArchive
+        self.archiveURL = archiveURL
+        self.archivePath = archivePath
+
+        // Determine file type
+        if isDirectory {
+            self.fileType = .folder
+        } else if let ct = contentType {
+            self.fileType = FileItem.determineFileType(from: ct)
+        } else {
+            let ext = (name as NSString).pathExtension
+            if let extType = UTType(filenameExtension: ext) {
+                self.fileType = FileItem.determineFileType(from: extType)
+            } else {
+                self.fileType = .other
+            }
         }
     }
 

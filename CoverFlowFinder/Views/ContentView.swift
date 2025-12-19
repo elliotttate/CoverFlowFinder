@@ -375,8 +375,8 @@ struct PathBarView: View {
                 }
                 .buttonStyle(.plain)
             } else {
-                // Breadcrumb path display
-                ForEach(Array(pathComponents.enumerated()), id: \.offset) { index, component in
+                // Breadcrumb path display - use archive-aware path components
+                ForEach(Array(viewModel.pathComponents.enumerated()), id: \.offset) { index, component in
                     if index > 0 {
                         Image(systemName: "chevron.right")
                             .font(.caption)
@@ -387,11 +387,19 @@ struct PathBarView: View {
                         if index == 0 {
                             Image(systemName: "desktopcomputer")
                                 .font(.caption)
+                        } else if component.archivePath != nil && component.archivePath == "" {
+                            // This is the ZIP file itself
+                            Image(systemName: "doc.zipper")
+                                .font(.caption)
+                        } else if component.url == nil && component.archivePath != nil {
+                            // Folder inside archive
+                            Image(systemName: "folder.fill")
+                                .font(.caption)
                         }
                         Text(component.name)
                             .lineLimit(1)
                     }
-                    .foregroundColor(index == pathComponents.count - 1 ? .primary : .secondary)
+                    .foregroundColor(index == viewModel.pathComponents.count - 1 ? .primary : .secondary)
                     .padding(.horizontal, 4)
                     .padding(.vertical, 2)
                     .contentShape(Rectangle())
@@ -413,22 +421,19 @@ struct PathBarView: View {
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
     }
 
-    private var pathComponents: [(name: String, url: URL)] {
-        var components: [(String, URL)] = []
-        var url = viewModel.currentPath
-
-        while url.path != "/" {
-            components.insert((url.lastPathComponent, url), at: 0)
-            url = url.deletingLastPathComponent()
-        }
-        components.insert(("Macintosh HD", URL(fileURLWithPath: "/")), at: 0)
-
-        return components
-    }
-
     private func navigateToComponent(at index: Int) {
-        let url = pathComponents[index].url
-        viewModel.navigateToAndSelectCurrent(url)
+        let component = viewModel.pathComponents[index]
+
+        if let url = component.url {
+            // Regular filesystem navigation
+            if viewModel.isInsideArchive {
+                viewModel.exitArchive()
+            }
+            viewModel.navigateToAndSelectCurrent(url)
+        } else if let archivePath = component.archivePath {
+            // Navigate within archive
+            viewModel.navigateInArchive(to: archivePath)
+        }
     }
 
     private func startEditing() {
@@ -555,21 +560,27 @@ struct TabContentWrapper: View {
         }
     }
 
+    // Generate a unique ID for view refresh that includes archive state
+    private var contentViewId: String {
+        let archiveId = viewModel.isInsideArchive ? "-archive-\(viewModel.currentArchivePath)" : ""
+        return "\(viewModel.currentPath.path)-\(selectedTabId)\(archiveId)-\(viewModel.navigationGeneration)"
+    }
+
     @ViewBuilder
     private var mainContentView: some View {
         switch viewModel.viewMode {
         case .coverFlow:
             CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
-                .id("coverflow-\(viewModel.currentPath.path)-\(selectedTabId)")
+                .id("coverflow-\(contentViewId)")
         case .icons:
             IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
-                .id("icons-\(viewModel.currentPath.path)-\(selectedTabId)")
+                .id("icons-\(contentViewId)")
         case .list:
             FileListView(viewModel: viewModel, items: viewModel.filteredItems)
-                .id("list-\(viewModel.currentPath.path)-\(selectedTabId)")
+                .id("list-\(contentViewId)")
         case .columns:
             ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
-                .id("columns-\(viewModel.currentPath.path)-\(selectedTabId)")
+                .id("columns-\(contentViewId)")
         case .dualPane, .quadPane:
             EmptyView()
         }
