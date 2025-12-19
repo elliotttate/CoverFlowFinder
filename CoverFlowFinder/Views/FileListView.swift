@@ -344,6 +344,9 @@ struct FileListRowView: View {
                     .frame(width: 20, height: 20)
                     .cornerRadius(2)
                 InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
+                if !item.tags.isEmpty {
+                    TagDotsView(tags: item.tags)
+                }
             }
         case .dateModified:
             Text(item.formattedDate)
@@ -409,16 +412,24 @@ struct TagsView: View {
             }
         }
         .onAppear {
-            loadTags()
+            tags = FileTagManager.getTags(for: url)
         }
     }
+}
 
-    private func loadTags() {
-        do {
-            let resourceValues = try url.resourceValues(forKeys: [.tagNamesKey])
-            tags = resourceValues.tagNames ?? []
-        } catch {
-            tags = []
+/// Displays tag dots inline (Finder-style) - just colored circles
+struct TagDotsView: View {
+    let tags: [String]
+
+    var body: some View {
+        HStack(spacing: 2) {
+            ForEach(tags.prefix(3), id: \.self) { tagName in
+                if let tag = FinderTag.from(name: tagName) {
+                    Circle()
+                        .fill(tag.color)
+                        .frame(width: 10, height: 10)
+                }
+            }
         }
     }
 }
@@ -437,16 +448,9 @@ struct TagBadge: View {
     }
 
     private var tagColor: Color {
-        // Map common Finder tag colors
-        switch name.lowercased() {
-        case "red": return .red
-        case "orange": return .orange
-        case "yellow": return .yellow
-        case "green": return .green
-        case "blue": return .blue
-        case "purple": return .purple
-        case "gray", "grey": return .gray
-        default: return .accentColor
+        if let finderTag = FinderTag.from(name: name) {
+            return finderTag.color
         }
+        return .accentColor
     }
 }

@@ -318,6 +318,10 @@ struct ColumnRowView: View {
 
             InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
 
+            if !item.tags.isEmpty {
+                TagDotsView(tags: item.tags)
+            }
+
             Spacer()
 
             if item.isDirectory {

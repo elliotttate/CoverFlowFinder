@@ -50,9 +50,42 @@ struct SidebarView: View {
                 }
             }
 
-            // Tags Section (placeholder)
+            // Tags Section
             Section(header: Text("Tags").font(.caption).foregroundColor(.secondary)) {
-                EmptyView()
+                ForEach(FinderTag.allTags) { tag in
+                    Button(action: {
+                        if viewModel.filterTag == tag.name {
+                            viewModel.filterTag = nil  // Clicking active filter clears it
+                        } else {
+                            viewModel.filterTag = tag.name  // Set new filter
+                        }
+                    }) {
+                        HStack {
+                            Circle()
+                                .fill(tag.color)
+                                .frame(width: 12, height: 12)
+                            Text(tag.name)
+                                .lineLimit(1)
+                            Spacer()
+                            if viewModel.filterTag == tag.name {
+                                Image(systemName: "checkmark")
+                                    .foregroundColor(.accentColor)
+                                    .font(.caption)
+                            }
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                if viewModel.filterTag != nil {
+                    Button(action: {
+                        viewModel.filterTag = nil
+                    }) {
+                        Label("Clear Filter", systemImage: "xmark.circle")
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
         }
         .listStyle(.sidebar)

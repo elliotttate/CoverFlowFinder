@@ -406,6 +406,10 @@ struct PaneListView: View {
 
                         InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
 
+                        if !item.tags.isEmpty {
+                            TagDotsView(tags: item.tags)
+                        }
+
                         Spacer()
 
                         Text(item.formattedSize)
@@ -523,6 +527,10 @@ struct PaneIconView: View {
 
                                 InlineRenameField(item: item, viewModel: viewModel, font: .caption, alignment: .center, lineLimit: 2)
                                     .frame(width: 80)
+
+                                if !item.tags.isEmpty {
+                                    TagDotsView(tags: item.tags)
+                                }
                             }
                             .id(item.id)
                             .onAppear { loadThumbnail(for: item) }

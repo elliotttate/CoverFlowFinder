@@ -418,6 +418,10 @@ struct QuadPaneListRow: View {
 
             InlineRenameField(item: item, viewModel: viewModel, font: .caption, alignment: .leading, lineLimit: 1)
 
+            if !item.tags.isEmpty {
+                TagDotsView(tags: item.tags)
+            }
+
             Spacer()
 
             Text(item.formattedSize)
@@ -535,6 +539,10 @@ struct QuadPaneIconCell: View {
 
             InlineRenameField(item: item, viewModel: viewModel, font: .caption2, alignment: .center, lineLimit: 2)
                 .frame(width: 70, height: 28)
+
+            if !item.tags.isEmpty {
+                TagDotsView(tags: item.tags)
+            }
         }
         .frame(width: 70)
         .padding(4)

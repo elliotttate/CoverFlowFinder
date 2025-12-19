@@ -2119,6 +2119,9 @@ struct CoverFlowFileRow: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: 20, height: 20)
                 InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
+                if !item.tags.isEmpty {
+                    TagDotsView(tags: item.tags)
+                }
             }
         case .dateModified:
             Text(item.formattedDate)
@@ -2172,18 +2175,16 @@ struct CoverFlowTagsView: View {
     var body: some View {
         HStack(spacing: 4) {
             ForEach(tags.prefix(3), id: \.self) { tag in
-                Text(tag)
+                TagBadge(name: tag)
+            }
+            if tags.count > 3 {
+                Text("+\(tags.count - 3)")
                     .font(.caption2)
-                    .padding(.horizontal, 4)
-                    .padding(.vertical, 1)
-                    .background(Color.accentColor.opacity(0.3))
-                    .clipShape(Capsule())
+                    .foregroundColor(.secondary)
             }
         }
         .onAppear {
-            if let tagNames = try? url.resourceValues(forKeys: [.tagNamesKey]).tagNames {
-                tags = tagNames
-            }
+            tags = FileTagManager.getTags(for: url)
         }
     }
 }

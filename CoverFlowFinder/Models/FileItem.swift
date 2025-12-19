@@ -3,6 +3,97 @@ import AppKit
 import UniformTypeIdentifiers
 import SwiftUI
 
+/// Represents a Finder tag with its color
+struct FinderTag: Identifiable, Hashable {
+    let id: String
+    let name: String
+    let color: Color
+
+    static let none = FinderTag(id: "none", name: "None", color: .clear)
+
+    // Standard Finder tag colors
+    static let red = FinderTag(id: "red", name: "Red", color: Color(nsColor: NSColor(red: 1.0, green: 0.23, blue: 0.19, alpha: 1.0)))
+    static let orange = FinderTag(id: "orange", name: "Orange", color: Color(nsColor: NSColor(red: 1.0, green: 0.58, blue: 0.0, alpha: 1.0)))
+    static let yellow = FinderTag(id: "yellow", name: "Yellow", color: Color(nsColor: NSColor(red: 1.0, green: 0.80, blue: 0.0, alpha: 1.0)))
+    static let green = FinderTag(id: "green", name: "Green", color: Color(nsColor: NSColor(red: 0.27, green: 0.85, blue: 0.46, alpha: 1.0)))
+    static let blue = FinderTag(id: "blue", name: "Blue", color: Color(nsColor: NSColor(red: 0.0, green: 0.48, blue: 1.0, alpha: 1.0)))
+    static let purple = FinderTag(id: "purple", name: "Purple", color: Color(nsColor: NSColor(red: 0.69, green: 0.32, blue: 0.87, alpha: 1.0)))
+    static let gray = FinderTag(id: "gray", name: "Gray", color: Color(nsColor: NSColor(red: 0.6, green: 0.6, blue: 0.6, alpha: 1.0)))
+
+    static let allTags: [FinderTag] = [.red, .orange, .yellow, .green, .blue, .purple, .gray]
+
+    /// Get FinderTag from tag name (case-insensitive match)
+    static func from(name: String) -> FinderTag? {
+        let lowercased = name.lowercased()
+        return allTags.first { $0.name.lowercased() == lowercased }
+    }
+}
+
+/// Helper to read and write file tags using extended attributes
+enum FileTagManager {
+    private static let tagAttributeName = "com.apple.metadata:_kMDItemUserTags"
+
+    /// Read tags from a file URL
+    static func getTags(for url: URL) -> [String] {
+        guard let resourceValues = try? url.resourceValues(forKeys: [.tagNamesKey]),
+              let tags = resourceValues.tagNames else {
+            return []
+        }
+        return tags
+    }
+
+    /// Set tags on a file URL using xattr (works on all macOS versions)
+    static func setTags(_ tags: [String], for url: URL) {
+        // Use xattr command to set tags (macOS stores tags as a plist in extended attributes)
+        let tagsWithNewlines = tags.map { $0 + "\n" }
+        if let plistData = try? PropertyListSerialization.data(fromPropertyList: tagsWithNewlines, format: .binary, options: 0) {
+            do {
+                try url.withUnsafeFileSystemRepresentation { fileSystemPath in
+                    guard let path = fileSystemPath else { return }
+                    let result = plistData.withUnsafeBytes { bytes in
+                        setxattr(path, tagAttributeName, bytes.baseAddress, bytes.count, 0, 0)
+                    }
+                    if result != 0 {
+                        // If setxattr fails, try removing the attribute first
+                        removexattr(path, tagAttributeName, 0)
+                        _ = plistData.withUnsafeBytes { bytes in
+                            setxattr(path, tagAttributeName, bytes.baseAddress, bytes.count, 0, 0)
+                        }
+                    }
+                }
+            } catch {
+                // Silently fail
+            }
+        }
+    }
+
+    /// Add a tag to a file
+    static func addTag(_ tag: String, to url: URL) {
+        var currentTags = getTags(for: url)
+        if !currentTags.contains(tag) {
+            currentTags.append(tag)
+            setTags(currentTags, for: url)
+        }
+    }
+
+    /// Remove a tag from a file
+    static func removeTag(_ tag: String, from url: URL) {
+        var currentTags = getTags(for: url)
+        currentTags.removeAll { $0 == tag }
+        setTags(currentTags, for: url)
+    }
+
+    /// Toggle a tag on a file
+    static func toggleTag(_ tag: String, on url: URL) {
+        let currentTags = getTags(for: url)
+        if currentTags.contains(tag) {
+            removeTag(tag, from: url)
+        } else {
+            addTag(tag, to: url)
+        }
+    }
+}
+
 /// Cache for file icons to avoid repeated NSWorkspace lookups
 private class IconCache {
     static let shared = IconCache()
@@ -84,6 +175,17 @@ struct FileItem: Identifiable, Hashable, Transferable {
     let isFromArchive: Bool
     let archiveURL: URL?
     let archivePath: String?
+
+    /// Get tags for this file (reads from filesystem each time)
+    var tags: [String] {
+        guard !isFromArchive else { return [] }
+        return FileTagManager.getTags(for: url)
+    }
+
+    /// Get FinderTag objects for display
+    var finderTags: [FinderTag] {
+        tags.compactMap { FinderTag.from(name: $0) }
+    }
 
     // Lazy icon lookup - only loads when accessed
     var icon: NSImage {

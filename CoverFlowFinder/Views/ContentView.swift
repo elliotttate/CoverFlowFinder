@@ -302,6 +302,39 @@ struct FileItemContextMenu: View {
 
             Divider()
 
+            // Tags submenu
+            if !item.isFromArchive {
+                Menu("Tags") {
+                    ForEach(FinderTag.allTags) { tag in
+                        Button {
+                            FileTagManager.toggleTag(tag.name, on: item.url)
+                            viewModel.loadContents()
+                        } label: {
+                            HStack {
+                                Circle()
+                                    .fill(tag.color)
+                                    .frame(width: 12, height: 12)
+                                Text(tag.name)
+                                if item.tags.contains(tag.name) {
+                                    Spacer()
+                                    Image(systemName: "checkmark")
+                                }
+                            }
+                        }
+                    }
+
+                    if !item.tags.isEmpty {
+                        Divider()
+                        Button("Remove All Tags") {
+                            FileTagManager.setTags([], for: item.url)
+                            viewModel.loadContents()
+                        }
+                    }
+                }
+
+                Divider()
+            }
+
             Button("Copy") {
                 viewModel.selectItem(item)
                 viewModel.copySelectedItems()

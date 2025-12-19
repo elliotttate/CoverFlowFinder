@@ -78,6 +78,7 @@ class FileBrowserViewModel: ObservableObject {
     @Published var sortOption: SortOption = .name
     @Published var sortAscending: Bool = true
     @Published var searchText: String = ""
+    @Published var filterTag: String? = nil
     @Published var isLoading: Bool = false
     @Published var navigationHistory: [URL] = []
     @Published var historyIndex: Int = -1
@@ -174,9 +175,22 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     var filteredItems: [FileItem] {
-        let filtered = searchText.isEmpty ? items : items.filter {
-            $0.name.localizedCaseInsensitiveContains(searchText)
+        var filtered = items
+
+        // Filter by search text
+        if !searchText.isEmpty {
+            filtered = filtered.filter {
+                $0.name.localizedCaseInsensitiveContains(searchText)
+            }
         }
+
+        // Filter by tag
+        if let tag = filterTag {
+            filtered = filtered.filter { item in
+                item.tags.contains(tag)
+            }
+        }
+
         return sortItems(filtered)
     }
 
@@ -189,6 +203,13 @@ class FileBrowserViewModel: ObservableObject {
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+
+        $filterTag
+            .dropFirst() // Skip initial value
+            .sink { [weak self] _ in
+                self?.navigationGeneration += 1
             }
             .store(in: &cancellables)
     }

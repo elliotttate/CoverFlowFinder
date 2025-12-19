@@ -241,15 +241,21 @@ struct IconGridItem: View {
                     .cornerRadius(4)
             }
 
-            InlineRenameField(item: item, viewModel: viewModel, font: .caption, alignment: .center, lineLimit: 2)
-                .frame(width: 100)
-                .padding(.horizontal, 4)
-                .padding(.vertical, 2)
-                .background(
-                    RoundedRectangle(cornerRadius: 4)
-                        .fill(isSelected && viewModel.renamingURL != item.url ? Color.accentColor : Color.clear)
-                )
-                .foregroundColor(isSelected && viewModel.renamingURL != item.url ? .white : .primary)
+            VStack(spacing: 2) {
+                InlineRenameField(item: item, viewModel: viewModel, font: .caption, alignment: .center, lineLimit: 2)
+                    .frame(width: 100)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
+                    .background(
+                        RoundedRectangle(cornerRadius: 4)
+                            .fill(isSelected && viewModel.renamingURL != item.url ? Color.accentColor : Color.clear)
+                    )
+                    .foregroundColor(isSelected && viewModel.renamingURL != item.url ? .white : .primary)
+
+                if !item.tags.isEmpty {
+                    TagDotsView(tags: item.tags)
+                }
+            }
         }
         .padding(8)
         .background(
