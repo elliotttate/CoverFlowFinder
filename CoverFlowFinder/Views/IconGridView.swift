@@ -1,7 +1,9 @@
 import SwiftUI
+import AppKit
 import Quartz
 
 struct IconGridView: View {
+    @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
     @State private var isDropTargeted = false
@@ -12,17 +14,23 @@ struct IconGridView: View {
     @State private var thumbnails: [URL: NSImage] = [:]
     private let thumbnailCache = ThumbnailCacheManager.shared
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 100, maximum: 120), spacing: 20)
-    ]
+    private var cellWidth: CGFloat {
+        let iconSize = settings.iconGridIconSizeValue
+        let labelWidth = iconSize + 20
+        let labelPadding: CGFloat = 8
+        let outerPadding: CGFloat = 16
+        return labelWidth + labelPadding + outerPadding
+    }
+
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: cellWidth, maximum: cellWidth), spacing: settings.iconGridSpacingValue)]
+    }
 
     // Calculate columns based on current width - called at navigation time
     private var calculatedColumns: Int {
-        let availableWidth = currentWidth - 40 // Subtract padding (20 each side)
-        // Use the actual item width that SwiftUI uses (closer to max in most cases)
-        // Formula: availableWidth / (itemWidth + spacing)
-        // Be conservative - use ceiling of spacing to avoid overcount
-        let cols = Int(availableWidth / 120)  // Simplified: just divide by item+spacing
+        let availableWidth = max(0, currentWidth - 40) // Subtract padding (20 each side)
+        let spacing = settings.iconGridSpacingValue
+        let cols = Int((availableWidth + spacing) / (cellWidth + spacing))
         return max(1, cols)
     }
 
@@ -30,7 +38,7 @@ struct IconGridView: View {
         GeometryReader { geometry in
             ScrollViewReader { scrollProxy in
                 ScrollView {
-                    LazyVGrid(columns: columns, spacing: 24) {
+                    LazyVGrid(columns: columns, spacing: settings.iconGridSpacingValue) {
                         ForEach(items) { item in
                             IconGridItem(
                                 item: item,
@@ -48,7 +56,8 @@ struct IconGridView: View {
                                 loadThumbnail(for: item)
                             }
                             .onDrag {
-                                NSItemProvider(object: item.url as NSURL)
+                                guard !item.isFromArchive else { return NSItemProvider() }
+                                return NSItemProvider(object: item.url as NSURL)
                             }
                             .onDrop(of: [.fileURL], delegate: IconFolderDropDelegate(
                                 item: item,
@@ -67,6 +76,7 @@ struct IconGridView: View {
                                             withShift: modifiers.contains(.shift),
                                             withCommand: modifiers.contains(.command)
                                         )
+                                        updateQuickLook(for: item)
                                     }
                                 },
                                 onDoubleClick: {
@@ -93,11 +103,13 @@ struct IconGridView: View {
                         withAnimation {
                             scrollProxy.scrollTo(firstSelected.id)
                         }
+                        updateQuickLook(for: firstSelected)
+                    } else {
+                        updateQuickLook(for: nil)
                     }
                 }
             }
         }
-        .background(QuickLookHost())
         .background(Color(nsColor: .controlBackgroundColor))
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
@@ -162,7 +174,7 @@ struct IconGridView: View {
         viewModel.selectItem(newItem)
 
         // Refresh Quick Look if visible
-        QuickLookControllerView.shared.updatePreview(for: newItem.url)
+        updateQuickLook(for: newItem)
     }
 
     private func openSelectedItem() {
@@ -174,8 +186,26 @@ struct IconGridView: View {
     private func toggleQuickLook() {
         guard let selectedItem = viewModel.selectedItems.first else { return }
 
-        QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { [self] offset in
+        guard let previewURL = viewModel.previewURL(for: selectedItem) else {
+            NSSound.beep()
+            return
+        }
+
+        QuickLookControllerView.shared.togglePreview(for: previewURL) { [self] offset in
             navigateSelection(by: offset)
+        }
+    }
+
+    private func updateQuickLook(for item: FileItem?) {
+        guard let item else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+            return
+        }
+
+        if let previewURL = viewModel.previewURL(for: item) {
+            QuickLookControllerView.shared.updatePreview(for: previewURL)
+        } else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
         }
     }
 
@@ -227,6 +257,7 @@ struct IconGridView: View {
 }
 
 struct IconGridItem: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
@@ -239,22 +270,26 @@ struct IconGridItem: View {
     }
 
     var body: some View {
+        let iconSize = appSettings.iconGridIconSizeValue
+        let backgroundSize = iconSize + 10
+        let labelWidth = iconSize + 20
+
         VStack(spacing: 8) {
             ZStack {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
-                    .frame(width: 90, height: 90)
+                    .frame(width: backgroundSize, height: backgroundSize)
 
                 Image(nsImage: displayImage)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 80, height: 80)
+                    .frame(width: iconSize, height: iconSize)
                     .cornerRadius(4)
             }
 
             VStack(spacing: 2) {
-                InlineRenameField(item: item, viewModel: viewModel, font: .caption, alignment: .center, lineLimit: 2)
-                    .frame(width: 100)
+                InlineRenameField(item: item, viewModel: viewModel, font: appSettings.iconGridFont, alignment: .center, lineLimit: 2)
+                    .frame(width: labelWidth)
                     .padding(.horizontal, 4)
                     .padding(.vertical, 2)
                     .background(
@@ -288,7 +323,7 @@ struct IconFolderDropDelegate: DropDelegate {
     @Binding var dropTargetedItemID: UUID?
 
     func validateDrop(info: DropInfo) -> Bool {
-        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
     }
 
     func dropEntered(info: DropInfo) {
@@ -304,13 +339,13 @@ struct IconFolderDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
         let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
         return DropProposal(operation: operation)
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        guard item.isDirectory else { return false }
+        guard item.isDirectory && !item.isFromArchive else { return false }
 
         let providers = info.itemProviders(for: [.fileURL])
         for provider in providers {

@@ -6,6 +6,7 @@ import AVFoundation
 import CoreMedia
 
 struct FileInfoView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let item: FileItem
     @Environment(\.dismiss) private var dismiss
 
@@ -13,6 +14,8 @@ struct FileInfoView: View {
     @State private var fileAttributes: FileAttributes?
     @State private var mediaMetadata: MediaMetadata?
     @State private var isLoadingAttributes = true
+    @State private var attributesTask: Task<Void, Never>?
+    @State private var metadataTask: Task<Void, Never>?
 
     private var hasMediaInfo: Bool {
         mediaMetadata != nil && !(mediaMetadata?.isEmpty ?? true)
@@ -94,6 +97,10 @@ struct FileInfoView: View {
             loadFileAttributes()
             loadMediaMetadata()
         }
+        .onDisappear {
+            attributesTask?.cancel()
+            metadataTask?.cancel()
+        }
     }
 
     @ViewBuilder
@@ -146,9 +153,11 @@ struct FileInfoView: View {
     }
 
     private func loadMediaMetadata() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let metadata = MediaMetadata(url: item.url)
-            DispatchQueue.main.async {
+        metadataTask?.cancel()
+        metadataTask = Task.detached(priority: .userInitiated) { [url = item.url] in
+            let metadata = await MediaMetadata(url: url)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
                 self.mediaMetadata = metadata
             }
         }
@@ -174,7 +183,7 @@ struct FileInfoView: View {
             }
 
             // File name
-            Text(item.name)
+            Text(item.displayName(showFileExtensions: appSettings.showFileExtensions))
                 .font(.headline)
                 .lineLimit(2)
                 .multilineTextAlignment(.center)
@@ -209,19 +218,7 @@ struct FileInfoView: View {
     }
 
     private var kindDescription: String {
-        if item.isDirectory {
-            return "Folder"
-        }
-        switch item.fileType {
-        case .image: return "Image"
-        case .video: return "Video"
-        case .audio: return "Audio"
-        case .document: return "Document"
-        case .code: return "Source Code"
-        case .archive: return "Archive"
-        case .application: return "Application"
-        default: return "Document"
-        }
+        item.kindDescription
     }
 
     private func generalInfo(_ attrs: FileAttributes) -> [(String, String)] {
@@ -297,9 +294,12 @@ struct FileInfoView: View {
     }
 
     private func loadFileAttributes() {
-        DispatchQueue.global(qos: .userInitiated).async {
-            let attrs = FileAttributes(url: item.url)
-            DispatchQueue.main.async {
+        attributesTask?.cancel()
+        isLoadingAttributes = true
+        attributesTask = Task.detached(priority: .userInitiated) { [url = item.url] in
+            let attrs = FileAttributes(url: url)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
                 self.fileAttributes = attrs
                 self.isLoadingAttributes = false
             }
@@ -527,7 +527,7 @@ struct MediaMetadata {
         pdfInfo.isEmpty && archiveInfo.isEmpty && documentInfo.isEmpty
     }
 
-    init(url: URL) {
+    init(url: URL) async {
         let ext = url.pathExtension.lowercased()
         let imageExtensions = ["jpg", "jpeg", "png", "gif", "tiff", "tif", "heic", "heif", "bmp", "webp", "raw", "cr2", "nef", "arw", "dng", "svg"]
         let videoExtensions = ["mp4", "mov", "m4v", "avi", "mkv", "wmv", "flv", "webm", "mpeg", "mpg", "3gp"]
@@ -537,9 +537,9 @@ struct MediaMetadata {
         if imageExtensions.contains(ext) {
             loadImageMetadata(from: url)
         } else if videoExtensions.contains(ext) {
-            loadVideoMetadata(from: url)
+            await loadVideoMetadata(from: url)
         } else if audioExtensions.contains(ext) {
-            loadAudioMetadata(from: url)
+            await loadAudioMetadata(from: url)
         } else if ext == "pdf" {
             loadPDFMetadata(from: url)
         } else if archiveExtensions.contains(ext) {
@@ -787,37 +787,38 @@ struct MediaMetadata {
         }
     }
 
-    private mutating func loadVideoMetadata(from url: URL) {
+    private mutating func loadVideoMetadata(from url: URL) async {
         let asset = AVURLAsset(url: url)
 
         // Duration
-        let duration = asset.duration
-        if duration.seconds > 0 {
+        if let duration = try? await asset.load(.duration),
+           duration.seconds > 0 {
             videoInfo.append(("Duration", formatDuration(duration.seconds)))
         }
 
         // Video track info
-        if let videoTrack = asset.tracks(withMediaType: .video).first {
-            let size = videoTrack.naturalSize
-            let transform = videoTrack.preferredTransform
-            let isPortrait = transform.a == 0 && abs(transform.b) == 1
-            let width = isPortrait ? Int(size.height) : Int(size.width)
-            let height = isPortrait ? Int(size.width) : Int(size.height)
+        if let videoTrack = (try? await asset.loadTracks(withMediaType: .video))?.first {
+            let size = (try? await videoTrack.load(.naturalSize)) ?? .zero
+            let transform = (try? await videoTrack.load(.preferredTransform)) ?? .identity
+            if size != .zero {
+                let isPortrait = transform.a == 0 && abs(transform.b) == 1
+                let width = isPortrait ? Int(size.height) : Int(size.width)
+                let height = isPortrait ? Int(size.width) : Int(size.height)
+                videoInfo.append(("Resolution", "\(width) × \(height)"))
+            }
 
-            videoInfo.append(("Resolution", "\(width) × \(height)"))
-
-            let frameRate = videoTrack.nominalFrameRate
+            let frameRate = (try? await videoTrack.load(.nominalFrameRate)) ?? 0
             if frameRate > 0 {
                 videoInfo.append(("Frame Rate", String(format: "%.2f fps", frameRate)))
             }
 
-            let bitRate = videoTrack.estimatedDataRate
+            let bitRate = (try? await videoTrack.load(.estimatedDataRate)) ?? 0
             if bitRate > 0 {
                 videoInfo.append(("Video Bitrate", formatBitrate(bitRate)))
             }
 
             // Codec
-            if let formatDescriptions = videoTrack.formatDescriptions as? [CMFormatDescription],
+            if let formatDescriptions = try? await videoTrack.load(.formatDescriptions),
                let formatDesc = formatDescriptions.first {
                 let codec = CMFormatDescriptionGetMediaSubType(formatDesc)
                 let codecString = fourCharCodeToString(codec)
@@ -826,8 +827,8 @@ struct MediaMetadata {
         }
 
         // Audio track info
-        if let audioTrack = asset.tracks(withMediaType: .audio).first {
-            if let formatDescriptions = audioTrack.formatDescriptions as? [CMFormatDescription],
+        if let audioTrack = (try? await asset.loadTracks(withMediaType: .audio))?.first {
+            if let formatDescriptions = try? await audioTrack.load(.formatDescriptions),
                let formatDesc = formatDescriptions.first {
                 if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
                     let sampleRate = asbd.pointee.mSampleRate
@@ -843,28 +844,28 @@ struct MediaMetadata {
                 audioInfo.append(("Audio Codec", codecString))
             }
 
-            let bitRate = audioTrack.estimatedDataRate
+            let bitRate = (try? await audioTrack.load(.estimatedDataRate)) ?? 0
             if bitRate > 0 {
                 audioInfo.append(("Audio Bitrate", formatBitrate(bitRate)))
             }
         }
 
         // Metadata
-        loadAVMetadata(from: asset)
+        await loadAVMetadata(from: asset)
     }
 
-    private mutating func loadAudioMetadata(from url: URL) {
+    private mutating func loadAudioMetadata(from url: URL) async {
         let asset = AVURLAsset(url: url)
 
         // Duration
-        let duration = asset.duration
-        if duration.seconds > 0 {
+        if let duration = try? await asset.load(.duration),
+           duration.seconds > 0 {
             audioInfo.append(("Duration", formatDuration(duration.seconds)))
         }
 
         // Audio track info
-        if let audioTrack = asset.tracks(withMediaType: .audio).first {
-            if let formatDescriptions = audioTrack.formatDescriptions as? [CMFormatDescription],
+        if let audioTrack = (try? await asset.loadTracks(withMediaType: .audio))?.first {
+            if let formatDescriptions = try? await audioTrack.load(.formatDescriptions),
                let formatDesc = formatDescriptions.first {
                 if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
                     let sampleRate = asbd.pointee.mSampleRate
@@ -885,22 +886,22 @@ struct MediaMetadata {
                 audioInfo.append(("Codec", codecString))
             }
 
-            let bitRate = audioTrack.estimatedDataRate
+            let bitRate = (try? await audioTrack.load(.estimatedDataRate)) ?? 0
             if bitRate > 0 {
                 audioInfo.append(("Bitrate", formatBitrate(bitRate)))
             }
         }
 
         // Metadata
-        loadAVMetadata(from: asset)
+        await loadAVMetadata(from: asset)
     }
 
-    private mutating func loadAVMetadata(from asset: AVURLAsset) {
-        let metadata = asset.metadata
+    private mutating func loadAVMetadata(from asset: AVURLAsset) async {
+        guard let metadata = try? await asset.load(.metadata) else { return }
 
         for item in metadata {
             guard let key = item.commonKey?.rawValue ?? item.key as? String,
-                  let value = item.stringValue else { continue }
+                  let value = try? await item.load(.stringValue) else { continue }
 
             switch key {
             case "title", AVMetadataKey.commonKeyTitle.rawValue:
@@ -1167,6 +1168,7 @@ struct MediaMetadata {
 }
 
 struct FileInfoWindow: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let item: FileItem
     @Binding var isPresented: Bool
 
@@ -1174,7 +1176,7 @@ struct FileInfoWindow: View {
         VStack(spacing: 0) {
             // Title bar
             HStack {
-                Text("Info - \(item.name)")
+                Text("Info - \(item.displayName(showFileExtensions: appSettings.showFileExtensions))")
                     .font(.headline)
                     .lineLimit(1)
                 Spacer()

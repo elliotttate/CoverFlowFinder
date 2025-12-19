@@ -75,6 +75,11 @@ enum SortDirection: String, Codable {
     }
 }
 
+struct SortState: Equatable {
+    let column: ListColumn
+    let direction: SortDirection
+}
+
 // Observable column configuration manager
 class ListColumnConfigManager: ObservableObject {
     static let shared = ListColumnConfigManager()
@@ -159,6 +164,10 @@ class ListColumnConfigManager: ObservableObject {
         sortDirection = .ascending
     }
 
+    func sortStateSnapshot() -> SortState {
+        SortState(column: sortColumn, direction: sortDirection)
+    }
+
     private func saveConfig() {
         let config = SavedConfig(columns: columns, sortColumn: sortColumn, sortDirection: sortDirection)
         if let data = try? JSONEncoder().encode(config) {
@@ -173,44 +182,50 @@ class ListColumnConfigManager: ObservableObject {
     }
 
     // Sort items based on current configuration
-    func sortedItems(_ items: [FileItem]) -> [FileItem] {
-        let sorted = items.sorted { item1, item2 in
-            let result: Bool
-            switch sortColumn {
+    func sortedItems(_ items: [FileItem], foldersFirst: Bool = true) -> [FileItem] {
+        Self.sortedItems(items, sortState: sortStateSnapshot(), foldersFirst: foldersFirst)
+    }
+
+    static func sortedItems(_ items: [FileItem], sortState: SortState, foldersFirst: Bool = true) -> [FileItem] {
+        items.sorted { item1, item2 in
+            // Folders always come first
+            if foldersFirst, item1.isDirectory != item2.isDirectory {
+                return item1.isDirectory
+            }
+
+            let comparison: ComparisonResult
+            switch sortState.column {
             case .name:
-                result = item1.name.localizedStandardCompare(item2.name) == .orderedAscending
+                comparison = item1.name.localizedStandardCompare(item2.name)
             case .dateModified:
                 let date1 = item1.modificationDate ?? Date.distantPast
                 let date2 = item2.modificationDate ?? Date.distantPast
-                result = date1 < date2
+                comparison = date1.compare(date2)
             case .dateCreated:
                 let date1 = item1.creationDate ?? Date.distantPast
                 let date2 = item2.creationDate ?? Date.distantPast
-                result = date1 < date2
+                comparison = date1.compare(date2)
             case .size:
-                result = item1.size < item2.size
+                if item1.size == item2.size {
+                    comparison = .orderedSame
+                } else {
+                    comparison = item1.size < item2.size ? .orderedAscending : .orderedDescending
+                }
             case .kind:
-                result = kindDescription(for: item1) < kindDescription(for: item2)
+                comparison = item1.kindDescription.localizedStandardCompare(item2.kindDescription)
             case .tags:
-                // Tags sorting - for now just by name as we don't have tags implemented
-                result = item1.name.localizedStandardCompare(item2.name) == .orderedAscending
+                let tags1 = FileTagManager.getTags(for: item1.url).joined(separator: ",")
+                let tags2 = FileTagManager.getTags(for: item2.url).joined(separator: ",")
+                comparison = tags1.localizedCaseInsensitiveCompare(tags2)
             }
-            return sortDirection == .ascending ? result : !result
-        }
-        return sorted
-    }
 
-    private func kindDescription(for item: FileItem) -> String {
-        if item.isDirectory { return "Folder" }
-        switch item.fileType {
-        case .image: return "Image"
-        case .video: return "Video"
-        case .audio: return "Audio"
-        case .document: return "Document"
-        case .code: return "Source Code"
-        case .archive: return "Archive"
-        case .application: return "Application"
-        default: return "Document"
+            if comparison == .orderedSame {
+                return item1.name.localizedStandardCompare(item2.name) == .orderedAscending
+            }
+
+            return sortState.direction == .ascending
+                ? comparison == .orderedAscending
+                : comparison == .orderedDescending
         }
     }
 }

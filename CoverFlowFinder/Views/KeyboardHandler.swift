@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import Quartz
 
 // Global keyboard manager - singleton with single event monitor
@@ -128,7 +129,7 @@ struct InstantTapModifier<ID: Hashable>: ViewModifier {
     let onDoubleClick: () -> Void
 
     @StateObject private var clickState = ClickState()
-    private let doubleClickThreshold: TimeInterval = 0.3
+    private let doubleClickThreshold: TimeInterval = NSEvent.doubleClickInterval
 
     func body(content: Content) -> some View {
         content
@@ -172,6 +173,7 @@ extension View {
 }
 
 struct InlineRenameField: View {
+    @EnvironmentObject private var settings: AppSettings
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let font: Font
@@ -221,7 +223,7 @@ struct InlineRenameField: View {
                     }
                 }
         } else {
-            Text(item.name)
+            Text(item.displayName(showFileExtensions: settings.showFileExtensions))
                 .font(font)
                 .lineLimit(lineLimit)
                 .multilineTextAlignment(alignment)

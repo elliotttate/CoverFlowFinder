@@ -3,10 +3,12 @@ import SwiftUI
 @main
 struct CoverFlowFinderApp: App {
     @FocusedValue(\.viewModel) var viewModel
+    @StateObject private var settings = AppSettings.shared
 
     var body: some Scene {
         WindowGroup {
             ContentView()
+                .environmentObject(settings)
         }
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified(showsTitle: true))
@@ -158,6 +160,10 @@ struct CoverFlowFinderApp: App {
                 }
                 .keyboardShortcut("a", modifiers: [.command, .shift])
             }
+        }
+        Settings {
+            SettingsView()
+                .environmentObject(settings)
         }
     }
 }

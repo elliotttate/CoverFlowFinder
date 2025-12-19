@@ -32,12 +32,20 @@ struct FinderTag: Identifiable, Hashable {
 /// Helper to read and write file tags using extended attributes
 enum FileTagManager {
     private static let tagAttributeName = "com.apple.metadata:_kMDItemUserTags"
+    private static var tagCache: [URL: [String]] = [:]
+    private static let cacheQueue = DispatchQueue(label: "com.coverflowfinder.tagcache", qos: .userInitiated)
 
     /// Read tags from a file URL
     static func getTags(for url: URL) -> [String] {
+        if let cached = cacheQueue.sync(execute: { tagCache[url] }) {
+            return cached
+        }
         guard let resourceValues = try? url.resourceValues(forKeys: [.tagNamesKey]),
               let tags = resourceValues.tagNames else {
             return []
+        }
+        cacheQueue.async {
+            tagCache[url] = tags
         }
         return tags
     }
@@ -47,23 +55,22 @@ enum FileTagManager {
         // Use xattr command to set tags (macOS stores tags as a plist in extended attributes)
         let tagsWithNewlines = tags.map { $0 + "\n" }
         if let plistData = try? PropertyListSerialization.data(fromPropertyList: tagsWithNewlines, format: .binary, options: 0) {
-            do {
-                try url.withUnsafeFileSystemRepresentation { fileSystemPath in
-                    guard let path = fileSystemPath else { return }
-                    let result = plistData.withUnsafeBytes { bytes in
+            url.withUnsafeFileSystemRepresentation { fileSystemPath in
+                guard let path = fileSystemPath else { return }
+                let result = plistData.withUnsafeBytes { bytes in
+                    setxattr(path, tagAttributeName, bytes.baseAddress, bytes.count, 0, 0)
+                }
+                if result != 0 {
+                    // If setxattr fails, try removing the attribute first
+                    removexattr(path, tagAttributeName, 0)
+                    _ = plistData.withUnsafeBytes { bytes in
                         setxattr(path, tagAttributeName, bytes.baseAddress, bytes.count, 0, 0)
                     }
-                    if result != 0 {
-                        // If setxattr fails, try removing the attribute first
-                        removexattr(path, tagAttributeName, 0)
-                        _ = plistData.withUnsafeBytes { bytes in
-                            setxattr(path, tagAttributeName, bytes.baseAddress, bytes.count, 0, 0)
-                        }
-                    }
                 }
-            } catch {
-                // Silently fail
             }
+        }
+        cacheQueue.async {
+            tagCache[url] = tags
         }
     }
 
@@ -92,6 +99,12 @@ enum FileTagManager {
             addTag(tag, to: url)
         }
     }
+
+    static func invalidateCache(for url: URL) {
+        cacheQueue.async {
+            tagCache.removeValue(forKey: url)
+        }
+    }
 }
 
 /// Cache for file icons to avoid repeated NSWorkspace lookups
@@ -114,10 +127,10 @@ private class IconCache {
         cache.countLimit = 500
 
         // Pre-load generic icons (these are instant)
-        genericImageIcon = NSWorkspace.shared.icon(forFileType: UTType.image.identifier)
-        genericVideoIcon = NSWorkspace.shared.icon(forFileType: UTType.movie.identifier)
-        genericAudioIcon = NSWorkspace.shared.icon(forFileType: UTType.audio.identifier)
-        genericFolderIcon = NSWorkspace.shared.icon(forFileType: UTType.folder.identifier)
+        genericImageIcon = NSWorkspace.shared.icon(for: .image)
+        genericVideoIcon = NSWorkspace.shared.icon(for: .movie)
+        genericAudioIcon = NSWorkspace.shared.icon(for: .audio)
+        genericFolderIcon = NSWorkspace.shared.icon(for: .folder)
     }
 
     func icon(for url: URL) -> NSImage {
@@ -149,7 +162,7 @@ private class IconCache {
         case .video: return genericVideoIcon
         case .audio: return genericAudioIcon
         case .folder: return genericFolderIcon
-        default: return NSWorkspace.shared.icon(forFileType: UTType.data.identifier)
+        default: return NSWorkspace.shared.icon(for: .data)
         }
     }
 }
@@ -325,11 +338,34 @@ struct FileItem: Identifiable, Hashable, Transferable {
         return formatter.string(from: date)
     }
 
+    var kindDescription: String {
+        if isDirectory { return "Folder" }
+        switch fileType {
+        case .image: return "Image"
+        case .video: return "Video"
+        case .audio: return "Audio"
+        case .document: return "Document"
+        case .code: return "Source Code"
+        case .archive: return "Archive"
+        case .application: return "Application"
+        default: return "Document"
+        }
+    }
+
     func hash(into hasher: inout Hasher) {
         hasher.combine(url)
     }
 
     static func == (lhs: FileItem, rhs: FileItem) -> Bool {
         lhs.url == rhs.url
+    }
+}
+
+extension FileItem {
+    func displayName(showFileExtensions: Bool) -> String {
+        if showFileExtensions || isDirectory {
+            return name
+        }
+        return nameWithoutExtension
     }
 }

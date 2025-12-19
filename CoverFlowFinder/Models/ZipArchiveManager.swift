@@ -2,6 +2,7 @@ import Foundation
 import AppKit
 import UniformTypeIdentifiers
 import Compression
+import CryptoKit
 
 /// Represents an entry in a ZIP archive
 struct ZipEntry: Identifiable, Hashable {
@@ -27,6 +28,9 @@ class ZipArchiveManager {
     static let shared = ZipArchiveManager()
 
     private init() {}
+
+    private let extractionRoot = FileManager.default.temporaryDirectory
+        .appendingPathComponent("CoverFlowFinder-ArchivePreview", isDirectory: true)
 
     // ZIP signatures
     private let endOfCentralDirSignature: UInt32 = 0x06054b50
@@ -116,6 +120,11 @@ class ZipArchiveManager {
             throw ZipError.cannotExtractDirectory
         }
 
+        let tempFile = extractionURL(for: entry, in: zipURL)
+        if FileManager.default.fileExists(atPath: tempFile.path) {
+            return tempFile
+        }
+
         let fileHandle = try FileHandle(forReadingFrom: zipURL)
         defer { try? fileHandle.close() }
 
@@ -158,9 +167,9 @@ class ZipArchiveManager {
             throw ZipError.unsupportedCompression(entry.compressionMethod)
         }
 
-        // Write to temp file
-        let tempDir = FileManager.default.temporaryDirectory
-        let tempFile = tempDir.appendingPathComponent(entry.name)
+        // Write to temp file (stable, hashed path)
+        try FileManager.default.createDirectory(at: extractionRoot, withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: tempFile)
         try decompressedData.write(to: tempFile)
 
         return tempFile
@@ -347,6 +356,15 @@ class ZipArchiveManager {
         }
 
         return Data(bytes: destinationBuffer, count: decodedSize)
+    }
+
+    private func extractionURL(for entry: ZipEntry, in zipURL: URL) -> URL {
+        let mtime = (try? zipURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate?.timeIntervalSince1970) ?? 0
+        let key = "\(zipURL.path)|\(mtime)|\(entry.path)"
+        let hash = SHA256.hash(data: Data(key.utf8)).compactMap { String(format: "%02x", $0) }.joined()
+        let ext = (entry.name as NSString).pathExtension
+        let filename = ext.isEmpty ? hash : "\(hash).\(ext)"
+        return extractionRoot.appendingPathComponent(filename)
     }
 }
 

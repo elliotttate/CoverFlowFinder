@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 import Quartz
 
@@ -65,11 +66,10 @@ struct DualPaneView: View {
                 )
             }
         }
-        .background(QuickLookHost())
         .onAppear {
             // Select first item in left pane if nothing selected
-            if leftViewModel.selectedItems.isEmpty && !leftViewModel.items.isEmpty {
-                leftViewModel.selectItem(leftViewModel.items[0])
+            if leftViewModel.selectedItems.isEmpty && !leftViewModel.filteredItems.isEmpty {
+                leftViewModel.selectItem(leftViewModel.filteredItems[0])
             }
             registerKeyboardHandler(forPane: activePane)
         }
@@ -131,7 +131,12 @@ struct DualPaneView: View {
                     return true
                 case 49: // Space
                     if let selectedItem = vm.selectedItems.first {
-                        QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { offset in
+                        guard let previewURL = vm.previewURL(for: selectedItem) else {
+                            NSSound.beep()
+                            return true
+                        }
+
+                        QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
                             self.navigateInViewModel(vm, by: offset)
                         }
                     }
@@ -144,27 +149,33 @@ struct DualPaneView: View {
     }
 
     private func navigateInViewModel(_ vm: FileBrowserViewModel, by offset: Int) {
-        guard !vm.items.isEmpty else { return }
+        let items = vm.filteredItems
+        guard !items.isEmpty else { return }
 
         let currentIndex: Int
         if let selectedItem = vm.selectedItems.first,
-           let index = vm.items.firstIndex(of: selectedItem) {
+           let index = items.firstIndex(of: selectedItem) {
             currentIndex = index
         } else {
             currentIndex = -1
         }
 
-        let newIndex = max(0, min(vm.items.count - 1, currentIndex + offset))
-        let newItem = vm.items[newIndex]
+        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
+        let newItem = items[newIndex]
         vm.selectItem(newItem)
 
         // Refresh Quick Look if visible
-        QuickLookControllerView.shared.updatePreview(for: newItem.url)
+        if let previewURL = vm.previewURL(for: newItem) {
+            QuickLookControllerView.shared.updatePreview(for: previewURL)
+        } else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+        }
     }
 
 }
 
 struct PaneView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject var otherViewModel: FileBrowserViewModel
     let isActive: Bool
@@ -232,66 +243,68 @@ struct PaneView: View {
             Divider()
 
             // Path bar
-            HStack(spacing: 4) {
-                if isEditingPath {
-                    TextField("Path", text: $editPathText)
-                        .textFieldStyle(.plain)
-                        .font(.caption)
-                        .focused($isPathFieldFocused)
-                        .onSubmit { navigateToEditedPath() }
-                        .onExitCommand { cancelPathEditing() }
-                        .onAppear {
-                            editPathText = viewModel.currentPath.path
-                            isPathFieldFocused = true
-                        }
-
-                    Button(action: { navigateToEditedPath() }) {
-                        Image(systemName: "arrow.right.circle.fill")
+            if appSettings.showPathBar {
+                HStack(spacing: 4) {
+                    if isEditingPath {
+                        TextField("Path", text: $editPathText)
+                            .textFieldStyle(.plain)
                             .font(.caption)
-                            .foregroundColor(.accentColor)
-                    }
-                    .buttonStyle(.plain)
+                            .focused($isPathFieldFocused)
+                            .onSubmit { navigateToEditedPath() }
+                            .onExitCommand { cancelPathEditing() }
+                            .onAppear {
+                                editPathText = viewModel.currentPath.path
+                                isPathFieldFocused = true
+                            }
 
-                    Button(action: { cancelPathEditing() }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                } else {
-                    HStack(spacing: 4) {
-                        ForEach(pathComponents, id: \.self) { component in
-                            Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
+                        Button(action: { navigateToEditedPath() }) {
+                            Image(systemName: "arrow.right.circle.fill")
                                 .font(.caption)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    viewModel.navigateToAndSelectCurrent(component)
-                                    onActivate()
-                                }
+                                .foregroundColor(.accentColor)
+                        }
+                        .buttonStyle(.plain)
 
-                            if component != viewModel.currentPath {
-                                Image(systemName: "chevron.right")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
+                        Button(action: { cancelPathEditing() }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        HStack(spacing: 4) {
+                            ForEach(pathComponents, id: \.self) { component in
+                                Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
+                                    .font(.caption)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        viewModel.navigateToAndSelectCurrent(component)
+                                        onActivate()
+                                    }
+
+                                if component != viewModel.currentPath {
+                                    Image(systemName: "chevron.right")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
                             }
                         }
+
+                        Rectangle()
+                            .fill(Color.primary.opacity(0.001))
+                            .contentShape(Rectangle())
+                            .onTapGesture(count: 2) {
+                                startPathEditing()
+                            }
                     }
-
-                    Rectangle()
-                        .fill(Color.primary.opacity(0.001))
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) {
-                            startPathEditing()
-                        }
                 }
-            }
-            .padding(.horizontal, 12)
-            .frame(height: 24)
-            .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+                .padding(.horizontal, 12)
+                .frame(height: 24)
+                .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
 
-            Divider()
+                Divider()
+            }
 
             // Content with drop support
             Group {
@@ -315,22 +328,24 @@ struct PaneView: View {
             Divider()
 
             // Status bar
-            HStack {
-                Text("\(viewModel.items.count) items")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-
-                Spacer()
-
-                if !viewModel.selectedItems.isEmpty {
-                    Text("\(viewModel.selectedItems.count) selected")
-                        .font(.caption)
+            if appSettings.showStatusBar {
+                HStack {
+                    Text("\(viewModel.filteredItems.count) items")
+                        .font(appSettings.compactListDetailFont)
                         .foregroundColor(.secondary)
+
+                    Spacer()
+
+                    if !viewModel.selectedItems.isEmpty {
+                        Text("\(viewModel.selectedItems.count) selected")
+                            .font(appSettings.compactListDetailFont)
+                            .foregroundColor(.secondary)
+                    }
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .background(Color(nsColor: .controlBackgroundColor))
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 4)
-            .background(Color(nsColor: .controlBackgroundColor))
         }
         .background(isActive ? Color.clear : Color(nsColor: .windowBackgroundColor).opacity(0.5))
         .overlay(
@@ -349,8 +364,9 @@ struct PaneView: View {
                 guard let data = data as? Data,
                       let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
                 DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [sourceURL])
-                    otherViewModel.refresh()
+                    viewModel.handleDrop(urls: [sourceURL]) {
+                        otherViewModel.refresh()
+                    }
                 }
             }
         }
@@ -390,6 +406,7 @@ struct PaneView: View {
 }
 
 struct PaneListView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
     @State private var dropTargetedItemID: UUID?
@@ -397,29 +414,29 @@ struct PaneListView: View {
     var body: some View {
         ScrollViewReader { scrollProxy in
             List {
-                ForEach(viewModel.items) { item in
+                ForEach(viewModel.filteredItems) { item in
                     let isSelected = viewModel.selectedItems.contains(item)
                     HStack(spacing: 8) {
                         Image(nsImage: item.icon)
                             .resizable()
                             .aspectRatio(contentMode: .fit)
-                            .frame(width: 16, height: 16)
+                            .frame(width: appSettings.compactListIconSize, height: appSettings.compactListIconSize)
 
-                        InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
+                        InlineRenameField(item: item, viewModel: viewModel, font: appSettings.compactListFont, alignment: .leading, lineLimit: 1)
 
-                        if !item.tags.isEmpty {
+                        if appSettings.showItemTags, !item.tags.isEmpty {
                             TagDotsView(tags: item.tags)
                         }
 
                         Spacer()
 
                         Text(item.formattedSize)
-                            .font(.caption)
+                            .font(appSettings.compactListDetailFont)
                             .foregroundColor(.secondary)
                             .frame(width: 60, alignment: .trailing)
 
                         Text(item.formattedDate)
-                            .font(.caption)
+                            .font(appSettings.compactListDetailFont)
                             .foregroundColor(.secondary)
                             .frame(width: 100, alignment: .trailing)
                     }
@@ -440,7 +457,8 @@ struct PaneListView: View {
                     .contentShape(Rectangle())
                     .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
                     .onDrag {
-                        NSItemProvider(object: item.url as NSURL)
+                        guard !item.isFromArchive else { return NSItemProvider() }
+                        return NSItemProvider(object: item.url as NSURL)
                     }
                     .onDrop(of: [.fileURL], delegate: DualPaneFolderDropDelegate(
                         item: item,
@@ -451,15 +469,20 @@ struct PaneListView: View {
                         id: item.id,
                         onSingleClick: {
                             onActivate()
-                            if let index = viewModel.items.firstIndex(of: item) {
+                            if let index = viewModel.filteredItems.firstIndex(of: item) {
                                 let modifiers = NSEvent.modifierFlags
                                 viewModel.handleSelection(
                                     item: item,
                                     index: index,
-                                    in: viewModel.items,
+                                    in: viewModel.filteredItems,
                                     withShift: modifiers.contains(.shift),
                                     withCommand: modifiers.contains(.command)
                                 )
+                                if let previewURL = viewModel.previewURL(for: item) {
+                                    QuickLookControllerView.shared.updatePreview(for: previewURL)
+                                } else {
+                                    QuickLookControllerView.shared.updatePreview(for: nil)
+                                }
                             }
                         },
                         onDoubleClick: {
@@ -489,6 +512,7 @@ struct PaneListView: View {
 }
 
 struct PaneIconView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
     let onColumnsCalculated: (Int) -> Void
@@ -497,14 +521,19 @@ struct PaneIconView: View {
     @State private var dropTargetedItemID: UUID?
     private let thumbnailCache = ThumbnailCacheManager.shared
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 80, maximum: 100), spacing: 16)
-    ]
+    private var cellWidth: CGFloat {
+        appSettings.dualPaneIconSize + 32
+    }
+
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: cellWidth, maximum: cellWidth), spacing: appSettings.dualPaneGridSpacing)]
+    }
 
     private func calculateColumns(width: CGFloat) -> Int {
-        let availableWidth = width - 32
-        let cols = Int((availableWidth + 16) / 96)
-        return max(1, cols)
+        let availableWidth = max(0, width - 32)
+        let spacing = appSettings.dualPaneGridSpacing
+        let columns = Int((availableWidth + spacing) / (cellWidth + spacing))
+        return max(1, columns)
     }
 
     private func loadThumbnail(for item: FileItem) {
@@ -532,19 +561,19 @@ struct PaneIconView: View {
         GeometryReader { geometry in
             ScrollViewReader { scrollProxy in
                 ScrollView {
-                    LazyVGrid(columns: columns, spacing: 16) {
-                        ForEach(viewModel.items) { item in
+                    LazyVGrid(columns: columns, spacing: appSettings.dualPaneGridSpacing) {
+                        ForEach(viewModel.filteredItems) { item in
                             let isSelected = viewModel.selectedItems.contains(item)
                             VStack(spacing: 4) {
                                 Image(nsImage: thumbnails[item.url] ?? item.icon)
                                     .resizable()
                                     .aspectRatio(contentMode: .fit)
-                                    .frame(width: 48, height: 48)
+                                    .frame(width: appSettings.dualPaneIconSize, height: appSettings.dualPaneIconSize)
 
-                                InlineRenameField(item: item, viewModel: viewModel, font: .caption, alignment: .center, lineLimit: 2)
-                                    .frame(width: 80)
+                                InlineRenameField(item: item, viewModel: viewModel, font: appSettings.dualPaneFont, alignment: .center, lineLimit: 2)
+                                    .frame(width: cellWidth - 16)
 
-                                if !item.tags.isEmpty {
+                                if appSettings.showItemTags, !item.tags.isEmpty {
                                     TagDotsView(tags: item.tags)
                                 }
                             }
@@ -565,7 +594,8 @@ struct PaneIconView: View {
                             .contentShape(Rectangle())
                             .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
                             .onDrag {
-                                NSItemProvider(object: item.url as NSURL)
+                                guard !item.isFromArchive else { return NSItemProvider() }
+                                return NSItemProvider(object: item.url as NSURL)
                             }
                             .onDrop(of: [.fileURL], delegate: DualPaneFolderDropDelegate(
                                 item: item,
@@ -576,15 +606,20 @@ struct PaneIconView: View {
                                 id: item.id,
                                 onSingleClick: {
                                     onActivate()
-                                    if let index = viewModel.items.firstIndex(of: item) {
+                                    if let index = viewModel.filteredItems.firstIndex(of: item) {
                                         let modifiers = NSEvent.modifierFlags
                                         viewModel.handleSelection(
                                             item: item,
                                             index: index,
-                                            in: viewModel.items,
+                                            in: viewModel.filteredItems,
                                             withShift: modifiers.contains(.shift),
                                             withCommand: modifiers.contains(.command)
                                         )
+                                        if let previewURL = viewModel.previewURL(for: item) {
+                                            QuickLookControllerView.shared.updatePreview(for: previewURL)
+                                        } else {
+                                            QuickLookControllerView.shared.updatePreview(for: nil)
+                                        }
                                     }
                                 },
                                 onDoubleClick: {
@@ -607,6 +642,12 @@ struct PaneIconView: View {
                 .onChange(of: geometry.size.width) { newWidth in
                     onColumnsCalculated(calculateColumns(width: newWidth))
                 }
+                .onChange(of: appSettings.iconGridIconSize) { _ in
+                    onColumnsCalculated(calculateColumns(width: geometry.size.width))
+                }
+                .onChange(of: appSettings.iconGridSpacing) { _ in
+                    onColumnsCalculated(calculateColumns(width: geometry.size.width))
+                }
                 .onChange(of: viewModel.selectedItems) { newSelection in
                     if let firstSelected = newSelection.first {
                         withAnimation {
@@ -627,7 +668,7 @@ struct DualPaneFolderDropDelegate: DropDelegate {
     @Binding var dropTargetedItemID: UUID?
 
     func validateDrop(info: DropInfo) -> Bool {
-        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
     }
 
     func dropEntered(info: DropInfo) {
@@ -643,13 +684,13 @@ struct DualPaneFolderDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
         let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
         return DropProposal(operation: operation)
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        guard item.isDirectory else { return false }
+        guard item.isDirectory && !item.isFromArchive else { return false }
 
         let providers = info.itemProviders(for: [.fileURL])
         for provider in providers {

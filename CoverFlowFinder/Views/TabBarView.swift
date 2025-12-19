@@ -1,7 +1,7 @@
 import SwiftUI
 
 @MainActor
-struct BrowserTab: Identifiable, Equatable {
+struct BrowserTab: Identifiable {
     let id: UUID
     let viewModel: FileBrowserViewModel
 
@@ -14,9 +14,6 @@ struct BrowserTab: Identifiable, Equatable {
         }
     }
 
-    static func == (lhs: BrowserTab, rhs: BrowserTab) -> Bool {
-        lhs.id == rhs.id
-    }
 }
 
 struct TabBarView: View {
