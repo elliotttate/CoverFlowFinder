@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import UniformTypeIdentifiers
 import Quartz
 
@@ -13,6 +14,10 @@ struct QuadPaneView: View {
     @State private var topRightViewMode: PaneViewMode = .list
     @State private var bottomLeftViewMode: PaneViewMode = .list
     @State private var bottomRightViewMode: PaneViewMode = .list
+    @State private var topLeftColumns: Int = 1
+    @State private var topRightColumns: Int = 1
+    @State private var bottomLeftColumns: Int = 1
+    @State private var bottomRightColumns: Int = 1
 
     enum Pane {
         case topLeft, topRight, bottomLeft, bottomRight
@@ -60,7 +65,8 @@ struct QuadPaneView: View {
                         otherViewModels: otherViewModels(for: .topLeft),
                         isActive: activePane == .topLeft,
                         paneViewMode: $topLeftViewMode,
-                        onActivate: { activePane = .topLeft }
+                        onActivate: { activePane = .topLeft },
+                        onColumnsCalculated: { topLeftColumns = $0 }
                     )
 
                     QuadPaneCell(
@@ -68,7 +74,8 @@ struct QuadPaneView: View {
                         otherViewModels: otherViewModels(for: .topRight),
                         isActive: activePane == .topRight,
                         paneViewMode: $topRightViewMode,
-                        onActivate: { activePane = .topRight }
+                        onActivate: { activePane = .topRight },
+                        onColumnsCalculated: { topRightColumns = $0 }
                     )
                 }
 
@@ -78,7 +85,8 @@ struct QuadPaneView: View {
                         otherViewModels: otherViewModels(for: .bottomLeft),
                         isActive: activePane == .bottomLeft,
                         paneViewMode: $bottomLeftViewMode,
-                        onActivate: { activePane = .bottomLeft }
+                        onActivate: { activePane = .bottomLeft },
+                        onColumnsCalculated: { bottomLeftColumns = $0 }
                     )
 
                     QuadPaneCell(
@@ -86,25 +94,67 @@ struct QuadPaneView: View {
                         otherViewModels: otherViewModels(for: .bottomRight),
                         isActive: activePane == .bottomRight,
                         paneViewMode: $bottomRightViewMode,
-                        onActivate: { activePane = .bottomRight }
+                        onActivate: { activePane = .bottomRight },
+                        onColumnsCalculated: { bottomRightColumns = $0 }
                     )
                 }
             }
         }
-        .background(QuickLookHost())
         .onAppear {
-            if topLeftViewModel.selectedItems.isEmpty && !topLeftViewModel.items.isEmpty {
-                topLeftViewModel.selectItem(topLeftViewModel.items[0])
+            if topLeftViewModel.selectedItems.isEmpty && !topLeftViewModel.filteredItems.isEmpty {
+                topLeftViewModel.selectItem(topLeftViewModel.filteredItems[0])
             }
             registerKeyboardHandler()
         }
         .onChange(of: activePane) { _ in
             registerKeyboardHandler()
         }
+        .onChange(of: topLeftViewMode) { _ in
+            registerKeyboardHandler()
+        }
+        .onChange(of: topRightViewMode) { _ in
+            registerKeyboardHandler()
+        }
+        .onChange(of: bottomLeftViewMode) { _ in
+            registerKeyboardHandler()
+        }
+        .onChange(of: bottomRightViewMode) { _ in
+            registerKeyboardHandler()
+        }
+        .onChange(of: topLeftColumns) { _ in
+            registerKeyboardHandler()
+        }
+        .onChange(of: topRightColumns) { _ in
+            registerKeyboardHandler()
+        }
+        .onChange(of: bottomLeftColumns) { _ in
+            registerKeyboardHandler()
+        }
+        .onChange(of: bottomRightColumns) { _ in
+            registerKeyboardHandler()
+        }
     }
 
     private func registerKeyboardHandler() {
+        let pane = activePane
         let vm = activeViewModel
+        let mode: PaneViewMode
+        let columnsCount: Int
+        switch pane {
+        case .topLeft:
+            mode = topLeftViewMode
+            columnsCount = topLeftColumns
+        case .topRight:
+            mode = topRightViewMode
+            columnsCount = topRightColumns
+        case .bottomLeft:
+            mode = bottomLeftViewMode
+            columnsCount = bottomLeftColumns
+        case .bottomRight:
+            mode = bottomRightViewMode
+            columnsCount = bottomRightColumns
+        }
+        let safeColumns = max(1, columnsCount)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             KeyboardManager.shared.setHandler {
@@ -112,10 +162,12 @@ struct QuadPaneView: View {
 
                 switch event.keyCode {
                 case 126: // Up arrow
-                    navigateInViewModel(vm, by: -1)
+                    let offset = mode == .icons ? -safeColumns : -1
+                    navigateInViewModel(vm, by: offset)
                     return true
                 case 125: // Down arrow
-                    navigateInViewModel(vm, by: 1)
+                    let offset = mode == .icons ? safeColumns : 1
+                    navigateInViewModel(vm, by: offset)
                     return true
                 case 123: // Left arrow
                     navigateInViewModel(vm, by: -1)
@@ -130,7 +182,12 @@ struct QuadPaneView: View {
                     return true
                 case 49: // Space
                     if let selectedItem = vm.selectedItems.first {
-                        QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { offset in
+                        guard let previewURL = vm.previewURL(for: selectedItem) else {
+                            NSSound.beep()
+                            return true
+                        }
+
+                        QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
                             self.navigateInViewModel(vm, by: offset)
                         }
                     }
@@ -143,29 +200,36 @@ struct QuadPaneView: View {
     }
 
     private func navigateInViewModel(_ vm: FileBrowserViewModel, by offset: Int) {
-        guard !vm.items.isEmpty else { return }
+        let items = vm.filteredItems
+        guard !items.isEmpty else { return }
 
         var currentIndex: Int
         if let selectedItem = vm.selectedItems.first,
-           let index = vm.items.firstIndex(of: selectedItem) {
+           let index = items.firstIndex(of: selectedItem) {
             currentIndex = index
         } else {
             currentIndex = -1
         }
 
-        let newIndex = max(0, min(vm.items.count - 1, currentIndex + offset))
-        let newItem = vm.items[newIndex]
+        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
+        let newItem = items[newIndex]
         vm.selectItem(newItem)
-        QuickLookControllerView.shared.updatePreview(for: newItem.url)
+        if let previewURL = vm.previewURL(for: newItem) {
+            QuickLookControllerView.shared.updatePreview(for: previewURL)
+        } else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+        }
     }
 }
 
 struct QuadPaneCell: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     let otherViewModels: [FileBrowserViewModel]
     let isActive: Bool
     @Binding var paneViewMode: QuadPaneView.PaneViewMode
     let onActivate: () -> Void
+    let onColumnsCalculated: (Int) -> Void
     @State private var isDropTargeted = false
     @State private var isEditingPath = false
     @State private var editPathText = ""
@@ -223,73 +287,75 @@ struct QuadPaneCell: View {
 
             Divider()
 
-            HStack(spacing: 2) {
-                if isEditingPath {
-                    TextField("Path", text: $editPathText)
-                        .textFieldStyle(.plain)
-                        .font(.caption2)
-                        .focused($isPathFieldFocused)
-                        .onSubmit { navigateToEditedPath() }
-                        .onExitCommand { cancelPathEditing() }
-                        .onAppear {
-                            editPathText = viewModel.currentPath.path
-                            isPathFieldFocused = true
-                        }
-
-                    Button(action: { navigateToEditedPath() }) {
-                        Image(systemName: "arrow.right.circle.fill")
+            if appSettings.showPathBar {
+                HStack(spacing: 2) {
+                    if isEditingPath {
+                        TextField("Path", text: $editPathText)
+                            .textFieldStyle(.plain)
                             .font(.caption2)
-                            .foregroundColor(.accentColor)
-                    }
-                    .buttonStyle(.plain)
+                            .focused($isPathFieldFocused)
+                            .onSubmit { navigateToEditedPath() }
+                            .onExitCommand { cancelPathEditing() }
+                            .onAppear {
+                                editPathText = viewModel.currentPath.path
+                                isPathFieldFocused = true
+                            }
 
-                    Button(action: { cancelPathEditing() }) {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                    .buttonStyle(.plain)
-                } else {
-                    HStack(spacing: 2) {
-                        ForEach(pathComponents, id: \.self) { component in
-                            Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
+                        Button(action: { navigateToEditedPath() }) {
+                            Image(systemName: "arrow.right.circle.fill")
                                 .font(.caption2)
-                                .padding(.horizontal, 4)
-                                .padding(.vertical, 1)
-                                .contentShape(Rectangle())
-                                .onTapGesture {
-                                    viewModel.navigateToAndSelectCurrent(component)
-                                    onActivate()
-                                }
+                                .foregroundColor(.accentColor)
+                        }
+                        .buttonStyle(.plain)
 
-                            if component != viewModel.currentPath {
-                                Image(systemName: "chevron.right")
-                                    .font(.system(size: 8))
-                                    .foregroundColor(.secondary)
+                        Button(action: { cancelPathEditing() }) {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                    } else {
+                        HStack(spacing: 2) {
+                            ForEach(pathComponents, id: \.self) { component in
+                                Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
+                                    .font(.caption2)
+                                    .padding(.horizontal, 4)
+                                    .padding(.vertical, 1)
+                                    .contentShape(Rectangle())
+                                    .onTapGesture {
+                                        viewModel.navigateToAndSelectCurrent(component)
+                                        onActivate()
+                                    }
+
+                                if component != viewModel.currentPath {
+                                    Image(systemName: "chevron.right")
+                                        .font(.system(size: 8))
+                                        .foregroundColor(.secondary)
+                                }
                             }
                         }
+
+                        Rectangle()
+                            .fill(Color.primary.opacity(0.001))
+                            .contentShape(Rectangle())
+                            .onTapGesture(count: 2) {
+                                startPathEditing()
+                            }
                     }
-
-                    Rectangle()
-                        .fill(Color.primary.opacity(0.001))
-                        .contentShape(Rectangle())
-                        .onTapGesture(count: 2) {
-                            startPathEditing()
-                        }
                 }
-            }
-            .padding(.horizontal, 8)
-            .frame(height: 20)
-            .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+                .padding(.horizontal, 8)
+                .frame(height: 20)
+                .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
 
-            Divider()
+                Divider()
+            }
 
             Group {
                 switch paneViewMode {
                 case .list:
                     QuadPaneListView(viewModel: viewModel, onActivate: onActivate)
                 case .icons:
-                    QuadPaneIconView(viewModel: viewModel, onActivate: onActivate)
+                    QuadPaneIconView(viewModel: viewModel, onActivate: onActivate, onColumnsCalculated: onColumnsCalculated)
                 }
             }
             .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
@@ -304,22 +370,24 @@ struct QuadPaneCell: View {
 
             Divider()
 
-            HStack {
-                Text("\(viewModel.items.count) items")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-
-                Spacer()
-
-                if !viewModel.selectedItems.isEmpty {
-                    Text("\(viewModel.selectedItems.count) selected")
-                        .font(.caption2)
+            if appSettings.showStatusBar {
+                HStack {
+                    Text("\(viewModel.filteredItems.count) items")
+                        .font(appSettings.compactListDetailFont)
                         .foregroundColor(.secondary)
+
+                    Spacer()
+
+                    if !viewModel.selectedItems.isEmpty {
+                        Text("\(viewModel.selectedItems.count) selected")
+                            .font(appSettings.compactListDetailFont)
+                            .foregroundColor(.secondary)
+                    }
                 }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Color(nsColor: .controlBackgroundColor))
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 3)
-            .background(Color(nsColor: .controlBackgroundColor))
         }
         .background(isActive ? Color.clear : Color(nsColor: .windowBackgroundColor).opacity(0.5))
         .overlay(
@@ -338,9 +406,10 @@ struct QuadPaneCell: View {
                 guard let data = data as? Data,
                       let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
                 DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [sourceURL])
-                    for other in otherViewModels {
-                        other.refresh()
+                    viewModel.handleDrop(urls: [sourceURL]) {
+                        for other in otherViewModels {
+                            other.refresh()
+                        }
                     }
                 }
             }
@@ -388,7 +457,7 @@ struct QuadPaneListView: View {
     var body: some View {
         ScrollViewReader { scrollProxy in
             List {
-                ForEach(viewModel.items) { item in
+                ForEach(viewModel.filteredItems) { item in
                     QuadPaneListRow(item: item, viewModel: viewModel, onActivate: onActivate, dropTargetedItemID: $dropTargetedItemID)
                 }
             }
@@ -405,6 +474,7 @@ struct QuadPaneListView: View {
 }
 
 struct QuadPaneListRow: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
@@ -416,18 +486,18 @@ struct QuadPaneListRow: View {
             Image(nsImage: item.icon)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: 14, height: 14)
+                .frame(width: appSettings.compactListIconSize, height: appSettings.compactListIconSize)
 
-            InlineRenameField(item: item, viewModel: viewModel, font: .caption, alignment: .leading, lineLimit: 1)
+            InlineRenameField(item: item, viewModel: viewModel, font: appSettings.compactListFont, alignment: .leading, lineLimit: 1)
 
-            if !item.tags.isEmpty {
+            if appSettings.showItemTags, !item.tags.isEmpty {
                 TagDotsView(tags: item.tags)
             }
 
             Spacer()
 
             Text(item.formattedSize)
-                .font(.caption2)
+                .font(appSettings.compactListDetailFont)
                 .foregroundColor(.secondary)
                 .frame(width: 50, alignment: .trailing)
         }
@@ -449,7 +519,8 @@ struct QuadPaneListRow: View {
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
         .onDrag {
-            NSItemProvider(object: item.url as NSURL)
+            guard !item.isFromArchive else { return NSItemProvider() }
+            return NSItemProvider(object: item.url as NSURL)
         }
         .onDrop(of: [.fileURL], delegate: QuadPaneFolderDropDelegate(
             item: item,
@@ -473,31 +544,49 @@ struct QuadPaneListRow: View {
     }
 
     private func handleClick() {
-        if let index = viewModel.items.firstIndex(of: item) {
+        if let index = viewModel.filteredItems.firstIndex(of: item) {
             let modifiers = NSEvent.modifierFlags
             viewModel.handleSelection(
                 item: item,
                 index: index,
-                in: viewModel.items,
+                in: viewModel.filteredItems,
                 withShift: modifiers.contains(.shift),
                 withCommand: modifiers.contains(.command)
             )
         }
         onActivate()
+        if let previewURL = viewModel.previewURL(for: item) {
+            QuickLookControllerView.shared.updatePreview(for: previewURL)
+        } else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+        }
     }
 }
 
 struct QuadPaneIconView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
+    let onColumnsCalculated: (Int) -> Void
 
     @State private var thumbnails: [URL: NSImage] = [:]
     @State private var dropTargetedItemID: UUID?
     private let thumbnailCache = ThumbnailCacheManager.shared
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 60, maximum: 80), spacing: 8)
-    ]
+    private var cellWidth: CGFloat {
+        appSettings.quadPaneIconSize + 32
+    }
+
+    private var columns: [GridItem] {
+        [GridItem(.adaptive(minimum: cellWidth, maximum: cellWidth), spacing: appSettings.quadPaneGridSpacing)]
+    }
+
+    private func calculateColumns(width: CGFloat) -> Int {
+        let availableWidth = max(0, width - 16)
+        let spacing = appSettings.quadPaneGridSpacing
+        let columns = Int((availableWidth + spacing) / (cellWidth + spacing))
+        return max(1, columns)
+    }
 
     private func loadThumbnail(for item: FileItem) {
         let url = item.url
@@ -521,20 +610,34 @@ struct QuadPaneIconView: View {
     }
 
     var body: some View {
-        ScrollViewReader { scrollProxy in
-            ScrollView {
-                LazyVGrid(columns: columns, spacing: 8) {
-                    ForEach(viewModel.items) { item in
-                        QuadPaneIconCell(item: item, viewModel: viewModel, onActivate: onActivate, thumbnail: thumbnails[item.url], dropTargetedItemID: $dropTargetedItemID)
-                            .onAppear { loadThumbnail(for: item) }
+        GeometryReader { geometry in
+            ScrollViewReader { scrollProxy in
+                ScrollView {
+                    LazyVGrid(columns: columns, spacing: appSettings.quadPaneGridSpacing) {
+                        ForEach(viewModel.filteredItems) { item in
+                            QuadPaneIconCell(item: item, viewModel: viewModel, onActivate: onActivate, thumbnail: thumbnails[item.url], dropTargetedItemID: $dropTargetedItemID)
+                                .onAppear { loadThumbnail(for: item) }
+                        }
                     }
+                    .padding(8)
                 }
-                .padding(8)
-            }
-            .onChange(of: viewModel.selectedItems) { newSelection in
-                if let firstSelected = newSelection.first {
-                    withAnimation {
-                        scrollProxy.scrollTo(firstSelected.id)
+                .onAppear {
+                    onColumnsCalculated(calculateColumns(width: geometry.size.width))
+                }
+                .onChange(of: geometry.size.width) { newWidth in
+                    onColumnsCalculated(calculateColumns(width: newWidth))
+                }
+                .onChange(of: appSettings.iconGridIconSize) { _ in
+                    onColumnsCalculated(calculateColumns(width: geometry.size.width))
+                }
+                .onChange(of: appSettings.iconGridSpacing) { _ in
+                    onColumnsCalculated(calculateColumns(width: geometry.size.width))
+                }
+                .onChange(of: viewModel.selectedItems) { newSelection in
+                    if let firstSelected = newSelection.first {
+                        withAnimation {
+                            scrollProxy.scrollTo(firstSelected.id)
+                        }
                     }
                 }
             }
@@ -543,6 +646,7 @@ struct QuadPaneIconView: View {
 }
 
 struct QuadPaneIconCell: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
@@ -551,20 +655,22 @@ struct QuadPaneIconCell: View {
 
     var body: some View {
         let isSelected = viewModel.selectedItems.contains(item)
+        let iconSize = appSettings.quadPaneIconSize
+        let labelWidth = iconSize + 24
         VStack(spacing: 2) {
             Image(nsImage: thumbnail ?? item.icon)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: 36, height: 36)
+                .frame(width: iconSize, height: iconSize)
 
-            InlineRenameField(item: item, viewModel: viewModel, font: .caption2, alignment: .center, lineLimit: 2)
-                .frame(width: 70, height: 28)
+            InlineRenameField(item: item, viewModel: viewModel, font: appSettings.quadPaneFont, alignment: .center, lineLimit: 2)
+                .frame(width: labelWidth, height: 28)
 
-            if !item.tags.isEmpty {
+            if appSettings.showItemTags, !item.tags.isEmpty {
                 TagDotsView(tags: item.tags)
             }
         }
-        .frame(width: 70)
+        .frame(width: labelWidth)
         .padding(4)
         .background(
             dropTargetedItemID == item.id
@@ -581,7 +687,8 @@ struct QuadPaneIconCell: View {
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
         .onDrag {
-            NSItemProvider(object: item.url as NSURL)
+            guard !item.isFromArchive else { return NSItemProvider() }
+            return NSItemProvider(object: item.url as NSURL)
         }
         .onDrop(of: [.fileURL], delegate: QuadPaneFolderDropDelegate(
             item: item,
@@ -605,17 +712,22 @@ struct QuadPaneIconCell: View {
     }
 
     private func handleClick() {
-        if let index = viewModel.items.firstIndex(of: item) {
+        if let index = viewModel.filteredItems.firstIndex(of: item) {
             let modifiers = NSEvent.modifierFlags
             viewModel.handleSelection(
                 item: item,
                 index: index,
-                in: viewModel.items,
+                in: viewModel.filteredItems,
                 withShift: modifiers.contains(.shift),
                 withCommand: modifiers.contains(.command)
             )
         }
         onActivate()
+        if let previewURL = viewModel.previewURL(for: item) {
+            QuickLookControllerView.shared.updatePreview(for: previewURL)
+        } else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+        }
     }
 }
 
@@ -627,7 +739,7 @@ struct QuadPaneFolderDropDelegate: DropDelegate {
     @Binding var dropTargetedItemID: UUID?
 
     func validateDrop(info: DropInfo) -> Bool {
-        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
     }
 
     func dropEntered(info: DropInfo) {
@@ -643,13 +755,13 @@ struct QuadPaneFolderDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
         let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
         return DropProposal(operation: operation)
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        guard item.isDirectory else { return false }
+        guard item.isDirectory && !item.isFromArchive else { return false }
 
         let providers = info.itemProviders(for: [.fileURL])
         for provider in providers {

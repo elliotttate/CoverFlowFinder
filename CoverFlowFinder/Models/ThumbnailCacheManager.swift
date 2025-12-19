@@ -67,12 +67,16 @@ class ThumbnailCacheManager {
 
     /// Check if URL has failed before (don't retry)
     func hasFailed(url: URL) -> Bool {
-        return failedURLs.contains(url)
+        queue.sync {
+            failedURLs.contains(url)
+        }
     }
 
     /// Check if request is pending
     func isPending(url: URL) -> Bool {
-        return pendingRequests[url] != nil
+        queue.sync {
+            pendingRequests[url] != nil
+        }
     }
 
     /// Increment generation (call when navigating to new folder or scrolling)
@@ -100,13 +104,15 @@ class ThumbnailCacheManager {
         let url = item.url
 
         // Skip if already failed
-        guard !failedURLs.contains(url) else {
+        let alreadyFailed = queue.sync { failedURLs.contains(url) }
+        guard !alreadyFailed else {
             completion(url, item.icon)
             return
         }
 
         // Skip if already pending
-        guard pendingRequests[url] == nil else {
+        let alreadyPending = queue.sync { pendingRequests[url] != nil }
+        guard !alreadyPending else {
             return
         }
 
@@ -353,7 +359,10 @@ class ThumbnailCacheManager {
         memoryCache.removeAllObjects()
         try? fileManager.removeItem(at: diskCacheURL)
         try? fileManager.createDirectory(at: diskCacheURL, withIntermediateDirectories: true)
-        failedURLs.removeAll()
-        pendingRequests.removeAll()
+        queue.sync {
+            failedURLs.removeAll()
+            pendingRequests.removeAll()
+            currentGeneration = 0
+        }
     }
 }

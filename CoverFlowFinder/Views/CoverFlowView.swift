@@ -4,9 +4,9 @@ import AppKit
 import Quartz
 
 struct CoverFlowView: View {
+    @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
-    @ObservedObject private var columnConfig = ListColumnConfigManager.shared
 
     @State private var sortedItemsCache: [FileItem] = []
     @State private var thumbnails: [URL: NSImage] = [:]
@@ -33,6 +33,8 @@ struct CoverFlowView: View {
                     thumbnailCount: thumbnails.count,
                     navigationGeneration: viewModel.navigationGeneration,
                     selectedItems: viewModel.selectedItems,
+                    coverScale: settings.coverFlowScaleValue,
+                    scrollSensitivity: settings.coverFlowSwipeSpeedValue,
                     onSelect: { index in
                         viewModel.coverFlowSelectedIndex = index
                         if index < sortedItemsCache.count {
@@ -45,7 +47,7 @@ struct CoverFlowView: View {
                                 withShift: modifiers.contains(.shift),
                                 withCommand: modifiers.contains(.command)
                             )
-                            QuickLookControllerView.shared.updatePreview(for: item.url)
+                            updateQuickLook(for: item)
                         }
                     },
                     onOpen: { index in
@@ -81,15 +83,26 @@ struct CoverFlowView: View {
                     },
                     onDelete: {
                         viewModel.deleteSelectedItems()
+                    },
+                    onQuickLook: { item in
+                        guard let previewURL = viewModel.previewURL(for: item) else {
+                            NSSound.beep()
+                            return
+                        }
+                        QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
+                            navigateSelection(by: offset)
+                        }
                     }
                 )
                 .frame(height: max(250, geometry.size.height * 0.45))
 
-                if !sortedItemsCache.isEmpty && viewModel.coverFlowSelectedIndex < sortedItemsCache.count {
+                if settings.coverFlowShowInfo,
+                   !sortedItemsCache.isEmpty,
+                   viewModel.coverFlowSelectedIndex < sortedItemsCache.count {
                     let selectedItem = sortedItemsCache[viewModel.coverFlowSelectedIndex]
                     VStack(spacing: 4) {
-                        Text(selectedItem.name)
-                            .font(.headline)
+                        Text(selectedItem.displayName(showFileExtensions: settings.showFileExtensions))
+                            .font(settings.coverFlowTitleFont)
                             .lineLimit(1)
                         HStack(spacing: 16) {
                             if !selectedItem.isDirectory {
@@ -99,7 +112,7 @@ struct CoverFlowView: View {
                             Text(selectedItem.formattedDate)
                                 .foregroundColor(.secondary)
                         }
-                        .font(.caption)
+                        .font(settings.coverFlowDetailFont)
                     }
                     .padding(.vertical, 8)
                     .frame(maxWidth: .infinity)
@@ -113,6 +126,7 @@ struct CoverFlowView: View {
                     selectedItems: viewModel.selectedItems,
                     onSelect: { item, index in
                         viewModel.coverFlowSelectedIndex = index
+                        updateQuickLook(for: item)
                     },
                     onOpen: { item in
                         viewModel.openItem(item)
@@ -143,22 +157,10 @@ struct CoverFlowView: View {
                 syncSelection()
             }
         }
-        .onChange(of: columnConfig.sortColumn) { _ in
-            DispatchQueue.main.async {
-                updateSortedItems()
-                loadVisibleThumbnails()
-            }
-        }
-        .onChange(of: columnConfig.sortDirection) { _ in
-            DispatchQueue.main.async {
-                updateSortedItems()
-                loadVisibleThumbnails()
-            }
-        }
         .onChange(of: viewModel.coverFlowSelectedIndex) { _ in
             DispatchQueue.main.async {
                 throttledLoadThumbnails()
-                viewModel.hydrateMetadataAroundSelection()
+                updateQuickLookForSelection()
             }
         }
     }
@@ -183,13 +185,59 @@ struct CoverFlowView: View {
     }
 
     private func updateSortedItems() {
-        sortedItemsCache = columnConfig.sortedItems(items)
-        viewModel.coverFlowSelectedIndex = min(viewModel.coverFlowSelectedIndex, max(0, sortedItemsCache.count - 1))
+        sortedItemsCache = items
+        if let selected = viewModel.selectedItems.first,
+           let index = sortedItemsCache.firstIndex(of: selected) {
+            viewModel.coverFlowSelectedIndex = index
+        } else {
+            viewModel.coverFlowSelectedIndex = min(viewModel.coverFlowSelectedIndex, max(0, sortedItemsCache.count - 1))
+        }
     }
 
     private func syncSelection() {
         guard !sortedItemsCache.isEmpty && viewModel.coverFlowSelectedIndex < sortedItemsCache.count else { return }
-        viewModel.selectedItems = [sortedItemsCache[viewModel.coverFlowSelectedIndex]]
+        if let selected = viewModel.selectedItems.first,
+           let index = sortedItemsCache.firstIndex(of: selected) {
+            viewModel.coverFlowSelectedIndex = index
+        } else if viewModel.selectedItems.isEmpty {
+            let item = sortedItemsCache[viewModel.coverFlowSelectedIndex]
+            viewModel.selectedItems = [item]
+            updateQuickLook(for: item)
+        }
+    }
+
+    private func updateQuickLook(for item: FileItem?) {
+        guard let item else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+            return
+        }
+        if let previewURL = viewModel.previewURL(for: item) {
+            QuickLookControllerView.shared.updatePreview(for: previewURL)
+        } else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+        }
+    }
+
+    private func updateQuickLookForSelection() {
+        guard !sortedItemsCache.isEmpty else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+            return
+        }
+        let index = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
+        updateQuickLook(for: sortedItemsCache[index])
+    }
+
+    private func navigateSelection(by offset: Int) {
+        guard !sortedItemsCache.isEmpty else { return }
+
+        let currentIndex = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
+        let newIndex = max(0, min(sortedItemsCache.count - 1, currentIndex + offset))
+        guard newIndex != currentIndex else { return }
+
+        viewModel.coverFlowSelectedIndex = newIndex
+        let item = sortedItemsCache[newIndex]
+        viewModel.selectItem(item)
+        updateQuickLook(for: item)
     }
 
     private func handleDrop(urls: [URL]) {
@@ -302,6 +350,8 @@ struct CoverFlowContainer: NSViewRepresentable {
     let thumbnailCount: Int  // Explicit count to force SwiftUI updates
     let navigationGeneration: Int  // Forces update on every navigation
     let selectedItems: Set<FileItem>  // Multi-selection for drag
+    let coverScale: CGFloat
+    let scrollSensitivity: CGFloat
     let onSelect: (Int) -> Void
     let onOpen: (Int) -> Void
     let onRightClick: (Int) -> Void
@@ -312,6 +362,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onCut: () -> Void
     let onPaste: () -> Void
     let onDelete: () -> Void
+    let onQuickLook: (FileItem) -> Void
 
     func makeNSView(context: Context) -> CoverFlowNSView {
         let view = CoverFlowNSView()
@@ -327,7 +378,10 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.onCut = onCut
         view.onPaste = onPaste
         view.onDelete = onDelete
+        view.onQuickLook = onQuickLook
         view.selectedItems = selectedItems
+        view.coverScale = coverScale
+        view.scrollSensitivity = scrollSensitivity
         view.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
         return view
     }
@@ -345,12 +399,15 @@ struct CoverFlowContainer: NSViewRepresentable {
         nsView.onCut = onCut
         nsView.onPaste = onPaste
         nsView.onDelete = onDelete
+        nsView.onQuickLook = onQuickLook
         nsView.selectedItems = selectedItems
+        nsView.coverScale = coverScale
+        nsView.scrollSensitivity = scrollSensitivity
         nsView.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
     }
 }
 
-class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+class CoverFlowNSView: NSView {
     var onSelect: ((Int) -> Void)?
     var onOpen: ((Int) -> Void)?
     var onRightClick: ((Int, NSPoint) -> Void)?
@@ -359,6 +416,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     var onCut: (() -> Void)?
     var onPaste: (() -> Void)?
     var onDelete: (() -> Void)?
+    var onQuickLook: ((FileItem) -> Void)?
     var selectedItems: Set<FileItem> = []  // Track multi-selection for drag
 
     private var items: [FileItem] = []
@@ -385,108 +443,22 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     private var typeAheadTimer: Timer?
     private let typeAheadTimeout: TimeInterval = 1.0
 
-    // Quick Look keyboard monitor
-    private var quickLookKeyMonitor: Any?
-
     // Dynamic sizing based on view bounds
-    private var baseCoverSize: CGFloat { min(bounds.height * 0.6, bounds.width * 0.22, 280) }
+    var coverScale: CGFloat = 1.0 {
+        didSet {
+            if coverScale != oldValue {
+                rebuildCovers()
+                needsLayout = true
+            }
+        }
+    }
+    var scrollSensitivity: CGFloat = 1.0
+
+    private var baseCoverSize: CGFloat { min(bounds.height * 0.6, bounds.width * 0.22, 280) * coverScale }
     private var coverSpacing: CGFloat { baseCoverSize * 0.22 }  // Space between side covers
     private var sideOffset: CGFloat { baseCoverSize * 0.62 }    // Distance from center to first side cover
     private let sideAngle: CGFloat = 60
     private let visibleRange = 12
-
-    // MARK: - Quick Look Support
-
-    override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
-        return true
-    }
-
-    override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
-        panel.dataSource = self
-        panel.delegate = self
-    }
-
-    override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
-        panel.dataSource = nil
-        panel.delegate = nil
-    }
-
-    func numberOfPreviewItems(in panel: QLPreviewPanel!) -> Int {
-        return 1
-    }
-
-    func previewPanel(_ panel: QLPreviewPanel!, previewItemAt index: Int) -> QLPreviewItem! {
-        guard selectedIndex >= 0 && selectedIndex < items.count else { return nil }
-        return items[selectedIndex].url as QLPreviewItem
-    }
-
-    func toggleQuickLook() {
-        guard selectedIndex >= 0 && selectedIndex < items.count else { return }
-
-        if let panel = QLPreviewPanel.shared() {
-            if panel.isVisible {
-                panel.orderOut(nil)
-                stopQuickLookKeyMonitor()
-            } else {
-                panel.orderFront(nil)
-                startQuickLookKeyMonitor()
-            }
-        }
-    }
-
-    private func startQuickLookKeyMonitor() {
-        // Remove any existing monitor
-        stopQuickLookKeyMonitor()
-
-        // Add local monitor to capture arrow keys even when Quick Look has focus
-        quickLookKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self = self,
-                  let panel = QLPreviewPanel.shared(),
-                  panel.isVisible else {
-                return event
-            }
-
-            switch event.keyCode {
-            case 123: // Left arrow - previous
-                if self.selectedIndex > 0 {
-                    self.onSelect?(self.selectedIndex - 1)
-                }
-                return nil // Consume the event
-            case 124: // Right arrow - next
-                if self.selectedIndex < self.items.count - 1 {
-                    self.onSelect?(self.selectedIndex + 1)
-                }
-                return nil // Consume the event
-            case 125: // Down arrow - next (down in list = higher index)
-                if self.selectedIndex < self.items.count - 1 {
-                    self.onSelect?(self.selectedIndex + 1)
-                }
-                return nil // Consume the event
-            case 126: // Up arrow - previous (up in list = lower index)
-                if self.selectedIndex > 0 {
-                    self.onSelect?(self.selectedIndex - 1)
-                }
-                return nil // Consume the event
-            case 49: // Space - close Quick Look
-                panel.orderOut(nil)
-                self.stopQuickLookKeyMonitor()
-                return nil
-            case 53: // Escape - close Quick Look
-                panel.orderOut(nil)
-                self.stopQuickLookKeyMonitor()
-                return nil
-            default:
-                return event
-            }
-        }
-    }
-
-    private func stopQuickLookKeyMonitor() {
-        if let monitor = quickLookKeyMonitor {
-            NSEvent.removeMonitor(monitor)
-            quickLookKeyMonitor = nil
-        }
-    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -1022,9 +994,12 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
                 itemsToDrag = [clickedItem]
             }
 
+            let draggableItems = itemsToDrag.filter { !$0.isFromArchive }
+            guard !draggableItems.isEmpty else { return }
+
             // Create dragging items for each file
             var draggingItems: [NSDraggingItem] = []
-            for (offset, item) in itemsToDrag.enumerated() {
+            for (offset, item) in draggableItems.enumerated() {
                 let pasteboardItem = NSPasteboardItem()
                 pasteboardItem.setString(item.url.absoluteString, forType: .fileURL)
 
@@ -1084,6 +1059,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 
     private func createContextMenu(for index: Int) -> NSMenu {
         let menu = NSMenu()
+        let item = index < items.count ? items[index] : nil
 
         let openItem = NSMenuItem(title: "Open", action: #selector(menuOpen(_:)), keyEquivalent: "")
         openItem.target = self
@@ -1104,10 +1080,16 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 
         let trashItem = NSMenuItem(title: "Move to Trash", action: #selector(menuTrash(_:)), keyEquivalent: "")
         trashItem.target = self
+        if let item, item.isFromArchive {
+            trashItem.isEnabled = false
+        }
         menu.addItem(trashItem)
 
         let finderItem = NSMenuItem(title: "Show in Finder", action: #selector(menuShowInFinder(_:)), keyEquivalent: "")
         finderItem.target = self
+        if let item, item.isFromArchive, item.archiveURL == nil {
+            finderItem.isEnabled = false
+        }
         menu.addItem(finderItem)
 
         return menu
@@ -1134,7 +1116,15 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     @objc private func menuShowInFinder(_ sender: NSMenuItem) {
         if selectedIndex < items.count {
             let item = items[selectedIndex]
-            NSWorkspace.shared.activateFileViewerSelecting([item.url])
+            if item.isFromArchive {
+                if let archiveURL = item.archiveURL {
+                    NSWorkspace.shared.activateFileViewerSelecting([archiveURL])
+                } else {
+                    NSSound.beep()
+                }
+            } else {
+                NSWorkspace.shared.activateFileViewerSelecting([item.url])
+            }
         }
     }
 
@@ -1227,16 +1217,18 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             delta = -event.scrollingDeltaY
         }
 
+        let adjustedDelta = delta * scrollSensitivity
+
         // Accumulate scroll for smooth single-item advancement
-        accumulatedScroll += delta
+        accumulatedScroll += adjustedDelta
 
         // Track velocity for momentum
         let now = Date()
         let timeDelta = now.timeIntervalSince(lastScrollTime)
         if timeDelta > 0 && timeDelta < 0.1 {
-            scrollVelocity = delta / CGFloat(timeDelta)
+            scrollVelocity = adjustedDelta / CGFloat(timeDelta)
         } else {
-            scrollVelocity = delta * 10
+            scrollVelocity = adjustedDelta * 10
         }
         lastScrollTime = now
 
@@ -1419,7 +1411,9 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
                 onOpen?(selectedIndex)
             }
         case 49: // Space - Quick Look
-            toggleQuickLook()
+            if selectedIndex >= 0 && selectedIndex < items.count {
+                onQuickLook?(items[selectedIndex])
+            }
         case 51: // Delete/Backspace - remove last character from type-ahead buffer (without Cmd)
             if !typeAheadBuffer.isEmpty {
                 typeAheadBuffer.removeLast()
@@ -1468,7 +1462,6 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         momentumTimer?.invalidate()
         typeAheadTimer?.invalidate()
         scrollSettleTimer?.invalidate()
-        stopQuickLookKeyMonitor()
     }
 
     // MARK: - NSDraggingSource
@@ -1514,7 +1507,8 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         if dropTargetIndex == nil,
            let hoveredIndex = hitTestCover(at: viewPoint),
            hoveredIndex < items.count,
-           items[hoveredIndex].isDirectory {
+           items[hoveredIndex].isDirectory,
+           !items[hoveredIndex].isFromArchive {
             dropTargetIndex = hoveredIndex
         }
 
@@ -1548,7 +1542,8 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         // If dropping on a folder, drop into that folder
         if let targetIndex = targetIndex,
            targetIndex < items.count,
-           items[targetIndex].isDirectory {
+           items[targetIndex].isDirectory,
+           !items[targetIndex].isFromArchive {
             onDropToFolder?(urls, items[targetIndex].url)
             return true
         }
@@ -1584,7 +1579,8 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
         for location in locations {
             if let index = hitTestCover(at: location),
                index < items.count,
-               items[index].isDirectory {
+               items[index].isDirectory,
+               !items[index].isFromArchive {
                 newTarget = index
                 break
             }
@@ -1739,7 +1735,8 @@ extension CoverFlowNSView: NSDraggingSource {
         if dropTargetIndex == nil,
            let hoveredIndex = hitTestCover(at: viewPoint),
            hoveredIndex < items.count,
-           items[hoveredIndex].isDirectory {
+           items[hoveredIndex].isDirectory,
+           !items[hoveredIndex].isFromArchive {
             dropTargetIndex = hoveredIndex
         }
 
@@ -1756,7 +1753,7 @@ extension CoverFlowNSView: NSDraggingSource {
                 }
             }
 
-            if !urls.isEmpty && targetIndex < items.count && items[targetIndex].isDirectory {
+            if !urls.isEmpty && targetIndex < items.count && items[targetIndex].isDirectory && !items[targetIndex].isFromArchive {
                 onDropToFolder?(urls, items[targetIndex].url)
             }
         }
@@ -1775,11 +1772,11 @@ struct CoverFlowFolderDropDelegate: DropDelegate {
 
     func validateDrop(info: DropInfo) -> Bool {
         // Only folders can accept drops
-        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
     }
 
     func dropEntered(info: DropInfo) {
-        if item.isDirectory {
+        if item.isDirectory && !item.isFromArchive {
             dropTargetedItemID = item.id
         }
     }
@@ -1791,14 +1788,14 @@ struct CoverFlowFolderDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
         // Option key = copy, otherwise move
         let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
         return DropProposal(operation: operation)
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        guard item.isDirectory else { return false }
+        guard item.isDirectory && !item.isFromArchive else { return false }
 
         let providers = info.itemProviders(for: [.fileURL])
         for provider in providers {
@@ -1860,8 +1857,14 @@ struct FileListSection: View {
                                     .opacity(dropTargetedItemID == item.id ? 1 : 0)
                             )
                             .onDrag {
+                                if item.isFromArchive {
+                                    return NSItemProvider()
+                                }
                                 if viewModel.selectedItems.contains(item) && viewModel.selectedItems.count > 1 {
-                                    let urls = viewModel.selectedItems.map { $0.url as NSURL }
+                                    let urls = viewModel.selectedItems
+                                        .filter { !$0.isFromArchive }
+                                        .map { $0.url as NSURL }
+                                    guard urls.first != nil else { return NSItemProvider() }
                                     let provider = NSItemProvider()
                                     provider.registerFileRepresentation(forTypeIdentifier: "public.file-url", visibility: .all) { completion in
                                         completion(urls.first as? URL, false, nil)
@@ -1937,6 +1940,7 @@ struct FileListSection: View {
 
 // Column header for CoverFlow file list
 struct CoverFlowColumnHeader: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var columnConfig: ListColumnConfigManager
 
     var body: some View {
@@ -1965,7 +1969,7 @@ struct CoverFlowColumnHeader: View {
     @ViewBuilder
     private var columnVisibilityMenu: some View {
         Text("Columns")
-            .font(.caption)
+            .font(appSettings.listDetailFont)
 
         Divider()
 
@@ -1994,6 +1998,7 @@ struct CoverFlowColumnHeader: View {
 
 // Column header cell with resize handle for CoverFlow
 struct CoverFlowColumnHeaderCell: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let settings: ColumnSettings
     let isSortColumn: Bool
     let sortDirection: SortDirection
@@ -2055,14 +2060,14 @@ struct CoverFlowColumnHeaderCell: View {
     @ViewBuilder
     private var headerContent: some View {
         Text(settings.column.rawValue)
-            .font(.caption)
+            .font(appSettings.listDetailFont)
             .fontWeight(.medium)
             .foregroundColor(.secondary)
             .lineLimit(1)
 
         if isSortColumn {
             Image(systemName: sortDirection == .ascending ? "chevron.up" : "chevron.down")
-                .font(.caption2)
+                .font(appSettings.listDetailFont)
                 .foregroundColor(.secondary)
         }
     }
@@ -2070,6 +2075,7 @@ struct CoverFlowColumnHeaderCell: View {
 
 // File row for CoverFlow file list
 struct CoverFlowFileRow: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
@@ -2117,28 +2123,28 @@ struct CoverFlowFileRow: View {
                 Image(nsImage: item.icon)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 20, height: 20)
-                InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
-                if !item.tags.isEmpty {
+                    .frame(width: appSettings.listIconSizeValue, height: appSettings.listIconSizeValue)
+                InlineRenameField(item: item, viewModel: viewModel, font: appSettings.listFont, alignment: .leading, lineLimit: 1)
+                if appSettings.showItemTags, !item.tags.isEmpty {
                     TagDotsView(tags: item.tags)
                 }
             }
         case .dateModified:
             Text(item.formattedDate)
                 .foregroundColor(.secondary)
-                .font(.caption)
+                .font(appSettings.listDetailFont)
         case .dateCreated:
             Text(formattedCreationDate)
                 .foregroundColor(.secondary)
-                .font(.caption)
+                .font(appSettings.listDetailFont)
         case .size:
             Text(item.formattedSize)
                 .foregroundColor(.secondary)
-                .font(.caption)
+                .font(appSettings.listDetailFont)
         case .kind:
-            Text(kindDescription)
+            Text(item.kindDescription)
                 .foregroundColor(.secondary)
-                .font(.caption)
+                .font(appSettings.listDetailFont)
         case .tags:
             CoverFlowTagsView(url: item.url)
         }
@@ -2152,35 +2158,26 @@ struct CoverFlowFileRow: View {
         return formatter.string(from: date)
     }
 
-    private var kindDescription: String {
-        if item.isDirectory { return "Folder" }
-        switch item.fileType {
-        case .image: return "Image"
-        case .video: return "Video"
-        case .audio: return "Audio"
-        case .document: return "Document"
-        case .code: return "Source Code"
-        case .archive: return "Archive"
-        case .application: return "Application"
-        default: return "Document"
-        }
-    }
-
 }
 
 struct CoverFlowTagsView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let url: URL
     @State private var tags: [String] = []
 
     var body: some View {
-        HStack(spacing: 4) {
-            ForEach(tags.prefix(3), id: \.self) { tag in
-                TagBadge(name: tag)
-            }
-            if tags.count > 3 {
-                Text("+\(tags.count - 3)")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+        Group {
+            if appSettings.showItemTags {
+                HStack(spacing: 4) {
+                    ForEach(tags.prefix(3), id: \.self) { tag in
+                        TagBadge(name: tag)
+                    }
+                    if tags.count > 3 {
+                        Text("+\(tags.count - 3)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
             }
         }
         .onAppear {

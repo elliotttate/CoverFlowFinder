@@ -12,6 +12,7 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
 
     /// Keyboard monitor for arrow navigation while Quick Look is open
     private var keyboardMonitor: Any?
+    private weak var previousFirstResponder: NSResponder?
 
     /// Callback for navigation
     var onNavigate: ((Int) -> Void)?
@@ -65,6 +66,15 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
 
     // MARK: - Public API
 
+    fileprivate func installIfNeeded(in window: NSWindow?) {
+        guard let window, superview == nil else { return }
+        if let themeFrame = window.contentView?.superview {
+            themeFrame.addSubview(self)
+        } else {
+            window.contentView?.addSubview(self)
+        }
+    }
+
     func showPreview(for url: URL, navigate: @escaping (Int) -> Void) {
         previewURL = url
         onNavigate = navigate
@@ -72,15 +82,11 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
         guard let panel = QLPreviewPanel.shared() else { return }
 
         // Make sure we're added to the window (above the hosting view, not as subview)
-        if let window = NSApp.mainWindow, superview == nil {
-            // Add to the window's themeFrame (parent of contentView) to avoid NSHostingView warning
-            if let themeFrame = window.contentView?.superview {
-                themeFrame.addSubview(self)
-            }
-        }
+        installIfNeeded(in: NSApp.mainWindow)
 
         // Only need to set up responder chain if we're not already controlling
         if panel.dataSource as? QuickLookControllerView !== self {
+            storePreviousFirstResponder()
             window?.makeFirstResponder(self)
             panel.updateController()
         }
@@ -93,10 +99,20 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
     }
 
     func updatePreview(for url: URL) {
+        updatePreview(for: Optional(url))
+    }
+
+    func updatePreview(for url: URL?) {
         previewURL = url
 
         if let panel = QLPreviewPanel.shared(), panel.isVisible {
-            panel.reloadData()
+            if url == nil {
+                panel.orderOut(nil)
+                stopKeyboardMonitor()
+                restorePreviousFirstResponder()
+            } else {
+                panel.reloadData()
+            }
         }
     }
 
@@ -105,6 +121,7 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
             panel.orderOut(nil)
         }
         stopKeyboardMonitor()
+        restorePreviousFirstResponder()
     }
 
     func togglePreview(for url: URL, navigate: @escaping (Int) -> Void) {
@@ -155,6 +172,31 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
             keyboardMonitor = nil
         }
     }
+
+    private func storePreviousFirstResponder() {
+        guard previousFirstResponder == nil else { return }
+        if let window, window.firstResponder !== self {
+            previousFirstResponder = window.firstResponder
+        }
+    }
+
+    private func restorePreviousFirstResponder() {
+        guard let window else {
+            previousFirstResponder = nil
+            return
+        }
+        if let previous = previousFirstResponder, previous !== self {
+            window.makeFirstResponder(previous)
+        } else {
+            window.makeFirstResponder(window.contentView)
+        }
+        previousFirstResponder = nil
+    }
+
+    func previewPanelWillClose(_ panel: QLPreviewPanel!) {
+        stopKeyboardMonitor()
+        restorePreviousFirstResponder()
+    }
 }
 
 /// SwiftUI view that ensures QuickLookControllerView is installed in the window
@@ -166,7 +208,7 @@ struct QuickLookWindowController: NSViewRepresentable {
         DispatchQueue.main.async {
             if let window = view.window,
                QuickLookControllerView.shared.superview == nil {
-                window.contentView?.addSubview(QuickLookControllerView.shared)
+                QuickLookControllerView.shared.installIfNeeded(in: window)
             }
         }
 

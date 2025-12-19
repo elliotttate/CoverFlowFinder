@@ -1,8 +1,10 @@
 import SwiftUI
+import AppKit
 import QuickLookThumbnailing
 import Quartz
 
 struct ColumnView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
 
@@ -27,6 +29,7 @@ struct ColumnView: View {
                         } else {
                             columns = []
                         }
+                        updateQuickLook(for: item)
                     },
                     onDoubleClick: { item in
                         viewModel.openItem(item)
@@ -49,6 +52,7 @@ struct ColumnView: View {
                             } else {
                                 removeColumnsAfter(column)
                             }
+                            updateQuickLook(for: item)
                         },
                         onDoubleClick: { item in
                             viewModel.openItem(item)
@@ -57,13 +61,14 @@ struct ColumnView: View {
                 }
 
                 // Preview column for selected file
-                if let lastSelection = lastSelectedItem, !lastSelection.isDirectory {
+                if appSettings.columnShowPreview,
+                   let lastSelection = lastSelectedItem,
+                   !lastSelection.isDirectory {
                     Divider()
                     PreviewColumn(item: lastSelection)
                 }
             }
         }
-        .background(QuickLookHost())
         .background(Color(nsColor: .controlBackgroundColor))
         .keyboardNavigable(
             onUpArrow: { navigateInActiveColumn(by: -1) },
@@ -160,7 +165,7 @@ struct ColumnView: View {
         }
 
         // Refresh Quick Look if visible
-        QuickLookControllerView.shared.updatePreview(for: newItem.url)
+        updateQuickLook(for: newItem)
     }
 
     private func navigateToParentColumn() {
@@ -203,9 +208,27 @@ struct ColumnView: View {
     private func toggleQuickLook() {
         guard let selectedItem = viewModel.selectedItems.first else { return }
 
-        QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { [self] offset in
+        guard let previewURL = viewModel.previewURL(for: selectedItem) else {
+            NSSound.beep()
+            return
+        }
+
+        QuickLookControllerView.shared.togglePreview(for: previewURL) { [self] offset in
             // Column view: up/down navigation within column
             navigateInActiveColumn(by: offset)
+        }
+    }
+
+    private func updateQuickLook(for item: FileItem?) {
+        guard let item else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+            return
+        }
+
+        if let previewURL = viewModel.previewURL(for: item) {
+            QuickLookControllerView.shared.updatePreview(for: previewURL)
+        } else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
         }
     }
 }
@@ -217,6 +240,7 @@ struct ColumnData: Identifiable {
 }
 
 struct SingleColumnView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let items: [FileItem]
     let selectedItem: FileItem?
     let columnURL: URL
@@ -251,7 +275,8 @@ struct SingleColumnView: View {
                             .opacity(dropTargetedItemID == item.id ? 1 : 0)
                     )
                     .onDrag {
-                        NSItemProvider(object: item.url as NSURL)
+                        guard !item.isFromArchive else { return NSItemProvider() }
+                        return NSItemProvider(object: item.url as NSURL)
                     }
                     .onDrop(of: [.fileURL], delegate: ColumnFolderDropDelegate(
                         item: item,
@@ -287,7 +312,7 @@ struct SingleColumnView: View {
                 }
             }
             .listStyle(.plain)
-            .frame(width: 220)
+            .frame(width: appSettings.columnWidthValue)
             .onDrop(of: [.fileURL], delegate: ColumnBackgroundDropDelegate(
                 columnURL: columnURL,
                 viewModel: viewModel,
@@ -310,6 +335,7 @@ struct SingleColumnView: View {
 }
 
 struct ColumnRowView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
@@ -319,11 +345,11 @@ struct ColumnRowView: View {
             Image(nsImage: item.icon)
                 .resizable()
                 .aspectRatio(contentMode: .fit)
-                .frame(width: 16, height: 16)
+                .frame(width: appSettings.columnIconSizeValue, height: appSettings.columnIconSizeValue)
 
-            InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
+            InlineRenameField(item: item, viewModel: viewModel, font: appSettings.columnFont, alignment: .leading, lineLimit: 1)
 
-            if !item.tags.isEmpty {
+            if appSettings.showItemTags, !item.tags.isEmpty {
                 TagDotsView(tags: item.tags)
             }
 
@@ -331,7 +357,7 @@ struct ColumnRowView: View {
 
             if item.isDirectory {
                 Image(systemName: "chevron.right")
-                    .font(.caption)
+                    .font(appSettings.columnDetailFont)
                     .foregroundColor(.secondary)
             }
         }
@@ -341,6 +367,7 @@ struct ColumnRowView: View {
 }
 
 struct PreviewColumn: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let item: FileItem
 
     @State private var thumbnail: NSImage?
@@ -367,8 +394,8 @@ struct PreviewColumn: View {
 
             // File info
             VStack(spacing: 8) {
-                Text(item.name)
-                    .font(.headline)
+                Text(item.displayName(showFileExtensions: appSettings.showFileExtensions))
+                    .font(appSettings.columnPreviewTitleFont)
                     .lineLimit(2)
                     .multilineTextAlignment(.center)
 
@@ -380,12 +407,12 @@ struct PreviewColumn: View {
                     InfoRow(label: "Size", value: item.formattedSize)
                     InfoRow(label: "Modified", value: item.formattedDate)
                 }
-                .font(.caption)
+                .font(appSettings.columnDetailFont)
             }
 
             Spacer()
         }
-        .frame(width: 260)
+        .frame(width: appSettings.columnPreviewWidthValue)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             loadThumbnail()
@@ -393,16 +420,7 @@ struct PreviewColumn: View {
     }
 
     private var kindDescription: String {
-        switch item.fileType {
-        case .image: return "Image"
-        case .video: return "Video"
-        case .audio: return "Audio"
-        case .document: return "Document"
-        case .code: return "Source Code"
-        case .archive: return "Archive"
-        case .application: return "Application"
-        default: return "Document"
-        }
+        item.kindDescription
     }
 
     private func loadThumbnail() {
@@ -448,7 +466,7 @@ struct ColumnFolderDropDelegate: DropDelegate {
 
     func validateDrop(info: DropInfo) -> Bool {
         // Only validate for folders - non-folders fall through to column drop
-        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
     }
 
     func dropEntered(info: DropInfo) {
@@ -465,14 +483,14 @@ struct ColumnFolderDropDelegate: DropDelegate {
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
         // Non-folders: return nil to let parent handle it
-        guard item.isDirectory else { return nil }
+        guard item.isDirectory && !item.isFromArchive else { return nil }
         let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
         return DropProposal(operation: operation)
     }
 
     func performDrop(info: DropInfo) -> Bool {
         // Non-folders: return false to let parent handle it
-        guard item.isDirectory else { return false }
+        guard item.isDirectory && !item.isFromArchive else { return false }
 
         let providers = info.itemProviders(for: [.fileURL])
         for provider in providers {
@@ -497,7 +515,7 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
     @Binding var isColumnDropTargeted: Bool
 
     func validateDrop(info: DropInfo) -> Bool {
-        return info.hasItemsConforming(to: [.fileURL])
+        return !viewModel.isInsideArchive && info.hasItemsConforming(to: [.fileURL])
     }
 
     func dropEntered(info: DropInfo) {
@@ -511,6 +529,10 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard !viewModel.isInsideArchive else {
+            isColumnDropTargeted = false
+            return DropProposal(operation: .forbidden)
+        }
         // Show column highlight when not over a folder
         if dropTargetedItemID == nil {
             isColumnDropTargeted = true
@@ -523,7 +545,7 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
 
     func performDrop(info: DropInfo) -> Bool {
         // If hovering over a folder, that delegate handles it
-        guard dropTargetedItemID == nil else { return false }
+        guard dropTargetedItemID == nil, !viewModel.isInsideArchive else { return false }
 
         let providers = info.itemProviders(for: [.fileURL])
         for provider in providers {

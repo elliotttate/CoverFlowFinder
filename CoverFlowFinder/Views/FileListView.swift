@@ -1,4 +1,5 @@
 import SwiftUI
+import AppKit
 import Quartz
 
 struct FileListView: View {
@@ -12,10 +13,6 @@ struct FileListView: View {
     @State private var thumbnails: [URL: NSImage] = [:]
     private let thumbnailCache = ThumbnailCacheManager.shared
 
-    private var sortedItems: [FileItem] {
-        columnConfig.sortedItems(items)
-    }
-
     var body: some View {
         VStack(spacing: 0) {
             // Column headers - fixed at top
@@ -27,10 +24,10 @@ struct FileListView: View {
                 List(selection: Binding(
                     get: { Set(viewModel.selectedItems.map { $0.id }) },
                     set: { ids in
-                        viewModel.selectedItems = Set(sortedItems.filter { ids.contains($0.id) })
+                        viewModel.selectedItems = Set(items.filter { ids.contains($0.id) })
                     }
                 )) {
-                    ForEach(sortedItems) { item in
+                    ForEach(items) { item in
                         FileListRowView(
                             item: item,
                             viewModel: viewModel,
@@ -59,7 +56,8 @@ struct FileListView: View {
                             loadThumbnail(for: item)
                         }
                         .onDrag {
-                            NSItemProvider(object: item.url as NSURL)
+                            guard !item.isFromArchive else { return NSItemProvider() }
+                            return NSItemProvider(object: item.url as NSURL)
                         }
                         .onDrop(of: [.fileURL], delegate: FolderDropDelegate(
                             item: item,
@@ -69,15 +67,16 @@ struct FileListView: View {
                         .instantTap(
                             id: item.id,
                             onSingleClick: {
-                                if let index = sortedItems.firstIndex(of: item) {
+                                if let index = items.firstIndex(of: item) {
                                     let modifiers = NSEvent.modifierFlags
                                     viewModel.handleSelection(
                                         item: item,
                                         index: index,
-                                        in: sortedItems,
+                                        in: items,
                                         withShift: modifiers.contains(.shift),
                                         withCommand: modifiers.contains(.command)
                                     )
+                                    updateQuickLook(for: item)
                                 }
                             },
                             onDoubleClick: {
@@ -100,12 +99,14 @@ struct FileListView: View {
                         withAnimation {
                             scrollProxy.scrollTo(firstSelected.id)
                         }
+                        updateQuickLook(for: firstSelected)
+                    } else {
+                        updateQuickLook(for: nil)
                     }
                 }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(QuickLookHost())
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
             return true
@@ -130,22 +131,22 @@ struct FileListView: View {
     }
 
     private func navigateSelection(by offset: Int) {
-        guard !sortedItems.isEmpty else { return }
+        guard !items.isEmpty else { return }
 
         let currentIndex: Int
         if let selectedItem = viewModel.selectedItems.first,
-           let index = sortedItems.firstIndex(of: selectedItem) {
+           let index = items.firstIndex(of: selectedItem) {
             currentIndex = index
         } else {
             currentIndex = -1
         }
 
-        let newIndex = max(0, min(sortedItems.count - 1, currentIndex + offset))
-        let newItem = sortedItems[newIndex]
+        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
+        let newItem = items[newIndex]
         viewModel.selectItem(newItem)
 
         // Refresh Quick Look if visible
-        QuickLookControllerView.shared.updatePreview(for: newItem.url)
+        updateQuickLook(for: newItem)
     }
 
     private func openSelectedItem() {
@@ -157,9 +158,27 @@ struct FileListView: View {
     private func toggleQuickLook() {
         guard let selectedItem = viewModel.selectedItems.first else { return }
 
-        QuickLookControllerView.shared.togglePreview(for: selectedItem.url) { [self] offset in
+        guard let previewURL = viewModel.previewURL(for: selectedItem) else {
+            NSSound.beep()
+            return
+        }
+
+        QuickLookControllerView.shared.togglePreview(for: previewURL) { [self] offset in
             // List: up/down navigation (offset is 1 or -1)
             navigateSelection(by: offset)
+        }
+    }
+
+    private func updateQuickLook(for item: FileItem?) {
+        guard let item else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+            return
+        }
+
+        if let previewURL = viewModel.previewURL(for: item) {
+            QuickLookControllerView.shared.updatePreview(for: previewURL)
+        } else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
         }
     }
 
@@ -213,6 +232,7 @@ struct FileListView: View {
 // MARK: - Column Header View
 
 struct ColumnHeaderView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var columnConfig: ListColumnConfigManager
     @State private var resizingColumn: ListColumn?
     @State private var initialWidth: CGFloat = 0
@@ -243,7 +263,7 @@ struct ColumnHeaderView: View {
     @ViewBuilder
     private var columnVisibilityMenu: some View {
         Text("Columns")
-            .font(.caption)
+            .font(appSettings.listDetailFont)
 
         Divider()
 
@@ -273,6 +293,7 @@ struct ColumnHeaderView: View {
 // MARK: - Column Header Cell
 
 struct ColumnHeaderCell: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let settings: ColumnSettings
     let isSortColumn: Bool
     let sortDirection: SortDirection
@@ -286,14 +307,14 @@ struct ColumnHeaderCell: View {
             Button(action: onSort) {
                 HStack(spacing: 4) {
                     Text(settings.column.rawValue)
-                        .font(.caption)
+                        .font(appSettings.listDetailFont)
                         .fontWeight(.medium)
                         .foregroundColor(.secondary)
                         .lineLimit(1)
 
                     if isSortColumn {
                         Image(systemName: sortDirection == .ascending ? "chevron.up" : "chevron.down")
-                            .font(.caption2)
+                            .font(appSettings.listDetailFont)
                             .foregroundColor(.secondary)
                     }
                 }
@@ -328,6 +349,7 @@ struct ColumnHeaderCell: View {
 // MARK: - File List Row View
 
 struct FileListRowView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
@@ -359,29 +381,29 @@ struct FileListRowView: View {
                 Image(nsImage: displayImage)
                     .resizable()
                     .aspectRatio(contentMode: .fit)
-                    .frame(width: 20, height: 20)
+                    .frame(width: appSettings.listIconSizeValue, height: appSettings.listIconSizeValue)
                     .cornerRadius(2)
-                InlineRenameField(item: item, viewModel: viewModel, font: .body, alignment: .leading, lineLimit: 1)
-                if !item.tags.isEmpty {
+                InlineRenameField(item: item, viewModel: viewModel, font: appSettings.listFont, alignment: .leading, lineLimit: 1)
+                if appSettings.showItemTags, !item.tags.isEmpty {
                     TagDotsView(tags: item.tags)
                 }
             }
         case .dateModified:
             Text(item.formattedDate)
                 .foregroundColor(.secondary)
-                .font(.caption)
+                .font(appSettings.listDetailFont)
         case .dateCreated:
             Text(formattedCreationDate)
                 .foregroundColor(.secondary)
-                .font(.caption)
+                .font(appSettings.listDetailFont)
         case .size:
             Text(item.formattedSize)
                 .foregroundColor(.secondary)
-                .font(.caption)
+                .font(appSettings.listDetailFont)
         case .kind:
-            Text(kindDescription(for: item))
+            Text(item.kindDescription)
                 .foregroundColor(.secondary)
-                .font(.caption)
+                .font(appSettings.listDetailFont)
         case .tags:
             TagsView(url: item.url)
         }
@@ -395,38 +417,28 @@ struct FileListRowView: View {
         return formatter.string(from: date)
     }
 
-    private func kindDescription(for item: FileItem) -> String {
-        if item.isDirectory {
-            return "Folder"
-        }
-        switch item.fileType {
-        case .image: return "Image"
-        case .video: return "Video"
-        case .audio: return "Audio"
-        case .document: return "Document"
-        case .code: return "Source Code"
-        case .archive: return "Archive"
-        case .application: return "Application"
-        default: return "Document"
-        }
-    }
 }
 
 // MARK: - Tags View
 
 struct TagsView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let url: URL
     @State private var tags: [String] = []
 
     var body: some View {
-        HStack(spacing: 4) {
-            ForEach(tags.prefix(3), id: \.self) { tag in
-                TagBadge(name: tag)
-            }
-            if tags.count > 3 {
-                Text("+\(tags.count - 3)")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+        Group {
+            if appSettings.showItemTags {
+                HStack(spacing: 4) {
+                    ForEach(tags.prefix(3), id: \.self) { tag in
+                        TagBadge(name: tag)
+                    }
+                    if tags.count > 3 {
+                        Text("+\(tags.count - 3)")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                }
             }
         }
         .onAppear {
@@ -437,15 +449,20 @@ struct TagsView: View {
 
 /// Displays tag dots inline (Finder-style) - just colored circles
 struct TagDotsView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     let tags: [String]
 
     var body: some View {
-        HStack(spacing: 2) {
-            ForEach(tags.prefix(3), id: \.self) { tagName in
-                if let tag = FinderTag.from(name: tagName) {
-                    Circle()
-                        .fill(tag.color)
-                        .frame(width: 10, height: 10)
+        Group {
+            if appSettings.showItemTags {
+                HStack(spacing: 2) {
+                    ForEach(tags.prefix(3), id: \.self) { tagName in
+                        if let tag = FinderTag.from(name: tagName) {
+                            Circle()
+                                .fill(tag.color)
+                                .frame(width: 10, height: 10)
+                        }
+                    }
                 }
             }
         }
@@ -481,7 +498,7 @@ struct FolderDropDelegate: DropDelegate {
     @Binding var dropTargetedItemID: UUID?
 
     func validateDrop(info: DropInfo) -> Bool {
-        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
     }
 
     func dropEntered(info: DropInfo) {
@@ -497,13 +514,13 @@ struct FolderDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
         let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
         return DropProposal(operation: operation)
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        guard item.isDirectory else { return false }
+        guard item.isDirectory && !item.isFromArchive else { return false }
 
         let providers = info.itemProviders(for: [.fileURL])
         for provider in providers {

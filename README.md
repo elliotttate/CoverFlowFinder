@@ -11,10 +11,12 @@ https://github.com/elliotttate/CoverFlowFinder/releases/download/v1.0.0/CoverFlo
 - **Cover Flow View** - Browse your files with the iconic 3D carousel effect, complete with smooth animations and reflections
 - **Multiple View Modes** - Switch between Cover Flow, Icons, List, Columns, and Dual Pane views
 - **Dual Pane Mode** - Two independent file browsers side by side for easy file management
+- **Quad Pane Mode** - Four independent panes for rapid comparison and organization
 - **Quick Look Integration** - Press Space to preview any file with Quick Look
 - **Full File Browser** - Navigate your entire file system with a familiar Finder-like interface
 - **Sidebar Navigation** - Quick access to Favorites, iCloud, and mounted volumes
 - **Sorting & Search** - Sort files by name, date, size, or kind; search to filter files instantly
+- **ZIP Archive Browsing** - Navigate ZIP contents without extracting the whole archive
 - **Clipboard Operations** - Copy, Cut, Paste, and Duplicate files with keyboard shortcuts
 - **Context Menus** - Right-click for quick access to file operations
 - **Type-Ahead Search** - Start typing to jump to matching files instantly
@@ -36,6 +38,10 @@ Download the latest DMG from the [Releases](https://github.com/elliotttate/Cover
    ```
 2. Open `CoverFlowFinder.xcodeproj` in Xcode
 3. Build and run (⌘R)
+
+## Development
+
+See [DEVELOPMENT.md](DEVELOPMENT.md) for architecture details and how to add a new view mode.
 
 ## Usage
 
@@ -68,6 +74,7 @@ Use the toolbar buttons or View menu to switch between:
 - List
 - Columns
 - Dual Pane
+- Quad Pane
 
 ## Technical Details
 
@@ -88,4 +95,3 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 Inspired by the classic Cover Flow view from iTunes and older versions of macOS Finder.
-

@@ -1,6 +1,7 @@
 import SwiftUI
 
 struct SidebarView: View {
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     var isDualPane: Bool = false
 
@@ -10,81 +11,89 @@ struct SidebarView: View {
             set: { if let url = $0 { viewModel.navigateTo(url) } }
         )) {
             // Favorites Section
-            Section(header: Text("Favorites").font(.caption).foregroundColor(.secondary)) {
-                // AirDrop - special handling (opens Finder's AirDrop window)
-                Button(action: {
-                    openAirDrop()
-                }) {
-                    Label {
-                        Text("AirDrop")
-                            .lineLimit(1)
-                    } icon: {
-                        Image(systemName: "antenna.radiowaves.left.and.right")
-                            .foregroundColor(.accentColor)
+            if appSettings.sidebarShowFavorites {
+                Section(header: Text("Favorites").font(.caption).foregroundColor(.secondary)) {
+                    // AirDrop - special handling (opens Finder's AirDrop window)
+                    Button(action: {
+                        openAirDrop()
+                    }) {
+                        Label {
+                            Text("AirDrop")
+                                .lineLimit(1)
+                        } icon: {
+                            Image(systemName: "antenna.radiowaves.left.and.right")
+                                .foregroundColor(.accentColor)
+                        }
                     }
-                }
-                .buttonStyle(.plain)
+                    .buttonStyle(.plain)
 
-                ForEach(favoriteLocations, id: \.url) { location in
-                    SidebarRow(icon: location.icon, title: location.name, url: location.url)
-                        .tag(location.url)
+                    ForEach(favoriteLocations, id: \.url) { location in
+                        SidebarRow(icon: location.icon, title: location.name, url: location.url)
+                            .tag(location.url)
+                    }
                 }
             }
 
             // iCloud Section
-            Section(header: Text("iCloud").font(.caption).foregroundColor(.secondary)) {
-                if let iCloudURL = FileManager.default.url(forUbiquityContainerIdentifier: nil)?.appendingPathComponent("Documents") {
-                    SidebarRow(icon: "icloud", title: "iCloud Drive", url: iCloudURL)
-                        .tag(iCloudURL)
-                } else {
-                    SidebarRow(icon: "icloud", title: "iCloud Drive", url: FileManager.default.homeDirectoryForCurrentUser)
-                        .disabled(true)
+            if appSettings.sidebarShowICloud {
+                Section(header: Text("iCloud").font(.caption).foregroundColor(.secondary)) {
+                    if let iCloudURL = FileManager.default.url(forUbiquityContainerIdentifier: nil)?.appendingPathComponent("Documents") {
+                        SidebarRow(icon: "icloud", title: "iCloud Drive", url: iCloudURL)
+                            .tag(iCloudURL)
+                    } else {
+                        SidebarRow(icon: "icloud", title: "iCloud Drive", url: FileManager.default.homeDirectoryForCurrentUser)
+                            .disabled(true)
+                    }
                 }
             }
 
             // Locations Section
-            Section(header: Text("Locations").font(.caption).foregroundColor(.secondary)) {
-                ForEach(volumeLocations, id: \.url) { location in
-                    SidebarRow(icon: location.icon, title: location.name, url: location.url)
-                        .tag(location.url)
+            if appSettings.sidebarShowLocations {
+                Section(header: Text("Locations").font(.caption).foregroundColor(.secondary)) {
+                    ForEach(volumeLocations, id: \.url) { location in
+                        SidebarRow(icon: location.icon, title: location.name, url: location.url)
+                            .tag(location.url)
+                    }
                 }
             }
 
             // Tags Section
-            Section(header: Text("Tags").font(.caption).foregroundColor(.secondary)) {
-                ForEach(FinderTag.allTags) { tag in
-                    Button(action: {
-                        if viewModel.filterTag == tag.name {
-                            viewModel.filterTag = nil  // Clicking active filter clears it
-                        } else {
-                            viewModel.filterTag = tag.name  // Set new filter
-                        }
-                    }) {
-                        HStack {
-                            Circle()
-                                .fill(tag.color)
-                                .frame(width: 12, height: 12)
-                            Text(tag.name)
-                                .lineLimit(1)
-                            Spacer()
+            if appSettings.sidebarShowTags {
+                Section(header: Text("Tags").font(.caption).foregroundColor(.secondary)) {
+                    ForEach(FinderTag.allTags) { tag in
+                        Button(action: {
                             if viewModel.filterTag == tag.name {
-                                Image(systemName: "checkmark")
-                                    .foregroundColor(.accentColor)
-                                    .font(.caption)
+                                viewModel.filterTag = nil  // Clicking active filter clears it
+                            } else {
+                                viewModel.filterTag = tag.name  // Set new filter
+                            }
+                        }) {
+                            HStack {
+                                Circle()
+                                    .fill(tag.color)
+                                    .frame(width: 12, height: 12)
+                                Text(tag.name)
+                                    .lineLimit(1)
+                                Spacer()
+                                if viewModel.filterTag == tag.name {
+                                    Image(systemName: "checkmark")
+                                        .foregroundColor(.accentColor)
+                                        .font(.caption)
+                                }
                             }
                         }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
-                }
 
-                if viewModel.filterTag != nil {
-                    Button(action: {
-                        viewModel.filterTag = nil
-                    }) {
-                        Label("Clear Filter", systemImage: "xmark.circle")
-                            .foregroundColor(.secondary)
+                    if viewModel.filterTag != nil {
+                        Button(action: {
+                            viewModel.filterTag = nil
+                        }) {
+                            Label("Clear Filter", systemImage: "xmark.circle")
+                                .foregroundColor(.secondary)
+                        }
+                        .buttonStyle(.plain)
                     }
-                    .buttonStyle(.plain)
                 }
             }
         }

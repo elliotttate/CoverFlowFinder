@@ -1,6 +1,8 @@
 import SwiftUI
+import AppKit
 
 struct ContentView: View {
+    @EnvironmentObject private var settings: AppSettings
     @State private var tabs: [BrowserTab] = [BrowserTab()]
     @State private var selectedTabId: UUID = UUID()
 
@@ -30,6 +32,7 @@ struct ContentView: View {
     @FocusState private var isSearchFocused: Bool
     @State private var navHistoryIndex: Int = 0
     @State private var navHistoryCount: Int = 1
+    @ObservedObject private var columnConfig = ListColumnConfigManager.shared
 
     private var viewModel: FileBrowserViewModel {
         tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
@@ -142,19 +145,19 @@ struct ContentView: View {
             ToolbarItemGroup(placement: .primaryAction) {
                 // Sort menu
                 Menu {
-                    ForEach(SortOption.allCases, id: \.self) { option in
+                    ForEach(ListColumn.allCases) { column in
                         Button(action: {
-                            if viewModel.sortOption == option {
-                                viewModel.sortAscending.toggle()
+                            if columnConfig.sortColumn == column {
+                                columnConfig.sortDirection.toggle()
                             } else {
-                                viewModel.sortOption = option
-                                viewModel.sortAscending = true
+                                columnConfig.sortColumn = column
+                                columnConfig.sortDirection = .ascending
                             }
                         }) {
                             HStack {
-                                Text(option.rawValue)
-                                if viewModel.sortOption == option {
-                                    Image(systemName: viewModel.sortAscending ? "chevron.up" : "chevron.down")
+                                Text(column.rawValue)
+                                if columnConfig.sortColumn == column {
+                                    Image(systemName: columnConfig.sortDirection == .ascending ? "chevron.up" : "chevron.down")
                                 }
                             }
                         }
@@ -226,6 +229,9 @@ struct ContentView: View {
             currentViewMode = viewModel.viewMode
             syncNavigationState()
         }
+        .onChange(of: settings.showHiddenFiles) { _ in
+            refreshAllViewModels()
+        }
         // Observe navigation changes from the viewModel
         .onReceive(viewModel.$historyIndex) { newIndex in
             navHistoryIndex = newIndex
@@ -274,6 +280,15 @@ struct ContentView: View {
         navHistoryIndex = viewModel.historyIndex
         navHistoryCount = viewModel.navigationHistory.count
     }
+
+    private func refreshAllViewModels() {
+        for tab in tabs {
+            tab.viewModel.refresh()
+        }
+        rightPaneViewModel.refresh()
+        bottomLeftPaneViewModel.refresh()
+        bottomRightPaneViewModel.refresh()
+    }
 }
 
 // MARK: - Context Menu for File Items
@@ -292,6 +307,7 @@ struct FileItemContextMenu: View {
             Button("Open With...") {
                 NSWorkspace.shared.activateFileViewerSelecting([item.url])
             }
+            .disabled(item.isFromArchive)
 
             Divider()
 
@@ -299,6 +315,7 @@ struct FileItemContextMenu: View {
                 viewModel.selectItem(item)
                 viewModel.getInfo()
             }
+            .disabled(item.isFromArchive)
 
             Divider()
 
@@ -349,17 +366,20 @@ struct FileItemContextMenu: View {
                 viewModel.selectItem(item)
                 viewModel.duplicateSelectedItems()
             }
+            .disabled(item.isFromArchive)
 
             Divider()
 
             Button("Rename") {
                 onRename(item)
             }
+            .disabled(item.isFromArchive)
 
             Button("Move to Trash") {
                 viewModel.selectItem(item)
                 viewModel.deleteSelectedItems()
             }
+            .disabled(item.isFromArchive)
 
             Divider()
 
@@ -510,17 +530,18 @@ struct PathBarView: View {
 }
 
 struct StatusBarView: View {
+    @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
 
     var body: some View {
         HStack {
             Text("\(viewModel.filteredItems.count) items")
-                .font(.caption)
+                .font(settings.listDetailFont)
                 .foregroundColor(.secondary)
 
             if !viewModel.selectedItems.isEmpty {
                 Text("• \(viewModel.selectedItems.count) selected")
-                    .font(.caption)
+                    .font(settings.listDetailFont)
                     .foregroundColor(.secondary)
             }
 
@@ -528,7 +549,7 @@ struct StatusBarView: View {
 
             if let totalSize = calculateTotalSize() {
                 Text(totalSize)
-                    .font(.caption)
+                    .font(settings.listDetailFont)
                     .foregroundColor(.secondary)
             }
         }
@@ -565,15 +586,17 @@ struct EmptyFolderView: View {
 
 // Wrapper view that properly observes the viewModel via @ObservedObject
 struct TabContentWrapper: View {
+    @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     let selectedTabId: UUID
 
     var body: some View {
         VStack(spacing: 0) {
             // Path bar
-            PathBarView(viewModel: viewModel)
-
-            Divider()
+            if settings.showPathBar {
+                PathBarView(viewModel: viewModel)
+                Divider()
+            }
 
             // Main content area
             Group {
@@ -589,7 +612,9 @@ struct TabContentWrapper: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
             // Status bar
-            StatusBarView(viewModel: viewModel)
+            if settings.showStatusBar {
+                StatusBarView(viewModel: viewModel)
+            }
         }
     }
 
@@ -692,4 +717,5 @@ struct SearchField: NSViewRepresentable {
 
 #Preview {
     ContentView()
+        .environmentObject(AppSettings.shared)
 }

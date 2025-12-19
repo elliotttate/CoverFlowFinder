@@ -1,4 +1,5 @@
 import Foundation
+import AppKit
 import SwiftUI
 import Combine
 
@@ -26,12 +27,9 @@ enum ViewMode: String, CaseIterable {
     }
 }
 
-enum SortOption: String, CaseIterable {
-    case name = "Name"
-    case dateModified = "Date Modified"
-    case dateCreated = "Date Created"
-    case size = "Size"
-    case kind = "Kind"
+enum NavigationLocation: Equatable {
+    case filesystem(URL)
+    case archive(archiveURL: URL, internalPath: String)
 }
 
 enum ClipboardOperation {
@@ -43,30 +41,8 @@ enum ClipboardOperation {
 private let cutOperationPasteboardType = NSPasteboard.PasteboardType("com.coverflowfinder.cut-operation")
 
 /// Thread-safe sort function for background use (non-isolated)
-private func sortItemsForBackground(_ items: [FileItem], sortOption: SortOption, ascending: Bool) -> [FileItem] {
-    return items.sorted { (item1: FileItem, item2: FileItem) -> Bool in
-        // Folders always come first
-        if item1.isDirectory != item2.isDirectory {
-            return item1.isDirectory
-        }
-
-        let result: Bool
-        switch sortOption {
-        case .name:
-            result = item1.name.localizedCaseInsensitiveCompare(item2.name) == .orderedAscending
-        case .dateModified, .dateCreated:
-            let date1 = item1.modificationDate ?? .distantPast
-            let date2 = item2.modificationDate ?? .distantPast
-            result = date1 < date2
-        case .size:
-            result = item1.size < item2.size
-        case .kind:
-            let kind1 = String(describing: item1.fileType)
-            let kind2 = String(describing: item2.fileType)
-            result = kind1 < kind2
-        }
-        return ascending ? result : !result
-    }
+private func sortItemsForBackground(_ items: [FileItem], sortState: SortState, foldersFirst: Bool) -> [FileItem] {
+    ListColumnConfigManager.sortedItems(items, sortState: sortState, foldersFirst: foldersFirst)
 }
 
 @MainActor
@@ -75,12 +51,10 @@ class FileBrowserViewModel: ObservableObject {
     @Published var items: [FileItem] = []
     @Published var selectedItems: Set<FileItem> = []
     @Published var viewMode: ViewMode = .coverFlow
-    @Published var sortOption: SortOption = .name
-    @Published var sortAscending: Bool = true
     @Published var searchText: String = ""
     @Published var filterTag: String? = nil
     @Published var isLoading: Bool = false
-    @Published var navigationHistory: [URL] = []
+    @Published var navigationHistory: [NavigationLocation] = []
     @Published var historyIndex: Int = -1
     @Published var coverFlowSelectedIndex: Int = 0
     @Published var renamingURL: URL? = nil
@@ -90,13 +64,15 @@ class FileBrowserViewModel: ObservableObject {
     // Track click timing for Finder-style rename triggering
     private var lastClickedURL: URL?
     private var lastClickTime: Date = .distantPast
+    private var pendingRenameWorkItem: DispatchWorkItem?
+    private let renameDelay: TimeInterval = 0.2
 
     // Track the folder we entered so we can select it when going back
     private var enteredFolderURL: URL?
     // URL to select after loading (used when going back)
     private var pendingSelectionURL: URL?
-    private var metadataHydrationWorkItem: DispatchWorkItem?
-    private let metadataHydrationWindow = 200
+
+    private let fileOperationQueue = DispatchQueue(label: "com.coverflowfinder.fileops", qos: .userInitiated)
 
     // Clipboard state
     @Published var clipboardItems: [URL] = []
@@ -139,7 +115,8 @@ class FileBrowserViewModel: ObservableObject {
             pathComps.insert((name: url.lastPathComponent, url: url), at: 0)
             url = url.deletingLastPathComponent()
         }
-        pathComps.insert((name: "Macintosh HD", url: URL(fileURLWithPath: "/")), at: 0)
+        let rootName = FileManager.default.displayName(atPath: "/")
+        pathComps.insert((name: rootName, url: URL(fileURLWithPath: "/")), at: 0)
 
         for comp in pathComps {
             components.append((name: comp.name, url: comp.url, archivePath: nil))
@@ -191,13 +168,15 @@ class FileBrowserViewModel: ObservableObject {
             }
         }
 
-        return sortItems(filtered)
+        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let foldersFirst = AppSettings.shared.foldersFirst
+        return sortItemsForBackground(filtered, sortState: sortState, foldersFirst: foldersFirst)
     }
 
     init(initialPath: URL = FileManager.default.homeDirectoryForCurrentUser) {
         self.currentPath = initialPath
         loadContents()
-        addToHistory(initialPath)
+        addToHistory(.filesystem(initialPath))
 
         $searchText
             .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
@@ -210,6 +189,19 @@ class FileBrowserViewModel: ObservableObject {
             .dropFirst() // Skip initial value
             .sink { [weak self] _ in
                 self?.navigationGeneration += 1
+            }
+            .store(in: &cancellables)
+
+        let columnConfig = ListColumnConfigManager.shared
+        columnConfig.$sortColumn
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
+            }
+            .store(in: &cancellables)
+
+        columnConfig.$sortDirection
+            .sink { [weak self] _ in
+                self?.objectWillChange.send()
             }
             .store(in: &cancellables)
     }
@@ -225,9 +217,9 @@ class FileBrowserViewModel: ObservableObject {
         items = []
         let pathToLoad = currentPath
         let pendingURL = pendingSelectionURL  // Capture before async
-        // Capture sort settings for thread-safe access
-        let capturedSortOption = sortOption
-        let capturedSortAscending = sortAscending
+        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let showHiddenFiles = AppSettings.shared.showHiddenFiles
+        let foldersFirst = AppSettings.shared.foldersFirst
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -241,7 +233,7 @@ class FileBrowserViewModel: ObservableObject {
                             .isDirectoryKey,
                             .contentTypeKey
                         ],
-                        options: [.skipsHiddenFiles]
+                        options: showHiddenFiles ? [] : [.skipsHiddenFiles]
                     )
 
                     // Build lightweight items - use reserveCapacity for better performance
@@ -261,9 +253,8 @@ class FileBrowserViewModel: ObservableObject {
                    let item = fileItems.first(where: { $0.url == pendingURL }) {
                     selectedItem = item
                     // Pre-sort on background thread using captured sort settings
-                    let viewModelSorted = sortItemsForBackground(fileItems, sortOption: capturedSortOption, ascending: capturedSortAscending)
-                    let finalSorted = ListColumnConfigManager.shared.sortedItems(viewModelSorted)
-                    if let index = finalSorted.firstIndex(of: item) {
+                    let sorted = sortItemsForBackground(fileItems, sortState: sortState, foldersFirst: foldersFirst)
+                    if let index = sorted.firstIndex(of: item) {
                         selectedIndex = index
                     }
                 }
@@ -289,7 +280,6 @@ class FileBrowserViewModel: ObservableObject {
                     self.isLoading = false
                     // Increment navigation generation to force SwiftUI update
                     self.navigationGeneration += 1
-                    self.hydrateMetadataAroundSelection()
                 }
             } catch {
                 DispatchQueue.main.async {
@@ -312,16 +302,18 @@ class FileBrowserViewModel: ObservableObject {
 
         // Get entries at the current path within the archive
         let entriesAtPath = ZipArchiveManager.shared.entriesAtPath(currentArchivePath, in: archiveEntries)
-        let fileItems = ZipArchiveManager.shared.fileItems(from: entriesAtPath, archiveURL: archiveURL)
+        var fileItems = ZipArchiveManager.shared.fileItems(from: entriesAtPath, archiveURL: archiveURL)
+        let showHiddenFiles = AppSettings.shared.showHiddenFiles
+        let foldersFirst = AppSettings.shared.foldersFirst
+        if !showHiddenFiles {
+            fileItems = fileItems.filter { !$0.name.hasPrefix(".") }
+        }
 
-        // Sort items
-        let sorted = sortItems(fileItems)
-        let finalSorted = ListColumnConfigManager.shared.sortedItems(sorted)
+        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let sorted = sortItemsForBackground(fileItems, sortState: sortState, foldersFirst: foldersFirst)
 
-        // Force SwiftUI to recognize the change
-        objectWillChange.send()
-        items = finalSorted
-        coverFlowSelectedIndex = min(coverFlowSelectedIndex, max(0, items.count - 1))
+        items = fileItems
+        coverFlowSelectedIndex = min(coverFlowSelectedIndex, max(0, sorted.count - 1))
         isLoading = false
         navigationGeneration += 1
     }
@@ -333,7 +325,7 @@ class FileBrowserViewModel: ObservableObject {
         selectedItems.removeAll()
         coverFlowSelectedIndex = 0
         loadContents()
-        addToHistory(url)
+        addToHistory(.filesystem(url))
     }
 
     /// Navigate to a URL and select the folder we came from (for path bar navigation)
@@ -345,7 +337,7 @@ class FileBrowserViewModel: ObservableObject {
         selectedItems.removeAll()
         // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
         loadContents()
-        addToHistory(url)
+        addToHistory(.filesystem(url))
     }
 
     func navigateToParent() {
@@ -357,102 +349,60 @@ class FileBrowserViewModel: ObservableObject {
 
     func goBack() {
         guard canGoBack else { return }
-
-        // If we're at the archive root, going back should exit the archive
-        if isInsideArchive && currentArchivePath.isEmpty {
-            exitArchive()
-            return
-        }
-
-        // If we're inside an archive subfolder, go up within the archive
-        if isInsideArchive && !currentArchivePath.isEmpty {
-            navigateUp()
-            return
-        }
-
-        pendingSelectionURL = enteredFolderURL ?? currentPath
-        enteredFolderURL = nil
         historyIndex -= 1
-
-        let historyURL = navigationHistory[historyIndex]
-
-        // Check if this is an archive URL (contains #)
-        if historyURL.path.contains("#") {
-            let components = historyURL.path.components(separatedBy: "#")
-            if components.count == 2 {
-                let archivePath = URL(fileURLWithPath: components[0])
-                let internalPath = String(components[1].dropFirst()) // Remove leading /
-
-                do {
-                    let entries = try ZipArchiveManager.shared.readContents(of: archivePath)
-                    archiveEntries = entries
-                    currentArchiveURL = archivePath
-                    currentArchivePath = internalPath
-                    isInsideArchive = true
-                    selectedItems.removeAll()
-                    loadContents()
-                    return
-                } catch {
-                    print("Failed to restore archive state: \(error)")
-                }
-            }
+        let location = navigationHistory[historyIndex]
+        if case .filesystem = location {
+            pendingSelectionURL = enteredFolderURL ?? currentPath
+        } else {
+            pendingSelectionURL = nil
         }
-
-        // Regular filesystem navigation
-        isInsideArchive = false
-        currentArchiveURL = nil
-        currentArchivePath = ""
-        archiveEntries = []
-
-        currentPath = historyURL
-        selectedItems.removeAll()
-        // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
-        // Setting it to 0 triggers an unnecessary SwiftUI update before items are loaded
-        loadContents()
+        enteredFolderURL = nil
+        applyNavigationLocation(location)
     }
 
     func goForward() {
         guard canGoForward else { return }
         historyIndex += 1
+        let location = navigationHistory[historyIndex]
+        pendingSelectionURL = nil
+        applyNavigationLocation(location)
+    }
 
-        let historyURL = navigationHistory[historyIndex]
-
-        // Check if this is an archive URL (contains #)
-        if historyURL.path.contains("#") {
-            let components = historyURL.path.components(separatedBy: "#")
-            if components.count == 2 {
-                let archivePath = URL(fileURLWithPath: components[0])
-                let internalPath = String(components[1].dropFirst()) // Remove leading /
-
-                do {
-                    let entries = try ZipArchiveManager.shared.readContents(of: archivePath)
-                    archiveEntries = entries
-                    currentArchiveURL = archivePath
-                    currentArchivePath = internalPath
-                    isInsideArchive = true
-                    selectedItems.removeAll()
-                    coverFlowSelectedIndex = 0
-                    loadContents()
-                    return
-                } catch {
-                    print("Failed to restore archive state: \(error)")
+    private func applyNavigationLocation(_ location: NavigationLocation) {
+        switch location {
+        case .filesystem(let url):
+            isInsideArchive = false
+            currentArchiveURL = nil
+            currentArchivePath = ""
+            archiveEntries = []
+            currentPath = url
+            selectedItems.removeAll()
+            loadContents()
+        case .archive(let archiveURL, let internalPath):
+            do {
+                if currentArchiveURL != archiveURL || archiveEntries.isEmpty {
+                    archiveEntries = try ZipArchiveManager.shared.readContents(of: archiveURL)
                 }
+                currentArchiveURL = archiveURL
+                currentArchivePath = internalPath
+                isInsideArchive = true
+                selectedItems.removeAll()
+                coverFlowSelectedIndex = 0
+                loadContents()
+            } catch {
+                print("Failed to restore archive state: \(error)")
+                isInsideArchive = false
+                currentArchiveURL = nil
+                currentArchivePath = ""
+                archiveEntries = []
+                currentPath = archiveURL.deletingLastPathComponent()
+                loadContents()
             }
         }
-
-        // Regular filesystem navigation
-        isInsideArchive = false
-        currentArchiveURL = nil
-        currentArchivePath = ""
-        archiveEntries = []
-
-        currentPath = historyURL
-        selectedItems.removeAll()
-        coverFlowSelectedIndex = 0
-        loadContents()
     }
 
     func openItem(_ item: FileItem) {
+        cancelPendingRename()
 
         // Handle items inside an archive
         if item.isFromArchive {
@@ -505,7 +455,7 @@ class FileBrowserViewModel: ObservableObject {
             loadContents()
 
             // Add to history (use a virtual URL)
-            addToHistory(URL(fileURLWithPath: url.path + "#/"))
+            addToHistory(.archive(archiveURL: url, internalPath: ""))
         } catch {
             // Fall back to opening with default app
             NSWorkspace.shared.open(url)
@@ -526,7 +476,7 @@ class FileBrowserViewModel: ObservableObject {
 
         // Add to history
         if let archiveURL = currentArchiveURL {
-            addToHistory(URL(fileURLWithPath: archiveURL.path + "#/" + normalizedPath))
+            addToHistory(.archive(archiveURL: archiveURL, internalPath: normalizedPath))
         }
     }
 
@@ -544,7 +494,7 @@ class FileBrowserViewModel: ObservableObject {
         pendingSelectionURL = archiveURL
         selectedItems.removeAll()
         loadContents()
-        addToHistory(currentPath)
+        addToHistory(.filesystem(currentPath))
     }
 
     /// Navigate up one level (handles both archive and filesystem)
@@ -575,13 +525,11 @@ class FileBrowserViewModel: ObservableObject {
     /// Extract and open a file from the archive
     private func openArchiveItem(_ item: FileItem) {
         guard let archiveURL = item.archiveURL,
-              let archivePath = item.archivePath else { return }
-
-        // Find the entry
-        guard let entry = archiveEntries.first(where: { $0.path == archivePath }) else {
-            print("Could not find archive entry for path: \(archivePath)")
+              let entry = archiveEntry(for: item) else {
             return
         }
+
+        guard !entry.isDirectory else { return }
 
         do {
             let tempURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
@@ -589,6 +537,33 @@ class FileBrowserViewModel: ObservableObject {
         } catch {
             print("Failed to extract file: \(error.localizedDescription)")
         }
+    }
+
+    private func archiveEntry(for item: FileItem) -> ZipEntry? {
+        guard let archivePath = item.archivePath else { return nil }
+        if let entry = archiveEntries.first(where: { $0.path == archivePath }) {
+            return entry
+        }
+        if let entry = archiveEntries.first(where: { $0.path == archivePath + "/" }) {
+            return entry
+        }
+        if archivePath.hasSuffix("/") {
+            let trimmed = String(archivePath.dropLast())
+            return archiveEntries.first(where: { $0.path == trimmed })
+        }
+        return nil
+    }
+
+    func previewURL(for item: FileItem) -> URL? {
+        if item.isFromArchive {
+            guard !item.isDirectory,
+                  let archiveURL = item.archiveURL,
+                  let entry = archiveEntry(for: item) else {
+                return nil
+            }
+            return try? ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
+        }
+        return item.url
     }
 
     // Track anchor index for Shift+click range selection
@@ -614,15 +589,14 @@ class FileBrowserViewModel: ObservableObject {
         let clampedStart = max(0, start)
         let clampedEnd = min(items.count - 1, end)
 
-        // Select all items in the range
-        for i in clampedStart...clampedEnd {
-            selectedItems.insert(items[i])
-        }
+        selectedItems = Set(items[clampedStart...clampedEnd])
+        lastSelectedIndex = index
     }
 
     /// Handle selection with all modifier combinations
     func handleSelection(item: FileItem, index: Int, in items: [FileItem], withShift: Bool, withCommand: Bool) {
         let now = Date()
+        cancelPendingRename()
 
         // Cancel any active rename when clicking on a different item
         if renamingURL != nil && renamingURL != item.url {
@@ -647,12 +621,17 @@ class FileBrowserViewModel: ObservableObject {
             let wasOnlySelected = selectedItems.count == 1 && selectedItems.contains(item)
             let timeSinceLastClick = now.timeIntervalSince(lastClickTime)
             let isSameItem = lastClickedURL == item.url
+            let doubleClickInterval = NSEvent.doubleClickInterval
 
-            // If clicking on the only selected item again after 0.8-3 seconds, trigger rename
-            // (0.8s minimum prevents accidental activation during double-click)
-            if wasOnlySelected && isSameItem && timeSinceLastClick > 0.8 && timeSinceLastClick < 3.0 && renamingURL == nil {
-                renamingURL = item.url
-                lastClickedURL = nil
+            // If clicking the only selected item after the system double-click interval,
+            // schedule rename with a short delay to avoid double-click collisions.
+            if wasOnlySelected && isSameItem && timeSinceLastClick > doubleClickInterval && timeSinceLastClick < 3.0 && renamingURL == nil {
+                if item.isFromArchive {
+                    NSSound.beep()
+                } else {
+                    scheduleRename(for: item)
+                    lastClickedURL = item.url
+                }
             } else {
                 // Normal selection
                 selectedItems = [item]
@@ -664,83 +643,29 @@ class FileBrowserViewModel: ObservableObject {
         lastClickTime = now
     }
 
-    func quickLook(_ item: FileItem) {
-        NSWorkspace.shared.activateFileViewerSelecting([item.url])
+    private func scheduleRename(for item: FileItem) {
+        cancelPendingRename()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.renamingURL == nil else { return }
+            guard self.selectedItems.count == 1, self.selectedItems.contains(item) else { return }
+            self.renamingURL = item.url
+        }
+        pendingRenameWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + renameDelay, execute: workItem)
     }
 
-    private func addToHistory(_ url: URL) {
+    private func cancelPendingRename() {
+        pendingRenameWorkItem?.cancel()
+        pendingRenameWorkItem = nil
+    }
+
+    private func addToHistory(_ location: NavigationLocation) {
         if historyIndex < navigationHistory.count - 1 {
             navigationHistory.removeSubrange((historyIndex + 1)...)
         }
-        navigationHistory.append(url)
+        navigationHistory.append(location)
         historyIndex = navigationHistory.count - 1
-    }
-
-    private func sortItems(_ items: [FileItem]) -> [FileItem] {
-        let sorted = items.sorted { item1, item2 in
-            // Folders always come first
-            if item1.isDirectory != item2.isDirectory {
-                return item1.isDirectory
-            }
-
-            let result: Bool
-            switch sortOption {
-            case .name:
-                result = item1.name.localizedCaseInsensitiveCompare(item2.name) == .orderedAscending
-            case .dateModified:
-                result = (item1.modificationDate ?? Date.distantPast) < (item2.modificationDate ?? Date.distantPast)
-            case .dateCreated:
-                result = (item1.creationDate ?? Date.distantPast) < (item2.creationDate ?? Date.distantPast)
-            case .size:
-                result = item1.size < item2.size
-            case .kind:
-                result = String(describing: item1.fileType) < String(describing: item2.fileType)
-            }
-            return sortAscending ? result : !result
-        }
-        return sorted
-    }
-
-    /// Hydrate heavy metadata (size/dates/type) around the current selection window.
-    func hydrateMetadataAroundSelection() {
-        let currentItems = items
-        guard !currentItems.isEmpty else { return }
-        let targetPath = currentPath
-
-        let sorted = ListColumnConfigManager.shared.sortedItems(sortItems(currentItems))
-        guard !sorted.isEmpty else { return }
-
-        let selected = min(max(0, coverFlowSelectedIndex), sorted.count - 1)
-        let halfWindow = metadataHydrationWindow / 2
-        let start = max(0, selected - halfWindow)
-        let end = min(sorted.count - 1, selected + halfWindow)
-        guard start <= end else { return }
-
-        let slice = sorted[start...end]
-        let targets = slice.filter { !$0.hasMetadata }
-        guard !targets.isEmpty else { return }
-
-        metadataHydrationWorkItem?.cancel()
-        let workItem = DispatchWorkItem { [weak self] in
-            let hydrated = targets.map { $0.hydrated() }
-            DispatchQueue.main.async {
-                guard let self else { return }
-                guard self.currentPath == targetPath else { return }
-                var updatedItems = self.items
-                var changed = false
-                for item in hydrated {
-                    if let index = updatedItems.firstIndex(where: { $0.url == item.url }) {
-                        updatedItems[index] = item
-                        changed = true
-                    }
-                }
-                if changed {
-                    self.items = updatedItems
-                }
-            }
-        }
-        metadataHydrationWorkItem = workItem
-        DispatchQueue.global(qos: .utility).async(execute: workItem)
     }
 
     func refresh() {
@@ -750,6 +675,7 @@ class FileBrowserViewModel: ObservableObject {
     // MARK: - Clipboard Operations
 
     var canPaste: Bool {
+        if isInsideArchive { return false }
         if !clipboardItems.isEmpty {
             return true
         }
@@ -759,34 +685,43 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     func copySelectedItems() {
-        guard !selectedItems.isEmpty else { return }
+        let itemsToCopy = Array(selectedItems)
+        guard !itemsToCopy.isEmpty else { return }
+        let entriesSnapshot = archiveEntries
 
-        var urlsToCopy: [URL] = []
+        fileOperationQueue.async { [weak self, itemsToCopy, entriesSnapshot] in
+            guard let self else { return }
+            var urlsToCopy: [URL] = []
+            urlsToCopy.reserveCapacity(itemsToCopy.count)
 
-        for item in selectedItems {
-            if item.isFromArchive {
-                // Extract archive item to temp location for copying
-                if let extractedURL = extractArchiveItemForCopy(item) {
-                    urlsToCopy.append(extractedURL)
+            for item in itemsToCopy {
+                if item.isFromArchive {
+                    // Extract archive item to temp location for copying
+                    if let extractedURL = self.extractArchiveItemForCopy(item, entries: entriesSnapshot) {
+                        urlsToCopy.append(extractedURL)
+                    }
+                } else {
+                    urlsToCopy.append(item.url)
                 }
-            } else {
-                urlsToCopy.append(item.url)
+            }
+
+            guard !urlsToCopy.isEmpty else { return }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.clipboardItems = urlsToCopy
+                self.clipboardOperation = .copy
+
+                // Also copy to system pasteboard
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
+                pasteboard.writeObjects(urlsToCopy as [NSURL])
             }
         }
-
-        guard !urlsToCopy.isEmpty else { return }
-
-        clipboardItems = urlsToCopy
-        clipboardOperation = .copy
-
-        // Also copy to system pasteboard
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.writeObjects(clipboardItems as [NSURL])
     }
 
     /// Extract an archive item to a temp directory for copy/paste operations
-    private func extractArchiveItemForCopy(_ item: FileItem) -> URL? {
+    nonisolated private func extractArchiveItemForCopy(_ item: FileItem, entries: [ZipEntry]) -> URL? {
         guard let archiveURL = item.archiveURL,
               let archivePath = item.archivePath else { return nil }
 
@@ -801,10 +736,10 @@ class FileBrowserViewModel: ObservableObject {
 
         if item.isDirectory {
             // For directories, we need to extract all contents
-            return extractArchiveDirectory(item, from: archiveURL, to: destURL)
+            return extractArchiveDirectory(item, from: archiveURL, to: destURL, entries: entries)
         } else {
             // For files, extract single file
-            if let entry = archiveEntries.first(where: { $0.path == archivePath || $0.path == archivePath + "/" }) {
+            if let entry = entries.first(where: { $0.path == archivePath || $0.path == archivePath + "/" }) {
                 do {
                     let extractedURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
                     // Move from temp extraction location to our desired location
@@ -820,7 +755,7 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     /// Extract an entire directory from archive
-    private func extractArchiveDirectory(_ item: FileItem, from archiveURL: URL, to destURL: URL) -> URL? {
+    nonisolated private func extractArchiveDirectory(_ item: FileItem, from archiveURL: URL, to destURL: URL, entries: [ZipEntry]) -> URL? {
         guard let basePath = item.archivePath else { return nil }
 
         let normalizedBase = basePath.hasSuffix("/") ? basePath : basePath + "/"
@@ -829,7 +764,7 @@ class FileBrowserViewModel: ObservableObject {
             try FileManager.default.createDirectory(at: destURL, withIntermediateDirectories: true)
 
             // Find all entries under this directory
-            for entry in archiveEntries {
+            for entry in entries {
                 guard entry.path.hasPrefix(normalizedBase) else { continue }
 
                 let relativePath = String(entry.path.dropFirst(normalizedBase.count))
@@ -878,8 +813,10 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     func paste() {
-        let fileManager = FileManager.default
-        var pastedAny = false
+        guard !isInsideArchive else {
+            NSSound.beep()
+            return
+        }
 
         // Use internal clipboard if available, otherwise read from system pasteboard
         var urlsToPaste = clipboardItems
@@ -897,115 +834,166 @@ class FileBrowserViewModel: ObservableObject {
 
         guard !urlsToPaste.isEmpty else { return }
 
-        for sourceURL in urlsToPaste {
-            let destinationURL = currentPath.appendingPathComponent(sourceURL.lastPathComponent)
+        let destinationPath = currentPath
 
-            // Handle name conflicts
-            let finalDestination = uniqueDestinationURL(for: destinationURL)
+        fileOperationQueue.async { [urlsToPaste, operationIsCut, destinationPath] in
+            let fileManager = FileManager.default
+            var didPasteAny = false
+            for sourceURL in urlsToPaste {
+                let destinationURL = destinationPath.appendingPathComponent(sourceURL.lastPathComponent)
+                let finalDestination = self.uniqueDestinationURL(for: destinationURL)
 
-            do {
-                if operationIsCut {
-                    try fileManager.moveItem(at: sourceURL, to: finalDestination)
-                } else {
-                    try fileManager.copyItem(at: sourceURL, to: finalDestination)
+                do {
+                    if operationIsCut {
+                        try self.moveItemWithFallback(fileManager, from: sourceURL, to: finalDestination)
+                    } else {
+                        try fileManager.copyItem(at: sourceURL, to: finalDestination)
+                    }
+                    didPasteAny = true
+                } catch {
+                    print("Failed to paste \(sourceURL.lastPathComponent): \(error.localizedDescription)")
                 }
-                pastedAny = true
-            } catch {
-                print("Failed to paste \(sourceURL.lastPathComponent): \(error.localizedDescription)")
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if operationIsCut && didPasteAny {
+                    self.clipboardItems.removeAll()
+                    // Clear the cut marker from pasteboard to prevent re-pasting moved files
+                    let pasteboard = NSPasteboard.general
+                    pasteboard.clearContents()
+                }
+
+                self.refresh()
             }
         }
-
-        if operationIsCut && pastedAny {
-            clipboardItems.removeAll()
-            // Clear the cut marker from pasteboard to prevent re-pasting moved files
-            let pasteboard = NSPasteboard.general
-            pasteboard.clearContents()
-        }
-
-        refresh()
     }
 
     func deleteSelectedItems() {
-        guard !selectedItems.isEmpty else { return }
-
-        let fileManager = FileManager.default
-
-        for item in selectedItems {
-            do {
-                try fileManager.trashItem(at: item.url, resultingItemURL: nil)
-            } catch {
-                print("Failed to delete \(item.name): \(error.localizedDescription)")
-            }
+        let itemsToDelete = selectedItems.filter { !$0.isFromArchive }
+        guard !itemsToDelete.isEmpty else {
+            NSSound.beep()
+            return
         }
 
         selectedItems.removeAll()
-        refresh()
+
+        fileOperationQueue.async {
+            let fileManager = FileManager.default
+            for item in itemsToDelete {
+                do {
+                    try fileManager.trashItem(at: item.url, resultingItemURL: nil)
+                } catch {
+                    print("Failed to delete \(item.name): \(error.localizedDescription)")
+                }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                self?.refresh()
+            }
+        }
     }
 
-    func handleDrop(urls: [URL], to destPath: URL? = nil) {
+    func handleDrop(urls: [URL], to destPath: URL? = nil, completion: (() -> Void)? = nil) {
+        guard !isInsideArchive else {
+            NSSound.beep()
+            return
+        }
+
         let destination = destPath ?? currentPath
         // Finder behavior: Drag = Move, Option+Drag = Copy
         let shouldCopy = NSEvent.modifierFlags.contains(.option)
+        let destinationPath = destination
 
-        for sourceURL in urls {
-            if sourceURL.deletingLastPathComponent() == destination { continue }
+        fileOperationQueue.async { [urls, shouldCopy, destinationPath] in
+            let fileManager = FileManager.default
 
-            let destURL = destination.appendingPathComponent(sourceURL.lastPathComponent)
-            let finalURL = uniqueDestinationURL(for: destURL)
+            for sourceURL in urls {
+                if sourceURL.deletingLastPathComponent() == destinationPath { continue }
 
-            do {
-                if shouldCopy {
-                    try FileManager.default.copyItem(at: sourceURL, to: finalURL)
-                } else {
-                    try FileManager.default.moveItem(at: sourceURL, to: finalURL)
+                let destURL = destinationPath.appendingPathComponent(sourceURL.lastPathComponent)
+                let finalURL = self.uniqueDestinationURL(for: destURL)
+
+                do {
+                    if shouldCopy {
+                        try fileManager.copyItem(at: sourceURL, to: finalURL)
+                    } else {
+                        try self.moveItemWithFallback(fileManager, from: sourceURL, to: finalURL)
+                    }
+                } catch {
+                    print("Failed to \(shouldCopy ? "copy" : "move") \(sourceURL.lastPathComponent): \(error)")
                 }
-            } catch {
-                print("Failed to \(shouldCopy ? "copy" : "move") \(sourceURL.lastPathComponent): \(error)")
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                self?.refresh()
+                completion?()
             }
         }
-
-        refresh()
     }
 
     func duplicateSelectedItems() {
-        guard !selectedItems.isEmpty else { return }
-
-        let fileManager = FileManager.default
-
-        for item in selectedItems {
-            let baseName = item.url.deletingPathExtension().lastPathComponent
-            let ext = item.url.pathExtension
-            var copyName = ext.isEmpty ? "\(baseName) copy" : "\(baseName) copy.\(ext)"
-            var destinationURL = currentPath.appendingPathComponent(copyName)
-
-            // Handle existing copies
-            var copyNumber = 2
-            while fileManager.fileExists(atPath: destinationURL.path) {
-                copyName = ext.isEmpty ? "\(baseName) copy \(copyNumber)" : "\(baseName) copy \(copyNumber).\(ext)"
-                destinationURL = currentPath.appendingPathComponent(copyName)
-                copyNumber += 1
-            }
-
-            do {
-                try fileManager.copyItem(at: item.url, to: destinationURL)
-            } catch {
-                print("Failed to duplicate \(item.name): \(error.localizedDescription)")
-            }
+        guard !isInsideArchive else {
+            NSSound.beep()
+            return
         }
 
-        refresh()
+        let itemsToDuplicate = selectedItems.filter { !$0.isFromArchive }
+        guard !itemsToDuplicate.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
+        let destinationPath = currentPath
+
+        fileOperationQueue.async { [itemsToDuplicate, destinationPath] in
+            let fileManager = FileManager.default
+            for item in itemsToDuplicate {
+                let baseName = item.url.deletingPathExtension().lastPathComponent
+                let ext = item.url.pathExtension
+                var copyName = ext.isEmpty ? "\(baseName) copy" : "\(baseName) copy.\(ext)"
+                var destinationURL = destinationPath.appendingPathComponent(copyName)
+
+                // Handle existing copies
+                var copyNumber = 2
+                while fileManager.fileExists(atPath: destinationURL.path) {
+                    copyName = ext.isEmpty ? "\(baseName) copy \(copyNumber)" : "\(baseName) copy \(copyNumber).\(ext)"
+                    destinationURL = destinationPath.appendingPathComponent(copyName)
+                    copyNumber += 1
+                }
+
+                do {
+                    try fileManager.copyItem(at: item.url, to: destinationURL)
+                } catch {
+                    print("Failed to duplicate \(item.name): \(error.localizedDescription)")
+                }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                self?.refresh()
+            }
+        }
     }
 
     func renameItem(_ item: FileItem, to newName: String) {
+        guard !item.isFromArchive else {
+            NSSound.beep()
+            return
+        }
+
         let newURL = item.url.deletingLastPathComponent().appendingPathComponent(newName)
 
         guard newURL != item.url else { return }
 
-        do {
-            try FileManager.default.moveItem(at: item.url, to: newURL)
-            refresh()
-        } catch {
-            print("Failed to rename \(item.name): \(error.localizedDescription)")
+        fileOperationQueue.async {
+            do {
+                try FileManager.default.moveItem(at: item.url, to: newURL)
+                DispatchQueue.main.async { [weak self] in
+                    self?.refresh()
+                }
+            } catch {
+                print("Failed to rename \(item.name): \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1015,40 +1003,75 @@ class FileBrowserViewModel: ObservableObject {
 
     func getInfo() {
         guard let item = selectedItems.first else { return }
+        guard !item.isFromArchive else {
+            NSSound.beep()
+            return
+        }
         infoItem = item
         NotificationCenter.default.post(name: .showGetInfo, object: item)
     }
 
     func showInFinder() {
-        let urls = selectedItems.isEmpty ? [currentPath] : selectedItems.map { $0.url }
+        let urls: [URL]
+        if selectedItems.isEmpty {
+            if isInsideArchive, let archiveURL = currentArchiveURL {
+                urls = [archiveURL]
+            } else {
+                urls = [currentPath]
+            }
+        } else {
+            urls = selectedItems.compactMap { item in
+                if item.isFromArchive {
+                    return item.archiveURL
+                }
+                return item.url
+            }
+        }
+
+        guard !urls.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
         NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
 
     func createNewFolder() {
-        let fileManager = FileManager.default
-        var folderName = "untitled folder"
-        var folderURL = currentPath.appendingPathComponent(folderName)
-
-        var counter = 2
-        while fileManager.fileExists(atPath: folderURL.path) {
-            folderName = "untitled folder \(counter)"
-            folderURL = currentPath.appendingPathComponent(folderName)
-            counter += 1
+        guard !isInsideArchive else {
+            NSSound.beep()
+            return
         }
 
-        do {
-            try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
-            refresh()
-        } catch {
-            print("Failed to create folder: \(error.localizedDescription)")
+        let destinationPath = currentPath
+
+        fileOperationQueue.async {
+            let fileManager = FileManager.default
+            var folderName = "untitled folder"
+            var folderURL = destinationPath.appendingPathComponent(folderName)
+
+            var counter = 2
+            while fileManager.fileExists(atPath: folderURL.path) {
+                folderName = "untitled folder \(counter)"
+                folderURL = destinationPath.appendingPathComponent(folderName)
+                counter += 1
+            }
+
+            do {
+                try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
+                DispatchQueue.main.async { [weak self] in
+                    self?.refresh()
+                }
+            } catch {
+                print("Failed to create folder: \(error.localizedDescription)")
+            }
         }
     }
 
     func selectAll() {
-        selectedItems = Set(items)
+        selectedItems = Set(filteredItems)
     }
 
-    func uniqueDestinationURL(for url: URL) -> URL {
+    nonisolated func uniqueDestinationURL(for url: URL) -> URL {
         let fileManager = FileManager.default
         var destinationURL = url
 
@@ -1065,5 +1088,20 @@ class FileBrowserViewModel: ObservableObject {
         }
 
         return destinationURL
+    }
+
+    nonisolated private func moveItemWithFallback(_ fileManager: FileManager, from sourceURL: URL, to destinationURL: URL) throws {
+        do {
+            try fileManager.moveItem(at: sourceURL, to: destinationURL)
+        } catch {
+            let nsError = error as NSError
+            if nsError.domain == NSPOSIXErrorDomain &&
+                nsError.code == POSIXErrorCode.EXDEV.rawValue {
+                try fileManager.copyItem(at: sourceURL, to: destinationURL)
+                try fileManager.removeItem(at: sourceURL)
+            } else {
+                throw error
+            }
+        }
     }
 }
