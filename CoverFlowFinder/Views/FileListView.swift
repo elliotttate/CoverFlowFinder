@@ -6,6 +6,7 @@ struct FileListView: View {
     let items: [FileItem]
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
     @State private var isDropTargeted = false
+    @State private var dropTargetedItemID: UUID?
 
     // Thumbnail loading
     @State private var thumbnails: [URL: NSImage] = [:]
@@ -42,12 +43,29 @@ struct FileListView: View {
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .contentShape(Rectangle())
                         .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
+                        .listRowBackground(
+                            dropTargetedItemID == item.id
+                                ? Color.accentColor.opacity(0.3)
+                                : (viewModel.selectedItems.contains(item)
+                                    ? Color.accentColor.opacity(0.2)
+                                    : Color.clear)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color.accentColor, lineWidth: 2)
+                                .opacity(dropTargetedItemID == item.id ? 1 : 0)
+                        )
                         .onAppear {
                             loadThumbnail(for: item)
                         }
                         .onDrag {
                             NSItemProvider(object: item.url as NSURL)
                         }
+                        .onDrop(of: [.fileURL], delegate: FolderDropDelegate(
+                            item: item,
+                            viewModel: viewModel,
+                            dropTargetedItemID: $dropTargetedItemID
+                        ))
                         .instantTap(
                             id: item.id,
                             onSingleClick: {
@@ -452,5 +470,51 @@ struct TagBadge: View {
             return finderTag.color
         }
         return .accentColor
+    }
+}
+
+// MARK: - Folder Drop Delegate
+
+struct FolderDropDelegate: DropDelegate {
+    let item: FileItem
+    let viewModel: FileBrowserViewModel
+    @Binding var dropTargetedItemID: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        if item.isDirectory {
+            dropTargetedItemID = item.id
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetedItemID == item.id {
+            dropTargetedItemID = nil
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        return DropProposal(operation: operation)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard item.isDirectory else { return false }
+
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [url], to: item.url)
+                }
+            }
+        }
+        return true
     }
 }

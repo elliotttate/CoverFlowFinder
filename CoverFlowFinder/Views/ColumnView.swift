@@ -223,81 +223,86 @@ struct SingleColumnView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let onSelect: (FileItem) -> Void
     let onDoubleClick: (FileItem) -> Void
-    @State private var isDropTargeted = false
+    @State private var dropTargetedItemID: UUID?
+    @State private var isColumnDropTargeted = false
 
     var body: some View {
         ScrollViewReader { scrollProxy in
-            List(items, id: \.id) { item in
-                ColumnRowView(
-                    item: item,
-                    viewModel: viewModel,
-                    isSelected: viewModel.selectedItems.contains(item)
-                )
-                .id(item.id)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-                .onDrag {
-                    NSItemProvider(object: item.url as NSURL)
-                }
-                .instantTap(
-                    id: item.id,
-                    onSingleClick: {
-                        if let index = items.firstIndex(of: item) {
-                            let modifiers = NSEvent.modifierFlags
-                            viewModel.handleSelection(
-                                item: item,
-                                index: index,
-                                in: items,
-                                withShift: modifiers.contains(.shift),
-                                withCommand: modifiers.contains(.command)
-                            )
+            List {
+                ForEach(items) { item in
+                    ColumnRowView(
+                        item: item,
+                        viewModel: viewModel,
+                        isSelected: viewModel.selectedItems.contains(item)
+                    )
+                    .id(item.id)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    .listRowBackground(
+                        dropTargetedItemID == item.id
+                            ? Color.accentColor.opacity(0.3)
+                            : (viewModel.selectedItems.contains(item)
+                                ? Color.accentColor.opacity(0.2)
+                                : Color.clear)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(Color.accentColor, lineWidth: 2)
+                            .opacity(dropTargetedItemID == item.id ? 1 : 0)
+                    )
+                    .onDrag {
+                        NSItemProvider(object: item.url as NSURL)
+                    }
+                    .onDrop(of: [.fileURL], delegate: ColumnFolderDropDelegate(
+                        item: item,
+                        viewModel: viewModel,
+                        dropTargetedItemID: $dropTargetedItemID
+                    ))
+                    .instantTap(
+                        id: item.id,
+                        onSingleClick: {
+                            if let index = items.firstIndex(of: item) {
+                                let modifiers = NSEvent.modifierFlags
+                                viewModel.handleSelection(
+                                    item: item,
+                                    index: index,
+                                    in: items,
+                                    withShift: modifiers.contains(.shift),
+                                    withCommand: modifiers.contains(.command)
+                                )
+                            }
+                            onSelect(item)
+                        },
+                        onDoubleClick: {
+                            onDoubleClick(item)
                         }
-                        onSelect(item)
-                    },
-                    onDoubleClick: {
-                        onDoubleClick(item)
+                    )
+                    .contextMenu {
+                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                            viewModel.renamingURL = item.url
+                        }
                     }
-                )
-                .contextMenu {
-                    FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                        viewModel.renamingURL = item.url
-                    }
+                    .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
+                    .listRowSeparator(.hidden)
                 }
-                .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
-                .listRowSeparator(.hidden)
-                .listRowBackground(
-                    viewModel.selectedItems.contains(item)
-                        ? Color.accentColor.opacity(0.3)
-                        : Color.clear
-                )
             }
             .listStyle(.plain)
             .frame(width: 220)
+            .onDrop(of: [.fileURL], delegate: ColumnBackgroundDropDelegate(
+                columnURL: columnURL,
+                viewModel: viewModel,
+                dropTargetedItemID: $dropTargetedItemID,
+                isColumnDropTargeted: $isColumnDropTargeted
+            ))
+            .overlay(
+                RoundedRectangle(cornerRadius: 4)
+                    .stroke(isColumnDropTargeted && dropTargetedItemID == nil ? Color.accentColor : Color.clear, lineWidth: 2)
+            )
             .onChange(of: selectedItem) { newSelection in
                 if let selected = newSelection {
                     withAnimation {
                         scrollProxy.scrollTo(selected.id)
                     }
-                }
-            }
-        }
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-            handleDrop(providers: providers, destPath: columnURL)
-            return true
-        }
-        .overlay(
-            RoundedRectangle(cornerRadius: 4)
-                .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 2)
-        )
-    }
-
-    private func handleDrop(providers: [NSItemProvider], destPath: URL) {
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [sourceURL], to: destPath)
                 }
             }
         }
@@ -431,5 +436,105 @@ struct InfoRow: View {
             Text(value)
                 .lineLimit(1)
         }
+    }
+}
+
+// MARK: - Folder Drop Delegate
+
+struct ColumnFolderDropDelegate: DropDelegate {
+    let item: FileItem
+    let viewModel: FileBrowserViewModel
+    @Binding var dropTargetedItemID: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        // Only validate for folders - non-folders fall through to column drop
+        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        if item.isDirectory {
+            dropTargetedItemID = item.id
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetedItemID == item.id {
+            dropTargetedItemID = nil
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        // Non-folders: return nil to let parent handle it
+        guard item.isDirectory else { return nil }
+        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        return DropProposal(operation: operation)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        // Non-folders: return false to let parent handle it
+        guard item.isDirectory else { return false }
+
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [url], to: item.url)
+                }
+            }
+        }
+        return true
+    }
+}
+
+// MARK: - Column Background Drop Delegate
+
+struct ColumnBackgroundDropDelegate: DropDelegate {
+    let columnURL: URL
+    let viewModel: FileBrowserViewModel
+    @Binding var dropTargetedItemID: UUID?
+    @Binding var isColumnDropTargeted: Bool
+
+    func validateDrop(info: DropInfo) -> Bool {
+        return info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        if dropTargetedItemID == nil {
+            isColumnDropTargeted = true
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        isColumnDropTargeted = false
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        // Show column highlight when not over a folder
+        if dropTargetedItemID == nil {
+            isColumnDropTargeted = true
+        } else {
+            isColumnDropTargeted = false
+        }
+        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        return DropProposal(operation: operation)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        // If hovering over a folder, that delegate handles it
+        guard dropTargetedItemID == nil else { return false }
+
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [url], to: columnURL)
+                }
+            }
+        }
+        return true
     }
 }

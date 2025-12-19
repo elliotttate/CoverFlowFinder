@@ -5,6 +5,7 @@ struct IconGridView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
     @State private var isDropTargeted = false
+    @State private var dropTargetedItemID: UUID?
     @State private var currentWidth: CGFloat = 800
 
     // Thumbnail loading
@@ -38,12 +39,22 @@ struct IconGridView: View {
                                 thumbnail: thumbnails[item.url]
                             )
                             .id(item.id)
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Color.accentColor, lineWidth: 3)
+                                    .opacity(dropTargetedItemID == item.id ? 1 : 0)
+                            )
                             .onAppear {
                                 loadThumbnail(for: item)
                             }
                             .onDrag {
                                 NSItemProvider(object: item.url as NSURL)
                             }
+                            .onDrop(of: [.fileURL], delegate: IconFolderDropDelegate(
+                                item: item,
+                                viewModel: viewModel,
+                                dropTargetedItemID: $dropTargetedItemID
+                            ))
                             .instantTap(
                                 id: item.id,
                                 onSingleClick: {
@@ -266,5 +277,51 @@ struct IconGridItem: View {
             isHovering = hovering
         }
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+    }
+}
+
+// MARK: - Folder Drop Delegate
+
+struct IconFolderDropDelegate: DropDelegate {
+    let item: FileItem
+    let viewModel: FileBrowserViewModel
+    @Binding var dropTargetedItemID: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        if item.isDirectory {
+            dropTargetedItemID = item.id
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetedItemID == item.id {
+            dropTargetedItemID = nil
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        return DropProposal(operation: operation)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard item.isDirectory else { return false }
+
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [url], to: item.url)
+                }
+            }
+        }
+        return true
     }
 }

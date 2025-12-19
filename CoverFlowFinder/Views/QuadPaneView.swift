@@ -383,12 +383,13 @@ struct QuadPaneCell: View {
 struct QuadPaneListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
+    @State private var dropTargetedItemID: UUID?
 
     var body: some View {
         ScrollViewReader { scrollProxy in
             List {
                 ForEach(viewModel.items) { item in
-                    QuadPaneListRow(item: item, viewModel: viewModel, onActivate: onActivate)
+                    QuadPaneListRow(item: item, viewModel: viewModel, onActivate: onActivate, dropTargetedItemID: $dropTargetedItemID)
                 }
             }
             .listStyle(.plain)
@@ -407,6 +408,7 @@ struct QuadPaneListRow: View {
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
+    @Binding var dropTargetedItemID: UUID?
 
     var body: some View {
         let isSelected = viewModel.selectedItems.contains(item)
@@ -432,12 +434,28 @@ struct QuadPaneListRow: View {
         .padding(.vertical, 1)
         .padding(.horizontal, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+        .background(
+            dropTargetedItemID == item.id
+                ? Color.accentColor.opacity(0.4)
+                : (isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 3)
+                .stroke(Color.accentColor, lineWidth: 2)
+                .opacity(dropTargetedItemID == item.id ? 1 : 0)
+        )
         .cornerRadius(3)
         .contentShape(Rectangle())
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
-        .draggable(item.url)
+        .onDrag {
+            NSItemProvider(object: item.url as NSURL)
+        }
+        .onDrop(of: [.fileURL], delegate: QuadPaneFolderDropDelegate(
+            item: item,
+            viewModel: viewModel,
+            dropTargetedItemID: $dropTargetedItemID
+        ))
         .instantTap(
             id: item.id,
             onSingleClick: {
@@ -474,6 +492,7 @@ struct QuadPaneIconView: View {
     let onActivate: () -> Void
 
     @State private var thumbnails: [URL: NSImage] = [:]
+    @State private var dropTargetedItemID: UUID?
     private let thumbnailCache = ThumbnailCacheManager.shared
 
     private let columns = [
@@ -506,7 +525,7 @@ struct QuadPaneIconView: View {
             ScrollView {
                 LazyVGrid(columns: columns, spacing: 8) {
                     ForEach(viewModel.items) { item in
-                        QuadPaneIconCell(item: item, viewModel: viewModel, onActivate: onActivate, thumbnail: thumbnails[item.url])
+                        QuadPaneIconCell(item: item, viewModel: viewModel, onActivate: onActivate, thumbnail: thumbnails[item.url], dropTargetedItemID: $dropTargetedItemID)
                             .onAppear { loadThumbnail(for: item) }
                     }
                 }
@@ -528,6 +547,7 @@ struct QuadPaneIconCell: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
     let thumbnail: NSImage?
+    @Binding var dropTargetedItemID: UUID?
 
     var body: some View {
         let isSelected = viewModel.selectedItems.contains(item)
@@ -546,12 +566,28 @@ struct QuadPaneIconCell: View {
         }
         .frame(width: 70)
         .padding(4)
-        .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+        .background(
+            dropTargetedItemID == item.id
+                ? Color.accentColor.opacity(0.4)
+                : (isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.accentColor, lineWidth: 2)
+                .opacity(dropTargetedItemID == item.id ? 1 : 0)
+        )
         .cornerRadius(6)
         .contentShape(Rectangle())
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
-        .draggable(item.url)
+        .onDrag {
+            NSItemProvider(object: item.url as NSURL)
+        }
+        .onDrop(of: [.fileURL], delegate: QuadPaneFolderDropDelegate(
+            item: item,
+            viewModel: viewModel,
+            dropTargetedItemID: $dropTargetedItemID
+        ))
         .instantTap(
             id: item.id,
             onSingleClick: {
@@ -580,5 +616,51 @@ struct QuadPaneIconCell: View {
             )
         }
         onActivate()
+    }
+}
+
+// MARK: - Folder Drop Delegate
+
+struct QuadPaneFolderDropDelegate: DropDelegate {
+    let item: FileItem
+    let viewModel: FileBrowserViewModel
+    @Binding var dropTargetedItemID: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        if item.isDirectory {
+            dropTargetedItemID = item.id
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetedItemID == item.id {
+            dropTargetedItemID = nil
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        return DropProposal(operation: operation)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard item.isDirectory else { return false }
+
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [url], to: item.url)
+                }
+            }
+        }
+        return true
     }
 }

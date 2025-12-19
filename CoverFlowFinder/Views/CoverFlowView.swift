@@ -1768,7 +1768,7 @@ extension CoverFlowNSView: NSDraggingSource {
 
 // MARK: - Folder Drop Delegate
 
-struct FolderDropDelegate: DropDelegate {
+struct CoverFlowFolderDropDelegate: DropDelegate {
     let item: FileItem
     let viewModel: FileBrowserViewModel
     @Binding var dropTargetedItemID: UUID?
@@ -1871,7 +1871,7 @@ struct FileListSection: View {
                                 }
                                 return NSItemProvider(object: item.url as NSURL)
                             }
-                            .onDrop(of: [.fileURL], delegate: FolderDropDelegate(
+                            .onDrop(of: [.fileURL], delegate: CoverFlowFolderDropDelegate(
                                 item: item,
                                 viewModel: viewModel,
                                 dropTargetedItemID: $dropTargetedItemID

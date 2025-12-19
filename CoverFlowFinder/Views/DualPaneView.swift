@@ -392,6 +392,7 @@ struct PaneView: View {
 struct PaneListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
+    @State private var dropTargetedItemID: UUID?
 
     var body: some View {
         ScrollViewReader { scrollProxy in
@@ -426,12 +427,26 @@ struct PaneListView: View {
                     .padding(.vertical, 4)
                     .padding(.horizontal, 4)
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+                    .background(
+                        dropTargetedItemID == item.id
+                            ? Color.accentColor.opacity(0.4)
+                            : (isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(Color.accentColor, lineWidth: 2)
+                            .opacity(dropTargetedItemID == item.id ? 1 : 0)
+                    )
                     .contentShape(Rectangle())
                     .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
                     .onDrag {
                         NSItemProvider(object: item.url as NSURL)
                     }
+                    .onDrop(of: [.fileURL], delegate: DualPaneFolderDropDelegate(
+                        item: item,
+                        viewModel: viewModel,
+                        dropTargetedItemID: $dropTargetedItemID
+                    ))
                     .instantTap(
                         id: item.id,
                         onSingleClick: {
@@ -479,6 +494,7 @@ struct PaneIconView: View {
     let onColumnsCalculated: (Int) -> Void
 
     @State private var thumbnails: [URL: NSImage] = [:]
+    @State private var dropTargetedItemID: UUID?
     private let thumbnailCache = ThumbnailCacheManager.shared
 
     private let columns = [
@@ -535,13 +551,27 @@ struct PaneIconView: View {
                             .id(item.id)
                             .onAppear { loadThumbnail(for: item) }
                             .padding(8)
-                            .background(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
+                            .background(
+                                dropTargetedItemID == item.id
+                                    ? Color.accentColor.opacity(0.4)
+                                    : (isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
+                            )
+                            .overlay(
+                                RoundedRectangle(cornerRadius: 8)
+                                    .stroke(Color.accentColor, lineWidth: 3)
+                                    .opacity(dropTargetedItemID == item.id ? 1 : 0)
+                            )
                             .cornerRadius(8)
                             .contentShape(Rectangle())
                             .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
                             .onDrag {
                                 NSItemProvider(object: item.url as NSURL)
                             }
+                            .onDrop(of: [.fileURL], delegate: DualPaneFolderDropDelegate(
+                                item: item,
+                                viewModel: viewModel,
+                                dropTargetedItemID: $dropTargetedItemID
+                            ))
                             .instantTap(
                                 id: item.id,
                                 onSingleClick: {
@@ -586,5 +616,51 @@ struct PaneIconView: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Folder Drop Delegate
+
+struct DualPaneFolderDropDelegate: DropDelegate {
+    let item: FileItem
+    let viewModel: FileBrowserViewModel
+    @Binding var dropTargetedItemID: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        if item.isDirectory {
+            dropTargetedItemID = item.id
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetedItemID == item.id {
+            dropTargetedItemID = nil
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        return DropProposal(operation: operation)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard item.isDirectory else { return false }
+
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [url], to: item.url)
+                }
+            }
+        }
+        return true
     }
 }
