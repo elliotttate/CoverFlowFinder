@@ -88,3 +88,4 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 Inspired by the classic Cover Flow view from iTunes and older versions of macOS Finder.
+
