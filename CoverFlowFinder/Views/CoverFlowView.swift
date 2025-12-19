@@ -59,6 +59,9 @@ struct CoverFlowView: View {
                     onDrop: { urls in
                         handleDrop(urls: urls)
                     },
+                    onDropToFolder: { urls, folderURL in
+                        viewModel.handleDrop(urls: urls, to: folderURL)
+                    },
                     onScrollStateChange: { scrolling in
                         DispatchQueue.main.async {
                             isCoverFlowScrolling = scrolling
@@ -303,6 +306,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onOpen: (Int) -> Void
     let onRightClick: (Int) -> Void
     let onDrop: ([URL]) -> Void
+    let onDropToFolder: ([URL], URL) -> Void  // Drop to specific folder
     let onScrollStateChange: (Bool) -> Void
     let onCopy: () -> Void
     let onCut: () -> Void
@@ -317,6 +321,7 @@ struct CoverFlowContainer: NSViewRepresentable {
             onRightClick(index)
         }
         view.onDrop = onDrop
+        view.onDropToFolder = onDropToFolder
         view.onScrollStateChange = onScrollStateChange
         view.onCopy = onCopy
         view.onCut = onCut
@@ -334,6 +339,7 @@ struct CoverFlowContainer: NSViewRepresentable {
             onRightClick(index)
         }
         nsView.onDrop = onDrop
+        nsView.onDropToFolder = onDropToFolder
         nsView.onScrollStateChange = onScrollStateChange
         nsView.onCopy = onCopy
         nsView.onCut = onCut
@@ -493,9 +499,12 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 
     // Drag and drop
     var onDrop: (([URL]) -> Void)?
+    var onDropToFolder: (([URL], URL) -> Void)?  // Drop to specific folder
     private var dragStartLocation: NSPoint?
     private var dragStartIndex: Int?
     private var isDropTargeted = false
+    private var dropTargetIndex: Int?  // Which folder cover is being hovered
+    private var dropTargetHighlightLayer: CAShapeLayer?  // Visible hover ring
 
     private func setupView() {
         wantsLayer = true
@@ -947,6 +956,10 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
 
     override var acceptsFirstResponder: Bool { true }
 
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        return true
+    }
+
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
 
@@ -989,7 +1002,9 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     override func mouseDragged(with event: NSEvent) {
         guard let startLocation = dragStartLocation,
               let index = dragStartIndex,
-              index < items.count else { return }
+              index < items.count else {
+            return
+        }
 
         let location = convert(event.locationInWindow, from: nil)
         let distance = hypot(location.x - startLocation.x, location.y - startLocation.y)
@@ -1029,7 +1044,7 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
                 draggingItems.append(draggingItem)
             }
 
-            beginDraggingSession(with: draggingItems, event: event, source: self)
+            _ = beginDraggingSession(with: draggingItems, event: event, source: self)
 
             dragStartLocation = nil
             dragStartIndex = nil
@@ -1167,7 +1182,8 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
             // Generous hit area expansion
             let hitFrame = coverFrame.insetBy(dx: -20, dy: -20)
             if hitFrame.contains(point) {
-                return coverLayer.value(forKey: "itemIndex") as? Int
+                let idx = coverLayer.value(forKey: "itemIndex") as? Int
+                return idx
             }
         }
 
@@ -1458,24 +1474,33 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     // MARK: - NSDraggingSource
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        return context == .outsideApplication ? .copy : .copy
+        // Allow both move and copy - the actual operation depends on Option key
+        return [.move, .copy]
     }
 
     // MARK: - NSDraggingDestination
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         isDropTargeted = true
-        needsDisplay = true
-        return .copy
+        updateDropTarget(from: sender)
+        return currentDragOperation()
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
-        return .copy
+        updateDropTarget(from: sender)
+        return currentDragOperation()
+    }
+
+    private func currentDragOperation() -> NSDragOperation {
+        guard dropTargetIndex != nil else { return .generic }
+        // Option key = copy (shows + icon), otherwise move (no icon)
+        return NSEvent.modifierFlags.contains(.option) ? .copy : .move
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
         isDropTargeted = false
-        needsDisplay = true
+        clearDropTargetHighlight()
+        dropTargetIndex = nil
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -1483,35 +1508,311 @@ class CoverFlowNSView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate 
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
-        isDropTargeted = false
-        needsDisplay = true
+        // Re-evaluate the drop target at the final location so hovering glitches don't lose the folder target
+        let windowPoint = sender.draggingLocation
+        let viewPoint = convert(windowPoint, from: nil)
+        if dropTargetIndex == nil,
+           let hoveredIndex = hitTestCover(at: viewPoint),
+           hoveredIndex < items.count,
+           items[hoveredIndex].isDirectory {
+            dropTargetIndex = hoveredIndex
+        }
 
-        guard let pasteboard = sender.draggingPasteboard.propertyList(forType: .fileURL) as? String,
-              let url = URL(string: pasteboard) else {
-            // Try reading multiple URLs
-            var urls: [URL] = []
-            if let items = sender.draggingPasteboard.pasteboardItems {
-                for item in items {
-                    if let urlString = item.string(forType: .fileURL),
-                       let url = URL(string: urlString) {
+        let targetIndex = dropTargetIndex
+        isDropTargeted = false
+        clearDropTargetHighlight()
+        dropTargetIndex = nil
+
+        // Collect URLs from pasteboard
+        var urls: [URL] = []
+        // Prefer reading as file URLs directly for reliability (Finder and internal drags)
+        if let objectURLs = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
+            urls.append(contentsOf: objectURLs)
+        }
+        // Fallback to raw pasteboard items if needed
+        if urls.isEmpty, let items = sender.draggingPasteboard.pasteboardItems {
+            for item in items {
+                if let urlString = item.string(forType: .fileURL) {
+                    // fileURL comes percent-encoded; URL(string:) keeps it intact
+                    if let url = URL(string: urlString) {
                         urls.append(url)
                     }
                 }
             }
+        }
 
-            if !urls.isEmpty {
-                onDrop?(urls)
-                return true
-            }
+        guard !urls.isEmpty else {
             return false
         }
 
-        onDrop?([url])
+        // If dropping on a folder, drop into that folder
+        if let targetIndex = targetIndex,
+           targetIndex < items.count,
+           items[targetIndex].isDirectory {
+            onDropToFolder?(urls, items[targetIndex].url)
+            return true
+        }
+
+        // Otherwise drop to current directory
+        onDrop?(urls)
         return true
+    }
+
+    private func updateDropTarget(from draggingInfo: NSDraggingInfo) {
+        // Try both interpretations of the drag location to be resilient to external drag sources
+        var candidateLocations: [NSPoint] = []
+        candidateLocations.append(normalizedDragLocation(from: draggingInfo))
+
+        if let window {
+            let screenPoint = draggingInfo.draggingLocation
+            let correctedWindowPoint = window.convertPoint(fromScreen: screenPoint)
+            candidateLocations.append(convert(correctedWindowPoint, from: nil))
+        }
+
+        updateDropTarget(at: candidateLocations)
+    }
+
+    private func updateDropTarget(at location: NSPoint) {
+        updateDropTarget(at: [location])
+    }
+
+    private func updateDropTarget(at locations: [NSPoint]) {
+        let oldTargetIndex = dropTargetIndex
+        var newTarget: Int?
+
+        // Hit test to find which cover we're over (first matching location wins)
+        for location in locations {
+            if let index = hitTestCover(at: location),
+               index < items.count,
+               items[index].isDirectory {
+                newTarget = index
+                break
+            }
+        }
+
+        dropTargetIndex = newTarget
+
+        // Update highlighting if target changed
+        if oldTargetIndex != dropTargetIndex {
+            if let oldIndex = oldTargetIndex {
+                updateCoverHighlight(at: oldIndex, highlighted: false)
+            }
+            if let newIndex = dropTargetIndex {
+                updateCoverHighlight(at: newIndex, highlighted: true)
+            }
+        } else if let current = dropTargetIndex {
+            // Re-apply every update so highlight survives layer refreshes
+            updateCoverHighlight(at: current, highlighted: true)
+        }
+    }
+
+    private func clearDropTargetHighlight() {
+        hideDropTargetHighlight()
+    }
+
+    private func updateCoverHighlight(at index: Int, highlighted: Bool) {
+        // Use a single overlay drawn above everything. This avoids 3D transform / z-order issues.
+        if highlighted {
+            showDropTargetHighlight(for: index)
+        } else {
+            hideDropTargetHighlight()
+        }
+    }
+
+    private func ensureDropTargetHighlightLayer() -> CAShapeLayer? {
+        guard let rootLayer = layer else { return nil }
+
+        if let existing = dropTargetHighlightLayer {
+            return existing
+        }
+
+        let highlight = CAShapeLayer()
+        highlight.name = "dropTargetHighlightLayer"
+        highlight.fillColor = NSColor.controlAccentColor.withAlphaComponent(0.18).cgColor
+        highlight.strokeColor = NSColor.controlAccentColor.cgColor
+        highlight.lineWidth = 5
+        highlight.lineJoin = .round
+        highlight.lineCap = .round
+        highlight.zPosition = 200_000
+        highlight.isHidden = true
+
+        // Prevent implicit animations while dragging
+        highlight.actions = [
+            "position": NSNull(),
+            "bounds": NSNull(),
+            "path": NSNull(),
+            "opacity": NSNull(),
+            "hidden": NSNull()
+        ]
+
+        rootLayer.addSublayer(highlight)
+        dropTargetHighlightLayer = highlight
+        return highlight
+    }
+
+    private func showDropTargetHighlight(for index: Int) {
+        guard let highlight = ensureDropTargetHighlightLayer() else { return }
+
+        // Find the visible cover layer for this index
+        guard let coverLayer = coverLayers.first(where: { ($0.value(forKey: "itemIndex") as? Int) == index }) else {
+            highlight.isHidden = true
+            return
+        }
+
+        let coverWidth = coverLayer.value(forKey: "coverWidth") as? CGFloat ?? coverLayer.bounds.width
+        let coverHeight = coverLayer.value(forKey: "coverHeight") as? CGFloat ?? coverLayer.bounds.height
+
+        // NOTE: This is an axis-aligned box in view coordinates. It’s intentionally simple and reliable.
+        var frame = CGRect(
+            x: coverLayer.position.x - coverWidth / 2,
+            y: coverLayer.position.y - coverHeight / 2,
+            width: coverWidth,
+            height: coverHeight
+        )
+        frame = frame.insetBy(dx: -8, dy: -8)
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        highlight.frame = frame
+        highlight.path = CGPath(roundedRect: highlight.bounds, cornerWidth: 12, cornerHeight: 12, transform: nil)
+        highlight.isHidden = false
+        highlight.opacity = 1
+        CATransaction.commit()
+    }
+
+    private func hideDropTargetHighlight() {
+        guard let highlight = dropTargetHighlightLayer else { return }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        highlight.isHidden = true
+        CATransaction.commit()
+    }
+
+    /// Normalize dragging location so we handle both window and screen-based coordinates
+    private func normalizedDragLocation(from draggingInfo: NSDraggingInfo) -> NSPoint {
+        // Default: treat draggingLocation as window coords (AppKit standard)
+        let windowPoint = draggingInfo.draggingLocation
+        let viewPoint = convert(windowPoint, from: nil)
+
+        // Some external drags report screen coordinates; fallback if the point is far outside our bounds
+        if !bounds.insetBy(dx: -200, dy: -200).contains(viewPoint), let window {
+            let screenPoint = draggingInfo.draggingLocation
+            let correctedWindowPoint = window.convertPoint(fromScreen: screenPoint)
+            return convert(correctedWindowPoint, from: nil)
+        }
+
+        return viewPoint
     }
 }
 
-extension CoverFlowNSView: NSDraggingSource {}
+extension CoverFlowNSView: NSDraggingSource {
+    func draggingSession(_ session: NSDraggingSession, movedTo screenPoint: NSPoint) {
+        // Convert screen point to view coordinates
+        guard let window = window else { return }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let viewPoint = convert(windowPoint, from: nil)
+
+        // Check if we're still within this view
+        if bounds.contains(viewPoint) {
+            updateDropTarget(at: viewPoint)
+        } else {
+            // Clear highlight when dragging outside
+            if dropTargetIndex != nil {
+                clearDropTargetHighlight()
+                dropTargetIndex = nil
+            }
+        }
+    }
+
+    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+
+        guard let window = window else {
+            clearDropTargetHighlight()
+            dropTargetIndex = nil
+            return
+        }
+
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let viewPoint = convert(windowPoint, from: nil)
+
+        // Ensure we have the final hovered folder when the drag ends (for drags we originate)
+        if dropTargetIndex == nil,
+           let hoveredIndex = hitTestCover(at: viewPoint),
+           hoveredIndex < items.count,
+           items[hoveredIndex].isDirectory {
+            dropTargetIndex = hoveredIndex
+        }
+
+        // Check if dropped within this view on a folder
+        if bounds.contains(viewPoint), let targetIndex = dropTargetIndex {
+
+            // Get the dragged URLs from the session
+            var urls: [URL] = []
+            session.enumerateDraggingItems(options: [], for: nil, classes: [NSPasteboardItem.self], searchOptions: [:]) { draggingItem, _, _ in
+                if let pasteboardItem = draggingItem.item as? NSPasteboardItem,
+                   let urlString = pasteboardItem.string(forType: .fileURL),
+                   let url = URL(string: urlString) {
+                    urls.append(url)
+                }
+            }
+
+            if !urls.isEmpty && targetIndex < items.count && items[targetIndex].isDirectory {
+                onDropToFolder?(urls, items[targetIndex].url)
+            }
+        }
+
+        clearDropTargetHighlight()
+        dropTargetIndex = nil
+    }
+}
+
+// MARK: - Folder Drop Delegate
+
+struct FolderDropDelegate: DropDelegate {
+    let item: FileItem
+    let viewModel: FileBrowserViewModel
+    @Binding var dropTargetedItemID: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        // Only folders can accept drops
+        return item.isDirectory && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        if item.isDirectory {
+            dropTargetedItemID = item.id
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetedItemID == item.id {
+            dropTargetedItemID = nil
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard item.isDirectory else { return DropProposal(operation: .forbidden) }
+        // Option key = copy, otherwise move
+        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        return DropProposal(operation: operation)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard item.isDirectory else { return false }
+
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [url], to: item.url)
+                }
+            }
+        }
+        return true
+    }
+}
 
 // MARK: - File List Section
 
@@ -1523,6 +1824,7 @@ struct FileListSection: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
     @State private var isDropTargeted = false
+    @State private var dropTargetedItemID: UUID?  // Track which folder row is being hovered
 
     var body: some View {
         VStack(spacing: 0) {
@@ -1545,9 +1847,17 @@ struct FileListSection: View {
                             .id(item.id)
                             .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
                             .listRowBackground(
-                                selectedItems.contains(item)
-                                    ? Color.accentColor.opacity(0.2)
-                                    : Color.clear
+                                dropTargetedItemID == item.id
+                                    ? Color.accentColor.opacity(0.3)  // Drop target highlight
+                                    : (selectedItems.contains(item)
+                                        ? Color.accentColor.opacity(0.2)
+                                        : Color.clear)
+                            )
+                            .overlay(
+                                // Blue border when this folder is a drop target
+                                RoundedRectangle(cornerRadius: 4)
+                                    .stroke(Color.accentColor, lineWidth: 2)
+                                    .opacity(dropTargetedItemID == item.id ? 1 : 0)
                             )
                             .onDrag {
                                 if viewModel.selectedItems.contains(item) && viewModel.selectedItems.count > 1 {
@@ -1561,6 +1871,11 @@ struct FileListSection: View {
                                 }
                                 return NSItemProvider(object: item.url as NSURL)
                             }
+                            .onDrop(of: [.fileURL], delegate: FolderDropDelegate(
+                                item: item,
+                                viewModel: viewModel,
+                                dropTargetedItemID: $dropTargetedItemID
+                            ))
                             .instantTap(
                                 id: item.id,
                                 onSingleClick: {
@@ -1771,6 +2086,7 @@ struct CoverFlowFileRow: View {
         .padding(.vertical, 4)
         .frame(maxWidth: .infinity)
         .contentShape(Rectangle())
+        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
     }
 
     @ViewBuilder

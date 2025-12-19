@@ -167,6 +167,9 @@ struct QuadPaneCell: View {
     @Binding var paneViewMode: QuadPaneView.PaneViewMode
     let onActivate: () -> Void
     @State private var isDropTargeted = false
+    @State private var isEditingPath = false
+    @State private var editPathText = ""
+    @FocusState private var isPathFieldFocused: Bool
 
     private var pathComponents: [URL] {
         var components: [URL] = []
@@ -220,30 +223,63 @@ struct QuadPaneCell: View {
 
             Divider()
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 2) {
-                    ForEach(pathComponents, id: \.self) { component in
-                        Button(action: {
-                            viewModel.navigateToAndSelectCurrent(component)
-                            onActivate()
-                        }) {
+            HStack(spacing: 2) {
+                if isEditingPath {
+                    TextField("Path", text: $editPathText)
+                        .textFieldStyle(.plain)
+                        .font(.caption2)
+                        .focused($isPathFieldFocused)
+                        .onSubmit { navigateToEditedPath() }
+                        .onExitCommand { cancelPathEditing() }
+                        .onAppear {
+                            editPathText = viewModel.currentPath.path
+                            isPathFieldFocused = true
+                        }
+
+                    Button(action: { navigateToEditedPath() }) {
+                        Image(systemName: "arrow.right.circle.fill")
+                            .font(.caption2)
+                            .foregroundColor(.accentColor)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: { cancelPathEditing() }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    HStack(spacing: 2) {
+                        ForEach(pathComponents, id: \.self) { component in
                             Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
                                 .font(.caption2)
                                 .padding(.horizontal, 4)
                                 .padding(.vertical, 1)
-                        }
-                        .buttonStyle(.plain)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    viewModel.navigateToAndSelectCurrent(component)
+                                    onActivate()
+                                }
 
-                        if component != viewModel.currentPath {
-                            Image(systemName: "chevron.right")
-                                .font(.system(size: 8))
-                                .foregroundColor(.secondary)
+                            if component != viewModel.currentPath {
+                                Image(systemName: "chevron.right")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
+
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.001))
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) {
+                            startPathEditing()
+                        }
                 }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 2)
             }
+            .padding(.horizontal, 8)
+            .frame(height: 20)
             .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
 
             Divider()
@@ -310,6 +346,38 @@ struct QuadPaneCell: View {
             }
         }
     }
+
+    private func startPathEditing() {
+        editPathText = viewModel.currentPath.path
+        isEditingPath = true
+    }
+
+    private func cancelPathEditing() {
+        isEditingPath = false
+        isPathFieldFocused = false
+    }
+
+    private func navigateToEditedPath() {
+        var expandedPath = editPathText.trimmingCharacters(in: .whitespaces)
+        if expandedPath.hasPrefix("~") {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            expandedPath = home + expandedPath.dropFirst()
+        }
+
+        let url = URL(fileURLWithPath: expandedPath)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            if isDirectory.boolValue {
+                viewModel.navigateTo(url)
+            } else {
+                viewModel.navigateTo(url.deletingLastPathComponent())
+            }
+            isEditingPath = false
+            isPathFieldFocused = false
+        } else {
+            NSSound.beep()
+        }
+    }
 }
 
 struct QuadPaneListView: View {
@@ -363,6 +431,7 @@ struct QuadPaneListRow: View {
         .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
         .cornerRadius(3)
         .contentShape(Rectangle())
+        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
         .draggable(item.url)
         .instantTap(
@@ -472,6 +541,7 @@ struct QuadPaneIconCell: View {
         .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
         .cornerRadius(6)
         .contentShape(Rectangle())
+        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
         .draggable(item.url)
         .instantTap(

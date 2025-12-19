@@ -189,11 +189,9 @@ struct ContentView: View {
                 }
                 .help("Actions")
 
-                // Search field
-                TextField("Search", text: searchTextBinding)
-                    .textFieldStyle(.roundedBorder)
+                // Search field with clear button
+                SearchField(text: searchTextBinding)
                     .frame(width: 180)
-                    .focused($isSearchFocused)
             }
         }
         .navigationTitle(viewModel.currentPath.lastPathComponent)
@@ -385,32 +383,34 @@ struct PathBarView: View {
                             .foregroundColor(.secondary)
                     }
 
-                    Button(action: {
-                        navigateToComponent(at: index)
-                    }) {
-                        HStack(spacing: 4) {
-                            if index == 0 {
-                                Image(systemName: "desktopcomputer")
-                                    .font(.caption)
-                            }
-                            Text(component.name)
-                                .lineLimit(1)
+                    HStack(spacing: 4) {
+                        if index == 0 {
+                            Image(systemName: "desktopcomputer")
+                                .font(.caption)
                         }
+                        Text(component.name)
+                            .lineLimit(1)
                     }
-                    .buttonStyle(.plain)
                     .foregroundColor(index == pathComponents.count - 1 ? .primary : .secondary)
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 2)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        navigateToComponent(at: index)
+                    }
                 }
 
-                Spacer()
+                Rectangle()
+                    .fill(Color.primary.opacity(0.001))
+                    .contentShape(Rectangle())
+                    .onTapGesture(count: 2) {
+                        startEditing()
+                    }
             }
         }
         .padding(.horizontal, 12)
-        .padding(.vertical, 6)
+        .frame(height: 28)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
-        .contentShape(Rectangle())
-        .onTapGesture(count: 2) {
-            startEditing()
-        }
     }
 
     private var pathComponents: [(name: String, url: URL)] {
@@ -594,6 +594,56 @@ extension Notification.Name {
     static let closeTab = Notification.Name("closeTab")
     static let nextTab = Notification.Name("nextTab")
     static let previousTab = Notification.Name("previousTab")
+}
+
+// Native macOS search field
+struct SearchField: NSViewRepresentable {
+    @Binding var text: String
+
+    func makeNSView(context: Context) -> NSSearchField {
+        let searchField = NSSearchField()
+        searchField.placeholderString = "Search"
+        searchField.delegate = context.coordinator
+        searchField.target = context.coordinator
+        searchField.action = #selector(Coordinator.searchFieldAction(_:))
+        searchField.sendsSearchStringImmediately = true
+        searchField.sendsWholeSearchString = false
+        return searchField
+    }
+
+    func updateNSView(_ nsView: NSSearchField, context: Context) {
+        if nsView.stringValue != text {
+            nsView.stringValue = text
+        }
+    }
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(self)
+    }
+
+    class Coordinator: NSObject, NSSearchFieldDelegate {
+        var parent: SearchField
+
+        init(_ parent: SearchField) {
+            self.parent = parent
+        }
+
+        func controlTextDidChange(_ obj: Notification) {
+            if let searchField = obj.object as? NSSearchField {
+                parent.text = searchField.stringValue
+            }
+        }
+
+        @objc func searchFieldAction(_ sender: NSSearchField) {
+            // Called when X button is clicked or Enter is pressed
+            parent.text = sender.stringValue
+        }
+
+        func searchFieldDidEndSearching(_ sender: NSSearchField) {
+            // Called when search is cancelled (X button clicked)
+            parent.text = ""
+        }
+    }
 }
 
 #Preview {

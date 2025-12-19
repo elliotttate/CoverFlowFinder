@@ -327,6 +327,7 @@ struct ColumnRowView: View {
             }
         }
         .padding(.vertical, 2)
+        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
     }
 }
 

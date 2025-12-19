@@ -39,6 +39,9 @@ enum ClipboardOperation {
     case cut
 }
 
+// Custom pasteboard type to track cut operations
+private let cutOperationPasteboardType = NSPasteboard.PasteboardType("com.coverflowfinder.cut-operation")
+
 /// Thread-safe sort function for background use (non-isolated)
 private func sortItemsForBackground(_ items: [FileItem], sortOption: SortOption, ascending: Bool) -> [FileItem] {
     return items.sorted { (item1: FileItem, item2: FileItem) -> Bool in
@@ -98,6 +101,11 @@ class FileBrowserViewModel: ObservableObject {
     @Published var clipboardItems: [URL] = []
     @Published var clipboardOperation: ClipboardOperation = .copy
 
+    /// Check if a file is marked for cut (should appear dimmed)
+    func isItemCut(_ item: FileItem) -> Bool {
+        clipboardOperation == .cut && clipboardItems.contains(item.url)
+    }
+
     @Published var infoItem: FileItem?
 
     private var cancellables = Set<AnyCancellable>()
@@ -123,7 +131,7 @@ class FileBrowserViewModel: ObservableObject {
         addToHistory(initialPath)
 
         $searchText
-            .debounce(for: .milliseconds(300), scheduler: RunLoop.main)
+            .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
             .sink { [weak self] _ in
                 self?.objectWillChange.send()
             }
@@ -422,7 +430,12 @@ class FileBrowserViewModel: ObservableObject {
     // MARK: - Clipboard Operations
 
     var canPaste: Bool {
-        !clipboardItems.isEmpty
+        if !clipboardItems.isEmpty {
+            return true
+        }
+        // Also check system pasteboard
+        let pasteboard = NSPasteboard.general
+        return pasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
     }
 
     func copySelectedItems() {
@@ -441,26 +454,42 @@ class FileBrowserViewModel: ObservableObject {
         clipboardItems = selectedItems.map { $0.url }
         clipboardOperation = .cut
 
-        // Also copy to system pasteboard
+        // Also copy to system pasteboard with cut marker
         let pasteboard = NSPasteboard.general
         pasteboard.clearContents()
         pasteboard.writeObjects(clipboardItems as [NSURL])
+        // Add marker to indicate this is a cut operation
+        pasteboard.setData(Data([1]), forType: cutOperationPasteboardType)
     }
 
     func paste() {
-        guard !clipboardItems.isEmpty else { return }
-
         let fileManager = FileManager.default
         var pastedAny = false
 
-        for sourceURL in clipboardItems {
+        // Use internal clipboard if available, otherwise read from system pasteboard
+        var urlsToPaste = clipboardItems
+        var operationIsCut = clipboardOperation == .cut
+
+        if urlsToPaste.isEmpty {
+            // Fall back to system pasteboard
+            let pasteboard = NSPasteboard.general
+            if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+                urlsToPaste = urls
+                // Check if this was a cut operation (our custom marker)
+                operationIsCut = pasteboard.data(forType: cutOperationPasteboardType) != nil
+            }
+        }
+
+        guard !urlsToPaste.isEmpty else { return }
+
+        for sourceURL in urlsToPaste {
             let destinationURL = currentPath.appendingPathComponent(sourceURL.lastPathComponent)
 
             // Handle name conflicts
             let finalDestination = uniqueDestinationURL(for: destinationURL)
 
             do {
-                if clipboardOperation == .cut {
+                if operationIsCut {
                     try fileManager.moveItem(at: sourceURL, to: finalDestination)
                 } else {
                     try fileManager.copyItem(at: sourceURL, to: finalDestination)
@@ -471,8 +500,11 @@ class FileBrowserViewModel: ObservableObject {
             }
         }
 
-        if clipboardOperation == .cut && pastedAny {
+        if operationIsCut && pastedAny {
             clipboardItems.removeAll()
+            // Clear the cut marker from pasteboard to prevent re-pasting moved files
+            let pasteboard = NSPasteboard.general
+            pasteboard.clearContents()
         }
 
         refresh()
@@ -497,7 +529,8 @@ class FileBrowserViewModel: ObservableObject {
 
     func handleDrop(urls: [URL], to destPath: URL? = nil) {
         let destination = destPath ?? currentPath
-        let shouldMove = NSEvent.modifierFlags.contains(.option)
+        // Finder behavior: Drag = Move, Option+Drag = Copy
+        let shouldCopy = NSEvent.modifierFlags.contains(.option)
 
         for sourceURL in urls {
             if sourceURL.deletingLastPathComponent() == destination { continue }
@@ -506,13 +539,13 @@ class FileBrowserViewModel: ObservableObject {
             let finalURL = uniqueDestinationURL(for: destURL)
 
             do {
-                if shouldMove {
-                    try FileManager.default.moveItem(at: sourceURL, to: finalURL)
-                } else {
+                if shouldCopy {
                     try FileManager.default.copyItem(at: sourceURL, to: finalURL)
+                } else {
+                    try FileManager.default.moveItem(at: sourceURL, to: finalURL)
                 }
             } catch {
-                print("Failed to \(shouldMove ? "move" : "copy") \(sourceURL.lastPathComponent): \(error)")
+                print("Failed to \(shouldCopy ? "copy" : "move") \(sourceURL.lastPathComponent): \(error)")
             }
         }
 

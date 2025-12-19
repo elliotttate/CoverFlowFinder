@@ -330,6 +330,7 @@ struct FileListRowView: View {
         }
         .padding(.horizontal, 8)
         .padding(.vertical, 4)
+        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
     }
 
     @ViewBuilder

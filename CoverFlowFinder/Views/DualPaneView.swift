@@ -172,6 +172,9 @@ struct PaneView: View {
     let onActivate: () -> Void
     let onColumnsCalculated: (Int) -> Void
     @State private var isDropTargeted = false
+    @State private var isEditingPath = false
+    @State private var editPathText = ""
+    @FocusState private var isPathFieldFocused: Bool
 
     // Cache path components
     private var pathComponents: [URL] {
@@ -229,30 +232,63 @@ struct PaneView: View {
             Divider()
 
             // Path bar
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 4) {
-                    ForEach(pathComponents, id: \.self) { component in
-                        Button(action: {
-                            viewModel.navigateToAndSelectCurrent(component)
-                            onActivate()
-                        }) {
+            HStack(spacing: 4) {
+                if isEditingPath {
+                    TextField("Path", text: $editPathText)
+                        .textFieldStyle(.plain)
+                        .font(.caption)
+                        .focused($isPathFieldFocused)
+                        .onSubmit { navigateToEditedPath() }
+                        .onExitCommand { cancelPathEditing() }
+                        .onAppear {
+                            editPathText = viewModel.currentPath.path
+                            isPathFieldFocused = true
+                        }
+
+                    Button(action: { navigateToEditedPath() }) {
+                        Image(systemName: "arrow.right.circle.fill")
+                            .font(.caption)
+                            .foregroundColor(.accentColor)
+                    }
+                    .buttonStyle(.plain)
+
+                    Button(action: { cancelPathEditing() }) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                } else {
+                    HStack(spacing: 4) {
+                        ForEach(pathComponents, id: \.self) { component in
                             Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
                                 .font(.caption)
                                 .padding(.horizontal, 6)
                                 .padding(.vertical, 2)
-                        }
-                        .buttonStyle(.plain)
+                                .contentShape(Rectangle())
+                                .onTapGesture {
+                                    viewModel.navigateToAndSelectCurrent(component)
+                                    onActivate()
+                                }
 
-                        if component != viewModel.currentPath {
-                            Image(systemName: "chevron.right")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
+                            if component != viewModel.currentPath {
+                                Image(systemName: "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
                         }
                     }
+
+                    Rectangle()
+                        .fill(Color.primary.opacity(0.001))
+                        .contentShape(Rectangle())
+                        .onTapGesture(count: 2) {
+                            startPathEditing()
+                        }
                 }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 4)
             }
+            .padding(.horizontal, 12)
+            .frame(height: 24)
             .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
 
             Divider()
@@ -319,6 +355,38 @@ struct PaneView: View {
             }
         }
     }
+
+    private func startPathEditing() {
+        editPathText = viewModel.currentPath.path
+        isEditingPath = true
+    }
+
+    private func cancelPathEditing() {
+        isEditingPath = false
+        isPathFieldFocused = false
+    }
+
+    private func navigateToEditedPath() {
+        var expandedPath = editPathText.trimmingCharacters(in: .whitespaces)
+        if expandedPath.hasPrefix("~") {
+            let home = FileManager.default.homeDirectoryForCurrentUser.path
+            expandedPath = home + expandedPath.dropFirst()
+        }
+
+        let url = URL(fileURLWithPath: expandedPath)
+        var isDirectory: ObjCBool = false
+        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
+            if isDirectory.boolValue {
+                viewModel.navigateTo(url)
+            } else {
+                viewModel.navigateTo(url.deletingLastPathComponent())
+            }
+            isEditingPath = false
+            isPathFieldFocused = false
+        } else {
+            NSSound.beep()
+        }
+    }
 }
 
 struct PaneListView: View {
@@ -356,6 +424,7 @@ struct PaneListView: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .background(isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
                     .contentShape(Rectangle())
+                    .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
                     .onDrag {
                         NSItemProvider(object: item.url as NSURL)
                     }
@@ -461,6 +530,7 @@ struct PaneIconView: View {
                             .background(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
                             .cornerRadius(8)
                             .contentShape(Rectangle())
+                            .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
                             .onDrag {
                                 NSItemProvider(object: item.url as NSURL)
                             }

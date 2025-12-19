@@ -259,5 +259,6 @@ struct IconGridItem: View {
         .onHover { hovering in
             isHovering = hovering
         }
+        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
     }
 }
