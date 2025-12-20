@@ -69,6 +69,11 @@ struct ContentView: View {
         return viewModel
     }
 
+    private var viewModePickerWidth: CGFloat {
+        let count = CGFloat(ViewMode.allCases.count)
+        return min(420, max(260, count * 48))
+    }
+
     init() {
         let initialTab = BrowserTab()
         _tabs = State(initialValue: [initialTab])
@@ -135,10 +140,12 @@ struct ContentView: View {
                     ForEach(ViewMode.allCases, id: \.self) { mode in
                         Image(systemName: mode.systemImage)
                             .tag(mode)
+                            .help(mode.rawValue)
+                            .accessibilityLabel(mode.rawValue)
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(width: 220)
+                .frame(width: viewModePickerWidth)
                 .help("Change view mode")
             }
 
@@ -325,7 +332,7 @@ struct FileItemContextMenu: View {
                     ForEach(FinderTag.allTags) { tag in
                         Button {
                             FileTagManager.toggleTag(tag.name, on: item.url)
-                            viewModel.loadContents()
+                            viewModel.refreshTags(for: [item.url])
                         } label: {
                             HStack {
                                 Circle()
@@ -344,7 +351,7 @@ struct FileItemContextMenu: View {
                         Divider()
                         Button("Remove All Tags") {
                             FileTagManager.setTags([], for: item.url)
-                            viewModel.loadContents()
+                            viewModel.refreshTags(for: [item.url])
                         }
                     }
                 }
@@ -633,6 +640,9 @@ struct TabContentWrapper: View {
         case .icons:
             IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
                 .id("icons-\(contentViewId)")
+        case .masonry:
+            MasonryView(viewModel: viewModel, items: viewModel.filteredItems)
+                .id("masonry-\(contentViewId)")
         case .list:
             FileListView(viewModel: viewModel, items: viewModel.filteredItems)
                 .id("list-\(contentViewId)")

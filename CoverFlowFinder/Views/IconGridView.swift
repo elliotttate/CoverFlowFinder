@@ -9,6 +9,9 @@ struct IconGridView: View {
     @State private var isDropTargeted = false
     @State private var dropTargetedItemID: UUID?
     @State private var currentWidth: CGFloat = 800
+    @State private var pinchStartIconSize: Double?
+    @State private var pinchStartSpacing: Double?
+    @State private var pinchStartFontSize: Double?
 
     // Thumbnail loading
     @State private var thumbnails: [URL: NSImage] = [:]
@@ -24,6 +27,14 @@ struct IconGridView: View {
 
     private var columns: [GridItem] {
         [GridItem(.adaptive(minimum: cellWidth, maximum: cellWidth), spacing: settings.iconGridSpacingValue)]
+    }
+
+    private var iconGridThumbnailPixelSize: CGFloat {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        let baseTarget = max(256, settings.iconGridIconSizeValue * scale)
+        let target = baseTarget * settings.thumbnailQualityValue
+        let bucket = (target / 64).rounded() * 64
+        return min(768, max(96, bucket))
     }
 
     // Calculate columns based on current width - called at navigation time
@@ -148,6 +159,12 @@ struct IconGridView: View {
                 thumbnailCache.clearForNewFolder()
             }
         }
+        .onChange(of: settings.thumbnailQuality) { _ in
+            refreshThumbnails()
+        }
+        .onChange(of: settings.iconGridIconSize) { _ in
+            refreshThumbnails()
+        }
         .keyboardNavigable(
             onUpArrow: { navigateSelection(by: -calculatedColumns) },
             onDownArrow: { navigateSelection(by: calculatedColumns) },
@@ -156,6 +173,7 @@ struct IconGridView: View {
             onReturn: { openSelectedItem() },
             onSpace: { toggleQuickLook() }
         )
+        .simultaneousGesture(magnificationGesture)
     }
 
     private func navigateSelection(by offset: Int) {
@@ -211,10 +229,14 @@ struct IconGridView: View {
 
     private func loadThumbnail(for item: FileItem) {
         let url = item.url
+        let targetPixelSize = iconGridThumbnailPixelSize
 
         // Already loaded or loading
-        if thumbnails[url] != nil { return }
-        if thumbnailCache.isPending(url: url) { return }
+        if let existing = thumbnails[url],
+           imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
+            return
+        }
+        if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) { return }
         if thumbnailCache.hasFailed(url: url) {
             // Defer state change to avoid publishing during view update
             DispatchQueue.main.async {
@@ -224,7 +246,7 @@ struct IconGridView: View {
         }
 
         // Check cache first
-        if let cached = thumbnailCache.getCachedThumbnail(for: url) {
+        if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
             DispatchQueue.main.async {
                 thumbnails[url] = cached
             }
@@ -232,7 +254,7 @@ struct IconGridView: View {
         }
 
         // Generate thumbnail
-        thumbnailCache.generateThumbnail(for: item) { url, image in
+        thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { url, image in
             DispatchQueue.main.async { [self] in
                 if let image = image {
                     thumbnails[url] = image
@@ -253,6 +275,52 @@ struct IconGridView: View {
                 }
             }
         }
+    }
+
+    private func refreshThumbnails() {
+        let targetPixelSize = iconGridThumbnailPixelSize
+        DispatchQueue.main.async {
+            for item in items {
+                if let existing = thumbnails[item.url],
+                   imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
+                    continue
+                }
+                loadThumbnail(for: item)
+            }
+        }
+    }
+
+    private func imageSatisfiesMinimum(_ image: NSImage, minPixelSize: CGFloat) -> Bool {
+        let maxDimension = max(image.size.width, image.size.height)
+        return maxDimension >= minPixelSize * 0.9
+    }
+
+    private var magnificationGesture: some Gesture {
+        MagnificationGesture()
+            .onChanged { value in
+                if pinchStartIconSize == nil {
+                    pinchStartIconSize = settings.iconGridIconSize
+                    pinchStartSpacing = settings.iconGridSpacing
+                    pinchStartFontSize = settings.iconGridFontSize
+                }
+
+                let baseIcon = pinchStartIconSize ?? settings.iconGridIconSize
+                let baseSpacing = pinchStartSpacing ?? settings.iconGridSpacing
+                let baseFont = pinchStartFontSize ?? settings.iconGridFontSize
+
+                settings.iconGridIconSize = clamp(baseIcon * Double(value), range: 48...160)
+                settings.iconGridSpacing = clamp(baseSpacing * Double(value), range: 12...40)
+                settings.iconGridFontSize = clamp(baseFont * Double(value), range: 9...16)
+            }
+            .onEnded { _ in
+                pinchStartIconSize = nil
+                pinchStartSpacing = nil
+                pinchStartFontSize = nil
+            }
+    }
+
+    private func clamp(_ value: Double, range: ClosedRange<Double>) -> Double {
+        min(max(value, range.lowerBound), range.upperBound)
     }
 }
 

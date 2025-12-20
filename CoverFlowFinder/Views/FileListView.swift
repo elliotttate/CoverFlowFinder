@@ -3,6 +3,7 @@ import AppKit
 import Quartz
 
 struct FileListView: View {
+    @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
@@ -12,6 +13,14 @@ struct FileListView: View {
     // Thumbnail loading
     @State private var thumbnails: [URL: NSImage] = [:]
     private let thumbnailCache = ThumbnailCacheManager.shared
+
+    private var listThumbnailPixelSize: CGFloat {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        let baseTarget = max(192, settings.listIconSizeValue * scale)
+        let target = baseTarget * settings.thumbnailQualityValue
+        let bucket = (target / 64).rounded() * 64
+        return min(512, max(96, bucket))
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -122,6 +131,12 @@ struct FileListView: View {
                 thumbnailCache.clearForNewFolder()
             }
         }
+        .onChange(of: settings.thumbnailQuality) { _ in
+            refreshThumbnails()
+        }
+        .onChange(of: settings.listIconSize) { _ in
+            refreshThumbnails()
+        }
         .keyboardNavigable(
             onUpArrow: { navigateSelection(by: -1) },
             onDownArrow: { navigateSelection(by: 1) },
@@ -184,10 +199,14 @@ struct FileListView: View {
 
     private func loadThumbnail(for item: FileItem) {
         let url = item.url
+        let targetPixelSize = listThumbnailPixelSize
 
         // Already loaded or loading
-        if thumbnails[url] != nil { return }
-        if thumbnailCache.isPending(url: url) { return }
+        if let existing = thumbnails[url],
+           imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
+            return
+        }
+        if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) { return }
         if thumbnailCache.hasFailed(url: url) {
             // Defer state change to avoid publishing during view update
             DispatchQueue.main.async {
@@ -197,7 +216,7 @@ struct FileListView: View {
         }
 
         // Check cache first
-        if let cached = thumbnailCache.getCachedThumbnail(for: url) {
+        if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
             DispatchQueue.main.async {
                 thumbnails[url] = cached
             }
@@ -205,7 +224,7 @@ struct FileListView: View {
         }
 
         // Generate thumbnail
-        thumbnailCache.generateThumbnail(for: item) { url, image in
+        thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { url, image in
             DispatchQueue.main.async { [self] in
                 if let image = image {
                     thumbnails[url] = image
@@ -226,6 +245,24 @@ struct FileListView: View {
                 }
             }
         }
+    }
+
+    private func refreshThumbnails() {
+        let targetPixelSize = listThumbnailPixelSize
+        DispatchQueue.main.async {
+            for item in items {
+                if let existing = thumbnails[item.url],
+                   imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
+                    continue
+                }
+                loadThumbnail(for: item)
+            }
+        }
+    }
+
+    private func imageSatisfiesMinimum(_ image: NSImage, minPixelSize: CGFloat) -> Bool {
+        let maxDimension = max(image.size.width, image.size.height)
+        return maxDimension >= minPixelSize * 0.9
     }
 }
 

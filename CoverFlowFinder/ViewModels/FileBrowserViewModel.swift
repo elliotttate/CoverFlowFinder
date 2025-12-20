@@ -10,6 +10,7 @@ extension Notification.Name {
 enum ViewMode: String, CaseIterable {
     case coverFlow = "Cover Flow"
     case icons = "Icons"
+    case masonry = "Masonry"
     case list = "List"
     case columns = "Columns"
     case dualPane = "Dual Pane"
@@ -19,6 +20,7 @@ enum ViewMode: String, CaseIterable {
         switch self {
         case .coverFlow: return "square.stack.3d.forward.dottedline"
         case .icons: return "square.grid.2x2"
+        case .masonry: return "square.grid.3x2"
         case .list: return "list.bullet"
         case .columns: return "rectangle.split.3x1"
         case .dualPane: return "rectangle.split.2x1"
@@ -60,6 +62,7 @@ class FileBrowserViewModel: ObservableObject {
     @Published var renamingURL: URL? = nil
     // Navigation generation counter - forces SwiftUI to update on navigation
     @Published var navigationGeneration: Int = 0
+    @Published var tagRefreshToken: Int = 0
 
     // Track click timing for Finder-style rename triggering
     private var lastClickedURL: URL?
@@ -670,6 +673,13 @@ class FileBrowserViewModel: ObservableObject {
 
     func refresh() {
         loadContents()
+    }
+
+    func refreshTags(for urls: [URL]) {
+        for url in urls {
+            FileTagManager.invalidateCache(for: url)
+        }
+        tagRefreshToken &+= 1
     }
 
     // MARK: - Clipboard Operations

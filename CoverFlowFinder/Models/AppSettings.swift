@@ -16,6 +16,7 @@ final class AppSettings: ObservableObject {
         static let sidebarShowICloud = "settings.sidebarShowICloud"
         static let sidebarShowLocations = "settings.sidebarShowLocations"
         static let sidebarShowTags = "settings.sidebarShowTags"
+        static let thumbnailQuality = "settings.thumbnailQuality"
 
         static let listFontSize = "settings.listFontSize"
         static let listIconSize = "settings.listIconSize"
@@ -34,6 +35,7 @@ final class AppSettings: ObservableObject {
         static let coverFlowScale = "settings.coverFlowScale"
         static let coverFlowSwipeSpeed = "settings.coverFlowSwipeSpeed"
         static let coverFlowShowInfo = "settings.coverFlowShowInfo"
+        static let coverFlowPaneHeight = "settings.coverFlowPaneHeight"
     }
 
     private enum Defaults {
@@ -47,6 +49,7 @@ final class AppSettings: ObservableObject {
         static let sidebarShowICloud = true
         static let sidebarShowLocations = true
         static let sidebarShowTags = true
+        static let thumbnailQuality: Double = 1.15
 
         static let listFontSize: Double = 13
         static let listIconSize: Double = 20
@@ -62,9 +65,10 @@ final class AppSettings: ObservableObject {
         static let columnPreviewWidth: Double = 260
 
         static let coverFlowTitleFontSize: Double = 15
-        static let coverFlowScale: Double = 1.0
+        static let coverFlowScale: Double = 1.2
         static let coverFlowSwipeSpeed: Double = 1.0
         static let coverFlowShowInfo = true
+        static let coverFlowPaneHeight: Double = 0
     }
 
     private let defaults: UserDefaults
@@ -98,6 +102,9 @@ final class AppSettings: ObservableObject {
     }
     @Published var sidebarShowTags: Bool {
         didSet { defaults.set(sidebarShowTags, forKey: Keys.sidebarShowTags) }
+    }
+    @Published var thumbnailQuality: Double {
+        didSet { defaults.set(thumbnailQuality, forKey: Keys.thumbnailQuality) }
     }
 
     @Published var listFontSize: Double {
@@ -145,6 +152,9 @@ final class AppSettings: ObservableObject {
     @Published var coverFlowShowInfo: Bool {
         didSet { defaults.set(coverFlowShowInfo, forKey: Keys.coverFlowShowInfo) }
     }
+    @Published var coverFlowPaneHeight: Double {
+        didSet { defaults.set(coverFlowPaneHeight, forKey: Keys.coverFlowPaneHeight) }
+    }
 
     private init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -160,6 +170,7 @@ final class AppSettings: ObservableObject {
             Keys.sidebarShowICloud: Defaults.sidebarShowICloud,
             Keys.sidebarShowLocations: Defaults.sidebarShowLocations,
             Keys.sidebarShowTags: Defaults.sidebarShowTags,
+            Keys.thumbnailQuality: Defaults.thumbnailQuality,
             Keys.listFontSize: Defaults.listFontSize,
             Keys.listIconSize: Defaults.listIconSize,
             Keys.iconGridIconSize: Defaults.iconGridIconSize,
@@ -173,7 +184,8 @@ final class AppSettings: ObservableObject {
             Keys.coverFlowTitleFontSize: Defaults.coverFlowTitleFontSize,
             Keys.coverFlowScale: Defaults.coverFlowScale,
             Keys.coverFlowSwipeSpeed: Defaults.coverFlowSwipeSpeed,
-            Keys.coverFlowShowInfo: Defaults.coverFlowShowInfo
+            Keys.coverFlowShowInfo: Defaults.coverFlowShowInfo,
+            Keys.coverFlowPaneHeight: Defaults.coverFlowPaneHeight
         ])
 
         showHiddenFiles = defaults.bool(forKey: Keys.showHiddenFiles)
@@ -186,6 +198,7 @@ final class AppSettings: ObservableObject {
         sidebarShowICloud = defaults.bool(forKey: Keys.sidebarShowICloud)
         sidebarShowLocations = defaults.bool(forKey: Keys.sidebarShowLocations)
         sidebarShowTags = defaults.bool(forKey: Keys.sidebarShowTags)
+        thumbnailQuality = defaults.double(forKey: Keys.thumbnailQuality)
 
         listFontSize = defaults.double(forKey: Keys.listFontSize)
         listIconSize = defaults.double(forKey: Keys.listIconSize)
@@ -204,6 +217,7 @@ final class AppSettings: ObservableObject {
         coverFlowScale = defaults.double(forKey: Keys.coverFlowScale)
         coverFlowSwipeSpeed = defaults.double(forKey: Keys.coverFlowSwipeSpeed)
         coverFlowShowInfo = defaults.bool(forKey: Keys.coverFlowShowInfo)
+        coverFlowPaneHeight = defaults.double(forKey: Keys.coverFlowPaneHeight)
     }
 
     func resetToDefaults() {
@@ -217,6 +231,7 @@ final class AppSettings: ObservableObject {
         sidebarShowICloud = Defaults.sidebarShowICloud
         sidebarShowLocations = Defaults.sidebarShowLocations
         sidebarShowTags = Defaults.sidebarShowTags
+        thumbnailQuality = Defaults.thumbnailQuality
 
         listFontSize = Defaults.listFontSize
         listIconSize = Defaults.listIconSize
@@ -235,6 +250,7 @@ final class AppSettings: ObservableObject {
         coverFlowScale = Defaults.coverFlowScale
         coverFlowSwipeSpeed = Defaults.coverFlowSwipeSpeed
         coverFlowShowInfo = Defaults.coverFlowShowInfo
+        coverFlowPaneHeight = Defaults.coverFlowPaneHeight
     }
 
     var listFont: Font {
@@ -335,5 +351,9 @@ final class AppSettings: ObservableObject {
 
     var quadPaneGridSpacing: CGFloat {
         max(6, CGFloat(iconGridSpacing) * 0.5)
+    }
+
+    var thumbnailQualityValue: CGFloat {
+        CGFloat(thumbnailQuality)
     }
 }

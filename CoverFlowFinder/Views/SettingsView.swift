@@ -53,6 +53,16 @@ struct SettingsView: View {
                 Toggle("Keep folders on top", isOn: $settings.foldersFirst)
             }
 
+            Section("Thumbnails") {
+                SettingsSliderRow(
+                    title: "Thumbnail quality",
+                    value: $settings.thumbnailQuality,
+                    range: 0.75...1.6,
+                    step: 0.05,
+                    format: "%.2fx"
+                )
+            }
+
             Section {
                 Button("Reset to Defaults") {
                     settings.resetToDefaults()
@@ -165,7 +175,7 @@ struct SettingsView: View {
                 SettingsSliderRow(
                     title: "Cover scale",
                     value: $settings.coverFlowScale,
-                    range: 0.8...1.3,
+                    range: 0.8...2.0,
                     step: 0.05,
                     format: "%.2fx"
                 )

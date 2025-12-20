@@ -15,7 +15,7 @@ class ThumbnailCacheManager {
     private let fileManager = FileManager.default
 
     // MARK: - Request Tracking
-    private var pendingRequests: [URL: Int] = [:]  // URL -> generation
+    private var pendingRequests: [String: Int] = [:]  // Cache key -> generation
     private var failedURLs: Set<URL> = []  // URLs that failed - don't retry
     private var currentGeneration: Int = 0
     private let queue = DispatchQueue(label: "com.coverflowfinder.thumbnailcache", qos: .userInitiated)
@@ -24,6 +24,8 @@ class ThumbnailCacheManager {
     private let maxMemoryCacheCount = 1000  // Max thumbnails in memory
     private let maxMemoryCacheCost = 400 * 1024 * 1024  // 400MB
     private let diskCacheMaxAge: TimeInterval = 7 * 24 * 60 * 60  // 7 days
+    private static let defaultMaxPixelSize: CGFloat = 256
+    private static let minimumPixelSize: CGFloat = 96
 
     private init() {
         // Setup disk cache directory
@@ -46,8 +48,11 @@ class ThumbnailCacheManager {
     // MARK: - Public API
 
     /// Get cached thumbnail (memory or disk), returns nil if not cached
-    func getCachedThumbnail(for url: URL) -> NSImage? {
-        let key = cacheKey(for: url)
+    func getCachedThumbnail(
+        for url: URL,
+        maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize
+    ) -> NSImage? {
+        let key = cacheKey(for: url, maxPixelSize: maxPixelSize)
 
         // Check memory cache first
         if let cached = memoryCache.object(forKey: key as NSString) {
@@ -73,9 +78,13 @@ class ThumbnailCacheManager {
     }
 
     /// Check if request is pending
-    func isPending(url: URL) -> Bool {
-        queue.sync {
-            pendingRequests[url] != nil
+    func isPending(
+        url: URL,
+        maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize
+    ) -> Bool {
+        let key = cacheKey(for: url, maxPixelSize: maxPixelSize)
+        return queue.sync {
+            pendingRequests[key] != nil
         }
     }
 
@@ -99,9 +108,12 @@ class ThumbnailCacheManager {
     /// Generate thumbnail with caching and cancellation support
     func generateThumbnail(
         for item: FileItem,
+        maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize,
         completion: @escaping (URL, NSImage?) -> Void
     ) {
         let url = item.url
+        let targetSize = clampPixelSize(maxPixelSize)
+        let cacheKey = cacheKey(for: url, maxPixelSize: targetSize)
 
         // Skip if already failed
         let alreadyFailed = queue.sync { failedURLs.contains(url) }
@@ -111,20 +123,20 @@ class ThumbnailCacheManager {
         }
 
         // Skip if already pending
-        let alreadyPending = queue.sync { pendingRequests[url] != nil }
+        let alreadyPending = queue.sync { pendingRequests[cacheKey] != nil }
         guard !alreadyPending else {
             return
         }
 
         // Check caches first
-        if let cached = getCachedThumbnail(for: url) {
+        if let cached = getCachedThumbnail(for: url, maxPixelSize: targetSize) {
             completion(url, cached)
             return
         }
 
         // Track this request
         let generation: Int = queue.sync {
-            pendingRequests[url] = currentGeneration
+            pendingRequests[cacheKey] = currentGeneration
             return currentGeneration
         }
 
@@ -133,9 +145,21 @@ class ThumbnailCacheManager {
         let ext = url.pathExtension.lowercased()
 
         if imageExtensions.contains(ext) {
-            generateImageThumbnail(for: item, generation: generation, completion: completion)
+            generateImageThumbnail(
+                for: item,
+                generation: generation,
+                cacheKey: cacheKey,
+                maxPixelSize: targetSize,
+                completion: completion
+            )
         } else {
-            generateQuickLookThumbnail(for: item, generation: generation, completion: completion)
+            generateQuickLookThumbnail(
+                for: item,
+                generation: generation,
+                cacheKey: cacheKey,
+                maxPixelSize: targetSize,
+                completion: completion
+            )
         }
     }
 
@@ -144,12 +168,14 @@ class ThumbnailCacheManager {
     private func generateImageThumbnail(
         for item: FileItem,
         generation: Int,
+        cacheKey: String,
+        maxPixelSize: CGFloat,
         completion: @escaping (URL, NSImage?) -> Void
     ) {
         let url = item.url
 
         // First try QuickLook cache (instant if system has it cached)
-        let size = CGSize(width: 256, height: 256)
+        let size = CGSize(width: maxPixelSize, height: maxPixelSize)
         let request = QLThumbnailGenerator.Request(
             fileAt: url,
             size: size,
@@ -164,17 +190,23 @@ class ThumbnailCacheManager {
             if let thumbnail = thumbnail {
                 // Got cached thumbnail instantly
                 DispatchQueue.main.async {
-                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: url) }
+                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
                     let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
                     guard stillValid else { return }
 
                     let image = thumbnail.nsImage
-                    self.cacheImage(image, for: url)
+                    self.cacheImage(image, for: url, maxPixelSize: maxPixelSize)
                     completion(url, image)
                 }
             } else {
                 // No cache - generate with ImageIO (fast)
-                self.generateImageIOThumbnail(for: item, generation: generation, completion: completion)
+                self.generateImageIOThumbnail(
+                    for: item,
+                    generation: generation,
+                    cacheKey: cacheKey,
+                    maxPixelSize: maxPixelSize,
+                    completion: completion
+                )
             }
         }
     }
@@ -182,6 +214,8 @@ class ThumbnailCacheManager {
     private func generateImageIOThumbnail(
         for item: FileItem,
         generation: Int,
+        cacheKey: String,
+        maxPixelSize: CGFloat,
         completion: @escaping (URL, NSImage?) -> Void
     ) {
         let url = item.url
@@ -189,9 +223,9 @@ class ThumbnailCacheManager {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
-            let isValid = self.queue.sync { self.pendingRequests[url] == generation }
+            let isValid = self.queue.sync { self.pendingRequests[cacheKey] == generation }
             guard isValid else {
-                _ = self.queue.sync { self.pendingRequests.removeValue(forKey: url) }
+                _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
                 return
             }
 
@@ -199,7 +233,7 @@ class ThumbnailCacheManager {
 
             // Use ImageIO - can read embedded EXIF thumbnails instantly
             let options: [CFString: Any] = [
-                kCGImageSourceThumbnailMaxPixelSize: 256,
+                kCGImageSourceThumbnailMaxPixelSize: Int(maxPixelSize),
                 kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
                 kCGImageSourceCreateThumbnailWithTransform: true,
                 kCGImageSourceShouldCache: false  // Don't cache full image
@@ -211,12 +245,12 @@ class ThumbnailCacheManager {
             }
 
             DispatchQueue.main.async {
-                _ = self.queue.sync { self.pendingRequests.removeValue(forKey: url) }
+                _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
                 let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
                 guard stillValid else { return }
 
                 if let image = resultImage {
-                    self.cacheImage(image, for: url)
+                    self.cacheImage(image, for: url, maxPixelSize: maxPixelSize)
                     completion(url, image)
                 } else {
                     _ = self.queue.sync { self.failedURLs.insert(url) }
@@ -229,10 +263,12 @@ class ThumbnailCacheManager {
     private func generateQuickLookThumbnail(
         for item: FileItem,
         generation: Int,
+        cacheKey: String,
+        maxPixelSize: CGFloat,
         completion: @escaping (URL, NSImage?) -> Void
     ) {
         let url = item.url
-        let size = CGSize(width: 256, height: 256)
+        let size = CGSize(width: maxPixelSize, height: maxPixelSize)
         let request = QLThumbnailGenerator.Request(
             fileAt: url,
             size: size,
@@ -244,13 +280,13 @@ class ThumbnailCacheManager {
             guard let self = self else { return }
 
             DispatchQueue.main.async {
-                _ = self.queue.sync { self.pendingRequests.removeValue(forKey: url) }
+                _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
                 let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
                 guard stillValid else { return }
 
                 if let thumbnail = thumbnail {
                     let image = thumbnail.nsImage
-                    self.cacheImage(image, for: url)
+                    self.cacheImage(image, for: url, maxPixelSize: maxPixelSize)
                     completion(url, image)
                 } else {
                     _ = self.queue.sync { self.failedURLs.insert(url) }
@@ -262,8 +298,8 @@ class ThumbnailCacheManager {
 
     // MARK: - Caching
 
-    private func cacheImage(_ image: NSImage, for url: URL) {
-        let key = cacheKey(for: url)
+    private func cacheImage(_ image: NSImage, for url: URL, maxPixelSize: CGFloat) {
+        let key = cacheKey(for: url, maxPixelSize: maxPixelSize)
 
         // Memory cache
         let cost = estimateCost(for: image)
@@ -275,9 +311,9 @@ class ThumbnailCacheManager {
         }
     }
 
-    private func cacheKey(for url: URL) -> String {
-        // Use URL path + modification date for cache key
-        var keyString = url.path
+    private func cacheKey(for url: URL, maxPixelSize: CGFloat) -> String {
+        let sizeBucket = Int(clampPixelSize(maxPixelSize).rounded(.toNearestOrAwayFromZero))
+        var keyString = "\(url.path)_\(sizeBucket)"
         if let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
             keyString += "_\(mtime.timeIntervalSince1970)"
         }
@@ -285,6 +321,10 @@ class ThumbnailCacheManager {
         // Hash the key for safe filename
         let hash = SHA256.hash(data: Data(keyString.utf8))
         return hash.compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    private func clampPixelSize(_ size: CGFloat) -> CGFloat {
+        min(max(size, Self.minimumPixelSize), 1024)
     }
 
     private func estimateCost(for image: NSImage) -> Int {
@@ -297,6 +337,11 @@ class ThumbnailCacheManager {
 
     private func diskCachePath(for key: String) -> URL {
         return diskCacheURL.appendingPathComponent(key + ".png")
+    }
+
+    private func removeFromDisk(key: String) {
+        let path = diskCachePath(for: key)
+        try? fileManager.removeItem(at: path)
     }
 
     private func saveToDisk(image: NSImage, key: String) {

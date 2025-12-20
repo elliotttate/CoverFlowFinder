@@ -14,17 +14,51 @@ struct CoverFlowView: View {
     @State private var thumbnailLoadGeneration: Int = 0
     @State private var rightClickedIndex: Int?
     @State private var isCoverFlowScrolling: Bool = false
+    @State private var dragStartCoverFlowHeight: CGFloat?
+    @State private var liveCoverFlowHeight: CGFloat?
+    @State private var infoPanelHeight: CGFloat = 0
 
     @State private var lastThumbnailLoadTime: Date = .distantPast
     @State private var thumbnailLoadTimer: Timer?
     private let thumbnailLoadThrottle: TimeInterval = 0.016
 
+    private var coverFlowThumbnailPixelSize: CGFloat {
+        let base = 192 * settings.coverFlowScaleValue * settings.thumbnailQualityValue
+        let bucket = (base / 64).rounded() * 64
+        return min(768, max(128, bucket))
+    }
+
+    private var coverFlowPlaceholderPixelSize: CGFloat {
+        let base = coverFlowThumbnailPixelSize * 0.5
+        let bucket = (base / 32).rounded() * 32
+        return min(256, max(96, bucket))
+    }
+
     private let visibleRange = 12
     private let maxConcurrentThumbnails = 8
+    private let maxConcurrentPreloadThumbnails = 6
+    private let preloadRangeMultiplier = 3
     private let thumbnailCache = ThumbnailCacheManager.shared
 
     var body: some View {
         GeometryReader { geometry in
+            let handleHeight: CGFloat = 8
+            let minCoverFlowHeight: CGFloat = 250
+            let minListHeight: CGFloat = 160
+            let infoHeight = settings.coverFlowShowInfo ? infoPanelHeight : 0
+            let maxCoverFlowHeight = max(0, geometry.size.height - infoHeight - handleHeight - minListHeight)
+            let defaultCoverFlowHeight = max(minCoverFlowHeight, geometry.size.height * 0.45)
+            let storedCoverFlowHeight = settings.coverFlowPaneHeight > 0
+                ? CGFloat(settings.coverFlowPaneHeight)
+                : defaultCoverFlowHeight
+            let activeCoverFlowHeight = liveCoverFlowHeight ?? storedCoverFlowHeight
+            let coverFlowHeight: CGFloat = {
+                if maxCoverFlowHeight < minCoverFlowHeight {
+                    return maxCoverFlowHeight
+                }
+                return min(max(activeCoverFlowHeight, minCoverFlowHeight), maxCoverFlowHeight)
+            }()
+
             VStack(spacing: 0) {
                 CoverFlowContainer(
                     items: sortedItemsCache,
@@ -94,7 +128,7 @@ struct CoverFlowView: View {
                         }
                     }
                 )
-                .frame(height: max(250, geometry.size.height * 0.45))
+                .frame(height: coverFlowHeight)
 
                 if settings.coverFlowShowInfo,
                    !sortedItemsCache.isEmpty,
@@ -117,9 +151,31 @@ struct CoverFlowView: View {
                     .padding(.vertical, 8)
                     .frame(maxWidth: .infinity)
                     .background(Color(nsColor: .windowBackgroundColor))
+                    .background(
+                        GeometryReader { proxy in
+                            Color.clear.preference(key: CoverFlowInfoHeightKey.self, value: proxy.size.height)
+                        }
+                    )
                 }
 
-                Divider()
+                CoverFlowResizeHandle(
+                    height: handleHeight,
+                    onDrag: { delta in
+                        updateCoverFlowHeight(
+                            delta: delta,
+                            currentHeight: coverFlowHeight,
+                            minHeight: minCoverFlowHeight,
+                            maxHeight: maxCoverFlowHeight
+                        )
+                    },
+                    onDragEnded: {
+                        if let liveHeight = liveCoverFlowHeight {
+                            settings.coverFlowPaneHeight = Double(liveHeight)
+                        }
+                        liveCoverFlowHeight = nil
+                        dragStartCoverFlowHeight = nil
+                    }
+                )
 
                 FileListSection(
                     items: sortedItemsCache,
@@ -162,6 +218,17 @@ struct CoverFlowView: View {
                 throttledLoadThumbnails()
                 updateQuickLookForSelection()
             }
+        }
+        .onPreferenceChange(CoverFlowInfoHeightKey.self) { newValue in
+            if newValue > 0 {
+                infoPanelHeight = newValue
+            }
+        }
+        .onChange(of: settings.coverFlowScale) { _ in
+            throttledLoadThumbnails()
+        }
+        .onChange(of: settings.thumbnailQuality) { _ in
+            throttledLoadThumbnails()
         }
     }
 
@@ -249,6 +316,8 @@ struct CoverFlowView: View {
     private func loadVisibleThumbnails() {
         guard !sortedItemsCache.isEmpty else { return }
         guard !isCoverFlowScrolling else { return }
+        let thumbnailPixelSize = coverFlowThumbnailPixelSize
+        let placeholderPixelSize = coverFlowPlaceholderPixelSize
         let selected = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
         let start = max(0, selected - visibleRange)
         let end = min(sortedItemsCache.count - 1, selected + visibleRange)
@@ -257,10 +326,14 @@ struct CoverFlowView: View {
         var thumbnailUpdates: [URL: NSImage] = [:]
         var placeholdersToAdd: Set<URL> = []
         var placeholdersToRemove: Set<URL> = []
-        var itemsToLoad: [(item: FileItem, distance: Int)] = []
+        var itemsToLoadHigh: [(item: FileItem, distance: Int)] = []
+        var itemsToLoadLow: [(item: FileItem, distance: Int)] = []
 
         let windowStart = max(0, selected - thumbnailWindowSize)
         let windowEnd = min(sortedItemsCache.count - 1, selected + thumbnailWindowSize)
+        let preloadRange = min(visibleRange * preloadRangeMultiplier, thumbnailWindowSize)
+        let preloadStart = max(0, selected - preloadRange)
+        let preloadEnd = min(sortedItemsCache.count - 1, selected + preloadRange)
         var keepURLs = Set<URL>()
         for i in windowStart...windowEnd {
             keepURLs.insert(sortedItemsCache[i].url)
@@ -275,30 +348,75 @@ struct CoverFlowView: View {
         for index in start...end {
             let item = sortedItemsCache[index]
             let distance = abs(index - selected)
-            let hasRealThumbnail = thumbnails[item.url] != nil && !iconPlaceholders.contains(item.url)
+            let hasRealThumbnail = hasSufficientThumbnail(
+                for: item.url,
+                minPixelSize: thumbnailPixelSize
+            )
 
             if hasRealThumbnail {
                 continue
             } else if thumbnailCache.hasFailed(url: item.url) {
                 thumbnailUpdates[item.url] = item.icon
                 placeholdersToRemove.insert(item.url)
-            } else if thumbnailCache.isPending(url: item.url) {
-                if thumbnails[item.url] == nil {
+            } else {
+                if let cachedHigh = thumbnailCache.getCachedThumbnail(for: item.url, maxPixelSize: thumbnailPixelSize) {
+                    thumbnailUpdates[item.url] = cachedHigh
+                    placeholdersToRemove.insert(item.url)
+                    continue
+                }
+
+                let cachedLow = thumbnailCache.getCachedThumbnail(for: item.url, maxPixelSize: placeholderPixelSize)
+                if let cachedLow {
+                    if thumbnails[item.url] == nil || iconPlaceholders.contains(item.url) {
+                        thumbnailUpdates[item.url] = cachedLow
+                        placeholdersToAdd.insert(item.url)
+                    }
+                } else if thumbnails[item.url] == nil {
                     thumbnailUpdates[item.url] = item.icon
                     placeholdersToAdd.insert(item.url)
                 }
-            } else if let cached = thumbnailCache.getCachedThumbnail(for: item.url) {
-                thumbnailUpdates[item.url] = cached
-                placeholdersToRemove.insert(item.url)
-            } else {
-                thumbnailUpdates[item.url] = item.icon
-                placeholdersToAdd.insert(item.url)
-                itemsToLoad.append((item, distance))
+
+                if !thumbnailCache.isPending(url: item.url, maxPixelSize: thumbnailPixelSize) {
+                    itemsToLoadHigh.append((item, distance))
+                }
+                if cachedLow == nil && !thumbnailCache.isPending(url: item.url, maxPixelSize: placeholderPixelSize) {
+                    itemsToLoadLow.append((item, distance))
+                }
             }
         }
 
-        itemsToLoad.sort { $0.distance < $1.distance }
-        let loadItems = Array(itemsToLoad.prefix(maxConcurrentThumbnails))
+        if preloadStart <= preloadEnd {
+            for index in preloadStart...preloadEnd {
+                if index >= start && index <= end { continue }
+                let item = sortedItemsCache[index]
+                let distance = abs(index - selected)
+                let hasRealThumbnail = hasSufficientThumbnail(
+                    for: item.url,
+                    minPixelSize: thumbnailPixelSize
+                )
+
+                if hasRealThumbnail || thumbnailCache.hasFailed(url: item.url) {
+                    continue
+                }
+
+                if let cachedLow = thumbnailCache.getCachedThumbnail(for: item.url, maxPixelSize: placeholderPixelSize) {
+                    if thumbnails[item.url] == nil || iconPlaceholders.contains(item.url) {
+                        thumbnailUpdates[item.url] = cachedLow
+                        placeholdersToAdd.insert(item.url)
+                    }
+                    continue
+                }
+
+                if !thumbnailCache.isPending(url: item.url, maxPixelSize: placeholderPixelSize) {
+                    itemsToLoadLow.append((item, distance))
+                }
+            }
+        }
+
+        itemsToLoadHigh.sort { $0.distance < $1.distance }
+        itemsToLoadLow.sort { $0.distance < $1.distance }
+        let loadHighItems = Array(itemsToLoadHigh.prefix(maxConcurrentThumbnails))
+        let loadLowItems = Array(itemsToLoadLow.prefix(maxConcurrentPreloadThumbnails))
 
         DispatchQueue.main.async { [self] in
             for url in urlsToEvict {
@@ -314,30 +432,78 @@ struct CoverFlowView: View {
             for url in placeholdersToRemove {
                 iconPlaceholders.remove(url)
             }
-            for (item, _) in loadItems {
-                generateThumbnail(for: item)
+            for (item, _) in loadHighItems {
+                generateHighThumbnail(for: item)
+            }
+            for (item, _) in loadLowItems {
+                generatePlaceholderThumbnail(for: item, maxPixelSize: placeholderPixelSize)
             }
         }
     }
 
-    private func generateThumbnail(for item: FileItem) {
+    private func generateHighThumbnail(for item: FileItem) {
+        generateThumbnail(for: item, maxPixelSize: coverFlowThumbnailPixelSize, placeholder: false, refreshAfter: true)
+    }
+
+    private func generatePlaceholderThumbnail(for item: FileItem, maxPixelSize: CGFloat) {
+        generateThumbnail(for: item, maxPixelSize: maxPixelSize, placeholder: true, refreshAfter: false)
+    }
+
+    private func generateThumbnail(
+        for item: FileItem,
+        maxPixelSize: CGFloat,
+        placeholder: Bool,
+        refreshAfter: Bool
+    ) {
         let currentGen = thumbnailLoadGeneration
 
-        thumbnailCache.generateThumbnail(for: item) { url, image in
+        thumbnailCache.generateThumbnail(for: item, maxPixelSize: maxPixelSize) { url, image in
             DispatchQueue.main.async { [self] in
                 guard currentGen == thumbnailLoadGeneration else { return }
 
-                if let image = image {
-                    thumbnails[url] = image
-                    iconPlaceholders.remove(url)
+                if placeholder {
+                    if thumbnails[url] != nil && !iconPlaceholders.contains(url) {
+                        return
+                    }
+                    thumbnails[url] = image ?? item.icon
+                    iconPlaceholders.insert(url)
                 } else {
-                    thumbnails[url] = item.icon
+                    thumbnails[url] = image ?? item.icon
                     iconPlaceholders.remove(url)
                 }
 
-                loadVisibleThumbnails()
+                if refreshAfter {
+                    loadVisibleThumbnails()
+                }
             }
         }
+    }
+
+    private func updateCoverFlowHeight(
+        delta: CGFloat,
+        currentHeight: CGFloat,
+        minHeight: CGFloat,
+        maxHeight: CGFloat
+    ) {
+        if dragStartCoverFlowHeight == nil {
+            dragStartCoverFlowHeight = currentHeight
+        }
+        let startHeight = dragStartCoverFlowHeight ?? currentHeight
+        let proposedHeight = startHeight + delta
+        let clampedHeight: CGFloat
+        if maxHeight < minHeight {
+            clampedHeight = maxHeight
+        } else {
+            clampedHeight = min(max(proposedHeight, minHeight), maxHeight)
+        }
+        liveCoverFlowHeight = clampedHeight
+    }
+
+    private func hasSufficientThumbnail(for url: URL, minPixelSize: CGFloat) -> Bool {
+        guard let image = thumbnails[url] else { return false }
+        guard !iconPlaceholders.contains(url) else { return false }
+        let maxDimension = max(image.size.width, image.size.height)
+        return maxDimension >= minPixelSize * 0.9
     }
 }
 
@@ -454,7 +620,11 @@ class CoverFlowNSView: NSView {
     }
     var scrollSensitivity: CGFloat = 1.0
 
-    private var baseCoverSize: CGFloat { min(bounds.height * 0.6, bounds.width * 0.22, 280) * coverScale }
+    private var baseCoverSize: CGFloat {
+        let heightDriven = bounds.height * 0.7
+        let widthDriven = bounds.width * 0.28
+        return min(heightDriven, widthDriven, 480) * coverScale
+    }
     private var coverSpacing: CGFloat { baseCoverSize * 0.22 }  // Space between side covers
     private var sideOffset: CGFloat { baseCoverSize * 0.62 }    // Distance from center to first side cover
     private let sideAngle: CGFloat = 60
@@ -552,8 +722,19 @@ class CoverFlowNSView: NSView {
             let item = items[index]
             guard let thumbnail = thumbnails[item.url] else { continue }
 
-            // Convert NSImage to CGImage
-            let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil)
+            let token = thumbnailToken(for: item, thumbnail: thumbnail)
+            if let existingToken = coverLayer.value(forKey: "thumbnailToken") as? Int,
+               existingToken == token {
+                continue
+            }
+            coverLayer.setValue(token, forKey: "thumbnailToken")
+
+            let imageContent: Any
+            if let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil) {
+                imageContent = cgImage
+            } else {
+                imageContent = thumbnail
+            }
 
             // Find the image layer and reflection container
             var imageLayer: CALayer?
@@ -569,7 +750,7 @@ class CoverFlowNSView: NSView {
 
             // Update main image
             if let imageLayer = imageLayer {
-                imageLayer.contents = cgImage ?? thumbnail
+                imageLayer.contents = imageContent
                 imageLayer.contentsGravity = .resizeAspect
             }
 
@@ -578,7 +759,7 @@ class CoverFlowNSView: NSView {
                 // Find the reflection image layer
                 for sublayer in reflectionContainer.sublayers ?? [] {
                     if sublayer.name == "reflectionImage" {
-                        sublayer.contents = cgImage ?? thumbnail
+                        sublayer.contents = imageContent
                         sublayer.contentsGravity = .resizeAspect
                     }
                 }
@@ -592,6 +773,13 @@ class CoverFlowNSView: NSView {
                 }
             }
         }
+    }
+
+    private func thumbnailToken(for item: FileItem, thumbnail: NSImage?) -> Int {
+        if let thumbnail {
+            return ObjectIdentifier(thumbnail).hashValue
+        }
+        return ObjectIdentifier(item.icon).hashValue
     }
 
     private func rebuildCovers() {
@@ -719,6 +907,7 @@ class CoverFlowNSView: NSView {
         coverLayer.setValue(index, forKey: "itemIndex")
         coverLayer.setValue(coverSize.width, forKey: "coverWidth")
         coverLayer.setValue(coverSize.height, forKey: "coverHeight")
+        coverLayer.setValue(thumbnailToken(for: item, thumbnail: thumbnail), forKey: "thumbnailToken")
         // Match createCoverLayer - bounds should NOT include reflection height
         coverLayer.bounds = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
 
@@ -746,6 +935,9 @@ class CoverFlowNSView: NSView {
         if let reflectionContainer = coverLayer.sublayers?.first(where: { $0.name == "reflectionContainer" }) {
             reflectionContainer.opacity = (hasThumbnail && !isScrolling) ? 1.0 : 0.0
             reflectionContainer.frame = CGRect(x: 0, y: -reflectionHeight - 4, width: coverSize.width, height: reflectionHeight)
+            if let mask = reflectionContainer.mask as? CAGradientLayer {
+                mask.frame = reflectionContainer.bounds
+            }
             if let reflectionImage = reflectionContainer.sublayers?.first(where: { $0.name == "reflectionImage" }) {
                 reflectionImage.frame = CGRect(x: 0, y: reflectionHeight - coverSize.height, width: coverSize.width, height: coverSize.height)
                 reflectionImage.contents = hasThumbnail ? imageContent : nil
@@ -792,6 +984,7 @@ class CoverFlowNSView: NSView {
         container.setValue(index, forKey: "itemIndex")
         container.setValue(coverWidth, forKey: "coverWidth")
         container.setValue(coverHeight, forKey: "coverHeight")
+        container.setValue(thumbnailToken(for: item, thumbnail: thumbnail), forKey: "thumbnailToken")
         container.backgroundColor = NSColor.clear.cgColor
         // CRITICAL: Set bounds so anchorPoint works correctly for rotation
         container.bounds = CGRect(x: 0, y: 0, width: coverWidth, height: coverHeight)
@@ -921,7 +1114,22 @@ class CoverFlowNSView: NSView {
     override func layout() {
         super.layout()
         layer?.sublayers?.first?.frame = bounds // Update gradient
-        rebuildCovers()
+        guard !items.isEmpty else { return }
+        if coverLayers.isEmpty {
+            rebuildCovers()
+            return
+        }
+        let centerX = bounds.width / 2
+        let centerY = bounds.height / 2
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for coverLayer in coverLayers {
+            guard let index = coverLayer.value(forKey: "itemIndex") as? Int,
+                  index < items.count else { continue }
+            updateCoverLayer(coverLayer, for: items[index], at: index)
+            positionCover(coverLayer, at: index, centerX: centerX, centerY: centerY, animated: false)
+        }
+        CATransaction.commit()
     }
 
     // MARK: - Event Handling
@@ -1808,6 +2016,42 @@ struct CoverFlowFolderDropDelegate: DropDelegate {
             }
         }
         return true
+    }
+}
+
+// MARK: - Cover Flow Resize Handle
+
+struct CoverFlowResizeHandle: View {
+    let height: CGFloat
+    let onDrag: (CGFloat) -> Void
+    let onDragEnded: () -> Void
+
+    var body: some View {
+        ZStack {
+            Divider()
+            Capsule()
+                .fill(Color.secondary.opacity(0.7))
+                .frame(width: 36, height: 3)
+        }
+        .frame(height: height)
+        .contentShape(Rectangle())
+        .gesture(
+            DragGesture(minimumDistance: 0, coordinateSpace: .global)
+                .onChanged { value in
+                    onDrag(value.translation.height)
+                }
+                .onEnded { _ in
+                    onDragEnded()
+                }
+        )
+    }
+}
+
+struct CoverFlowInfoHeightKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
     }
 }
 

@@ -231,6 +231,8 @@ struct PaneView: View {
                     ForEach(DualPaneView.PaneViewMode.allCases, id: \.self) { mode in
                         Image(systemName: mode.systemImage)
                             .tag(mode)
+                            .help(mode.rawValue)
+                            .accessibilityLabel(mode.rawValue)
                     }
                 }
                 .pickerStyle(.segmented)
@@ -529,6 +531,14 @@ struct PaneIconView: View {
         [GridItem(.adaptive(minimum: cellWidth, maximum: cellWidth), spacing: appSettings.dualPaneGridSpacing)]
     }
 
+    private var thumbnailPixelSize: CGFloat {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        let baseTarget = max(192, appSettings.dualPaneIconSize * scale)
+        let target = baseTarget * appSettings.thumbnailQualityValue
+        let bucket = (target / 64).rounded() * 64
+        return min(512, max(96, bucket))
+    }
+
     private func calculateColumns(width: CGFloat) -> Int {
         let availableWidth = max(0, width - 32)
         let spacing = appSettings.dualPaneGridSpacing
@@ -538,23 +548,46 @@ struct PaneIconView: View {
 
     private func loadThumbnail(for item: FileItem) {
         let url = item.url
-        guard thumbnails[url] == nil else { return }
+        let targetPixelSize = thumbnailPixelSize
+        if let existing = thumbnails[url],
+           imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
+            return
+        }
+        if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) { return }
 
         if thumbnailCache.hasFailed(url: url) {
             DispatchQueue.main.async { thumbnails[url] = item.icon }
             return
         }
 
-        if let cached = thumbnailCache.getCachedThumbnail(for: url) {
+        if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
             DispatchQueue.main.async { thumbnails[url] = cached }
             return
         }
 
-        thumbnailCache.generateThumbnail(for: item) { url, image in
+        thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { url, image in
             DispatchQueue.main.async {
                 thumbnails[url] = image ?? item.icon
             }
         }
+    }
+
+    private func refreshThumbnails() {
+        let targetPixelSize = thumbnailPixelSize
+        DispatchQueue.main.async {
+            for item in viewModel.filteredItems {
+                if let existing = thumbnails[item.url],
+                   imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
+                    continue
+                }
+                loadThumbnail(for: item)
+            }
+        }
+    }
+
+    private func imageSatisfiesMinimum(_ image: NSImage, minPixelSize: CGFloat) -> Bool {
+        let maxDimension = max(image.size.width, image.size.height)
+        return maxDimension >= minPixelSize * 0.9
     }
 
     var body: some View {
@@ -644,9 +677,13 @@ struct PaneIconView: View {
                 }
                 .onChange(of: appSettings.iconGridIconSize) { _ in
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
+                    refreshThumbnails()
                 }
                 .onChange(of: appSettings.iconGridSpacing) { _ in
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
+                }
+                .onChange(of: appSettings.thumbnailQuality) { _ in
+                    refreshThumbnails()
                 }
                 .onChange(of: viewModel.selectedItems) { newSelection in
                     if let firstSelected = newSelection.first {

@@ -424,7 +424,9 @@ struct PreviewColumn: View {
     }
 
     private func loadThumbnail() {
-        let size = CGSize(width: 400, height: 400)
+        let baseSize = 400.0 * appSettings.thumbnailQualityValue
+        let clamped = min(640.0, max(240.0, baseSize))
+        let size = CGSize(width: clamped, height: clamped)
         let request = QLThumbnailGenerator.Request(
             fileAt: item.url,
             size: size,

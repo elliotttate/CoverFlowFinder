@@ -28,6 +28,7 @@
 		A1000026001 /* ZipArchiveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000026000 /* ZipArchiveManager.swift */; };
 		A1000027001 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000027000 /* AppSettings.swift */; };
 		A1000028001 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000028000 /* SettingsView.swift */; };
+		A1000029001 /* MasonryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000029000 /* MasonryView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -55,6 +56,7 @@
 		A1000026000 /* ZipArchiveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipArchiveManager.swift; sourceTree = "<group>"; };
 		A1000027000 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		A1000028000 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		A1000029000 /* MasonryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MasonryView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -134,6 +136,7 @@
 				A1000021000 /* QuickLookController.swift */,
 				A1000023000 /* TabBarView.swift */,
 				A1000028000 /* SettingsView.swift */,
+				A1000029000 /* MasonryView.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -227,6 +230,7 @@
 				A1000026001 /* ZipArchiveManager.swift in Sources */,
 				A1000027001 /* AppSettings.swift in Sources */,
 				A1000028001 /* SettingsView.swift in Sources */,
+				A1000029001 /* MasonryView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
