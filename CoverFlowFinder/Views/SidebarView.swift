@@ -1,1067 +1,960 @@
-import SwiftUI
-import UniformTypeIdentifiers
 import AppKit
+import SwiftUI
 
 struct SidebarView: View {
     @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     var isDualPane: Bool = false
-    @State private var draggingFavorite: SidebarFavorite?
-    @State private var dropIndicator: SidebarDropIndicator?
-    @State private var dropTargetedFavoriteID: String?
-    @State private var favoriteRowFrames: [String: CGRect] = [:]
-    @State private var favoritesDropZoneFrame: CGRect = .zero
-    @State private var dropJustCompleted: Bool = false
-    private static let favoriteDragType = UTType(exportedAs: "com.coverflowfinder.sidebar.favorite")
-    private static let dropIndicatorYOffset: CGFloat = -5
 
     var body: some View {
-        List(selection: Binding(
-            get: { viewModel.currentPath },
-            set: { if let url = $0 { viewModel.navigateTo(url) } }
-        )) {
-            // Favorites Section
+        SidebarOutlineView(appSettings: appSettings, viewModel: viewModel, isDualPane: isDualPane)
+            .frame(minWidth: 180)
+    }
+}
+
+struct SidebarOutlineView: NSViewRepresentable {
+    @ObservedObject var appSettings: AppSettings
+    @ObservedObject var viewModel: FileBrowserViewModel
+    var isDualPane: Bool = false
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(appSettings: appSettings, viewModel: viewModel)
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.contentView.drawsBackground = false
+
+        let outlineView = NSOutlineView()
+        outlineView.headerView = nil
+        outlineView.style = .sourceList
+        outlineView.floatsGroupRows = true
+        outlineView.rowHeight = 24
+        outlineView.intercellSpacing = NSSize(width: 0, height: 2)
+        outlineView.backgroundColor = .clear
+        outlineView.allowsMultipleSelection = false
+
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("SidebarColumn"))
+        column.resizingMask = .autoresizingMask
+        outlineView.addTableColumn(column)
+        outlineView.outlineTableColumn = column
+        outlineView.autoresizesOutlineColumn = true
+
+        outlineView.dataSource = context.coordinator
+        outlineView.delegate = context.coordinator
+
+        outlineView.registerForDraggedTypes([.fileURL, context.coordinator.internalDragType])
+        outlineView.setDraggingSourceOperationMask(.move, forLocal: true)
+        outlineView.setDraggingSourceOperationMask(.copy, forLocal: false)
+
+        let menu = NSMenu(title: "Sidebar")
+        menu.delegate = context.coordinator
+        outlineView.menu = menu
+
+        scrollView.documentView = outlineView
+        context.coordinator.outlineView = outlineView
+        context.coordinator.refreshIfNeeded(force: true)
+
+        return scrollView
+    }
+
+    func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.appSettings = appSettings
+        context.coordinator.viewModel = viewModel
+        context.coordinator.refreshIfNeeded(force: false)
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate {
+        var appSettings: AppSettings
+        var viewModel: FileBrowserViewModel
+        weak var outlineView: NSOutlineView?
+        let internalDragType = NSPasteboard.PasteboardType("com.coverflowfinder.sidebar.favorite")
+
+        private var sections: [SidebarSection] = []
+        private var snapshot: SidebarSnapshot?
+        private var isUpdatingSelection = false
+        private let insertZoneHeight: CGFloat = 6
+
+        init(appSettings: AppSettings, viewModel: FileBrowserViewModel) {
+            self.appSettings = appSettings
+            self.viewModel = viewModel
+        }
+
+        func refreshIfNeeded(force: Bool) {
+            let context = buildContext()
+            let nextSnapshot = SidebarSnapshot(
+                showFavorites: appSettings.sidebarShowFavorites,
+                showICloud: appSettings.sidebarShowICloud,
+                showLocations: appSettings.sidebarShowLocations,
+                showTags: appSettings.sidebarShowTags,
+                favorites: appSettings.sidebarFavorites,
+                filterTag: viewModel.filterTag,
+                iCloudURL: context.iCloudURL,
+                locations: context.locations
+            )
+
+            if force || snapshot != nextSnapshot {
+                snapshot = nextSnapshot
+                sections = buildSections(context: context)
+                outlineView?.reloadData()
+                expandAllSections()
+            }
+
+            updateSelection()
+        }
+
+        private func expandAllSections() {
+            guard let outlineView else { return }
+            for section in sections {
+                outlineView.expandItem(section)
+            }
+        }
+
+        // MARK: - NSOutlineViewDataSource
+
+        func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
+            if let section = item as? SidebarSection {
+                return section.items.count
+            }
+            return sections.count
+        }
+
+        func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
+            if let section = item as? SidebarSection {
+                return section.items[index]
+            }
+            return sections[index]
+        }
+
+        func outlineView(_ outlineView: NSOutlineView, isItemExpandable item: Any) -> Bool {
+            item is SidebarSection
+        }
+
+        func outlineView(_ outlineView: NSOutlineView, isGroupItem item: Any) -> Bool {
+            item is SidebarSection
+        }
+
+        func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
+            guard let sidebarItem = item as? SidebarItem else { return nil }
+            guard case let .favorite(resolvedFavorite) = sidebarItem.kind else { return nil }
+
+            let pbItem = NSPasteboardItem()
+            pbItem.setString(resolvedFavorite.favorite.id, forType: internalDragType)
+            if let url = resolvedFavorite.url {
+                pbItem.setString(url.absoluteString, forType: .fileURL)
+            }
+            return pbItem
+        }
+
+        func outlineView(_ outlineView: NSOutlineView,
+                         validateDrop info: NSDraggingInfo,
+                         proposedItem item: Any?,
+                         proposedChildIndex index: Int) -> NSDragOperation {
+            guard let favoritesSection = favoritesSection() else { return [] }
+
+            let isInternal = isInternalDrag(info)
+            let isExternal = info.draggingPasteboard.canReadObject(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+            )
+
+            guard isInternal || isExternal else { return [] }
+
+            guard let target = dropTarget(for: info, in: favoritesSection, isInternal: isInternal) else {
+                return []
+            }
+
+            switch target {
+            case .between(let sectionIndex, _):
+                outlineView.setDropItem(favoritesSection, dropChildIndex: sectionIndex)
+                return isInternal ? .move : .copy
+            case .onFavorite(let favoriteItem):
+                outlineView.setDropItem(favoriteItem, dropChildIndex: NSOutlineViewDropOnItemIndex)
+                if isInternal {
+                    return .move
+                }
+                return NSEvent.modifierFlags.contains(.option) ? .copy : .move
+            }
+        }
+
+        func outlineView(_ outlineView: NSOutlineView,
+                         acceptDrop info: NSDraggingInfo,
+                         item: Any?,
+                         childIndex index: Int) -> Bool {
+            guard let favoritesSection = favoritesSection() else { return false }
+            guard let target = dropTarget(for: info, in: favoritesSection, isInternal: isInternalDrag(info)) else {
+                return false
+            }
+
+            if isInternalDrag(info) {
+                let ids = draggingFavoriteIDs(from: info.draggingPasteboard)
+                guard !ids.isEmpty else { return false }
+
+                switch target {
+                case .between(_, let favoritesIndex):
+                    moveFavorites(ids: ids, to: favoritesIndex)
+                    return true
+                case .onFavorite:
+                    return false
+                }
+            }
+
+            guard let urls = info.draggingPasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+            ) as? [URL], !urls.isEmpty else {
+                return false
+            }
+
+            switch target {
+            case .between(_, let favoritesIndex):
+                insertFavorites(urls: urls, at: favoritesIndex)
+                return true
+            case .onFavorite(let favoriteItem):
+                guard case let .favorite(resolvedFavorite) = favoriteItem.kind,
+                      let destination = resolvedFavorite.url else { return false }
+                viewModel.handleDrop(urls: urls, to: destination)
+                return true
+            }
+        }
+
+        // MARK: - NSOutlineViewDelegate
+
+        func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
+            if let section = item as? SidebarSection {
+                let view = outlineView.makeView(withIdentifier: SidebarGroupCellView.identifier, owner: nil) as? SidebarGroupCellView
+                    ?? SidebarGroupCellView()
+                view.identifier = SidebarGroupCellView.identifier
+                view.configure(title: section.title)
+                return view
+            }
+
+            guard let sidebarItem = item as? SidebarItem else { return nil }
+            let view = outlineView.makeView(withIdentifier: SidebarItemCellView.identifier, owner: nil) as? SidebarItemCellView
+                ?? SidebarItemCellView()
+            view.identifier = SidebarItemCellView.identifier
+
+            let presentation = presentation(for: sidebarItem)
+            view.configure(presentation: presentation)
+            return view
+        }
+
+        func outlineView(_ outlineView: NSOutlineView, shouldSelectItem item: Any) -> Bool {
+            if item is SidebarSection { return false }
+            if let sidebarItem = item as? SidebarItem {
+                return sidebarItem.isEnabled
+            }
+            return true
+        }
+
+        func outlineViewSelectionDidChange(_ notification: Notification) {
+            guard !isUpdatingSelection else { return }
+            guard let outlineView = outlineView else { return }
+
+            let row = outlineView.selectedRow
+            guard row >= 0, let item = outlineView.item(atRow: row) as? SidebarItem else { return }
+            handleSelection(for: item)
+        }
+
+        // MARK: - NSMenuDelegate
+
+        func menuNeedsUpdate(_ menu: NSMenu) {
+            menu.removeAllItems()
+            guard let outlineView = outlineView else { return }
+            let row = outlineView.clickedRow
+            guard row >= 0, let item = outlineView.item(atRow: row) as? SidebarItem else { return }
+
+            guard case let .favorite(resolvedFavorite) = item.kind else { return }
+
+            let removeItem = NSMenuItem(title: "Remove from Favorites", action: #selector(removeFavoriteFromMenu(_:)), keyEquivalent: "")
+            removeItem.representedObject = resolvedFavorite.favorite.id
+            removeItem.target = self
+            menu.addItem(removeItem)
+        }
+
+        @objc private func removeFavoriteFromMenu(_ sender: NSMenuItem) {
+            guard let id = sender.representedObject as? String else { return }
+            appSettings.sidebarFavorites.removeAll { $0.id == id }
+        }
+
+        // MARK: - Selection
+
+        private func handleSelection(for item: SidebarItem) {
+            switch item.kind {
+            case .airDrop:
+                openAirDrop()
+            case .favorite(let resolvedFavorite):
+                guard resolvedFavorite.isAvailable, let url = resolvedFavorite.url else { return }
+                viewModel.navigateTo(url)
+            case .iCloud(let url, let isAvailable):
+                guard isAvailable, let url else { return }
+                viewModel.navigateTo(url)
+            case .location(let location):
+                viewModel.navigateTo(location.url)
+            case .tag(let tag):
+                if viewModel.filterTag == tag.name {
+                    viewModel.filterTag = nil
+                } else {
+                    viewModel.filterTag = tag.name
+                }
+            case .clearTagFilter:
+                viewModel.filterTag = nil
+            }
+        }
+
+        private func updateSelection() {
+            guard let outlineView = outlineView else { return }
+            let itemToSelect: SidebarItem?
+
+            if let filterTag = viewModel.filterTag {
+                itemToSelect = findTagItem(named: filterTag)
+            } else {
+                itemToSelect = bestMatchingLocationItem(for: viewModel.currentPath)
+            }
+
+            isUpdatingSelection = true
+            if let itemToSelect {
+                let row = outlineView.row(forItem: itemToSelect)
+                if row >= 0 {
+                    outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+                } else {
+                    outlineView.deselectAll(nil)
+                }
+            } else {
+                outlineView.deselectAll(nil)
+            }
+            isUpdatingSelection = false
+        }
+
+        private func findTagItem(named name: String) -> SidebarItem? {
+            for section in sections where section.kind == .tags {
+                if let match = section.items.first(where: {
+                    if case let .tag(tag) = $0.kind {
+                        return tag.name == name
+                    }
+                    return false
+                }) {
+                    return match
+                }
+            }
+            return nil
+        }
+
+        private func bestMatchingLocationItem(for url: URL) -> SidebarItem? {
+            var bestItem: SidebarItem?
+            var bestMatchDepth: Int = -1
+            let targetComponents = url.standardizedFileURL.pathComponents
+
+            for section in sections {
+                for item in section.items {
+                    guard let itemURL = item.url else { continue }
+                    let itemComponents = itemURL.standardizedFileURL.pathComponents
+                    guard targetComponents.starts(with: itemComponents) else { continue }
+                    if itemComponents.count > bestMatchDepth {
+                        bestItem = item
+                        bestMatchDepth = itemComponents.count
+                    }
+                }
+            }
+
+            return bestItem
+        }
+
+        // MARK: - Drag Helpers
+
+        private enum DropTarget {
+            case between(sectionIndex: Int, favoritesIndex: Int)
+            case onFavorite(SidebarItem)
+        }
+
+        private func isInternalDrag(_ info: NSDraggingInfo) -> Bool {
+            info.draggingPasteboard.types?.contains(internalDragType) == true
+        }
+
+        private func draggingFavoriteIDs(from pasteboard: NSPasteboard) -> [String] {
+            guard let items = pasteboard.pasteboardItems else { return [] }
+            return items.compactMap { $0.string(forType: internalDragType) }
+        }
+
+        private func dropTarget(for info: NSDraggingInfo,
+                                in favoritesSection: SidebarSection,
+                                isInternal: Bool) -> DropTarget? {
+            guard let outlineView = outlineView else { return nil }
+            let location = outlineView.convert(info.draggingLocation, from: nil)
+            let row = outlineView.row(at: location)
+
+            let airDropOffset: Int
+            if let firstItem = favoritesSection.items.first, case .airDrop = firstItem.kind {
+                airDropOffset = 1
+            } else {
+                airDropOffset = 0
+            }
+            let minSectionIndex = airDropOffset
+            let maxSectionIndex = favoritesSection.items.count
+
+            if row >= 0 {
+                if let section = outlineView.item(atRow: row) as? SidebarSection {
+                    guard section.kind == .favorites else { return nil }
+                    let sectionIndex = minSectionIndex
+                    let favoritesIndex = max(0, sectionIndex - airDropOffset)
+                    return .between(sectionIndex: sectionIndex, favoritesIndex: favoritesIndex)
+                }
+
+                guard let item = outlineView.item(atRow: row) as? SidebarItem else { return nil }
+                guard item.sectionKind == .favorites else { return nil }
+
+                let rowRect = outlineView.rect(ofRow: row)
+                let yInRow = location.y - rowRect.minY
+                let inTopZone = yInRow <= insertZoneHeight
+                let inBottomZone = yInRow >= (rowRect.height - insertZoneHeight)
+
+                let sectionIndex = favoritesSection.items.firstIndex(where: { $0 === item }) ?? 0
+
+                if !isInternal,
+                   case let .favorite(resolvedFavorite) = item.kind,
+                   resolvedFavorite.isAvailable,
+                   resolvedFavorite.url != nil,
+                   !inTopZone,
+                   !inBottomZone {
+                    return .onFavorite(item)
+                }
+
+                let insertionIndex = (inBottomZone ? sectionIndex + 1 : sectionIndex)
+                let clampedSectionIndex = min(max(insertionIndex, minSectionIndex), maxSectionIndex)
+                let favoritesIndex = max(0, clampedSectionIndex - airDropOffset)
+                return .between(sectionIndex: clampedSectionIndex, favoritesIndex: favoritesIndex)
+            }
+
+            guard favoritesSection.kind == .favorites else { return nil }
+
+            if let firstRow = firstRowIndex(for: favoritesSection),
+               let lastRow = lastRowIndex(for: favoritesSection) {
+                let firstRect = outlineView.rect(ofRow: firstRow)
+                let lastRect = outlineView.rect(ofRow: lastRow)
+
+                if location.y < firstRect.minY {
+                    let sectionIndex = minSectionIndex
+                    let favoritesIndex = max(0, sectionIndex - airDropOffset)
+                    return .between(sectionIndex: sectionIndex, favoritesIndex: favoritesIndex)
+                }
+
+                if location.y > lastRect.maxY {
+                    let sectionIndex = maxSectionIndex
+                    let favoritesIndex = max(0, sectionIndex - airDropOffset)
+                    return .between(sectionIndex: sectionIndex, favoritesIndex: favoritesIndex)
+                }
+            }
+
+            return nil
+        }
+
+        private func firstRowIndex(for section: SidebarSection) -> Int? {
+            guard let outlineView = outlineView else { return nil }
+            let rows = section.items.compactMap { item -> Int? in
+                let row = outlineView.row(forItem: item)
+                return row >= 0 ? row : nil
+            }
+            return rows.min()
+        }
+
+        private func lastRowIndex(for section: SidebarSection) -> Int? {
+            guard let outlineView = outlineView else { return nil }
+            let rows = section.items.compactMap { item -> Int? in
+                let row = outlineView.row(forItem: item)
+                return row >= 0 ? row : nil
+            }
+            return rows.max()
+        }
+
+        private func moveFavorites(ids: [String], to destinationIndex: Int) {
+            let favorites = appSettings.sidebarFavorites
+            let moving = favorites.filter { ids.contains($0.id) }
+            guard !moving.isEmpty else { return }
+
+            let countBefore = favorites.prefix(destinationIndex).filter { ids.contains($0.id) }.count
+            let adjustedIndex = max(0, destinationIndex - countBefore)
+
+            var remaining = favorites.filter { !ids.contains($0.id) }
+            let clampedIndex = min(adjustedIndex, remaining.count)
+            remaining.insert(contentsOf: moving, at: clampedIndex)
+            appSettings.sidebarFavorites = remaining
+        }
+
+        private func insertFavorites(urls: [URL], at index: Int) {
+            var insertIndex = min(max(0, index), appSettings.sidebarFavorites.count)
+
+            for url in urls {
+                guard let favorite = favoriteFromURL(url) else { continue }
+                if isDuplicateFavorite(favorite) { continue }
+
+                appSettings.sidebarFavorites.insert(favorite, at: insertIndex)
+                insertIndex += 1
+            }
+        }
+
+        private func favoriteFromURL(_ url: URL) -> SidebarFavorite? {
+            let standardizedURL = url.standardizedFileURL
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
+                  isDirectory.boolValue else { return nil }
+            return SidebarFavorite.custom(path: standardizedURL.path)
+        }
+
+        private func isDuplicateFavorite(_ favorite: SidebarFavorite) -> Bool {
+            guard let newURL = resolvedURL(for: favorite) else { return false }
+            let newPath = newURL.standardizedFileURL.path
+            return appSettings.sidebarFavorites.contains { existing in
+                guard let existingURL = resolvedURL(for: existing) else { return false }
+                return existingURL.standardizedFileURL.path == newPath
+            }
+        }
+
+        // MARK: - Data Building
+
+        private func buildContext() -> SidebarBuildContext {
+            let iCloudURL = FileManager.default
+                .url(forUbiquityContainerIdentifier: nil)?
+                .appendingPathComponent("Documents")
+            let locations = volumeLocations()
+            return SidebarBuildContext(iCloudURL: iCloudURL, locations: locations)
+        }
+
+        private func buildSections(context: SidebarBuildContext) -> [SidebarSection] {
+            var sections: [SidebarSection] = []
+
             if appSettings.sidebarShowFavorites {
-                Section(header: Text("Favorites").font(.caption).foregroundColor(.secondary)) {
-                    // AirDrop - special handling (opens Finder's AirDrop window)
-                    Button(action: {
-                        openAirDrop()
-                    }) {
-                        Label {
-                            Text("AirDrop")
-                                .lineLimit(1)
-                        } icon: {
-                            Image(systemName: "antenna.radiowaves.left.and.right")
-                                .foregroundColor(.accentColor)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .listRowInsets(EdgeInsets())
-                    .padding(.vertical, 4)
-                    .padding(.leading, 6)
-                    .padding(.trailing, 8)
-                    .padding(.bottom, 2)
+                let section = SidebarSection(kind: .favorites, title: "Favorites")
+                var items: [SidebarItem] = []
+                items.append(SidebarItem(kind: .airDrop, id: "airdrop", title: "AirDrop"))
 
-                    ForEach(Array(appSettings.sidebarFavorites.enumerated()), id: \.element.id) { index, favorite in
-                        let location = resolveFavorite(favorite)
-                        SidebarRow(icon: location.icon, title: location.name)
-                        .tag(location.url)
-                        .opacity(location.isAvailable ? 1 : 0.5)
-                        .contextMenu {
-                            Button("Remove from Favorites") {
-                                removeFavorite(favorite)
-                            }
-                        }
-                        .instantTap(
-                            id: favorite.id,
-                            onSingleClick: {
-                                guard location.isAvailable else { return }
-                                viewModel.navigateTo(location.url)
-                            },
-                            onDoubleClick: {
-                                guard location.isAvailable else { return }
-                                viewModel.navigateTo(location.url)
-                            }
-                        )
-                        .listRowInsets(EdgeInsets())
-                        .padding(.vertical, 4)
-                        .padding(.leading, 6)
-                        .padding(.trailing, 8)
-                        .background {
-                            if dropTargetedFavoriteID == favorite.id {
-                                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                                    .fill(Color.accentColor.opacity(0.4))
-                                    .padding(.horizontal, -4)
-                                    .padding(.vertical, -2)
-                            }
-                        }
-                        .overlay(alignment: .top) {
-                            if dropIndicator?.targetID == favorite.id && dropIndicator?.position == .before {
-                                SidebarDropIndicatorView()
-                                    .offset(y: Self.dropIndicatorYOffset)
-                            }
-                        }
-                        .overlay(alignment: .bottom) {
-                            if dropIndicator?.targetID == favorite.id && dropIndicator?.position == .after {
-                                SidebarDropIndicatorView()
-                                    .offset(y: -Self.dropIndicatorYOffset)
-                            }
-                        }
-                        // Extend hit area to cover gaps between rows
-                        .padding(.vertical, 4)
-                        .contentShape(Rectangle())
-                        .padding(.vertical, -4)
-                        .onDrag {
-                            draggingFavorite = favorite
-                            return favoriteItemProvider(for: favorite)
-                        }
-                        .onDrop(of: [Self.favoriteDragType, UTType.fileURL], delegate: FavoriteRowDropDelegate(
-                            favorite: favorite,
-                            index: index,
-                            favorites: $appSettings.sidebarFavorites,
-                            draggingFavorite: $draggingFavorite,
-                            dragType: Self.favoriteDragType,
-                            dropIndicator: $dropIndicator,
-                            dropTargetedFavoriteID: $dropTargetedFavoriteID,
-                            dropJustCompleted: $dropJustCompleted,
-                            onExternalDrop: { providers, insertIndex in
-                                handleFavoritesDrop(providers: providers, insertAt: insertIndex)
-                            },
-                            onExternalDropToFavorite: { urls, destinationURL in
-                                viewModel.handleDrop(urls: urls, to: destinationURL)
-                            },
-                            resolveTargetURL: { fav in
-                                resolvedURL(for: fav)
-                            }
-                        ))
-                    }
-                    // Drop zone at the end of the list
-                    Color.clear
-                        .frame(height: 24)
-                        .contentShape(Rectangle())
-                        .overlay(alignment: .top) {
-                            if let indicator = dropIndicator, indicator.targetID == nil {
-                                SidebarDropIndicatorView()
-                                    .offset(y: Self.dropIndicatorYOffset)
-                            }
-                        }
-                        .onDrop(of: [Self.favoriteDragType, UTType.fileURL], delegate: FavoriteEndDropDelegate(
-                            favorites: $appSettings.sidebarFavorites,
-                            draggingFavorite: $draggingFavorite,
-                            dragType: Self.favoriteDragType,
-                            dropIndicator: $dropIndicator,
-                            dropTargetedFavoriteID: $dropTargetedFavoriteID,
-                            dropJustCompleted: $dropJustCompleted,
-                            onExternalDrop: { providers in
-                                handleFavoritesDrop(providers: providers, insertAt: nil)
-                            }
-                        ))
+                for favorite in appSettings.sidebarFavorites {
+                    let resolved = resolveFavorite(favorite)
+                    let item = SidebarItem(
+                        kind: .favorite(resolved),
+                        id: resolved.favorite.id,
+                        title: resolved.name,
+                        isEnabled: resolved.isAvailable
+                    )
+                    items.append(item)
                 }
-                // Section-level fallback to catch drops that fall through gaps between rows
-                .onDrop(of: [Self.favoriteDragType, UTType.fileURL], delegate: FavoritesSectionFallbackDropDelegate(
-                    dropIndicator: $dropIndicator,
-                    dropTargetedFavoriteID: $dropTargetedFavoriteID,
-                    draggingFavorite: $draggingFavorite,
-                    dropJustCompleted: $dropJustCompleted,
-                    onExternalDrop: { providers in
-                        handleFavoritesDrop(providers: providers, insertAt: nil)
-                    }
-                ))
+                section.items = items
+                sections.append(section)
             }
 
-            // iCloud Section
             if appSettings.sidebarShowICloud {
-                Section(header: Text("iCloud").font(.caption).foregroundColor(.secondary)) {
-                    if let iCloudURL = FileManager.default.url(forUbiquityContainerIdentifier: nil)?.appendingPathComponent("Documents") {
-                        SidebarRow(icon: .system("icloud"), title: "iCloud Drive")
-                            .tag(iCloudURL)
-                    } else {
-                        SidebarRow(icon: .system("icloud"), title: "iCloud Drive")
-                            .disabled(true)
-                    }
-                }
+                let section = SidebarSection(kind: .icloud, title: "iCloud")
+                let isAvailable = context.iCloudURL != nil
+                let item = SidebarItem(
+                    kind: .iCloud(context.iCloudURL, isAvailable),
+                    id: "icloud",
+                    title: "iCloud Drive",
+                    isEnabled: isAvailable
+                )
+                section.items = [item]
+                sections.append(section)
             }
 
-            // Locations Section
             if appSettings.sidebarShowLocations {
-                Section(header: Text("Locations").font(.caption).foregroundColor(.secondary)) {
-                    ForEach(volumeLocations, id: \.url) { location in
-                        SidebarRow(icon: .system(location.icon), title: location.name)
-                            .tag(location.url)
-                    }
+                let section = SidebarSection(kind: .locations, title: "Locations")
+                section.items = context.locations.map { location in
+                    SidebarItem(
+                        kind: .location(location),
+                        id: "location:\(location.url.path)",
+                        title: location.name
+                    )
                 }
+                sections.append(section)
             }
 
-            // Tags Section
             if appSettings.sidebarShowTags {
-                Section(header: Text("Tags").font(.caption).foregroundColor(.secondary)) {
-                    ForEach(FinderTag.allTags) { tag in
-                        Button(action: {
-                            if viewModel.filterTag == tag.name {
-                                viewModel.filterTag = nil  // Clicking active filter clears it
-                            } else {
-                                viewModel.filterTag = tag.name  // Set new filter
-                            }
-                        }) {
-                            HStack {
-                                Circle()
-                                    .fill(tag.color)
-                                    .frame(width: 12, height: 12)
-                                Text(tag.name)
-                                    .lineLimit(1)
-                                Spacer()
-                                if viewModel.filterTag == tag.name {
-                                    Image(systemName: "checkmark")
-                                        .foregroundColor(.accentColor)
-                                        .font(.caption)
-                                }
-                            }
-                        }
-                        .buttonStyle(.plain)
-                    }
+                let section = SidebarSection(kind: .tags, title: "Tags")
+                var items: [SidebarItem] = FinderTag.allTags.map { tag in
+                    SidebarItem(kind: .tag(tag), id: "tag:\(tag.name)", title: tag.name)
+                }
+                if viewModel.filterTag != nil {
+                    items.append(SidebarItem(kind: .clearTagFilter, id: "tag:clear", title: "Clear Filter"))
+                }
+                section.items = items
+                sections.append(section)
+            }
 
-                    if viewModel.filterTag != nil {
-                        Button(action: {
-                            viewModel.filterTag = nil
-                        }) {
-                            Label("Clear Filter", systemImage: "xmark.circle")
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.plain)
+            return sections
+        }
+
+        private func resolveFavorite(_ favorite: SidebarFavorite) -> ResolvedFavorite {
+            switch favorite.kind {
+            case .custom:
+                let path = favorite.path ?? ""
+                let url = path.isEmpty ? nil : URL(fileURLWithPath: path)
+                let name = path.isEmpty ? "Missing Folder" : url?.lastPathComponent ?? "Missing Folder"
+                let isAvailable = url.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
+                return ResolvedFavorite(favorite: favorite, name: name, url: url, isAvailable: isAvailable)
+            default:
+                let info = systemFavoriteInfo(for: favorite.kind)
+                let isAvailable = info?.url != nil
+                return ResolvedFavorite(favorite: favorite, name: info?.name ?? favorite.kind.rawValue.capitalized, url: info?.url, isAvailable: isAvailable)
+            }
+        }
+
+        private func systemFavoriteInfo(for kind: SidebarFavorite.Kind) -> SystemFavoriteInfo? {
+            let fm = FileManager.default
+            switch kind {
+            case .documents:
+                return SystemFavoriteInfo(name: "Documents", url: fm.urls(for: .documentDirectory, in: .userDomainMask).first)
+            case .applications:
+                return SystemFavoriteInfo(name: "Applications", url: fm.urls(for: .applicationDirectory, in: .localDomainMask).first)
+            case .desktop:
+                return SystemFavoriteInfo(name: "Desktop", url: fm.urls(for: .desktopDirectory, in: .userDomainMask).first)
+            case .downloads:
+                return SystemFavoriteInfo(name: "Downloads", url: fm.urls(for: .downloadsDirectory, in: .userDomainMask).first)
+            case .movies:
+                return SystemFavoriteInfo(name: "Movies", url: fm.urls(for: .moviesDirectory, in: .userDomainMask).first)
+            case .music:
+                return SystemFavoriteInfo(name: "Music", url: fm.urls(for: .musicDirectory, in: .userDomainMask).first)
+            case .pictures:
+                return SystemFavoriteInfo(name: "Pictures", url: fm.urls(for: .picturesDirectory, in: .userDomainMask).first)
+            case .custom:
+                return nil
+            }
+        }
+
+        private func resolvedURL(for favorite: SidebarFavorite) -> URL? {
+            switch favorite.kind {
+            case .custom:
+                guard let path = favorite.path else { return nil }
+                return URL(fileURLWithPath: path)
+            default:
+                return systemFavoriteInfo(for: favorite.kind)?.url
+            }
+        }
+
+        private func favoritesSection() -> SidebarSection? {
+            sections.first { $0.kind == .favorites }
+        }
+
+        private func volumeLocations() -> [SidebarLocation] {
+            var locations: [SidebarLocation] = []
+
+            let rootURL = URL(fileURLWithPath: "/")
+            let rootName = Host.current().localizedName ?? "Macintosh HD"
+            locations.append(SidebarLocation(name: rootName, url: rootURL))
+
+            let volumesURL = URL(fileURLWithPath: "/Volumes")
+            if let volumes = try? FileManager.default.contentsOfDirectory(
+                at: volumesURL,
+                includingPropertiesForKeys: nil,
+                options: .skipsHiddenFiles
+            ) {
+                for volume in volumes {
+                    let name = volume.lastPathComponent
+                    if name != rootName {
+                        locations.append(SidebarLocation(name: name, url: volume))
+                    }
+                }
+            }
+
+            locations.append(SidebarLocation(name: "Network", url: URL(fileURLWithPath: "/Network")))
+            return locations
+        }
+
+        private func presentation(for item: SidebarItem) -> SidebarItemPresentation {
+            switch item.kind {
+            case .airDrop:
+                return SidebarItemPresentation(
+                    title: item.title,
+                    icon: symbolIcon(name: "antenna.radiowaves.left.and.right"),
+                    iconTint: .controlAccentColor,
+                    accessory: nil,
+                    isEnabled: true
+                )
+            case .favorite(let resolvedFavorite):
+                let icon = resolvedFavorite.url.map { NSWorkspace.shared.icon(forFile: $0.path) } ?? symbolIcon(name: "folder")
+                return SidebarItemPresentation(
+                    title: resolvedFavorite.name,
+                    icon: icon,
+                    iconTint: nil,
+                    accessory: nil,
+                    isEnabled: resolvedFavorite.isAvailable
+                )
+            case .iCloud:
+                return SidebarItemPresentation(
+                    title: item.title,
+                    icon: symbolIcon(name: "icloud"),
+                    iconTint: nil,
+                    accessory: nil,
+                    isEnabled: item.isEnabled
+                )
+            case .location(let location):
+                let icon = NSWorkspace.shared.icon(forFile: location.url.path)
+                return SidebarItemPresentation(
+                    title: location.name,
+                    icon: icon,
+                    iconTint: nil,
+                    accessory: nil,
+                    isEnabled: true
+                )
+            case .tag(let tag):
+                let checkmark = viewModel.filterTag == tag.name
+                    ? symbolIcon(name: "checkmark")
+                    : nil
+                return SidebarItemPresentation(
+                    title: tag.name,
+                    icon: symbolIcon(name: "circle.fill"),
+                    iconTint: NSColor(tag.color),
+                    accessory: checkmark,
+                    isEnabled: true
+                )
+            case .clearTagFilter:
+                return SidebarItemPresentation(
+                    title: item.title,
+                    icon: symbolIcon(name: "xmark.circle"),
+                    iconTint: .secondaryLabelColor,
+                    accessory: nil,
+                    isEnabled: true
+                )
+            }
+        }
+
+        private func symbolIcon(name: String) -> NSImage? {
+            NSImage(systemSymbolName: name, accessibilityDescription: nil)
+        }
+
+        private func openAirDrop() {
+            let script = """
+            tell application "Finder"
+                activate
+                if exists window "AirDrop" then
+                    set index of window "AirDrop" to 1
+                else
+                    make new Finder window
+                    set target of Finder window 1 to (POSIX file "/System/Library/CoreServices/Finder.app/Contents/Applications/AirDrop.app")
+                end if
+            end tell
+            """
+
+            if let appleScript = NSAppleScript(source: script) {
+                var error: NSDictionary?
+                appleScript.executeAndReturnError(&error)
+                if error != nil {
+                    if let url = URL(string: "nwnode://domain-AirDrop") {
+                        NSWorkspace.shared.open(url)
                     }
                 }
             }
         }
-        .listStyle(.sidebar)
-        .frame(minWidth: 180)
-        .coordinateSpace(name: "favoritesDropZone")
-        .onPreferenceChange(FavoriteRowFrameKey.self) { frames in
-            favoriteRowFrames = frames
-        }
-        .onChange(of: appSettings.sidebarFavorites) { _ in
-            clearDropIndicators()
-        }
+    }
+}
+
+private struct SidebarSnapshot: Equatable {
+    let showFavorites: Bool
+    let showICloud: Bool
+    let showLocations: Bool
+    let showTags: Bool
+    let favorites: [SidebarFavorite]
+    let filterTag: String?
+    let iCloudURL: URL?
+    let locations: [SidebarLocation]
+}
+
+private struct SidebarBuildContext {
+    let iCloudURL: URL?
+    let locations: [SidebarLocation]
+}
+
+private struct SidebarLocation: Equatable {
+    let name: String
+    let url: URL
+}
+
+private struct ResolvedFavorite {
+    let favorite: SidebarFavorite
+    let name: String
+    let url: URL?
+    let isAvailable: Bool
+}
+
+private struct SystemFavoriteInfo {
+    let name: String
+    let url: URL?
+}
+
+private struct SidebarItemPresentation {
+    let title: String
+    let icon: NSImage?
+    let iconTint: NSColor?
+    let accessory: NSImage?
+    let isEnabled: Bool
+}
+
+private final class SidebarSection: NSObject {
+    enum Kind {
+        case favorites
+        case icloud
+        case locations
+        case tags
     }
 
-    private struct ResolvedFavorite: Identifiable {
-        let id: String
-        let name: String
-        let icon: SidebarIcon
-        let url: URL
-        let isAvailable: Bool
+    let kind: Kind
+    let title: String
+    var items: [SidebarItem]
+
+    init(kind: Kind, title: String, items: [SidebarItem] = []) {
+        self.kind = kind
+        self.title = title
+        self.items = items
+    }
+}
+
+private final class SidebarItem: NSObject {
+    enum Kind {
+        case airDrop
+        case favorite(ResolvedFavorite)
+        case iCloud(URL?, Bool)
+        case location(SidebarLocation)
+        case tag(FinderTag)
+        case clearTagFilter
     }
 
-    private func resolveFavorite(_ favorite: SidebarFavorite) -> ResolvedFavorite {
-        switch favorite.kind {
-        case .custom:
-            let path = favorite.path ?? ""
-            let url = path.isEmpty
-                ? FileManager.default.homeDirectoryForCurrentUser
-                : URL(fileURLWithPath: path)
-            let name = path.isEmpty ? "Missing Folder" : url.lastPathComponent
-            let icon = SidebarIcon.system("folder")
-            let isAvailable = !path.isEmpty && FileManager.default.fileExists(atPath: url.path)
-            return ResolvedFavorite(
-                id: favorite.id,
-                name: name,
-                icon: icon,
-                url: url,
-                isAvailable: isAvailable
-            )
-        default:
-            let info = systemFavoriteInfo(for: favorite.kind)
-            let url = info?.url ?? FileManager.default.homeDirectoryForCurrentUser
-            let icon = SidebarIcon.system(info?.icon ?? "folder")
-            let isAvailable = info?.url != nil
-            return ResolvedFavorite(
-                id: favorite.id,
-                name: info?.name ?? favorite.kind.rawValue.capitalized,
-                icon: icon,
-                url: url,
-                isAvailable: isAvailable
-            )
-        }
+    let kind: Kind
+    let id: String
+    let title: String
+    let isEnabled: Bool
+
+    init(kind: Kind, id: String, title: String, isEnabled: Bool = true) {
+        self.kind = kind
+        self.id = id
+        self.title = title
+        self.isEnabled = isEnabled
     }
 
-    private struct SystemFavoriteInfo {
-        let name: String
-        let icon: String
-        let url: URL?
-    }
-
-    private func systemFavoriteInfo(for kind: SidebarFavorite.Kind) -> SystemFavoriteInfo? {
-        let fm = FileManager.default
+    var url: URL? {
         switch kind {
-        case .documents:
-            return SystemFavoriteInfo(
-                name: "Documents",
-                icon: "doc",
-                url: fm.urls(for: .documentDirectory, in: .userDomainMask).first
-            )
-        case .applications:
-            return SystemFavoriteInfo(
-                name: "Applications",
-                icon: "square.grid.2x2",
-                url: fm.urls(for: .applicationDirectory, in: .localDomainMask).first
-            )
-        case .desktop:
-            return SystemFavoriteInfo(
-                name: "Desktop",
-                icon: "menubar.dock.rectangle",
-                url: fm.urls(for: .desktopDirectory, in: .userDomainMask).first
-            )
-        case .downloads:
-            return SystemFavoriteInfo(
-                name: "Downloads",
-                icon: "arrow.down.circle",
-                url: fm.urls(for: .downloadsDirectory, in: .userDomainMask).first
-            )
-        case .movies:
-            return SystemFavoriteInfo(
-                name: "Movies",
-                icon: "film",
-                url: fm.urls(for: .moviesDirectory, in: .userDomainMask).first
-            )
-        case .music:
-            return SystemFavoriteInfo(
-                name: "Music",
-                icon: "music.note",
-                url: fm.urls(for: .musicDirectory, in: .userDomainMask).first
-            )
-        case .pictures:
-            return SystemFavoriteInfo(
-                name: "Pictures",
-                icon: "photo",
-                url: fm.urls(for: .picturesDirectory, in: .userDomainMask).first
-            )
-        case .custom:
+        case .favorite(let resolved):
+            return resolved.url
+        case .iCloud(let url, _):
+            return url
+        case .location(let location):
+            return location.url
+        default:
             return nil
         }
     }
 
-    private func handleFavoritesDrop(providers: [NSItemProvider], insertAt index: Int?) -> Bool {
-        clearDropIndicators()
-
-        // Schedule multiple cleanup passes to ensure indicators are cleared
-        // even if SwiftUI sends late drop events
-        for delay in [0.05, 0.1, 0.2, 0.5] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [self] in
-                clearDropIndicators()
-            }
-        }
-
-        let acceptedProviders = providers.filter {
-            $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier)
-        }
-        guard !acceptedProviders.isEmpty else { return false }
-
-        for provider in acceptedProviders {
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    self.addFavorite(from: url, insertAt: index)
-                }
-            }
-        }
-        return true
-    }
-
-    private func addFavorite(from url: URL, insertAt index: Int?) {
-        // Always clear indicators when this is called, even if we don't add the favorite
-        defer { clearDropIndicators() }
-
-        let standardizedURL = url.standardizedFileURL
-        var isDirectory: ObjCBool = false
-        guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
-              isDirectory.boolValue else { return }
-
-        guard !isDuplicateFavorite(standardizedURL) else { return }
-
-        let favorite = SidebarFavorite.custom(path: standardizedURL.path)
-        if let index, index < appSettings.sidebarFavorites.count {
-            appSettings.sidebarFavorites.insert(favorite, at: index)
-        } else {
-            appSettings.sidebarFavorites.append(favorite)
-        }
-    }
-
-    private func isDuplicateFavorite(_ url: URL) -> Bool {
-        let targetPath = url.standardizedFileURL.path
-        return appSettings.sidebarFavorites.contains { favorite in
-            guard let existingURL = resolvedURL(for: favorite) else { return false }
-            return existingURL.standardizedFileURL.path == targetPath
-        }
-    }
-
-    private func resolvedURL(for favorite: SidebarFavorite) -> URL? {
-        switch favorite.kind {
-        case .custom:
-            guard let path = favorite.path else { return nil }
-            return URL(fileURLWithPath: path)
-        default:
-            return systemFavoriteInfo(for: favorite.kind)?.url
-        }
-    }
-
-    private func removeFavorite(_ favorite: SidebarFavorite) {
-        appSettings.sidebarFavorites.removeAll { $0.id == favorite.id }
-    }
-
-    private func favoriteItemProvider(for favorite: SidebarFavorite) -> NSItemProvider {
-        let data = favorite.id.data(using: .utf8) ?? Data()
-        return NSItemProvider(item: data as NSData, typeIdentifier: Self.favoriteDragType.identifier)
-    }
-
-    private func indicatorPosition(for favoriteID: String) -> SidebarDropIndicatorPosition? {
-        guard let indicator = dropIndicator, indicator.targetID == favoriteID else { return nil }
-        return indicator.position
-    }
-
-    private func clearDropIndicators() {
-        dropIndicator = nil
-        dropTargetedFavoriteID = nil
-    }
-
-    private func openAirDrop() {
-        // Open Finder's AirDrop window using AppleScript
-        let script = """
-        tell application "Finder"
-            activate
-            if exists window "AirDrop" then
-                set index of window "AirDrop" to 1
-            else
-                make new Finder window
-                set target of Finder window 1 to (POSIX file "/System/Library/CoreServices/Finder.app/Contents/Applications/AirDrop.app")
-            end if
-        end tell
-        """
-
-        if let appleScript = NSAppleScript(source: script) {
-            var error: NSDictionary?
-            appleScript.executeAndReturnError(&error)
-            if error != nil {
-                // Fallback: try opening via URL scheme
-                if let url = URL(string: "nwnode://domain-AirDrop") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
-        }
-    }
-
-    private var volumeLocations: [SidebarLocation] {
-        var locations: [SidebarLocation] = []
-
-        // Main disk
-        locations.append(SidebarLocation(name: Host.current().localizedName ?? "Macintosh HD", icon: "desktopcomputer", url: URL(fileURLWithPath: "/")))
-
-        // External volumes
-        let volumesURL = URL(fileURLWithPath: "/Volumes")
-        if let volumes = try? FileManager.default.contentsOfDirectory(at: volumesURL, includingPropertiesForKeys: nil, options: .skipsHiddenFiles) {
-            for volume in volumes {
-                let name = volume.lastPathComponent
-                if name != "Macintosh HD" {
-                    locations.append(SidebarLocation(name: name, icon: "externaldrive", url: volume))
-                }
-            }
-        }
-
-        // Network
-        locations.append(SidebarLocation(name: "Network", icon: "network", url: URL(fileURLWithPath: "/Network")))
-
-        return locations
-    }
-}
-
-struct SidebarLocation {
-    let name: String
-    let icon: String
-    let url: URL
-}
-
-struct SidebarIcon {
-    let symbolName: String
-
-    static func system(_ symbolName: String) -> SidebarIcon {
-        SidebarIcon(symbolName: symbolName)
-    }
-}
-
-struct SidebarRow: View {
-    let icon: SidebarIcon
-    let title: String
-
-    var body: some View {
-        Label {
-            Text(title)
-                .lineLimit(1)
-        } icon: {
-            Image(systemName: icon.symbolName)
-                .foregroundColor(.primary)
-                .font(.system(size: 13, weight: .semibold))
-                .frame(width: 16, height: 16)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .contentShape(Rectangle())
-    }
-}
-
-struct FavoriteRowFrameKey: PreferenceKey {
-    static var defaultValue: [String: CGRect] = [:]
-
-    static func reduce(value: inout [String: CGRect], nextValue: () -> [String: CGRect]) {
-        value.merge(nextValue(), uniquingKeysWith: { $1 })
-    }
-}
-
-enum SidebarDropIndicatorPosition {
-    case before
-    case after
-}
-
-struct SidebarDropIndicator: Equatable {
-    let targetID: String?
-    let position: SidebarDropIndicatorPosition
-}
-
-struct SidebarDropIndicatorView: View {
-    var body: some View {
-        HStack(spacing: 6) {
-            Circle()
-                .fill(Color.accentColor)
-                .frame(width: 6, height: 6)
-            Rectangle()
-                .fill(Color.accentColor)
-                .frame(height: 2)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.leading, 6)
-        .padding(.trailing, 8)
-    }
-}
-
-struct FavoritesSectionDropDelegate: DropDelegate {
-    @Binding var favorites: [SidebarFavorite]
-    @Binding var draggingFavorite: SidebarFavorite?
-    let dragType: UTType
-    @Binding var dropIndicator: SidebarDropIndicator?
-    @Binding var dropTargetedFavoriteID: String?
-    @Binding var rowFrames: [String: CGRect]
-    let dropZoneFrame: CGRect
-    let onExternalDrop: ([NSItemProvider], Int?) -> Bool
-    let onExternalDropToFavorite: ([URL], URL) -> Void
-    let resolveTargetURL: (SidebarFavorite) -> URL?
-    private let insertZoneHeight: CGFloat = 8
-
-    func validateDrop(info: DropInfo) -> Bool {
-        isInternalDrag(info) || info.hasItemsConforming(to: [UTType.fileURL])
-    }
-
-    func dropEntered(info: DropInfo) {
-        _ = updateDropState(info: info, isInternal: isInternalDrag(info))
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        let isInternal = isInternalDrag(info)
-        let target = updateDropState(info: info, isInternal: isInternal)
-
-        if isInternal {
-            handleInternalMove(target: target)
-            return DropProposal(operation: .move)
-        }
-
-        switch target {
-        case .highlight:
-            let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
-            return DropProposal(operation: operation)
-        case .line:
-            return DropProposal(operation: .copy)
-        }
-    }
-
-    func dropExited(info: DropInfo) {
-        dropIndicator = nil
-        dropTargetedFavoriteID = nil
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        defer {
-            draggingFavorite = nil
-            dropIndicator = nil
-            dropTargetedFavoriteID = nil
-        }
-
-        if isInternalDrag(info) {
-            return true
-        }
-
-        let providers = info.itemProviders(for: [UTType.fileURL])
-        guard !providers.isEmpty else { return false }
-
-        let target = dropTarget(for: info.location, isInternal: false)
-        switch target {
-        case .highlight(let favoriteID):
-            guard let favorite = favorites.first(where: { $0.id == favoriteID }),
-                  let destinationURL = resolveTargetURL(favorite) else {
-                return false
-            }
-            loadFileURLs(from: providers) { urls in
-                guard !urls.isEmpty else { return }
-                DispatchQueue.main.async {
-                    onExternalDropToFavorite(urls, destinationURL)
-                }
-            }
-            return true
-        case .line(let targetID):
-            let insertIndex: Int?
-            if let targetID,
-               let targetIndex = favorites.firstIndex(where: { $0.id == targetID }) {
-                insertIndex = targetIndex
-            } else {
-                insertIndex = nil
-            }
-            return onExternalDrop(providers, insertIndex)
-        }
-    }
-
-    private enum DropTarget: Equatable {
-        case line(targetID: String?)
-        case highlight(favoriteID: String)
-    }
-
-    private func isInternalDrag(_ info: DropInfo) -> Bool {
-        guard draggingFavorite != nil else { return false }
-
-        let providers = info.itemProviders(for: [dragType])
-        let hasCustomType = providers.contains { provider in
-            provider.registeredTypeIdentifiers.contains(dragType.identifier)
-        }
-
-        if hasCustomType {
-            return true
-        }
-
-        return !info.hasItemsConforming(to: [UTType.fileURL])
-    }
-
-    @discardableResult
-    private func updateDropState(info: DropInfo, isInternal: Bool) -> DropTarget {
-        let target = dropTarget(for: info.location, isInternal: isInternal)
-        applyDropTarget(target)
-        return target
-    }
-
-    private func dropTarget(for location: CGPoint, isInternal: Bool) -> DropTarget {
-        let orderedRows = orderedFavoritesByFrame()
-        guard !orderedRows.isEmpty else {
-            return .line(targetID: nil)
-        }
-
-        // Check each row to determine insertion point
-        for (index, row) in orderedRows.enumerated() {
-            let rowMidY = (row.frame.minY + row.frame.maxY) / 2
-            
-            // If we're above the midpoint of this row, insert before it
-            if location.y < rowMidY {
-                return .line(targetID: row.favorite.id)
-            }
-            
-            // If we're within this row's bounds
-            if location.y <= row.frame.maxY {
-                // For external drops to folders, check if we should highlight (drop into) the folder
-                if !isInternal && canDropIntoFavorite(row.favorite) {
-                    // If we're in the top insert zone, insert before
-                    if location.y - row.frame.minY <= insertZoneHeight {
-                        return .line(targetID: row.favorite.id)
-                    }
-                    // Otherwise, highlight for dropping into the folder
-                    return .highlight(favoriteID: row.favorite.id)
-                }
-                
-                // For internal drags or non-folder items, check if we should insert after
-                if index < orderedRows.count - 1 {
-                    // Insert after this row (which is before the next row)
-                    return .line(targetID: orderedRows[index + 1].favorite.id)
-                } else {
-                    // This is the last row, insert at the end
-                    return .line(targetID: nil)
-                }
-            }
-        }
-
-        // If we're below all rows, insert at the end
-        return .line(targetID: nil)
-    }
-
-    private func applyDropTarget(_ target: DropTarget) {
-        switch target {
-        case .line(let targetID):
-            if dropTargetedFavoriteID != nil {
-                dropTargetedFavoriteID = nil
-            }
-            let position: SidebarDropIndicatorPosition = targetID == nil ? .after : .before
-            let indicator = SidebarDropIndicator(targetID: targetID, position: position)
-            if dropIndicator != indicator {
-                dropIndicator = indicator
-            }
-        case .highlight(let favoriteID):
-            if dropIndicator != nil {
-                dropIndicator = nil
-            }
-            if dropTargetedFavoriteID != favoriteID {
-                dropTargetedFavoriteID = favoriteID
-            }
-        }
-    }
-
-    private func orderedFavoritesByFrame() -> [(favorite: SidebarFavorite, frame: CGRect)] {
-        let rows = favorites.compactMap { favorite -> (favorite: SidebarFavorite, frame: CGRect)? in
-            guard let frame = rowFrames[favorite.id] else { return nil }
-            return (favorite: favorite, frame: frame)
-        }
-        return rows.sorted(by: { $0.frame.minY < $1.frame.minY })
-    }
-
-    private func canDropIntoFavorite(_ favorite: SidebarFavorite) -> Bool {
-        resolveTargetURL(favorite) != nil
-    }
-
-    private func loadFileURLs(from providers: [NSItemProvider], completion: @escaping ([URL]) -> Void) {
-        let group = DispatchGroup()
-        var urls: [URL] = []
-        let lock = NSLock()
-
-        for provider in providers {
-            guard provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else { continue }
-            group.enter()
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { data, _ in
-                defer { group.leave() }
-                guard let data = data as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                lock.lock()
-                urls.append(url)
-                lock.unlock()
-            }
-        }
-
-        group.notify(queue: .main) {
-            completion(urls)
-        }
-    }
-
-    private func handleInternalMove(target: DropTarget) {
-        guard let dragging = draggingFavorite,
-              let fromIndex = favorites.firstIndex(of: dragging) else { return }
-
-        let targetIndex: Int
-        switch target {
-        case .line(let targetID):
-            if let targetID, let index = favorites.firstIndex(where: { $0.id == targetID }) {
-                targetIndex = index
-            } else {
-                targetIndex = favorites.endIndex
-            }
-        case .highlight(let favoriteID):
-            if let index = favorites.firstIndex(where: { $0.id == favoriteID }) {
-                targetIndex = index
-            } else {
-                targetIndex = favorites.endIndex
-            }
-        }
-
-        var destination = targetIndex
-        if fromIndex < destination {
-            destination -= 1
-        }
-        guard destination != fromIndex else { return }
-
-        withAnimation(.easeInOut(duration: 0.08)) {
-            favorites.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: destination)
+    var sectionKind: SidebarSection.Kind? {
+        switch kind {
+        case .airDrop, .favorite:
+            return .favorites
+        case .iCloud:
+            return .icloud
+        case .location:
+            return .locations
+        case .tag, .clearTagFilter:
+            return .tags
         }
     }
 }
 
-// MARK: - Per-Row Drop Delegate
-struct FavoriteRowDropDelegate: DropDelegate {
-    let favorite: SidebarFavorite
-    let index: Int
-    @Binding var favorites: [SidebarFavorite]
-    @Binding var draggingFavorite: SidebarFavorite?
-    let dragType: UTType
-    @Binding var dropIndicator: SidebarDropIndicator?
-    @Binding var dropTargetedFavoriteID: String?
-    @Binding var dropJustCompleted: Bool
-    let onExternalDrop: ([NSItemProvider], Int?) -> Bool
-    let onExternalDropToFavorite: ([URL], URL) -> Void
-    let resolveTargetURL: (SidebarFavorite) -> URL?
+private final class SidebarItemCellView: NSTableCellView {
+    static let identifier = NSUserInterfaceItemIdentifier("SidebarItemCell")
 
-    func validateDrop(info: DropInfo) -> Bool {
-        let isInternal = isInternalDrag(info)
-        let hasFileURL = info.hasItemsConforming(to: [UTType.fileURL])
-        return isInternal || hasFileURL
+    private let iconView = NSImageView()
+    private let titleField = NSTextField(labelWithString: "")
+    private let accessoryView = NSImageView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
     }
 
-    func dropEntered(info: DropInfo) {
-        guard !dropJustCompleted else { return }
-        updateDropState(info: info)
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
     }
 
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard !dropJustCompleted else { return nil }
-        updateDropState(info: info)
+    private func setup() {
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        titleField.translatesAutoresizingMaskIntoConstraints = false
+        accessoryView.translatesAutoresizingMaskIntoConstraints = false
 
-        if isInternalDrag(info) {
-            return DropProposal(operation: .move)
-        }
+        titleField.lineBreakMode = .byTruncatingMiddle
+        titleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
-        // If hovering in upper half, show insert line; otherwise highlight for drop into folder
-        if isUpperHalf(info.location) {
-            return DropProposal(operation: .copy)
-        } else if canDropIntoFavorite() {
-            let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
-            return DropProposal(operation: operation)
-        } else {
-            return DropProposal(operation: .copy)
-        }
+        iconView.imageScaling = .scaleProportionallyDown
+        accessoryView.imageScaling = .scaleProportionallyDown
+        accessoryView.contentTintColor = .controlAccentColor
+
+        textField = titleField
+        imageView = iconView
+
+        addSubview(iconView)
+        addSubview(titleField)
+        addSubview(accessoryView)
+
+        NSLayoutConstraint.activate([
+            iconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            iconView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 16),
+            iconView.heightAnchor.constraint(equalToConstant: 16),
+
+            titleField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 8),
+            titleField.centerYAnchor.constraint(equalTo: centerYAnchor),
+
+            accessoryView.leadingAnchor.constraint(greaterThanOrEqualTo: titleField.trailingAnchor, constant: 6),
+            accessoryView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -8),
+            accessoryView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            accessoryView.widthAnchor.constraint(equalToConstant: 12),
+            accessoryView.heightAnchor.constraint(equalToConstant: 12)
+        ])
     }
 
-    func dropExited(info: DropInfo) {
-        // Don't clear indicators here - let the section fallback delegate handle it
-        // This prevents the "dead zone" issue where indicators disappear between rows
-    }
+    func configure(presentation: SidebarItemPresentation) {
+        titleField.stringValue = presentation.title
+        titleField.textColor = presentation.isEnabled ? .labelColor : .secondaryLabelColor
 
-    func performDrop(info: DropInfo) -> Bool {
-        dropJustCompleted = true
-        defer {
-            draggingFavorite = nil
-            dropIndicator = nil
-            dropTargetedFavoriteID = nil
-            // Schedule multiple cleanup passes to ensure indicators are cleared
-            // even if SwiftUI sends late drop events
-            for delay in [0.05, 0.1, 0.2, 0.5] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                    dropIndicator = nil
-                    dropTargetedFavoriteID = nil
-                }
-            }
-            // Reset the flag after cleanup passes complete
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                dropJustCompleted = false
-            }
-        }
+        iconView.image = presentation.icon
+        iconView.contentTintColor = presentation.iconTint
+        iconView.alphaValue = presentation.isEnabled ? 1.0 : 0.5
 
-        let isInternal = isInternalDrag(info)
-
-        if isInternal {
-            // Handle internal reordering
-            guard let dragging = draggingFavorite,
-                  let fromIndex = favorites.firstIndex(of: dragging) else { return false }
-
-            var targetIndex = index
-            if isUpperHalf(info.location) {
-                // Insert before this row
-            } else {
-                // Insert after this row
-                targetIndex = index + 1
-            }
-
-            if fromIndex < targetIndex {
-                targetIndex -= 1
-            }
-            guard targetIndex != fromIndex else { return true }
-
-            withAnimation(.easeInOut(duration: 0.08)) {
-                favorites.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: targetIndex)
-            }
-            return true
-        }
-
-        // External drop
-        let providers = info.itemProviders(for: [UTType.fileURL])
-        guard !providers.isEmpty else { return false }
-
-        let inUpperHalf = isUpperHalf(info.location)
-        let canDropInto = canDropIntoFavorite()
-
-        if inUpperHalf {
-            // Insert as new favorite before this row
-            return onExternalDrop(providers, index)
-        } else if canDropInto, let destinationURL = resolveTargetURL(favorite) {
-            // Drop into this favorite's folder
-            loadFileURLs(from: providers) { urls in
-                guard !urls.isEmpty else { return }
-                DispatchQueue.main.async {
-                    self.onExternalDropToFavorite(urls, destinationURL)
-                }
-            }
-            return true
-        } else {
-            // Insert as new favorite after this row
-            return onExternalDrop(providers, index + 1)
-        }
-    }
-
-    private func isInternalDrag(_ info: DropInfo) -> Bool {
-        guard draggingFavorite != nil else { return false }
-        let providers = info.itemProviders(for: [dragType])
-        return providers.contains { $0.registeredTypeIdentifiers.contains(dragType.identifier) }
-            || !info.hasItemsConforming(to: [UTType.fileURL])
-    }
-
-    private func isUpperHalf(_ location: CGPoint) -> Bool {
-        // Very small insert zone at top of row (6px), rest of row triggers folder highlight
-        location.y < 6
-    }
-
-    private func updateDropState(info: DropInfo) {
-        let isInternal = isInternalDrag(info)
-
-        if isUpperHalf(info.location) {
-            // Show insert line above this row
-            dropTargetedFavoriteID = nil
-            dropIndicator = SidebarDropIndicator(targetID: favorite.id, position: .before)
-        } else if !isInternal && canDropIntoFavorite() {
-            // Highlight this row for dropping into it
-            dropIndicator = nil
-            dropTargetedFavoriteID = favorite.id
-        } else {
-            // Show insert line below this row
-            dropTargetedFavoriteID = nil
-            dropIndicator = SidebarDropIndicator(targetID: favorite.id, position: .after)
-        }
-    }
-
-    private func canDropIntoFavorite() -> Bool {
-        resolveTargetURL(favorite) != nil
-    }
-
-    private func loadFileURLs(from providers: [NSItemProvider], completion: @escaping ([URL]) -> Void) {
-        let group = DispatchGroup()
-        var urls: [URL] = []
-        let lock = NSLock()
-
-        for provider in providers {
-            guard provider.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) else { continue }
-            group.enter()
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { data, _ in
-                defer { group.leave() }
-                guard let data = data as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                lock.lock()
-                urls.append(url)
-                lock.unlock()
-            }
-        }
-
-        group.notify(queue: .main) {
-            completion(urls)
-        }
+        accessoryView.image = presentation.accessory
+        accessoryView.isHidden = presentation.accessory == nil
     }
 }
 
-// MARK: - Section Fallback Drop Delegate (catches drops that fall through gaps)
-struct FavoritesSectionFallbackDropDelegate: DropDelegate {
-    @Binding var dropIndicator: SidebarDropIndicator?
-    @Binding var dropTargetedFavoriteID: String?
-    @Binding var draggingFavorite: SidebarFavorite?
-    @Binding var dropJustCompleted: Bool
-    let onExternalDrop: ([NSItemProvider]) -> Bool
+private final class SidebarGroupCellView: NSTableCellView {
+    static let identifier = NSUserInterfaceItemIdentifier("SidebarGroupCell")
 
-    func validateDrop(info: DropInfo) -> Bool {
-        info.hasItemsConforming(to: [UTType.fileURL])
+    private let titleField = NSTextField(labelWithString: "")
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setup()
     }
 
-    func dropEntered(info: DropInfo) {
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setup()
     }
 
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        // Return nil to let child delegates take priority
-        nil
+    private func setup() {
+        titleField.translatesAutoresizingMaskIntoConstraints = false
+        titleField.font = NSFont.systemFont(ofSize: 11, weight: .semibold)
+        titleField.textColor = .secondaryLabelColor
+
+        textField = titleField
+
+        addSubview(titleField)
+        NSLayoutConstraint.activate([
+            titleField.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 8),
+            titleField.centerYAnchor.constraint(equalTo: centerYAnchor)
+        ])
     }
 
-    func dropExited(info: DropInfo) {
-        guard !dropJustCompleted else { return }
-        dropIndicator = nil
-        dropTargetedFavoriteID = nil
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        dropJustCompleted = true
-        defer {
-            dropIndicator = nil
-            dropTargetedFavoriteID = nil
-            draggingFavorite = nil
-            // Schedule cleanup
-            for delay in [0.05, 0.1, 0.2, 0.5] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                    dropIndicator = nil
-                    dropTargetedFavoriteID = nil
-                }
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                dropJustCompleted = false
-            }
-        }
-
-        // Handle the drop - add at the end of favorites
-        let providers = info.itemProviders(for: [UTType.fileURL])
-        guard !providers.isEmpty else { return false }
-
-        return onExternalDrop(providers)
-    }
-}
-
-// MARK: - End of List Drop Delegate
-struct FavoriteEndDropDelegate: DropDelegate {
-    @Binding var favorites: [SidebarFavorite]
-    @Binding var draggingFavorite: SidebarFavorite?
-    let dragType: UTType
-    @Binding var dropIndicator: SidebarDropIndicator?
-    @Binding var dropTargetedFavoriteID: String?
-    @Binding var dropJustCompleted: Bool
-    let onExternalDrop: ([NSItemProvider]) -> Bool
-
-    func validateDrop(info: DropInfo) -> Bool {
-        isInternalDrag(info) || info.hasItemsConforming(to: [UTType.fileURL])
-    }
-
-    func dropEntered(info: DropInfo) {
-        guard !dropJustCompleted else { return }
-        dropTargetedFavoriteID = nil
-        dropIndicator = SidebarDropIndicator(targetID: nil, position: .after)
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard !dropJustCompleted else { return nil }
-        dropTargetedFavoriteID = nil
-        dropIndicator = SidebarDropIndicator(targetID: nil, position: .after)
-        return DropProposal(operation: isInternalDrag(info) ? .move : .copy)
-    }
-
-    func dropExited(info: DropInfo) {
-        // Don't clear indicators here - let the section fallback delegate handle it
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        dropJustCompleted = true
-        defer {
-            draggingFavorite = nil
-            dropIndicator = nil
-            dropTargetedFavoriteID = nil
-            // Schedule multiple cleanup passes to ensure indicators are cleared
-            for delay in [0.05, 0.1, 0.2, 0.5] {
-                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                    dropIndicator = nil
-                    dropTargetedFavoriteID = nil
-                }
-            }
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
-                dropJustCompleted = false
-            }
-        }
-
-        if isInternalDrag(info) {
-            guard let dragging = draggingFavorite,
-                  let fromIndex = favorites.firstIndex(of: dragging) else { return false }
-
-            let targetIndex = favorites.count - 1
-            guard targetIndex != fromIndex else { return true }
-
-            withAnimation(.easeInOut(duration: 0.08)) {
-                favorites.move(fromOffsets: IndexSet(integer: fromIndex), toOffset: favorites.count)
-            }
-            return true
-        }
-
-        let providers = info.itemProviders(for: [UTType.fileURL])
-        guard !providers.isEmpty else { return false }
-        return onExternalDrop(providers)
-    }
-
-    private func isInternalDrag(_ info: DropInfo) -> Bool {
-        guard draggingFavorite != nil else { return false }
-        let providers = info.itemProviders(for: [dragType])
-        return providers.contains { $0.registeredTypeIdentifiers.contains(dragType.identifier) }
-            || !info.hasItemsConforming(to: [UTType.fileURL])
+    func configure(title: String) {
+        titleField.stringValue = title
     }
 }
