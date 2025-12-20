@@ -16,6 +16,7 @@ final class AppSettings: ObservableObject {
         static let sidebarShowICloud = "settings.sidebarShowICloud"
         static let sidebarShowLocations = "settings.sidebarShowLocations"
         static let sidebarShowTags = "settings.sidebarShowTags"
+        static let sidebarFavorites = "settings.sidebarFavorites"
         static let thumbnailQuality = "settings.thumbnailQuality"
 
         static let listFontSize = "settings.listFontSize"
@@ -49,6 +50,18 @@ final class AppSettings: ObservableObject {
         static let sidebarShowICloud = true
         static let sidebarShowLocations = true
         static let sidebarShowTags = true
+        static let sidebarFavorites: [SidebarFavorite] = [
+            .system(.documents),
+            .system(.applications),
+            .system(.desktop),
+            .system(.downloads),
+            .system(.movies),
+            .system(.music),
+            .system(.pictures)
+        ]
+        static let sidebarFavoritesData: Data = {
+            (try? JSONEncoder().encode(sidebarFavorites)) ?? Data()
+        }()
         static let thumbnailQuality: Double = 1.15
 
         static let listFontSize: Double = 13
@@ -102,6 +115,13 @@ final class AppSettings: ObservableObject {
     }
     @Published var sidebarShowTags: Bool {
         didSet { defaults.set(sidebarShowTags, forKey: Keys.sidebarShowTags) }
+    }
+    @Published var sidebarFavorites: [SidebarFavorite] {
+        didSet {
+            if let data = try? JSONEncoder().encode(sidebarFavorites) {
+                defaults.set(data, forKey: Keys.sidebarFavorites)
+            }
+        }
     }
     @Published var thumbnailQuality: Double {
         didSet { defaults.set(thumbnailQuality, forKey: Keys.thumbnailQuality) }
@@ -170,6 +190,7 @@ final class AppSettings: ObservableObject {
             Keys.sidebarShowICloud: Defaults.sidebarShowICloud,
             Keys.sidebarShowLocations: Defaults.sidebarShowLocations,
             Keys.sidebarShowTags: Defaults.sidebarShowTags,
+            Keys.sidebarFavorites: Defaults.sidebarFavoritesData,
             Keys.thumbnailQuality: Defaults.thumbnailQuality,
             Keys.listFontSize: Defaults.listFontSize,
             Keys.listIconSize: Defaults.listIconSize,
@@ -198,6 +219,14 @@ final class AppSettings: ObservableObject {
         sidebarShowICloud = defaults.bool(forKey: Keys.sidebarShowICloud)
         sidebarShowLocations = defaults.bool(forKey: Keys.sidebarShowLocations)
         sidebarShowTags = defaults.bool(forKey: Keys.sidebarShowTags)
+        sidebarFavorites = {
+            if let data = defaults.data(forKey: Keys.sidebarFavorites),
+               let favorites = try? JSONDecoder().decode([SidebarFavorite].self, from: data),
+               !favorites.isEmpty {
+                return favorites
+            }
+            return Defaults.sidebarFavorites
+        }()
         thumbnailQuality = defaults.double(forKey: Keys.thumbnailQuality)
 
         listFontSize = defaults.double(forKey: Keys.listFontSize)
@@ -231,6 +260,7 @@ final class AppSettings: ObservableObject {
         sidebarShowICloud = Defaults.sidebarShowICloud
         sidebarShowLocations = Defaults.sidebarShowLocations
         sidebarShowTags = Defaults.sidebarShowTags
+        sidebarFavorites = Defaults.sidebarFavorites
         thumbnailQuality = Defaults.thumbnailQuality
 
         listFontSize = Defaults.listFontSize
@@ -355,5 +385,42 @@ final class AppSettings: ObservableObject {
 
     var thumbnailQualityValue: CGFloat {
         CGFloat(thumbnailQuality)
+    }
+}
+
+struct SidebarFavorite: Identifiable, Codable, Equatable {
+    enum Kind: String, Codable {
+        case documents
+        case applications
+        case desktop
+        case downloads
+        case movies
+        case music
+        case pictures
+        case custom
+    }
+
+    let id: String
+    let kind: Kind
+    let path: String?
+
+    init(kind: Kind, id: String? = nil, path: String? = nil) {
+        self.kind = kind
+        self.path = path
+        if let id {
+            self.id = id
+        } else if kind == .custom {
+            self.id = UUID().uuidString
+        } else {
+            self.id = kind.rawValue
+        }
+    }
+
+    static func system(_ kind: Kind) -> SidebarFavorite {
+        SidebarFavorite(kind: kind, id: kind.rawValue)
+    }
+
+    static func custom(path: String) -> SidebarFavorite {
+        SidebarFavorite(kind: .custom, id: UUID().uuidString, path: path)
     }
 }
