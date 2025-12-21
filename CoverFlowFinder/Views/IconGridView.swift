@@ -28,8 +28,17 @@ struct IconGridView: View {
         return labelWidth + labelPadding + outerPadding
     }
 
+    // Calculate columns based on current width - used for both grid layout and navigation
+    private var columnCount: Int {
+        let availableWidth = max(0, currentWidth - 40) // Subtract padding (20 each side)
+        let spacing = settings.iconGridSpacingValue
+        let cols = Int((availableWidth + spacing) / (cellWidth + spacing))
+        return max(1, cols)
+    }
+
     private var columns: [GridItem] {
-        [GridItem(.adaptive(minimum: cellWidth, maximum: cellWidth), spacing: settings.iconGridSpacingValue)]
+        // Use explicit column count to ensure navigation matches layout
+        Array(repeating: GridItem(.flexible(), spacing: settings.iconGridSpacingValue), count: columnCount)
     }
 
     private var iconGridThumbnailPixelSize: CGFloat {
@@ -38,14 +47,6 @@ struct IconGridView: View {
         let target = baseTarget * settings.thumbnailQualityValue
         let bucket = (target / 64).rounded() * 64
         return min(768, max(96, bucket))
-    }
-
-    // Calculate columns based on current width - called at navigation time
-    private var calculatedColumns: Int {
-        let availableWidth = max(0, currentWidth - 40) // Subtract padding (20 each side)
-        let spacing = settings.iconGridSpacingValue
-        let cols = Int((availableWidth + spacing) / (cellWidth + spacing))
-        return max(1, cols)
     }
 
     var body: some View {
@@ -77,7 +78,7 @@ struct IconGridView: View {
                                 guard !item.isFromArchive else { return NSItemProvider() }
                                 return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
                             }
-                            .onDrop(of: [.fileURL], delegate: IconFolderDropDelegate(
+                            .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
                                 item: item,
                                 viewModel: viewModel,
                                 dropTargetedItemID: $dropTargetedItemID
@@ -133,11 +134,7 @@ struct IconGridView: View {
             handleDrop(providers: providers)
             return true
         }
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 3)
-                .padding(8)
-        )
+        .dropTargetOverlay(isTargeted: isDropTargeted, padding: UI.Spacing.standard)
         .contextMenu {
             Button("New Folder") {
                 viewModel.createNewFolder()
@@ -177,12 +174,17 @@ struct IconGridView: View {
             refreshThumbnails()
         }
         .keyboardNavigable(
-            onUpArrow: { navigateSelection(by: -calculatedColumns) },
-            onDownArrow: { navigateSelection(by: calculatedColumns) },
+            onUpArrow: { navigateSelection(by: -columnCount) },
+            onDownArrow: { navigateSelection(by: columnCount) },
             onLeftArrow: { navigateSelection(by: -1) },
             onRightArrow: { navigateSelection(by: 1) },
             onReturn: { openSelectedItem() },
-            onSpace: { toggleQuickLook() }
+            onSpace: { toggleQuickLook() },
+            onDelete: { viewModel.deleteSelectedItems() },
+            onCopy: { viewModel.copySelectedItems() },
+            onCut: { viewModel.cutSelectedItems() },
+            onPaste: { viewModel.paste() },
+            onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
         .simultaneousGesture(magnificationGesture)
     }
@@ -212,30 +214,25 @@ struct IconGridView: View {
         }
     }
 
-    private func toggleQuickLook() {
-        guard let selectedItem = viewModel.selectedItems.first else { return }
+    private func jumpToMatch(_ searchString: String) {
+        guard !searchString.isEmpty else { return }
+        let lowercased = searchString.lowercased()
 
-        guard let previewURL = viewModel.previewURL(for: selectedItem) else {
-            NSSound.beep()
-            return
+        // Find the first item that starts with the typed string
+        if let matchItem = items.first(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
+            viewModel.selectItem(matchItem)
+            updateQuickLook(for: matchItem)
         }
+    }
 
-        QuickLookControllerView.shared.togglePreview(for: previewURL) { [self] offset in
+    private func toggleQuickLook() {
+        viewModel.toggleQuickLookForSelection { [self] offset in
             navigateSelection(by: offset)
         }
     }
 
     private func updateQuickLook(for item: FileItem?) {
-        guard let item else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-            return
-        }
-
-        if let previewURL = viewModel.previewURL(for: item) {
-            QuickLookControllerView.shared.updatePreview(for: previewURL)
-        } else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-        }
+        viewModel.updateQuickLookPreview(for: item)
     }
 
     private func updateVisibility(for item: FileItem, isVisible: Bool) {
@@ -244,28 +241,57 @@ struct IconGridView: View {
         } else {
             visibleItemIDs.remove(item.id)
         }
+        markScrolling()
         scheduleHydration()
+    }
+
+    @State private var isScrolling = false
+    @State private var scrollEndTimer: Timer?
+
+    private func markScrolling() {
+        isScrolling = true
+        scrollEndTimer?.invalidate()
+        scrollEndTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [self] _ in
+            DispatchQueue.main.async {
+                isScrolling = false
+                scheduleHydration()
+            }
+        }
     }
 
     private func scheduleHydration() {
         hydrationWorkItem?.cancel()
+        let debounceTime: TimeInterval = isScrolling ? 0.1 : 0.02
         let itemsSnapshot = items
         let visibleSnapshot = visibleItemIDs
-        let columnCount = calculatedColumns
-        let workItem = DispatchWorkItem { [itemsSnapshot, visibleSnapshot, columnCount] in
+        let currentColumnCount = columnCount
+        let scrolling = isScrolling
+
+        let workItem = DispatchWorkItem { [itemsSnapshot, visibleSnapshot, currentColumnCount, scrolling] in
             guard !visibleSnapshot.isEmpty else { return }
             let visibleIndices = itemsSnapshot.enumerated().compactMap { index, item in
                 visibleSnapshot.contains(item.id) ? index : nil
             }
             guard let minIndex = visibleIndices.min(),
                   let maxIndex = visibleIndices.max() else { return }
-            let buffer = max(8, columnCount * 2)
+
+            // Use larger buffer when not scrolling
+            let buffer: Int
+            if scrolling {
+                buffer = max(12, currentColumnCount * 3)
+            } else {
+                let visibleCount = maxIndex - minIndex + 1
+                buffer = max(80, visibleCount * 4)
+            }
+
             let start = max(0, minIndex - buffer)
             let end = min(itemsSnapshot.count - 1, maxIndex + buffer)
             let range = start..<(end + 1)
+
             DispatchQueue.main.async {
-                if range == self.lastHydratedRange { return }
+                if range == self.lastHydratedRange && scrolling { return }
                 self.lastHydratedRange = range
+
                 var urlsToHydrate: [URL] = []
                 urlsToHydrate.reserveCapacity(range.count)
                 for index in range {
@@ -277,17 +303,36 @@ struct IconGridView: View {
                 if !urlsToHydrate.isEmpty {
                     self.viewModel.hydrateMetadata(for: urlsToHydrate)
                 }
+
+                // Load thumbnails with batching
+                let maxLoadsPerPass = scrolling ? 8 : 48
+                var loadCount = 0
+                var hasMoreToLoad = false
+
                 for index in range {
                     let item = itemsSnapshot[index]
                     guard !item.isDirectory else { continue }
                     if self.thumbnails[item.url] == nil {
-                        self.loadThumbnail(for: item)
+                        if loadCount < maxLoadsPerPass {
+                            self.loadThumbnail(for: item)
+                            loadCount += 1
+                        } else {
+                            hasMoreToLoad = true
+                        }
+                    }
+                }
+
+                // Continue loading if not scrolling
+                if hasMoreToLoad && !self.isScrolling {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        self.lastHydratedRange = nil
+                        self.scheduleHydration()
                     }
                 }
             }
         }
         hydrationWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
+        DispatchQueue.main.asyncAfter(deadline: .now() + debounceTime, execute: workItem)
     }
 
     private func loadThumbnail(for item: FileItem) {
@@ -329,15 +374,7 @@ struct IconGridView: View {
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [sourceURL])
-                }
-            }
-        }
+        DropHelper.handleDrop(providers: providers, viewModel: viewModel)
     }
 
     private func refreshThumbnails() {
@@ -446,48 +483,3 @@ struct IconGridItem: View {
     }
 }
 
-// MARK: - Folder Drop Delegate
-
-struct IconFolderDropDelegate: DropDelegate {
-    let item: FileItem
-    let viewModel: FileBrowserViewModel
-    @Binding var dropTargetedItemID: UUID?
-
-    func validateDrop(info: DropInfo) -> Bool {
-        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
-    }
-
-    func dropEntered(info: DropInfo) {
-        if item.isDirectory {
-            dropTargetedItemID = item.id
-        }
-    }
-
-    func dropExited(info: DropInfo) {
-        if dropTargetedItemID == item.id {
-            dropTargetedItemID = nil
-        }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
-        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
-        return DropProposal(operation: operation)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        guard item.isDirectory && !item.isFromArchive else { return false }
-
-        let providers = info.itemProviders(for: [.fileURL])
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [url], to: item.url)
-                }
-            }
-        }
-        return true
-    }
-}

@@ -111,6 +111,7 @@ struct FileTableView: NSViewRepresentable {
         // Check if items actually changed (not just reference)
         let changed = oldItems.count != items.count || !oldItems.elementsEqual(items, by: { $0.id == $1.id })
         if changed {
+            context.coordinator.resetThumbnailState()
             context.coordinator.tableView?.reloadData()
             // Trigger hydration for newly visible rows
             context.coordinator.hydrateVisibleRows()
@@ -155,6 +156,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     var items: [FileItem] = []
     private var thumbnails: [URL: NSImage] = [:]
+    private var pendingThumbnailRows = IndexSet()
     private let thumbnailCache = ThumbnailCacheManager.shared
     private var isUpdatingSelection = false
     private var isUpdatingSort = false  // Prevent sort feedback loop
@@ -166,6 +168,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var lastVisibleRange: Range<Int>?
     private var hydrationDebounceTimer: Timer?
     private let hydrationDebounceInterval: TimeInterval = 0.05
+    private var isLiveScrolling = false
 
     // Thumbnail preheat state (like PHCachingImageManager)
     private var lastPreheatRange: Range<Int>?
@@ -414,6 +417,12 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             tableView.selectRowIndexes(newIndexSet, byExtendingSelection: false)
             isUpdatingSelection = false
         }
+
+        // Always scroll to make the first selected row visible
+        // This ensures the list follows cover flow selection even during rapid browsing
+        if let firstSelectedRow = rowsToSelect.first {
+            tableView.scrollRowToVisible(firstSelectedRow)
+        }
     }
 
     // MARK: - Actions
@@ -500,6 +509,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     // MARK: - Scroll & Lazy Hydration
 
     @objc func scrollViewDidScroll(_ notification: Notification) {
+        isLiveScrolling = true
         // Debounce hydration during active scrolling
         hydrationDebounceTimer?.invalidate()
         hydrationDebounceTimer = Timer.scheduledTimer(withTimeInterval: hydrationDebounceInterval, repeats: false) { [weak self] _ in
@@ -512,7 +522,10 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     @objc func scrollViewDidEndScroll(_ notification: Notification) {
         // Immediately hydrate when scroll ends
         hydrationDebounceTimer?.invalidate()
+        isLiveScrolling = false
         hydrateVisibleRows()
+        loadThumbnailsForVisibleRows()
+        flushPendingThumbnailRowReloads()
     }
 
     /// Hydrate metadata for currently visible rows
@@ -554,6 +567,24 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
         // Also preheat thumbnails
         preheatThumbnails(visibleStart: start, visibleEnd: end)
+    }
+
+    private func loadThumbnailsForVisibleRows() {
+        guard let tableView = tableView else { return }
+
+        let visibleRect = tableView.visibleRect
+        let visibleRows = tableView.rows(in: visibleRect)
+
+        guard visibleRows.location != NSNotFound else { return }
+
+        let start = visibleRows.location
+        let end = min(start + visibleRows.length, items.count)
+
+        guard start < end else { return }
+
+        for row in start..<end {
+            loadThumbnailIfNeeded(for: items[row])
+        }
     }
 
     /// Preheat thumbnails for rows coming into view (like PHCachingImageManager)
@@ -605,7 +636,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             ?? FileNameCellView()
         cell.identifier = identifier
 
-        let thumbnail = thumbnails[item.url] ?? item.icon
+        let thumbnail = thumbnails[item.url] ?? (isLiveScrolling ? item.placeholderIcon : item.icon)
         cell.configure(item: item, thumbnail: thumbnail, appSettings: appSettings)
 
         // Load thumbnail if needed
@@ -659,26 +690,83 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         if thumbnails[url] != nil { return }
         if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) { return }
         if thumbnailCache.hasFailed(url: url) {
+            if isLiveScrolling {
+                return
+            }
             thumbnails[url] = item.icon
+            queueThumbnailRowReload(for: url)
             return
         }
 
         if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
             thumbnails[url] = cached
+            queueThumbnailRowReload(for: url)
             return
         }
 
         thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { [weak self] loadedURL, image in
             DispatchQueue.main.async {
                 guard let self = self else { return }
-                self.thumbnails[loadedURL] = image ?? item.icon
-
-                // Find row and reload it
-                if let row = self.items.firstIndex(where: { $0.url == loadedURL }) {
-                    self.tableView?.reloadData(forRowIndexes: IndexSet(integer: row), columnIndexes: IndexSet(integer: 0))
+                if self.thumbnailCache.hasFailed(url: loadedURL) {
+                    if self.isLiveScrolling {
+                        return
+                    }
+                    self.thumbnails[loadedURL] = item.icon
+                    self.queueThumbnailRowReload(for: loadedURL)
+                    return
                 }
+
+                self.thumbnails[loadedURL] = image ?? item.icon
+                self.queueThumbnailRowReload(for: loadedURL)
             }
         }
+    }
+
+    func resetThumbnailState() {
+        pendingThumbnailRows.removeAll()
+        isLiveScrolling = false
+    }
+
+    private func queueThumbnailRowReload(for url: URL) {
+        guard let tableView = tableView else { return }
+        guard let row = items.firstIndex(where: { $0.url == url }) else { return }
+
+        if isLiveScrolling {
+            pendingThumbnailRows.insert(row)
+            return
+        }
+
+        let columnIndex = nameColumnIndex(in: tableView)
+        tableView.reloadData(
+            forRowIndexes: IndexSet(integer: row),
+            columnIndexes: IndexSet(integer: columnIndex)
+        )
+    }
+
+    private func flushPendingThumbnailRowReloads() {
+        guard let tableView = tableView else { return }
+        guard !pendingThumbnailRows.isEmpty else { return }
+
+        let maxIndex = items.count - 1
+        var validRows = IndexSet()
+        if maxIndex >= 0 {
+            for row in pendingThumbnailRows where row <= maxIndex {
+                validRows.insert(row)
+            }
+        }
+
+        pendingThumbnailRows.removeAll()
+        guard !validRows.isEmpty else { return }
+
+        let columnIndex = nameColumnIndex(in: tableView)
+        tableView.reloadData(forRowIndexes: validRows, columnIndexes: IndexSet(integer: columnIndex))
+    }
+
+    private func nameColumnIndex(in tableView: NSTableView) -> Int {
+        if let index = tableView.tableColumns.firstIndex(where: { $0.identifier.rawValue == ListColumn.name.rawValue }) {
+            return index
+        }
+        return 0
     }
 }
 

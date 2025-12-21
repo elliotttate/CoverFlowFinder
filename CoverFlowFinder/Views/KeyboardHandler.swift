@@ -9,6 +9,11 @@ class KeyboardManager {
     private var eventMonitor: Any?
     private var activeHandler: (() -> Bool)?
 
+    // Type-ahead state (shared across views)
+    var typeAheadBuffer: String = ""
+    var typeAheadTimer: Timer?
+    let typeAheadTimeout: TimeInterval = 1.0
+
     private init() {
         eventMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self = self,
@@ -32,6 +37,24 @@ class KeyboardManager {
     func clearHandler() {
         activeHandler = nil
     }
+
+    func appendTypeAhead(_ char: Character) {
+        typeAheadBuffer.append(char)
+        resetTypeAheadTimer()
+    }
+
+    func clearTypeAhead() {
+        typeAheadBuffer = ""
+        typeAheadTimer?.invalidate()
+        typeAheadTimer = nil
+    }
+
+    private func resetTypeAheadTimer() {
+        typeAheadTimer?.invalidate()
+        typeAheadTimer = Timer.scheduledTimer(withTimeInterval: typeAheadTimeout, repeats: false) { [weak self] _ in
+            self?.typeAheadBuffer = ""
+        }
+    }
 }
 
 // View modifier for keyboard handling - doesn't wrap the view
@@ -43,6 +66,11 @@ struct KeyboardNavigable: ViewModifier {
     let onRightArrow: () -> Void
     let onReturn: () -> Void
     let onSpace: () -> Void
+    let onDelete: () -> Void
+    let onCopy: () -> Void
+    let onCut: () -> Void
+    let onPaste: () -> Void
+    let onTypeAhead: ((String) -> Void)?
 
     func body(content: Content) -> some View {
         content
@@ -63,8 +91,12 @@ struct KeyboardNavigable: ViewModifier {
     }
 
     private func registerHandler() {
-        KeyboardManager.shared.setHandler { [onUpArrow, onDownArrow, onLeftArrow, onRightArrow, onReturn, onSpace] in
+        KeyboardManager.shared.setHandler { [onUpArrow, onDownArrow, onLeftArrow, onRightArrow, onReturn, onSpace, onDelete, onCopy, onCut, onPaste, onTypeAhead] in
             guard let event = NSApp.currentEvent else { return false }
+            let modifiers = event.modifierFlags
+
+            // Don't intercept if command key is held (except for specific shortcuts)
+            let hasCommand = modifiers.contains(.command)
 
             switch event.keyCode {
             case 126: // Up arrow
@@ -85,9 +117,52 @@ struct KeyboardNavigable: ViewModifier {
             case 49: // Space
                 onSpace()
                 return true
-            default:
+            case 53: // Escape - clear type-ahead
+                KeyboardManager.shared.clearTypeAhead()
+                return true
+            case 51: // Backspace/Delete
+                if hasCommand {
+                    onDelete()
+                    return true
+                }
                 return false
+            case 8: // C key
+                if hasCommand && !modifiers.contains(.shift) {
+                    onCopy()
+                    return true
+                }
+                // Fall through to type-ahead
+            case 7: // X key
+                if hasCommand && !modifiers.contains(.shift) {
+                    onCut()
+                    return true
+                }
+                // Fall through to type-ahead
+            case 9: // V key
+                if hasCommand && !modifiers.contains(.shift) {
+                    onPaste()
+                    return true
+                }
+                // Fall through to type-ahead
+            default:
+                break
             }
+
+            // Type-ahead: handle printable characters without modifiers
+            if let typeAhead = onTypeAhead,
+               !hasCommand,
+               !modifiers.contains(.control),
+               let characters = event.characters,
+               !characters.isEmpty {
+                let char = characters.first!
+                if char.isLetter || char.isNumber || char == " " || char == "." || char == "-" || char == "_" {
+                    KeyboardManager.shared.appendTypeAhead(char)
+                    typeAhead(KeyboardManager.shared.typeAheadBuffer)
+                    return true
+                }
+            }
+
+            return false
         }
     }
 }
@@ -100,7 +175,12 @@ extension View {
         onLeftArrow: @escaping () -> Void = {},
         onRightArrow: @escaping () -> Void = {},
         onReturn: @escaping () -> Void = {},
-        onSpace: @escaping () -> Void = {}
+        onSpace: @escaping () -> Void = {},
+        onDelete: @escaping () -> Void = {},
+        onCopy: @escaping () -> Void = {},
+        onCut: @escaping () -> Void = {},
+        onPaste: @escaping () -> Void = {},
+        onTypeAhead: ((String) -> Void)? = nil
     ) -> some View {
         modifier(KeyboardNavigable(
             isActive: isActive,
@@ -109,8 +189,92 @@ extension View {
             onLeftArrow: onLeftArrow,
             onRightArrow: onRightArrow,
             onReturn: onReturn,
-            onSpace: onSpace
+            onSpace: onSpace,
+            onDelete: onDelete,
+            onCopy: onCopy,
+            onCut: onCut,
+            onPaste: onPaste,
+            onTypeAhead: onTypeAhead
         ))
+    }
+}
+
+// MARK: - Unified Folder Drop Delegate
+
+/// A unified drop delegate for folder targeting that can be used across all views.
+/// This replaces the duplicated IconFolderDropDelegate, FolderDropDelegate,
+/// ColumnFolderDropDelegate, DualPaneFolderDropDelegate, and QuadPaneFolderDropDelegate.
+struct UnifiedFolderDropDelegate: DropDelegate {
+    let item: FileItem
+    let viewModel: FileBrowserViewModel
+    @Binding var dropTargetedItemID: UUID?
+
+    func validateDrop(info: DropInfo) -> Bool {
+        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        if item.isDirectory {
+            dropTargetedItemID = item.id
+        }
+    }
+
+    func dropExited(info: DropInfo) {
+        if dropTargetedItemID == item.id {
+            dropTargetedItemID = nil
+        }
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
+        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        return DropProposal(operation: operation)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard item.isDirectory && !item.isFromArchive else { return false }
+
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [url], to: item.url)
+                }
+            }
+        }
+        return true
+    }
+}
+
+// MARK: - QuickLook Helper Extension
+
+extension FileBrowserViewModel {
+    /// Updates QuickLook preview for the given item, or clears it if nil
+    func updateQuickLookPreview(for item: FileItem?) {
+        guard let item else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+            return
+        }
+
+        if let previewURL = previewURL(for: item) {
+            QuickLookControllerView.shared.updatePreview(for: previewURL)
+        } else {
+            QuickLookControllerView.shared.updatePreview(for: nil)
+        }
+    }
+
+    /// Toggles QuickLook for the selected item with navigation callback
+    func toggleQuickLookForSelection(onNavigate: @escaping (Int) -> Void) {
+        guard let selectedItem = selectedItems.first else { return }
+
+        guard let previewURL = previewURL(for: selectedItem) else {
+            NSSound.beep()
+            return
+        }
+
+        QuickLookControllerView.shared.togglePreview(for: previewURL, navigate: onNavigate)
     }
 }
 

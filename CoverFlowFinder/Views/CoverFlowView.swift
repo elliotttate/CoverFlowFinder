@@ -37,9 +37,9 @@ struct CoverFlowView: View {
     }
 
     private let visibleRange = 12
-    private let maxConcurrentThumbnails = 8
-    private let maxConcurrentPreloadThumbnails = 6
-    private let preloadRangeMultiplier = 3
+    private let maxConcurrentThumbnails = 24
+    private let maxConcurrentPreloadThumbnails = 16
+    private let preloadRangeMultiplier = 8
     private let thumbnailCache = ThumbnailCacheManager.shared
 
     var body: some View {
@@ -332,7 +332,8 @@ struct CoverFlowView: View {
 
     private func loadVisibleThumbnails() {
         guard !sortedItemsCache.isEmpty else { return }
-        guard !isCoverFlowScrolling else { return }
+        // Allow limited loading during scroll for smoother experience
+        let isScrolling = isCoverFlowScrolling
         let thumbnailPixelSize = coverFlowThumbnailPixelSize
         let placeholderPixelSize = coverFlowPlaceholderPixelSize
         let selected = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
@@ -452,8 +453,12 @@ struct CoverFlowView: View {
 
         itemsToLoadHigh.sort { $0.distance < $1.distance }
         itemsToLoadLow.sort { $0.distance < $1.distance }
-        let loadHighItems = Array(itemsToLoadHigh.prefix(maxConcurrentThumbnails))
-        let loadLowItems = Array(itemsToLoadLow.prefix(maxConcurrentPreloadThumbnails))
+        // Load fewer items during scroll to keep UI responsive
+        let highLimit = isScrolling ? 6 : maxConcurrentThumbnails
+        let lowLimit = isScrolling ? 4 : maxConcurrentPreloadThumbnails
+        let loadHighItems = Array(itemsToLoadHigh.prefix(highLimit))
+        let loadLowItems = Array(itemsToLoadLow.prefix(lowLimit))
+        let hasMoreToLoad = itemsToLoadHigh.count > highLimit || itemsToLoadLow.count > lowLimit
 
         DispatchQueue.main.async { [self] in
             for url in urlsToEvict {
@@ -474,6 +479,13 @@ struct CoverFlowView: View {
             }
             for (item, _) in loadLowItems {
                 generatePlaceholderThumbnail(for: item, maxPixelSize: placeholderPixelSize)
+            }
+
+            // If there are more items to load and we're not scrolling, schedule another pass
+            if hasMoreToLoad && !isCoverFlowScrolling {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
+                    loadVisibleThumbnails()
+                }
             }
         }
     }
@@ -726,14 +738,17 @@ class CoverFlowNSView: NSView {
         self.itemsToken = itemsToken
         self.thumbnails = thumbnails
 
+        let shouldSyncSelection = itemsChanged || !isScrolling
         let indexChanged = self.selectedIndex != selectedIndex
-        self.selectedIndex = selectedIndex
+        if shouldSyncSelection {
+            self.selectedIndex = selectedIndex
+        }
 
         if itemsChanged {
             rebuildCovers()
             layer?.setNeedsLayout()
             layer?.layoutIfNeeded()
-        } else if indexChanged {
+        } else if indexChanged && shouldSyncSelection {
             animateToSelection()
             DispatchQueue.main.async {
                 self.updateCoverImages()
@@ -1524,20 +1539,13 @@ class CoverFlowNSView: NSView {
             scrollSettleTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [weak self] _ in
                 self?.onScrollSettled()
             }
-        } else if wasScrolling {
-            // Immediately settle when explicitly stopped
-            onScrollSettled()
         }
     }
 
     private func onScrollSettled() {
+        // Notify SwiftUI before flipping scroll state to avoid selection snap-back
+        onSelect?(selectedIndex)
         setScrolling(false)
-
-        // NOW notify SwiftUI of the final position
-        DispatchQueue.main.async { [weak self] in
-            guard let self = self else { return }
-            self.onSelect?(self.selectedIndex)
-        }
 
         // Re-enable reflections on all visible covers
         for coverLayer in coverLayers {
@@ -1557,7 +1565,7 @@ class CoverFlowNSView: NSView {
     private func startMomentumScroll() {
         guard abs(scrollVelocity) > 100 else {
             accumulatedScroll = 0
-            setScrolling(false)
+            onScrollSettled()
             return
         }
 
@@ -1598,7 +1606,7 @@ class CoverFlowNSView: NSView {
             if abs(self.scrollVelocity) < 50 {
                 timer.invalidate()
                 self.accumulatedScroll = 0
-                self.setScrolling(false)
+                self.onScrollSettled()
             }
         }
     }
@@ -1997,54 +2005,6 @@ extension CoverFlowNSView: NSDraggingSource {
 
         clearDropTargetHighlight()
         dropTargetIndex = nil
-    }
-}
-
-// MARK: - Folder Drop Delegate
-
-struct CoverFlowFolderDropDelegate: DropDelegate {
-    let item: FileItem
-    let viewModel: FileBrowserViewModel
-    @Binding var dropTargetedItemID: UUID?
-
-    func validateDrop(info: DropInfo) -> Bool {
-        // Only folders can accept drops
-        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
-    }
-
-    func dropEntered(info: DropInfo) {
-        if item.isDirectory && !item.isFromArchive {
-            dropTargetedItemID = item.id
-        }
-    }
-
-    func dropExited(info: DropInfo) {
-        if dropTargetedItemID == item.id {
-            dropTargetedItemID = nil
-        }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
-        // Option key = copy, otherwise move
-        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
-        return DropProposal(operation: operation)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        guard item.isDirectory && !item.isFromArchive else { return false }
-
-        let providers = info.itemProviders(for: [.fileURL])
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [url], to: item.url)
-                }
-            }
-        }
-        return true
     }
 }
 

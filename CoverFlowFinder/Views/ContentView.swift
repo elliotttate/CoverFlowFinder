@@ -670,13 +670,7 @@ extension FocusedValues {
     }
 }
 
-// Tab notification names
-extension Notification.Name {
-    static let newTab = Notification.Name("newTab")
-    static let closeTab = Notification.Name("closeTab")
-    static let nextTab = Notification.Name("nextTab")
-    static let previousTab = Notification.Name("previousTab")
-}
+// Tab notification names are defined in UIConstants.swift
 
 // Native macOS search field
 struct SearchField: NSViewRepresentable {
@@ -712,18 +706,33 @@ struct SearchField: NSViewRepresentable {
 
         func controlTextDidChange(_ obj: Notification) {
             if let searchField = obj.object as? NSSearchField {
-                parent.text = searchField.stringValue
+                updateText(from: searchField)
             }
         }
 
         @objc func searchFieldAction(_ sender: NSSearchField) {
             // Called when X button is clicked or Enter is pressed
-            parent.text = sender.stringValue
+            DispatchQueue.main.async { [weak self] in
+                self?.updateText(from: sender)
+            }
         }
 
         func searchFieldDidEndSearching(_ sender: NSSearchField) {
             // Called when search is cancelled (X button clicked)
-            parent.text = ""
+            updateText(from: sender)
+        }
+
+        func controlTextDidEndEditing(_ obj: Notification) {
+            if let searchField = obj.object as? NSSearchField {
+                updateText(from: searchField)
+            }
+        }
+
+        private func updateText(from searchField: NSSearchField) {
+            let newValue = searchField.stringValue
+            if parent.text != newValue {
+                parent.text = newValue
+            }
         }
     }
 }
