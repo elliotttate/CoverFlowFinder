@@ -7,9 +7,7 @@ import Photos
 import os
 import CoreServices
 
-extension Notification.Name {
-    static let showGetInfo = Notification.Name("showGetInfo")
-}
+// Notification names are defined in UIConstants.swift
 
 enum ViewMode: String, CaseIterable {
     case coverFlow = "Cover Flow"
@@ -320,13 +318,13 @@ class FileBrowserViewModel: ObservableObject {
             loadPhotosLibraryContents(info: photosLibraryInfo)
             return
         }
-        startDirectoryWatcher(for: currentPath)
-
         isLoading = true
         items = []
         hydratedURLs.removeAll()
         pendingHydrationURLs.removeAll()
         let pathToLoad = currentPath
+        let listingURL = resolvedListingURL(for: pathToLoad)
+        startDirectoryWatcher(for: listingURL)
         let pendingURL = pendingSelectionURL  // Capture before async
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
         let showHiddenFiles = AppSettings.shared.showHiddenFiles
@@ -339,10 +337,23 @@ class FileBrowserViewModel: ObservableObject {
             guard let self = self else { return }
 
             do {
+                // Special handling for autofs mount points like /Network
+                // These require triggering the automounter before listing
+                let isAutofsMountPoint = listingURL.path == "/Network" ||
+                    listingURL.path.hasPrefix("/Network/")
+
+                if isAutofsMountPoint {
+                    // Trigger automounter by attempting to access the path
+                    // This may take a moment for network discovery
+                    _ = FileManager.default.fileExists(atPath: listingURL.path)
+                    // Give automounter a moment to populate
+                    Thread.sleep(forTimeInterval: 0.5)
+                }
+
                 // Phase 1: Get file list instantly (no stat calls)
                 let contents: [URL] = try autoreleasepool {
                     try FileManager.default.contentsOfDirectory(
-                        at: pathToLoad,
+                        at: listingURL,
                         includingPropertiesForKeys: [.isDirectoryKey, .contentTypeKey],
                         options: showHiddenFiles ? [] : [.skipsHiddenFiles]
                     )
@@ -445,6 +456,16 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
+    private func resolvedListingURL(for url: URL) -> URL {
+        if url.path == "/Network" {
+            let serversURL = URL(fileURLWithPath: "/Network/Servers")
+            if FileManager.default.fileExists(atPath: serversURL.path) {
+                return serversURL
+            }
+        }
+        return url
+    }
+
     // MARK: - Lazy Metadata Hydration
 
     /// Request metadata loading for specific items (call from visible row detection)
@@ -523,7 +544,9 @@ class FileBrowserViewModel: ObservableObject {
     private func queueDirectoryEvents(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
         guard !isInsideArchive, photosLibraryInfo == nil else { return }
-        guard let watchURL = watchingDirectoryURL, watchURL == currentPath else { return }
+        guard let watchURL = watchingDirectoryURL else { return }
+        let isNetworkRootListing = currentPath.path == "/Network" && watchURL.path == "/Network/Servers"
+        guard watchURL == currentPath || isNetworkRootListing else { return }
 
         let filtered = urls.filter { url in
             url.deletingLastPathComponent() == watchURL || url == watchURL

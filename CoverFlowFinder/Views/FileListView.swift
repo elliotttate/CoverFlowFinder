@@ -21,12 +21,8 @@ struct FileListView: View {
             handleDrop(providers: providers)
             return true
         }
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 3)
-                .padding(4)
-                .allowsHitTesting(false)  // Don't capture clicks on the overlay
-        )
+        .dropTargetOverlay(isTargeted: isDropTargeted)
+        .allowsHitTesting(true)
         .onChange(of: viewModel.selectedItems) { newSelection in
             if let firstSelected = newSelection.first {
                 updateQuickLook(for: firstSelected)
@@ -38,8 +34,23 @@ struct FileListView: View {
             onUpArrow: { navigateSelection(by: -1) },
             onDownArrow: { navigateSelection(by: 1) },
             onReturn: { openSelectedItem() },
-            onSpace: { toggleQuickLook() }
+            onSpace: { toggleQuickLook() },
+            onDelete: { viewModel.deleteSelectedItems() },
+            onCopy: { viewModel.copySelectedItems() },
+            onCut: { viewModel.cutSelectedItems() },
+            onPaste: { viewModel.paste() },
+            onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
+    }
+
+    private func jumpToMatch(_ searchString: String) {
+        guard !searchString.isEmpty else { return }
+        let lowercased = searchString.lowercased()
+
+        if let matchItem = items.first(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
+            viewModel.selectItem(matchItem)
+            updateQuickLook(for: matchItem)
+        }
     }
 
     private func navigateSelection(by offset: Int) {
@@ -68,42 +79,17 @@ struct FileListView: View {
     }
 
     private func toggleQuickLook() {
-        guard let selectedItem = viewModel.selectedItems.first else { return }
-
-        guard let previewURL = viewModel.previewURL(for: selectedItem) else {
-            NSSound.beep()
-            return
-        }
-
-        QuickLookControllerView.shared.togglePreview(for: previewURL) { [self] offset in
-            // List: up/down navigation (offset is 1 or -1)
+        viewModel.toggleQuickLookForSelection { [self] offset in
             navigateSelection(by: offset)
         }
     }
 
     private func updateQuickLook(for item: FileItem?) {
-        guard let item else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-            return
-        }
-
-        if let previewURL = viewModel.previewURL(for: item) {
-            QuickLookControllerView.shared.updatePreview(for: previewURL)
-        } else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-        }
+        viewModel.updateQuickLookPreview(for: item)
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [sourceURL])
-                }
-            }
-        }
+        DropHelper.handleDrop(providers: providers, viewModel: viewModel)
     }
 }
 
@@ -178,48 +164,3 @@ struct TagBadge: View {
     }
 }
 
-// MARK: - Folder Drop Delegate
-
-struct FolderDropDelegate: DropDelegate {
-    let item: FileItem
-    let viewModel: FileBrowserViewModel
-    @Binding var dropTargetedItemID: UUID?
-
-    func validateDrop(info: DropInfo) -> Bool {
-        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
-    }
-
-    func dropEntered(info: DropInfo) {
-        if item.isDirectory {
-            dropTargetedItemID = item.id
-        }
-    }
-
-    func dropExited(info: DropInfo) {
-        if dropTargetedItemID == item.id {
-            dropTargetedItemID = nil
-        }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
-        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
-        return DropProposal(operation: operation)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        guard item.isDirectory && !item.isFromArchive else { return false }
-
-        let providers = info.itemProviders(for: [.fileURL])
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [url], to: item.url)
-                }
-            }
-        }
-        return true
-    }
-}

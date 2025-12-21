@@ -832,25 +832,47 @@ struct SidebarOutlineView: NSViewRepresentable {
 
         private func volumeLocations() -> [SidebarLocation] {
             var locations: [SidebarLocation] = []
+            let fm = FileManager.default
 
-            let rootURL = URL(fileURLWithPath: "/")
-            let rootName = Host.current().localizedName ?? "Macintosh HD"
-            locations.append(SidebarLocation(name: rootName, url: rootURL))
+            // Add the computer itself, pointing to root
+            let computerName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
+            locations.append(SidebarLocation(name: computerName, url: URL(fileURLWithPath: "/")))
 
+            // Get the boot volume name (the volume that "/" is on)
+            let bootVolumePath = (try? fm.destinationOfSymbolicLink(atPath: "/Volumes/Macintosh HD")) ?? "/"
+            let bootVolumeRealPath = URL(fileURLWithPath: "/").standardizedFileURL.path
+
+            // Add mounted volumes, excluding the boot volume (which is already "/" via the computer name)
             let volumesURL = URL(fileURLWithPath: "/Volumes")
-            if let volumes = try? FileManager.default.contentsOfDirectory(
+            if let volumes = try? fm.contentsOfDirectory(
                 at: volumesURL,
-                includingPropertiesForKeys: nil,
+                includingPropertiesForKeys: [.isSymbolicLinkKey, .volumeIsLocalKey],
                 options: .skipsHiddenFiles
             ) {
                 for volume in volumes {
-                    let name = volume.lastPathComponent
-                    if name != rootName {
-                        locations.append(SidebarLocation(name: name, url: volume))
+                    // Skip symlinks that point to root (like "Macintosh HD" -> "/")
+                    let isSymlink = (try? volume.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
+                    if isSymlink {
+                        if let destination = try? fm.destinationOfSymbolicLink(atPath: volume.path) {
+                            let resolvedPath = URL(fileURLWithPath: destination, relativeTo: volumesURL).standardizedFileURL.path
+                            if resolvedPath == bootVolumeRealPath || resolvedPath == "/" {
+                                continue
+                            }
+                        }
                     }
+
+                    // Also check if this volume resolves to the same device as root
+                    let volumeRealPath = volume.standardizedFileURL.resolvingSymlinksInPath().path
+                    if volumeRealPath == bootVolumeRealPath || volumeRealPath == "/" {
+                        continue
+                    }
+
+                    let name = volume.lastPathComponent
+                    locations.append(SidebarLocation(name: name, url: volume))
                 }
             }
 
+            // Add Network location
             locations.append(SidebarLocation(name: "Network", url: URL(fileURLWithPath: "/Network")))
             return locations
         }

@@ -76,7 +76,12 @@ struct ColumnView: View {
             onLeftArrow: { navigateToParentColumn() },
             onRightArrow: { navigateToChildColumn() },
             onReturn: { openSelectedItem() },
-            onSpace: { toggleQuickLook() }
+            onSpace: { toggleQuickLook() },
+            onDelete: { viewModel.deleteSelectedItems() },
+            onCopy: { viewModel.copySelectedItems() },
+            onCut: { viewModel.cutSelectedItems() },
+            onPaste: { viewModel.paste() },
+            onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
     }
 
@@ -205,31 +210,42 @@ struct ColumnView: View {
         }
     }
 
-    private func toggleQuickLook() {
-        guard let selectedItem = viewModel.selectedItems.first else { return }
+    private func jumpToMatch(_ searchString: String) {
+        guard !searchString.isEmpty else { return }
+        let lowercased = searchString.lowercased()
+        let (columnItems, columnURL) = getActiveColumnData()
 
-        guard let previewURL = viewModel.previewURL(for: selectedItem) else {
-            NSSound.beep()
-            return
+        if let matchItem = columnItems.first(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
+            columnSelections[columnURL] = matchItem
+            viewModel.selectItem(matchItem)
+            updateQuickLook(for: matchItem)
+
+            // Update columns if directory
+            if activeColumnIndex == 0 {
+                if matchItem.isDirectory {
+                    updateColumns(from: matchItem)
+                } else {
+                    columns = []
+                }
+            } else if activeColumnIndex <= columns.count {
+                let column = columns[activeColumnIndex - 1]
+                if matchItem.isDirectory {
+                    updateColumnsFrom(column: column, selectedItem: matchItem)
+                } else {
+                    removeColumnsAfter(column)
+                }
+            }
         }
+    }
 
-        QuickLookControllerView.shared.togglePreview(for: previewURL) { [self] offset in
-            // Column view: up/down navigation within column
+    private func toggleQuickLook() {
+        viewModel.toggleQuickLookForSelection { [self] offset in
             navigateInActiveColumn(by: offset)
         }
     }
 
     private func updateQuickLook(for item: FileItem?) {
-        guard let item else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-            return
-        }
-
-        if let previewURL = viewModel.previewURL(for: item) {
-            QuickLookControllerView.shared.updatePreview(for: previewURL)
-        } else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-        }
+        viewModel.updateQuickLookPreview(for: item)
     }
 }
 
@@ -278,7 +294,7 @@ struct SingleColumnView: View {
                         guard !item.isFromArchive else { return NSItemProvider() }
                         return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
                     }
-                    .onDrop(of: [.fileURL], delegate: ColumnFolderDropDelegate(
+                    .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
                         item: item,
                         viewModel: viewModel,
                         dropTargetedItemID: $dropTargetedItemID
@@ -342,10 +358,7 @@ struct ColumnRowView: View {
 
     var body: some View {
         HStack(spacing: 8) {
-            Image(nsImage: item.icon)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: appSettings.columnIconSizeValue, height: appSettings.columnIconSizeValue)
+            AsyncListIconView(item: item, size: appSettings.columnIconSizeValue)
 
             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.columnFont, alignment: .leading, lineLimit: 1)
 
@@ -456,55 +469,6 @@ struct InfoRow: View {
             Text(value)
                 .lineLimit(1)
         }
-    }
-}
-
-// MARK: - Folder Drop Delegate
-
-struct ColumnFolderDropDelegate: DropDelegate {
-    let item: FileItem
-    let viewModel: FileBrowserViewModel
-    @Binding var dropTargetedItemID: UUID?
-
-    func validateDrop(info: DropInfo) -> Bool {
-        // Only validate for folders - non-folders fall through to column drop
-        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
-    }
-
-    func dropEntered(info: DropInfo) {
-        if item.isDirectory {
-            dropTargetedItemID = item.id
-        }
-    }
-
-    func dropExited(info: DropInfo) {
-        if dropTargetedItemID == item.id {
-            dropTargetedItemID = nil
-        }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        // Non-folders: return nil to let parent handle it
-        guard item.isDirectory && !item.isFromArchive else { return nil }
-        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
-        return DropProposal(operation: operation)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        // Non-folders: return false to let parent handle it
-        guard item.isDirectory && !item.isFromArchive else { return false }
-
-        let providers = info.itemProviders(for: [.fileURL])
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [url], to: item.url)
-                }
-            }
-        }
-        return true
     }
 }
 

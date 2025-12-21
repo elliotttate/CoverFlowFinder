@@ -20,6 +20,13 @@ struct MasonryView: View {
     @State private var pinchStartFontSize: Double?
     @State private var targetThumbnailPixelSize: CGFloat = 256
 
+    // Scroll optimization - defer thumbnail loading during scroll
+    @State private var visibleItemIDs: Set<UUID> = []
+    @State private var hydrationWorkItem: DispatchWorkItem?
+    @State private var lastHydratedRange: Range<Int>?
+    @State private var isScrolling = false
+    @State private var scrollEndTimer: Timer?
+
     private var columnSpacing: CGFloat {
         max(12, settings.iconGridSpacingValue * 0.6)
     }
@@ -154,7 +161,10 @@ struct MasonryView: View {
                                     )
                                     .id(item.id)
                                     .onAppear {
-                                        loadThumbnail(for: item)
+                                        updateVisibility(for: item, isVisible: true)
+                                    }
+                                    .onDisappear {
+                                        updateVisibility(for: item, isVisible: false)
                                     }
                                 }
                             }
@@ -188,16 +198,16 @@ struct MasonryView: View {
             handleDrop(providers: providers)
             return true
         }
-        .overlay(
-            RoundedRectangle(cornerRadius: 8)
-                .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 3)
-                .padding(6)
-        )
+        .dropTargetOverlay(isTargeted: isDropTargeted, padding: UI.Spacing.medium)
         .onChange(of: items) { _ in
             DispatchQueue.main.async {
                 thumbnails.removeAll()
                 aspectRatios.removeAll()
                 thumbnailCache.clearForNewFolder()
+                visibleItemIDs.removeAll()
+                lastHydratedRange = nil
+                hydrationWorkItem?.cancel()
+                hydrationWorkItem = nil
             }
         }
         .onChange(of: settings.iconGridIconSize) { _ in
@@ -215,7 +225,12 @@ struct MasonryView: View {
             onLeftArrow: { navigateHorizontal(-1) },
             onRightArrow: { navigateHorizontal(1) },
             onReturn: { openSelectedItem() },
-            onSpace: { toggleQuickLook() }
+            onSpace: { toggleQuickLook() },
+            onDelete: { viewModel.deleteSelectedItems() },
+            onCopy: { viewModel.copySelectedItems() },
+            onCut: { viewModel.cutSelectedItems() },
+            onPaste: { viewModel.paste() },
+            onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
         .simultaneousGesture(magnificationGesture)
     }
@@ -297,41 +312,33 @@ struct MasonryView: View {
         }
     }
 
-    private func toggleQuickLook() {
-        guard let selectedItem = viewModel.selectedItems.first else { return }
+    private func jumpToMatch(_ searchString: String) {
+        guard !searchString.isEmpty else { return }
+        let lowercased = searchString.lowercased()
 
-        guard let previewURL = viewModel.previewURL(for: selectedItem) else {
-            NSSound.beep()
-            return
+        // Find the first item that starts with the typed string
+        if let matchItem = items.first(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
+            selectItem(matchItem)
         }
+    }
 
-        QuickLookControllerView.shared.togglePreview(for: previewURL) { [self] offset in
+    private func toggleQuickLook() {
+        viewModel.toggleQuickLookForSelection { [self] offset in
             navigateLinear(by: offset)
         }
     }
 
     private func updateQuickLook(for item: FileItem?) {
-        guard let item else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-            return
-        }
-
-        if let previewURL = viewModel.previewURL(for: item) {
-            QuickLookControllerView.shared.updatePreview(for: previewURL)
-        } else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-        }
+        viewModel.updateQuickLookPreview(for: item)
     }
 
     private func refreshThumbnailTargetSize() {
         let newSize = masonryThumbnailPixelSize
         guard abs(newSize - targetThumbnailPixelSize) >= 8 else { return }
         targetThumbnailPixelSize = newSize
-        DispatchQueue.main.async {
-            for item in items {
-                loadThumbnail(for: item)
-            }
-        }
+        // Reset hydration range to force reload of visible items at new size
+        lastHydratedRange = nil
+        scheduleHydration()
     }
 
     @discardableResult
@@ -344,6 +351,119 @@ struct MasonryView: View {
         viewModel.selectItem(first)
         updateQuickLook(for: first)
         return first
+    }
+
+    // MARK: - Scroll-Optimized Loading
+
+    private func updateVisibility(for item: FileItem, isVisible: Bool) {
+        if isVisible {
+            visibleItemIDs.insert(item.id)
+        } else {
+            visibleItemIDs.remove(item.id)
+        }
+        markScrolling()
+        scheduleHydration()
+    }
+
+    private func markScrolling() {
+        isScrolling = true
+        scrollEndTimer?.invalidate()
+        scrollEndTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [self] _ in
+            DispatchQueue.main.async {
+                isScrolling = false
+                // Trigger a final hydration pass when scroll stops
+                scheduleHydration()
+            }
+        }
+    }
+
+    private func scheduleHydration() {
+        hydrationWorkItem?.cancel()
+
+        // During active scrolling, use longer debounce to reduce work
+        let debounceTime: TimeInterval = isScrolling ? 0.1 : 0.02
+
+        let itemsSnapshot = items
+        let visibleSnapshot = visibleItemIDs
+        let currentColumnCount = columnCount
+        let scrolling = isScrolling
+
+        let workItem = DispatchWorkItem { [itemsSnapshot, visibleSnapshot, currentColumnCount, scrolling] in
+            guard !visibleSnapshot.isEmpty else { return }
+
+            // Find visible indices
+            let visibleIndices = itemsSnapshot.enumerated().compactMap { index, item in
+                visibleSnapshot.contains(item.id) ? index : nil
+            }
+            guard let minIndex = visibleIndices.min(),
+                  let maxIndex = visibleIndices.max() else { return }
+
+            // Use larger buffer when not scrolling for better preloading
+            // During scroll: small buffer to prioritize visible items
+            // When stopped: large buffer to preload ahead
+            let buffer: Int
+            if scrolling {
+                buffer = max(12, currentColumnCount * 3)
+            } else {
+                // Preload 8 screens worth when stopped
+                let visibleCount = maxIndex - minIndex + 1
+                buffer = max(80, visibleCount * 4)
+            }
+
+            let start = max(0, minIndex - buffer)
+            let end = min(itemsSnapshot.count - 1, maxIndex + buffer)
+            let range = start..<(end + 1)
+
+            DispatchQueue.main.async {
+                // Skip if we already hydrated this exact range while scrolling
+                if range == self.lastHydratedRange && scrolling { return }
+                self.lastHydratedRange = range
+
+                // Hydrate metadata for items in range
+                var urlsToHydrate: [URL] = []
+                urlsToHydrate.reserveCapacity(range.count)
+                for index in range {
+                    let item = itemsSnapshot[index]
+                    if self.viewModel.needsHydration(item) {
+                        urlsToHydrate.append(item.url)
+                    }
+                }
+                if !urlsToHydrate.isEmpty {
+                    self.viewModel.hydrateMetadata(for: urlsToHydrate)
+                }
+
+                // Load thumbnails
+                // During scroll: limit to avoid blocking UI
+                // When stopped: load all items in range, batched for responsiveness
+                let maxLoadsPerPass = scrolling ? 8 : 48
+                var loadCount = 0
+                var hasMoreToLoad = false
+
+                for index in range {
+                    let item = itemsSnapshot[index]
+                    if self.thumbnails[item.url] == nil && !item.isDirectory {
+                        if loadCount < maxLoadsPerPass {
+                            self.loadThumbnail(for: item)
+                            loadCount += 1
+                        } else {
+                            hasMoreToLoad = true
+                        }
+                    }
+                }
+
+                // If not scrolling and there are more items to load, schedule another pass
+                if hasMoreToLoad && !self.isScrolling {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        // Clear lastHydratedRange to allow another pass
+                        self.lastHydratedRange = nil
+                        self.scheduleHydration()
+                    }
+                }
+            }
+        }
+
+        hydrationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + debounceTime, execute: workItem)
     }
 
     private func loadThumbnail(for item: FileItem) {
@@ -429,15 +549,7 @@ struct MasonryView: View {
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [sourceURL])
-                }
-            }
-        }
+        DropHelper.handleDrop(providers: providers, viewModel: viewModel)
     }
 
     private var magnificationGesture: some Gesture {
@@ -557,7 +669,7 @@ struct MasonryItemView: View {
             guard !item.isFromArchive else { return NSItemProvider() }
             return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
         }
-        .onDrop(of: [.fileURL], delegate: FolderDropDelegate(
+        .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
             dropTargetedItemID: $dropTargetedItemID

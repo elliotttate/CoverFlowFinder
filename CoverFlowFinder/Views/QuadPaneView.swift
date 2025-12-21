@@ -159,6 +159,7 @@ struct QuadPaneView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
             KeyboardManager.shared.setHandler {
                 guard let event = NSApp.currentEvent else { return false }
+                let modifiers = event.modifierFlags
 
                 switch event.keyCode {
                 case 126: // Up arrow
@@ -181,17 +182,34 @@ struct QuadPaneView: View {
                     }
                     return true
                 case 49: // Space
-                    if let selectedItem = vm.selectedItems.first {
-                        guard let previewURL = vm.previewURL(for: selectedItem) else {
-                            NSSound.beep()
-                            return true
-                        }
-
-                        QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
-                            self.navigateInViewModel(vm, by: offset)
-                        }
+                    vm.toggleQuickLookForSelection { offset in
+                        self.navigateInViewModel(vm, by: offset)
                     }
                     return true
+                case 51: // Backspace/Delete
+                    if modifiers.contains(.command) {
+                        vm.deleteSelectedItems()
+                        return true
+                    }
+                    return false
+                case 8: // C key
+                    if modifiers.contains(.command) && !modifiers.contains(.shift) {
+                        vm.copySelectedItems()
+                        return true
+                    }
+                    return false
+                case 7: // X key
+                    if modifiers.contains(.command) && !modifiers.contains(.shift) {
+                        vm.cutSelectedItems()
+                        return true
+                    }
+                    return false
+                case 9: // V key
+                    if modifiers.contains(.command) && !modifiers.contains(.shift) {
+                        vm.paste()
+                        return true
+                    }
+                    return false
                 default:
                     return false
                 }
@@ -214,11 +232,7 @@ struct QuadPaneView: View {
         let newIndex = max(0, min(items.count - 1, currentIndex + offset))
         let newItem = items[newIndex]
         vm.selectItem(newItem)
-        if let previewURL = vm.previewURL(for: newItem) {
-            QuickLookControllerView.shared.updatePreview(for: previewURL)
-        } else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-        }
+        vm.updateQuickLookPreview(for: newItem)
     }
 }
 
@@ -364,11 +378,7 @@ struct QuadPaneCell: View {
                 handleDrop(providers: providers)
                 return true
             }
-            .overlay(
-                RoundedRectangle(cornerRadius: 4)
-                    .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 2)
-                    .padding(2)
-            )
+            .dropTargetOverlay(isTargeted: isDropTargeted, cornerRadius: UI.CornerRadius.medium, lineWidth: UI.LineWidth.standard, padding: UI.Spacing.tiny)
 
             Divider()
 
@@ -403,17 +413,9 @@ struct QuadPaneCell: View {
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [sourceURL]) {
-                        for other in otherViewModels {
-                            other.refresh()
-                        }
-                    }
-                }
+        DropHelper.handleDrop(providers: providers, viewModel: viewModel) {
+            for other in otherViewModels {
+                other.refresh()
             }
         }
     }
@@ -485,10 +487,7 @@ struct QuadPaneListRow: View {
     var body: some View {
         let isSelected = viewModel.selectedItems.contains(item)
         HStack(spacing: 6) {
-            Image(nsImage: item.icon)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(width: appSettings.compactListIconSize, height: appSettings.compactListIconSize)
+            AsyncListIconView(item: item, size: appSettings.compactListIconSize)
 
             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.compactListFont, alignment: .leading, lineLimit: 1)
 
@@ -524,7 +523,7 @@ struct QuadPaneListRow: View {
             guard !item.isFromArchive else { return NSItemProvider() }
             return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
         }
-        .onDrop(of: [.fileURL], delegate: QuadPaneFolderDropDelegate(
+        .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
             dropTargetedItemID: $dropTargetedItemID
@@ -557,11 +556,7 @@ struct QuadPaneListRow: View {
             )
         }
         onActivate()
-        if let previewURL = viewModel.previewURL(for: item) {
-            QuickLookControllerView.shared.updatePreview(for: previewURL)
-        } else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-        }
+        viewModel.updateQuickLookPreview(for: item)
     }
 }
 
@@ -727,7 +722,7 @@ struct QuadPaneIconCell: View {
             guard !item.isFromArchive else { return NSItemProvider() }
             return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
         }
-        .onDrop(of: [.fileURL], delegate: QuadPaneFolderDropDelegate(
+        .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
             dropTargetedItemID: $dropTargetedItemID
@@ -760,56 +755,7 @@ struct QuadPaneIconCell: View {
             )
         }
         onActivate()
-        if let previewURL = viewModel.previewURL(for: item) {
-            QuickLookControllerView.shared.updatePreview(for: previewURL)
-        } else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-        }
+        viewModel.updateQuickLookPreview(for: item)
     }
 }
 
-// MARK: - Folder Drop Delegate
-
-struct QuadPaneFolderDropDelegate: DropDelegate {
-    let item: FileItem
-    let viewModel: FileBrowserViewModel
-    @Binding var dropTargetedItemID: UUID?
-
-    func validateDrop(info: DropInfo) -> Bool {
-        return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
-    }
-
-    func dropEntered(info: DropInfo) {
-        if item.isDirectory {
-            dropTargetedItemID = item.id
-        }
-    }
-
-    func dropExited(info: DropInfo) {
-        if dropTargetedItemID == item.id {
-            dropTargetedItemID = nil
-        }
-    }
-
-    func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
-        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
-        return DropProposal(operation: operation)
-    }
-
-    func performDrop(info: DropInfo) -> Bool {
-        guard item.isDirectory && !item.isFromArchive else { return false }
-
-        let providers = info.itemProviders(for: [.fileURL])
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [url], to: item.url)
-                }
-            }
-        }
-        return true
-    }
-}

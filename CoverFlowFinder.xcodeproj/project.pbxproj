@@ -32,6 +32,10 @@
 		A100002A001 /* FileTableView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002A000 /* FileTableView.swift */; };
 		A100002B001 /* FileTableCellViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002B000 /* FileTableCellViews.swift */; };
 		A100002D001 /* PerFolderColumnState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002D000 /* PerFolderColumnState.swift */; };
+		A100002E001 /* UIConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002E000 /* UIConstants.swift */; };
+		A100002F001 /* DropHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002F000 /* DropHelper.swift */; };
+		A1000030001 /* ViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000030000 /* ViewModifiers.swift */; };
+		A1000031001 /* AsyncListIconView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000031000 /* AsyncListIconView.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -63,6 +67,10 @@
 		A100002A000 /* FileTableView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTableView.swift; sourceTree = "<group>"; };
 		A100002B000 /* FileTableCellViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTableCellViews.swift; sourceTree = "<group>"; };
 		A100002D000 /* PerFolderColumnState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerFolderColumnState.swift; sourceTree = "<group>"; };
+		A100002E000 /* UIConstants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIConstants.swift; sourceTree = "<group>"; };
+		A100002F000 /* DropHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DropHelper.swift; sourceTree = "<group>"; };
+		A1000030000 /* ViewModifiers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewModifiers.swift; sourceTree = "<group>"; };
+		A1000031000 /* AsyncListIconView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AsyncListIconView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -114,6 +122,7 @@
 				A1000002002 /* ListColumnConfig.swift */,
 				A100002D000 /* PerFolderColumnState.swift */,
 				A1000024000 /* ThumbnailCacheManager.swift */,
+				A100002E000 /* UIConstants.swift */,
 				A1000026000 /* ZipArchiveManager.swift */,
 			);
 			path = Models;
@@ -131,8 +140,10 @@
 			isa = PBXGroup;
 			children = (
 				A100002C000 /* TableView */,
+				A1000031000 /* AsyncListIconView.swift */,
 				A1000004000 /* ContentView.swift */,
 				A1000005000 /* CoverFlowView.swift */,
+				A100002F000 /* DropHelper.swift */,
 				A1000006000 /* SidebarView.swift */,
 				A1000007000 /* IconGridView.swift */,
 				A1000008000 /* FileListView.swift */,
@@ -145,6 +156,7 @@
 				A1000023000 /* TabBarView.swift */,
 				A1000028000 /* SettingsView.swift */,
 				A1000029000 /* MasonryView.swift */,
+				A1000030000 /* ViewModifiers.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -251,6 +263,10 @@
 				A100002A001 /* FileTableView.swift in Sources */,
 				A100002B001 /* FileTableCellViews.swift in Sources */,
 				A100002D001 /* PerFolderColumnState.swift in Sources */,
+				A100002E001 /* UIConstants.swift in Sources */,
+				A100002F001 /* DropHelper.swift in Sources */,
+				A1000030001 /* ViewModifiers.swift in Sources */,
+				A1000031001 /* AsyncListIconView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -406,7 +422,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.17.0;
+				MARKETING_VERSION = 1.19.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.coverflowfinder.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -447,7 +463,7 @@
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.17.0;
+				MARKETING_VERSION = 1.19.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.coverflowfinder.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
