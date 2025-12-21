@@ -20,6 +20,11 @@ struct SettingsView: View {
                     Label("Icons", systemImage: "square.grid.2x2")
                 }
 
+            masonryTab
+                .tabItem {
+                    Label("Masonry", systemImage: "square.grid.3x2")
+                }
+
             columnsTab
                 .tabItem {
                     Label("Columns", systemImage: "rectangle.split.3x1")
@@ -122,6 +127,14 @@ struct SettingsView: View {
                     step: 1,
                     format: "%.0f pt"
                 )
+            }
+        }
+    }
+
+    private var masonryTab: some View {
+        Form {
+            Section("Labels") {
+                Toggle("Show filenames", isOn: $settings.masonryShowFilenames)
             }
         }
     }

@@ -2104,19 +2104,7 @@ struct FileListSection: View {
                                 if item.isFromArchive {
                                     return NSItemProvider()
                                 }
-                                if viewModel.selectedItems.contains(item) && viewModel.selectedItems.count > 1 {
-                                    let urls = viewModel.selectedItems
-                                        .filter { !$0.isFromArchive }
-                                        .map { $0.url as NSURL }
-                                    guard urls.first != nil else { return NSItemProvider() }
-                                    let provider = NSItemProvider()
-                                    provider.registerFileRepresentation(forTypeIdentifier: "public.file-url", visibility: .all) { completion in
-                                        completion(urls.first as? URL, false, nil)
-                                        return nil
-                                    }
-                                    return provider
-                                }
-                                return NSItemProvider(object: item.url as NSURL)
+                                return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
                             }
                             .onDrop(of: [.fileURL], delegate: CoverFlowFolderDropDelegate(
                                 item: item,

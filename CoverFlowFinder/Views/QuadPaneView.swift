@@ -522,7 +522,7 @@ struct QuadPaneListRow: View {
         .id(item.id)
         .onDrag {
             guard !item.isFromArchive else { return NSItemProvider() }
-            return NSItemProvider(object: item.url as NSURL)
+            return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
         }
         .onDrop(of: [.fileURL], delegate: QuadPaneFolderDropDelegate(
             item: item,
@@ -725,7 +725,7 @@ struct QuadPaneIconCell: View {
         .id(item.id)
         .onDrag {
             guard !item.isFromArchive else { return NSItemProvider() }
-            return NSItemProvider(object: item.url as NSURL)
+            return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
         }
         .onDrop(of: [.fileURL], delegate: QuadPaneFolderDropDelegate(
             item: item,

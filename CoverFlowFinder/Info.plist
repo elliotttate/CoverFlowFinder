@@ -26,5 +26,7 @@
     <string>Copyright 2024. All rights reserved.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <key>NSPhotoLibraryUsageDescription</key>
+    <string>CoverFlowFinder needs access to your Photos Library to show your photos.</string>
 </dict>
 </plist>

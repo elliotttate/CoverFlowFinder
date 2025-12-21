@@ -566,6 +566,9 @@ struct StatusBarView: View {
     }
 
     private func calculateTotalSize() -> String? {
+        if viewModel.isPhotosLibraryActive {
+            return nil
+        }
         let files = viewModel.filteredItems.filter { !$0.isDirectory }
         guard !files.isEmpty else { return nil }
 
@@ -641,8 +644,13 @@ struct TabContentWrapper: View {
             IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
                 .id("icons-\(contentViewId)")
         case .masonry:
-            MasonryView(viewModel: viewModel, items: viewModel.filteredItems)
-                .id("masonry-\(contentViewId)")
+            if viewModel.isPhotosLibraryActive {
+                PhotosMasonryView(viewModel: viewModel, items: viewModel.filteredItems)
+                    .id("masonry-photos-\(contentViewId)")
+            } else {
+                MasonryView(viewModel: viewModel, items: viewModel.filteredItems)
+                    .id("masonry-\(contentViewId)")
+            }
         case .list:
             FileListView(viewModel: viewModel, items: viewModel.filteredItems)
                 .id("list-\(contentViewId)")

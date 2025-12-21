@@ -2,6 +2,9 @@ import Foundation
 import AppKit
 import SwiftUI
 import Combine
+import UniformTypeIdentifiers
+import Photos
+import os
 
 extension Notification.Name {
     static let showGetInfo = Notification.Name("showGetInfo")
@@ -29,9 +32,15 @@ enum ViewMode: String, CaseIterable {
     }
 }
 
+struct PhotosLibraryInfo: Equatable {
+    let libraryURL: URL
+    let imagesURL: URL
+}
+
 enum NavigationLocation: Equatable {
     case filesystem(URL)
     case archive(archiveURL: URL, internalPath: String)
+    case photosLibrary(PhotosLibraryInfo)
 }
 
 enum ClipboardOperation {
@@ -50,7 +59,12 @@ private func sortItemsForBackground(_ items: [FileItem], sortState: SortState, f
 @MainActor
 class FileBrowserViewModel: ObservableObject {
     @Published var currentPath: URL
-    @Published var items: [FileItem] = []
+    @Published var items: [FileItem] = [] {
+        didSet {
+            itemsRevision &+= 1
+            filteredItemsCacheKey = nil
+        }
+    }
     @Published var selectedItems: Set<FileItem> = []
     @Published var viewMode: ViewMode = .coverFlow
     @Published var searchText: String = ""
@@ -87,6 +101,33 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     @Published var infoItem: FileItem?
+    private var itemsRevision: Int = 0
+    private struct FilteredItemsCacheKey: Equatable {
+        let itemsRevision: Int
+        let searchText: String
+        let filterTag: String?
+        let sortState: SortState
+        let foldersFirst: Bool
+    }
+    private var filteredItemsCacheKey: FilteredItemsCacheKey?
+    private var filteredItemsCache: [FileItem] = []
+
+    private var photosLibraryInfo: PhotosLibraryInfo?
+    private let photosImageManager = PHCachingImageManager()
+    private var photosAssetCache: [String: PHAsset] = [:]
+    private var photosAspectRatioCache: [String: CGFloat] = [:]
+    private var photosThumbnailRequests: [String: PHImageRequestID] = [:]
+    private var photosExportCache: [String: URL] = [:]
+    private var isRequestingPhotosAccess = false
+    private var pendingPhotosAccessCompletions: [(PHAuthorizationStatus) -> Void] = []
+    private var didForcePhotosAuthRefresh = false
+    private let photosLogger = Logger(subsystem: "com.coverflowfinder.app", category: "Photos")
+    private var photosLoadToken = UUID()
+    private var photosSortState: SortState?
+    struct PhotoAssetDragInfo {
+        let filename: String
+        let uti: String
+    }
 
     // MARK: - ZIP Archive Browsing State
     @Published var isInsideArchive: Bool = false
@@ -155,6 +196,32 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     var filteredItems: [FileItem] {
+        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let foldersFirst = AppSettings.shared.foldersFirst
+        let cacheKey = FilteredItemsCacheKey(
+            itemsRevision: itemsRevision,
+            searchText: searchText,
+            filterTag: filterTag,
+            sortState: sortState,
+            foldersFirst: foldersFirst
+        )
+
+        if let cachedKey = filteredItemsCacheKey, cachedKey == cacheKey {
+            return filteredItemsCache
+        }
+
+        if photosLibraryInfo != nil,
+           searchText.isEmpty,
+           filterTag == nil {
+            if sortState.column == .dateCreated || sortState.column == .dateModified {
+                if photosSortState == sortState {
+                    return items
+                }
+            } else {
+                return items
+            }
+        }
+
         var filtered = items
 
         // Filter by search text
@@ -171,9 +238,14 @@ class FileBrowserViewModel: ObservableObject {
             }
         }
 
-        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
-        let foldersFirst = AppSettings.shared.foldersFirst
-        return sortItemsForBackground(filtered, sortState: sortState, foldersFirst: foldersFirst)
+        let sorted = sortItemsForBackground(filtered, sortState: sortState, foldersFirst: foldersFirst)
+        filteredItemsCacheKey = cacheKey
+        filteredItemsCache = sorted
+        return sorted
+    }
+
+    var isPhotosLibraryActive: Bool {
+        photosLibraryInfo != nil
     }
 
     init(initialPath: URL = FileManager.default.homeDirectoryForCurrentUser) {
@@ -207,12 +279,26 @@ class FileBrowserViewModel: ObservableObject {
                 self?.objectWillChange.send()
             }
             .store(in: &cancellables)
+
+        AppSettings.shared.$masonryShowFilenames
+            .removeDuplicates()
+            .sink { [weak self] showFilenames in
+                guard let self else { return }
+                guard showFilenames, self.photosLibraryInfo != nil else { return }
+                self.loadContents()
+            }
+            .store(in: &cancellables)
     }
 
     func loadContents() {
         // If we're inside an archive, load archive contents instead
         if isInsideArchive {
             loadArchiveContents()
+            return
+        }
+        if let photosLibraryInfo {
+            photosLogger.info("loadContents routing to Photos library for path: \(self.currentPath.path, privacy: .public)")
+            loadPhotosLibraryContents(info: photosLibraryInfo)
             return
         }
 
@@ -321,9 +407,520 @@ class FileBrowserViewModel: ObservableObject {
         navigationGeneration += 1
     }
 
+    private func loadPhotosLibraryContents(info: PhotosLibraryInfo) {
+        isLoading = true
+        items = []
+        let infoSnapshot = info
+        let pendingURL = pendingSelectionURL
+        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let useOriginalFilenames = AppSettings.shared.masonryShowFilenames
+        let loadToken = UUID()
+        photosLoadToken = loadToken
+
+        photosLogger.info("Starting Photos library load: \(info.libraryURL.path, privacy: .public)")
+
+        ensurePhotosAccess { [weak self] status in
+            guard let self else { return }
+            let authorized = status == .authorized || status == .limited
+            guard authorized else {
+                self.photosLogger.warning("Photos access denied with status: \(status.rawValue)")
+                self.items = []
+                self.isLoading = false
+                self.showPhotosAccessAlert(for: status)
+                return
+            }
+
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self else { return }
+                let fallbackFormatter = DateFormatter()
+                fallbackFormatter.locale = Locale(identifier: "en_US_POSIX")
+                fallbackFormatter.timeZone = .current
+                fallbackFormatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+
+                var effectiveSortState = sortState
+                switch effectiveSortState.column {
+                case .dateCreated, .dateModified:
+                    break
+                default:
+                    effectiveSortState = SortState(column: .dateCreated, direction: .descending)
+                }
+
+                let fetchOptions = PHFetchOptions()
+                fetchOptions.predicate = NSPredicate(
+                    format: "mediaType == %d || mediaType == %d",
+                    PHAssetMediaType.image.rawValue,
+                    PHAssetMediaType.video.rawValue
+                )
+                fetchOptions.sortDescriptors = self.photosSortDescriptors(for: effectiveSortState)
+
+                let assets = PHAsset.fetchAssets(with: fetchOptions)
+                self.photosLogger.info("Fetched \(assets.count) Photos assets (status: \(status.rawValue))")
+
+                let totalCount = assets.count
+                let batchSize = 400
+                let initialCount = min(batchSize, totalCount)
+
+                func buildBatch(range: Range<Int>) -> (items: [FileItem], assetCache: [String: PHAsset], ratioCache: [String: CGFloat], selectedItem: FileItem?) {
+                    var batchItems: [FileItem] = []
+                    batchItems.reserveCapacity(range.count)
+                    var assetCache: [String: PHAsset] = [:]
+                    assetCache.reserveCapacity(range.count)
+                    var ratioCache: [String: CGFloat] = [:]
+                    ratioCache.reserveCapacity(range.count)
+                    var selectedItem: FileItem?
+
+                    let indexSet = IndexSet(integersIn: range)
+                    assets.enumerateObjects(at: indexSet, options: []) { asset, _, _ in
+                        guard let assetURL = self.photosAssetURL(for: asset.localIdentifier) else { return }
+                        let name = useOriginalFilenames
+                            ? self.photosAssetName(for: asset, fallbackFormatter: fallbackFormatter)
+                            : self.photosAssetFallbackName(for: asset, fallbackFormatter: fallbackFormatter)
+                        let contentType: UTType? = asset.mediaType == .video ? .movie : .image
+                        let modDate = asset.modificationDate ?? asset.creationDate
+                        let identifier = asset.localIdentifier
+                        assetCache[identifier] = asset
+                        if asset.pixelHeight > 0 {
+                            ratioCache[identifier] = CGFloat(asset.pixelWidth) / CGFloat(asset.pixelHeight)
+                        }
+
+                        let item = FileItem(
+                            url: assetURL,
+                            name: name,
+                            isDirectory: false,
+                            size: 0,
+                            modificationDate: modDate,
+                            creationDate: asset.creationDate,
+                            contentType: contentType
+                        )
+                        if let pendingURL, pendingURL == assetURL {
+                            selectedItem = item
+                        }
+                        batchItems.append(item)
+                    }
+
+                    return (batchItems, assetCache, ratioCache, selectedItem)
+                }
+
+                let initialBatch = buildBatch(range: 0..<initialCount)
+                DispatchQueue.main.async {
+                    let infoMatches = self.photosLibraryInfo == infoSnapshot
+                    let pathMatches = self.currentPath == infoSnapshot.libraryURL
+                    let tokenMatches = self.photosLoadToken == loadToken
+                    if !infoMatches || !pathMatches || !tokenMatches {
+                        self.photosLogger.warning("Photos load abandoned infoMatches=\(infoMatches) pathMatches=\(pathMatches) tokenMatches=\(tokenMatches) currentPath=\(self.currentPath.path, privacy: .public)")
+                        return
+                    }
+
+                    self.photosSortState = effectiveSortState
+                    self.photosAssetCache = initialBatch.assetCache
+                    self.photosAspectRatioCache = initialBatch.ratioCache
+
+                    if let item = initialBatch.selectedItem {
+                        self.selectedItems = [item]
+                        self.pendingSelectionURL = nil
+                    }
+
+                    self.items = initialBatch.items
+                    self.isLoading = false
+                    self.navigationGeneration += 1
+                    if totalCount == 0 {
+                        self.photosLogger.warning("Photos load completed with 0 items (status: \(status.rawValue))")
+                    }
+                }
+
+                guard totalCount > initialCount else { return }
+
+                for start in stride(from: initialCount, to: totalCount, by: batchSize) {
+                    let range = start..<min(start + batchSize, totalCount)
+                    let batch = buildBatch(range: range)
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        let infoMatches = self.photosLibraryInfo == infoSnapshot
+                        let pathMatches = self.currentPath == infoSnapshot.libraryURL
+                        let tokenMatches = self.photosLoadToken == loadToken
+                        guard infoMatches, pathMatches, tokenMatches else { return }
+
+                        self.photosAssetCache.merge(batch.assetCache) { current, _ in current }
+                        self.photosAspectRatioCache.merge(batch.ratioCache) { current, _ in current }
+                        self.items.append(contentsOf: batch.items)
+
+                        if self.pendingSelectionURL != nil, let item = batch.selectedItem {
+                            self.selectedItems = [item]
+                            self.pendingSelectionURL = nil
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func ensurePhotosAccess(completion: @escaping (PHAuthorizationStatus) -> Void) {
+        let status = photosAuthorizationStatus()
+        photosLogger.info("Photos authorization status: \(status.rawValue)")
+
+        switch status {
+        case .authorized, .limited:
+            completion(status)
+        case .notDetermined:
+            if isRequestingPhotosAccess {
+                pendingPhotosAccessCompletions.append(completion)
+                return
+            }
+            isRequestingPhotosAccess = true
+            pendingPhotosAccessCompletions.append(completion)
+            requestPhotosAuthorization { [weak self] newStatus in
+                guard let self else { return }
+                self.isRequestingPhotosAccess = false
+                self.photosLogger.info("Photos authorization result: \(newStatus.rawValue)")
+                let completions = self.pendingPhotosAccessCompletions
+                self.pendingPhotosAccessCompletions.removeAll()
+                completions.forEach { $0(newStatus) }
+            }
+        case .denied:
+            if didForcePhotosAuthRefresh {
+                completion(status)
+                return
+            }
+            didForcePhotosAuthRefresh = true
+            requestPhotosAuthorization { [weak self] newStatus in
+                guard let self else { return }
+                self.photosLogger.info("Photos authorization refresh result: \(newStatus.rawValue)")
+                completion(newStatus)
+            }
+        default:
+            completion(status)
+        }
+    }
+
+    private func photosAuthorizationStatus() -> PHAuthorizationStatus {
+        if #available(macOS 11.0, *) {
+            return PHPhotoLibrary.authorizationStatus(for: .readWrite)
+        }
+        return PHPhotoLibrary.authorizationStatus()
+    }
+
+    private func requestPhotosAuthorization(completion: @escaping (PHAuthorizationStatus) -> Void) {
+        let requestBlock = {
+            NSApp.activate(ignoringOtherApps: true)
+            if #available(macOS 11.0, *) {
+                PHPhotoLibrary.requestAuthorization(for: .readWrite) { status in
+                    DispatchQueue.main.async {
+                        completion(status)
+                    }
+                }
+            } else {
+                PHPhotoLibrary.requestAuthorization { status in
+                    DispatchQueue.main.async {
+                        completion(status)
+                    }
+                }
+            }
+        }
+
+        if Thread.isMainThread {
+            requestBlock()
+        } else {
+            DispatchQueue.main.async {
+                requestBlock()
+            }
+        }
+    }
+
+    private func showPhotosAccessAlert(for status: PHAuthorizationStatus) {
+        let alert = NSAlert()
+        alert.messageText = "Photos Access Needed"
+        if status == .restricted {
+            alert.informativeText = "Photos access is restricted on this Mac. Check Screen Time or configuration profiles."
+        } else {
+            alert.informativeText = "Allow Photos access in System Settings to show your full library."
+        }
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Open System Settings")
+        alert.addButton(withTitle: "Cancel")
+
+        if let window = NSApp.mainWindow {
+            alert.beginSheetModal(for: window) { response in
+                if response == .alertFirstButtonReturn {
+                    self.openPhotosPrivacySettings()
+                }
+            }
+        } else {
+            let response = alert.runModal()
+            if response == .alertFirstButtonReturn {
+                openPhotosPrivacySettings()
+            }
+        }
+    }
+
+    private func openPhotosPrivacySettings() {
+        guard let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Photos") else { return }
+        NSWorkspace.shared.open(url)
+    }
+
+    func isPhotosItem(_ item: FileItem) -> Bool {
+        photosAssetIdentifier(from: item.url) != nil
+    }
+
+    func photosAssetIdentifier(for item: FileItem) -> String? {
+        photosAssetIdentifier(from: item.url)
+    }
+
+    func photosAssetAspectRatio(for item: FileItem) -> CGFloat? {
+        guard let identifier = photosAssetIdentifier(from: item.url),
+              !identifier.isEmpty else { return nil }
+        if let cached = photosAspectRatioCache[identifier] {
+            return cached
+        }
+        guard let asset = photosAsset(for: identifier),
+              asset.pixelHeight > 0 else { return nil }
+        let ratio = CGFloat(asset.pixelWidth) / CGFloat(asset.pixelHeight)
+        photosAspectRatioCache[identifier] = ratio
+        return ratio
+    }
+
+    func startCachingPhotos(for items: [FileItem], targetSize: CGSize) {
+        let assets = items.compactMap { item -> PHAsset? in
+            guard let identifier = photosAssetIdentifier(from: item.url),
+                  let asset = photosAsset(for: identifier) else { return nil }
+            return asset
+        }
+        guard !assets.isEmpty else { return }
+
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .fastFormat
+        options.resizeMode = .fast
+
+        photosImageManager.startCachingImages(
+            for: assets,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        )
+    }
+
+    func stopCachingPhotos(for items: [FileItem], targetSize: CGSize) {
+        let assets = items.compactMap { item -> PHAsset? in
+            guard let identifier = photosAssetIdentifier(from: item.url),
+                  let asset = photosAsset(for: identifier) else { return nil }
+            return asset
+        }
+        guard !assets.isEmpty else { return }
+
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .fastFormat
+        options.resizeMode = .fast
+
+        photosImageManager.stopCachingImages(
+            for: assets,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        )
+    }
+
+    func stopCachingAllPhotos() {
+        photosImageManager.stopCachingImagesForAllAssets()
+    }
+
+    func requestPhotoThumbnail(
+        for item: FileItem,
+        targetPixelSize: CGFloat,
+        completion: @escaping (NSImage?, CGFloat?) -> Void
+    ) {
+        guard let identifier = photosAssetIdentifier(from: item.url),
+              let asset = photosAsset(for: identifier) else {
+            completion(nil, nil)
+            return
+        }
+
+        let requestKey = "\(identifier)-\(Int(targetPixelSize))"
+        if photosThumbnailRequests[requestKey] != nil { return }
+
+        let options = PHImageRequestOptions()
+        options.isNetworkAccessAllowed = true
+        options.deliveryMode = .opportunistic
+        options.resizeMode = .fast
+
+        let targetSize = CGSize(width: targetPixelSize, height: targetPixelSize)
+        let requestID = photosImageManager.requestImage(
+            for: asset,
+            targetSize: targetSize,
+            contentMode: .aspectFill,
+            options: options
+        ) { [weak self] image, _ in
+            guard let self else { return }
+            DispatchQueue.main.async {
+                self.photosThumbnailRequests.removeValue(forKey: requestKey)
+                let ratio = asset.pixelHeight > 0
+                    ? CGFloat(asset.pixelWidth) / CGFloat(asset.pixelHeight)
+                    : nil
+                completion(image, ratio)
+            }
+        }
+
+        photosThumbnailRequests[requestKey] = requestID
+    }
+
+    func photoAssetDragInfo(for item: FileItem) -> PhotoAssetDragInfo? {
+        guard let identifier = photosAssetIdentifier(from: item.url),
+              let asset = photosAsset(for: identifier),
+              let resource = primaryResource(for: asset) else { return nil }
+        let filename = resource.originalFilename.isEmpty ? item.name : resource.originalFilename
+        let uti = resource.uniformTypeIdentifier.isEmpty
+            ? (asset.mediaType == .video ? UTType.movie.identifier : UTType.image.identifier)
+            : resource.uniformTypeIdentifier
+        return PhotoAssetDragInfo(filename: filename, uti: uti)
+    }
+
+    func writePhotoAsset(for item: FileItem, to destinationURL: URL, completion: @escaping (Bool) -> Void) {
+        guard let identifier = photosAssetIdentifier(from: item.url),
+              let asset = photosAsset(for: identifier),
+              let resource = primaryResource(for: asset) else {
+            completion(false)
+            return
+        }
+
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+
+        try? FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: destinationURL)
+
+        PHAssetResourceManager.default().writeData(for: resource, toFile: destinationURL, options: options) { error in
+            DispatchQueue.main.async {
+                completion(error == nil)
+            }
+        }
+    }
+
+    func exportPhotoAsset(for item: FileItem, completion: @escaping (URL?) -> Void) {
+        guard let identifier = photosAssetIdentifier(from: item.url),
+              let asset = photosAsset(for: identifier) else {
+            completion(nil)
+            return
+        }
+
+        if let cached = photosExportCache[identifier], FileManager.default.fileExists(atPath: cached.path) {
+            completion(cached)
+            return
+        }
+
+        guard let resource = primaryResource(for: asset) else {
+            completion(nil)
+            return
+        }
+
+        let exportURL = photosExportURL(for: identifier, suggestedFilename: resource.originalFilename)
+        try? FileManager.default.createDirectory(at: exportURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? FileManager.default.removeItem(at: exportURL)
+
+        let options = PHAssetResourceRequestOptions()
+        options.isNetworkAccessAllowed = true
+
+        PHAssetResourceManager.default().writeData(for: resource, toFile: exportURL, options: options) { [weak self] error in
+            DispatchQueue.main.async {
+                guard let self else { return }
+                if error == nil {
+                    self.photosExportCache[identifier] = exportURL
+                    completion(exportURL)
+                } else {
+                    completion(nil)
+                }
+            }
+        }
+    }
+
+    nonisolated private func photosAssetURL(for identifier: String) -> URL? {
+        let scheme = "photos"
+        let host = "asset"
+        var components = URLComponents()
+        components.scheme = scheme
+        components.host = host
+        components.queryItems = [URLQueryItem(name: "id", value: identifier)]
+        return components.url
+    }
+
+    nonisolated private func photosAssetIdentifier(from url: URL) -> String? {
+        let scheme = "photos"
+        let host = "asset"
+        guard url.scheme == scheme, url.host == host else { return nil }
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        return components?.queryItems?.first(where: { $0.name == "id" })?.value
+    }
+
+    nonisolated private func photosSortDescriptors(for sortState: SortState) -> [NSSortDescriptor] {
+        switch sortState.column {
+        case .dateCreated:
+            return [NSSortDescriptor(key: "creationDate", ascending: sortState.direction == .ascending)]
+        case .dateModified:
+            return [NSSortDescriptor(key: "modificationDate", ascending: sortState.direction == .ascending)]
+        default:
+            return [NSSortDescriptor(key: "creationDate", ascending: false)]
+        }
+    }
+
+    private func photosAsset(for identifier: String) -> PHAsset? {
+        if let cached = photosAssetCache[identifier] {
+            return cached
+        }
+        let result = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil)
+        let asset = result.firstObject
+        if let asset {
+            photosAssetCache[identifier] = asset
+        }
+        return asset
+    }
+
+    nonisolated private func photosAssetName(for asset: PHAsset, fallbackFormatter: DateFormatter) -> String {
+        let resources = PHAssetResource.assetResources(for: asset)
+        if let resource = resources.first(where: { $0.type == .photo || $0.type == .fullSizePhoto }) {
+            return resource.originalFilename
+        }
+        if let resource = resources.first(where: { $0.type == .video || $0.type == .fullSizeVideo }) {
+            return resource.originalFilename
+        }
+        return photosAssetFallbackName(for: asset, fallbackFormatter: fallbackFormatter)
+    }
+
+    nonisolated private func photosAssetFallbackName(for asset: PHAsset, fallbackFormatter: DateFormatter) -> String {
+        if let date = asset.creationDate {
+            return "Photo \(fallbackFormatter.string(from: date))"
+        }
+        return "Photo"
+    }
+
+    private func primaryResource(for asset: PHAsset) -> PHAssetResource? {
+        let resources = PHAssetResource.assetResources(for: asset)
+        if asset.mediaType == .video {
+            return resources.first { $0.type == .video || $0.type == .fullSizeVideo } ?? resources.first
+        }
+        return resources.first { $0.type == .photo || $0.type == .fullSizePhoto } ?? resources.first
+    }
+
+    private func photosExportURL(for identifier: String, suggestedFilename: String) -> URL {
+        let safeIdentifier = identifier.replacingOccurrences(of: "/", with: "-")
+        let filename = suggestedFilename.isEmpty ? safeIdentifier : "\(safeIdentifier)-\(suggestedFilename)"
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent("CoverFlowFinder-PhotosExport", isDirectory: true)
+        return folder.appendingPathComponent(filename)
+    }
+
+    private func clearPhotosCaches() {
+        photosAssetCache.removeAll()
+        photosAspectRatioCache.removeAll()
+        photosThumbnailRequests.removeAll()
+        photosExportCache.removeAll()
+        photosImageManager.stopCachingImagesForAllAssets()
+        photosSortState = nil
+        photosLoadToken = UUID()
+    }
+
 
     func navigateTo(_ url: URL) {
         guard url != currentPath else { return }
+        photosLibraryInfo = nil
+        clearPhotosCaches()
         currentPath = url
         selectedItems.removeAll()
         coverFlowSelectedIndex = 0
@@ -334,6 +931,8 @@ class FileBrowserViewModel: ObservableObject {
     /// Navigate to a URL and select the folder we came from (for path bar navigation)
     func navigateToAndSelectCurrent(_ url: URL) {
         guard url != currentPath else { return }
+        photosLibraryInfo = nil
+        clearPhotosCaches()
         // Remember current path to select it after navigating
         pendingSelectionURL = currentPath
         currentPath = url
@@ -341,6 +940,21 @@ class FileBrowserViewModel: ObservableObject {
         // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
         loadContents()
         addToHistory(.filesystem(url))
+    }
+
+    func navigateToPhotosLibrary(_ info: PhotosLibraryInfo) {
+        clearPhotosCaches()
+        photosLibraryInfo = info
+        photosLogger.info("Navigate to Photos library: \(info.libraryURL.path, privacy: .public)")
+        isInsideArchive = false
+        currentArchiveURL = nil
+        currentArchivePath = ""
+        archiveEntries = []
+        currentPath = info.libraryURL
+        selectedItems.removeAll()
+        coverFlowSelectedIndex = 0
+        loadContents()
+        addToHistory(.photosLibrary(info))
     }
 
     func navigateToParent() {
@@ -356,6 +970,8 @@ class FileBrowserViewModel: ObservableObject {
         let location = navigationHistory[historyIndex]
         if case .filesystem = location {
             pendingSelectionURL = enteredFolderURL ?? currentPath
+        } else if case .photosLibrary = location {
+            pendingSelectionURL = nil
         } else {
             pendingSelectionURL = nil
         }
@@ -378,6 +994,8 @@ class FileBrowserViewModel: ObservableObject {
             currentArchiveURL = nil
             currentArchivePath = ""
             archiveEntries = []
+            photosLibraryInfo = nil
+            clearPhotosCaches()
             currentPath = url
             selectedItems.removeAll()
             loadContents()
@@ -398,14 +1016,38 @@ class FileBrowserViewModel: ObservableObject {
                 currentArchiveURL = nil
                 currentArchivePath = ""
                 archiveEntries = []
+                photosLibraryInfo = nil
+                clearPhotosCaches()
                 currentPath = archiveURL.deletingLastPathComponent()
                 loadContents()
             }
+        case .photosLibrary(let info):
+            isInsideArchive = false
+            currentArchiveURL = nil
+            currentArchivePath = ""
+            archiveEntries = []
+            photosLibraryInfo = info
+            photosLogger.info("Apply navigation to Photos library: \(info.libraryURL.path, privacy: .public)")
+            currentPath = info.libraryURL
+            selectedItems.removeAll()
+            coverFlowSelectedIndex = 0
+            loadContents()
         }
     }
 
     func openItem(_ item: FileItem) {
         cancelPendingRename()
+
+        if isPhotosItem(item) {
+            exportPhotoAsset(for: item) { url in
+                guard let url else {
+                    NSSound.beep()
+                    return
+                }
+                NSWorkspace.shared.open(url)
+            }
+            return
+        }
 
         // Handle items inside an archive
         if item.isFromArchive {
@@ -565,6 +1207,9 @@ class FileBrowserViewModel: ObservableObject {
                 return nil
             }
             return try? ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
+        }
+        if let identifier = photosAssetIdentifier(from: item.url) {
+            return photosExportCache[identifier]
         }
         return item.url
     }
