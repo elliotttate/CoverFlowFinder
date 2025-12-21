@@ -52,8 +52,10 @@ class ThumbnailCacheManager {
         for url: URL,
         maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize
     ) -> NSImage? {
-        // Check for cached directory icon first
-        let dirKey = "dir_\(url.path)" as NSString
+        // Check for cached directory icon first (size-aware)
+        let targetSize = clampPixelSize(maxPixelSize)
+        let sizeBucket = Int(targetSize)
+        let dirKey = "dir_\(sizeBucket)_\(url.path)" as NSString
         if let cached = memoryCache.object(forKey: dirKey) {
             return cached
         }
@@ -121,26 +123,65 @@ class ThumbnailCacheManager {
 
         // Skip directories - QuickLook returns generic blue folder icons
         // which loses custom folder colors. Use item.icon instead.
-        // Cache the icon to avoid repeated expensive lookups.
+        // Cache the icon at the requested size for high-resolution display.
         if item.isDirectory {
-            let cacheKey = "dir_\(url.path)" as NSString
+            let targetSize = clampPixelSize(maxPixelSize)
+            let sizeBucket = Int(targetSize)
+            let cacheKeyStr = "dir_\(sizeBucket)_\(url.path)"
+            let cacheKey = cacheKeyStr as NSString
+
+            // Check cache first
             if let cached = memoryCache.object(forKey: cacheKey) {
                 completion(url, cached)
                 return
             }
-            let icon = item.icon
-            memoryCache.setObject(icon, forKey: cacheKey)
-            completion(url, icon)
+
+            // Skip if already pending
+            let alreadyPending = queue.sync { pendingRequests[cacheKeyStr] != nil }
+            if alreadyPending { return }
+
+            // Mark as pending
+            let generation: Int = queue.sync {
+                pendingRequests[cacheKeyStr] = currentGeneration
+                return currentGeneration
+            }
+
+            // Fetch and render icon entirely on background queue (thread-safe)
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+
+                // Check if still valid
+                let isValid = self.queue.sync { self.pendingRequests[cacheKeyStr] == generation }
+                guard isValid else {
+                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKeyStr) }
+                    return
+                }
+
+                // Get icon and render at target size (both thread-safe now)
+                let icon = item.icon
+                let highResIcon = self.renderIconAtSize(icon, size: targetSize)
+
+                // Cache and call completion on main queue
+                DispatchQueue.main.async {
+                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKeyStr) }
+
+                    let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
+                    guard stillValid else { return }
+
+                    self.memoryCache.setObject(highResIcon, forKey: cacheKey)
+                    completion(url, highResIcon)
+                }
+            }
             return
         }
 
         let targetSize = clampPixelSize(maxPixelSize)
         let cacheKey = cacheKey(for: url, maxPixelSize: targetSize)
 
-        // Skip if already failed
+        // Skip if already failed - use fast placeholder
         let alreadyFailed = queue.sync { failedURLs.contains(url) }
         guard !alreadyFailed else {
-            completion(url, item.icon)
+            completion(url, item.placeholderIcon)
             return
         }
 
@@ -276,7 +317,7 @@ class ThumbnailCacheManager {
                     completion(url, image)
                 } else {
                     _ = self.queue.sync { self.failedURLs.insert(url) }
-                    completion(url, item.icon)
+                    completion(url, item.placeholderIcon)
                 }
             }
         }
@@ -312,7 +353,7 @@ class ThumbnailCacheManager {
                     completion(url, image)
                 } else {
                     _ = self.queue.sync { self.failedURLs.insert(url) }
-                    completion(url, item.icon)
+                    completion(url, item.placeholderIcon)
                 }
             }
         }
@@ -353,6 +394,51 @@ class ThumbnailCacheManager {
         // Estimate memory cost based on image dimensions
         let size = image.size
         return Int(size.width * size.height * 4)  // 4 bytes per pixel (RGBA)
+    }
+
+    /// Render an icon at a specific size for high-resolution display
+    /// Uses pure CGImage drawing for thread-safe off-main-thread rendering
+    private func renderIconAtSize(_ icon: NSImage, size: CGFloat) -> NSImage {
+        let targetSize = NSSize(width: size, height: size)
+        let pixelSize = Int(size)
+
+        // Get CGImage from the icon at the best available size
+        var proposedRect = NSRect(origin: .zero, size: targetSize)
+        guard let cgIcon = icon.cgImage(forProposedRect: &proposedRect, context: nil, hints: [.interpolation: NSNumber(value: NSImageInterpolation.high.rawValue)]) else {
+            return icon
+        }
+
+        // If the icon is already at or above target size, just wrap it
+        if cgIcon.width >= pixelSize && cgIcon.height >= pixelSize {
+            return NSImage(cgImage: cgIcon, size: targetSize)
+        }
+
+        // Create a context and draw at target size (thread-safe)
+        guard let colorSpace = CGColorSpace(name: CGColorSpace.sRGB),
+              let context = CGContext(
+                data: nil,
+                width: pixelSize,
+                height: pixelSize,
+                bitsPerComponent: 8,
+                bytesPerRow: 0,
+                space: colorSpace,
+                bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+              ) else {
+            return icon
+        }
+
+        // High quality scaling
+        context.interpolationQuality = .high
+
+        // Draw the CGImage scaled to fill
+        let rect = CGRect(origin: .zero, size: CGSize(width: pixelSize, height: pixelSize))
+        context.draw(cgIcon, in: rect)
+
+        guard let resultImage = context.makeImage() else {
+            return icon
+        }
+
+        return NSImage(cgImage: resultImage, size: targetSize)
     }
 
     // MARK: - Disk Cache Operations

@@ -25,7 +25,8 @@ struct FileTableView: NSViewRepresentable {
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = true
 
-        let tableView = NSTableView()
+        let tableView = KeyboardTableView()
+        tableView.coordinator = context.coordinator
         tableView.style = .automatic  // Use automatic for best native appearance
         tableView.usesAlternatingRowBackgroundColors = true
         tableView.allowsMultipleSelection = true
@@ -120,6 +121,26 @@ struct FileTableView: NSViewRepresentable {
 
         // Sync selection from SwiftUI to NSTableView
         context.coordinator.syncSelectionFromViewModel()
+    }
+}
+
+// MARK: - Custom TableView with Keyboard Handling
+
+@MainActor
+final class KeyboardTableView: NSTableView {
+    weak var coordinator: FileTableCoordinator?
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 49: // Space - Quick Look
+            coordinator?.triggerQuickLook()
+        case 36: // Return - Open item
+            coordinator?.openSelectedItem()
+        case 51 where event.modifierFlags.contains(.command): // Cmd+Backspace - Delete
+            coordinator?.deleteSelectedItems()
+        default:
+            super.keyDown(with: event)
+        }
     }
 }
 
@@ -404,6 +425,38 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
         let item = items[clickedRow]
         viewModel.openItem(item)
+    }
+
+    // MARK: - Keyboard Actions
+
+    func triggerQuickLook() {
+        guard let item = viewModel.selectedItems.first,
+              let previewURL = viewModel.previewURL(for: item) else {
+            NSSound.beep()
+            return
+        }
+        QuickLookControllerView.shared.togglePreview(for: previewURL) { [weak self] offset in
+            self?.navigateSelection(by: offset)
+        }
+    }
+
+    func openSelectedItem() {
+        guard let item = viewModel.selectedItems.first else { return }
+        viewModel.openItem(item)
+    }
+
+    func deleteSelectedItems() {
+        viewModel.deleteSelectedItems()
+    }
+
+    private func navigateSelection(by offset: Int) {
+        guard let tableView = tableView else { return }
+        let currentRow = tableView.selectedRow
+        let newRow = max(0, min(items.count - 1, currentRow + offset))
+        if newRow != currentRow && newRow >= 0 && newRow < items.count {
+            tableView.selectRowIndexes(IndexSet(integer: newRow), byExtendingSelection: false)
+            tableView.scrollRowToVisible(newRow)
+        }
     }
 
     // MARK: - Column Resize/Move Notifications

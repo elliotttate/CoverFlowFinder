@@ -154,12 +154,7 @@ struct ContentView: View {
                 Menu {
                     ForEach(ListColumn.allCases) { column in
                         Button(action: {
-                            if columnConfig.sortColumn == column {
-                                columnConfig.sortDirection.toggle()
-                            } else {
-                                columnConfig.sortColumn = column
-                                columnConfig.sortDirection = .ascending
-                            }
+                            columnConfig.setSortColumn(column)
                         }) {
                             HStack {
                                 Text(column.rawValue)

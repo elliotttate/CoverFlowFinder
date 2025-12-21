@@ -41,6 +41,15 @@ enum ListColumn: String, CaseIterable, Codable, Identifiable {
     var textAlignment: TextAlignment {
         return .leading
     }
+
+    var defaultSortDirection: SortDirection {
+        switch self {
+        case .name, .kind, .tags:
+            return .ascending
+        case .dateModified, .dateCreated, .size:
+            return .descending
+        }
+    }
 }
 
 // Configuration for a single column
@@ -136,7 +145,7 @@ class ListColumnConfigManager: ObservableObject {
             sortDirection.toggle()
         } else {
             sortColumn = column
-            sortDirection = .ascending
+            sortDirection = column.defaultSortDirection
         }
     }
 
