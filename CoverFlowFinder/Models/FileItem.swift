@@ -133,11 +133,8 @@ private class IconCache {
         genericFolderIcon = NSWorkspace.shared.icon(for: .folder)
     }
 
-    func icon(for url: URL) -> NSImage {
+    func icon(for url: URL, isPlainFolder: Bool = false) -> NSImage {
         let key = url.path as NSString
-        if let cached = cache.object(forKey: key) {
-            return cached
-        }
 
         // For media files, use pre-cached generic icons (instant)
         // The actual thumbnail will load later and replace this
@@ -150,7 +147,18 @@ private class IconCache {
             return genericAudioIcon
         }
 
-        // For other files, get the actual icon (usually fast for non-media)
+        // Don't cache plain folder icons - they can have custom colors
+        // But DO cache bundles (.app, .bundle, etc.) - they have stable icons
+        if isPlainFolder {
+            return NSWorkspace.shared.icon(forFile: url.path)
+        }
+
+        // Check cache for non-media, non-folder files (including .app bundles)
+        if let cached = cache.object(forKey: key) {
+            return cached
+        }
+
+        // Get the actual icon from filesystem and cache it
         let icon = NSWorkspace.shared.icon(forFile: url.path)
         cache.setObject(icon, forKey: key)
         return icon
@@ -206,7 +214,10 @@ struct FileItem: Identifiable, Hashable, Transferable {
             // For archive items, use generic icons based on file type
             return IconCache.shared.genericIcon(for: fileType)
         }
-        return IconCache.shared.icon(for: url)
+        // Only skip caching for actual folders (not bundles like .app)
+        // Folders can have custom colors that might change
+        let isPlainFolder = fileType == .folder
+        return IconCache.shared.icon(for: url, isPlainFolder: isPlainFolder)
     }
 
     /// Check if this item is a ZIP archive that can be browsed
@@ -254,13 +265,27 @@ struct FileItem: Identifiable, Hashable, Transferable {
         }
         self.hasMetadata = loadMetadata
 
-        // Determine file type quickly, falling back to filename extension when metadata is deferred
-        if self.isDirectory {
-            self.fileType = .folder
-        } else if let contentType = resourceValues?.contentType {
-            self.fileType = FileItem.determineFileType(from: contentType)
+        // Determine file type - check content type first for bundles/packages
+        if let contentType = resourceValues?.contentType {
+            // Check for application bundles BEFORE falling back to folder
+            if contentType.conforms(to: .application) || contentType.conforms(to: .bundle) || contentType.conforms(to: .package) {
+                self.fileType = FileItem.determineFileType(from: contentType)
+            } else if self.isDirectory {
+                self.fileType = .folder
+            } else {
+                self.fileType = FileItem.determineFileType(from: contentType)
+            }
         } else if let extType = UTType(filenameExtension: url.pathExtension) {
-            self.fileType = FileItem.determineFileType(from: extType)
+            // Check extension-based type for bundles
+            if extType.conforms(to: .application) || extType.conforms(to: .bundle) || extType.conforms(to: .package) {
+                self.fileType = FileItem.determineFileType(from: extType)
+            } else if self.isDirectory {
+                self.fileType = .folder
+            } else {
+                self.fileType = FileItem.determineFileType(from: extType)
+            }
+        } else if self.isDirectory {
+            self.fileType = .folder
         } else {
             self.fileType = .other
         }

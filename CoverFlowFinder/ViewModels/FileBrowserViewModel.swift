@@ -124,6 +124,17 @@ class FileBrowserViewModel: ObservableObject {
     private let photosLogger = Logger(subsystem: "com.coverflowfinder.app", category: "Photos")
     private var photosLoadToken = UUID()
     private var photosSortState: SortState?
+
+    // MARK: - Lazy Metadata Loading
+    /// Batch size for progressive loading of large directories
+    private let directoryBatchSize = 400
+    /// Token to invalidate in-flight loads when navigating away
+    private var directoryLoadToken = UUID()
+    /// Track which items have had their metadata loaded
+    private var hydratedURLs: Set<URL> = []
+    /// Queue for metadata hydration requests
+    private var pendingHydrationURLs: Set<URL> = []
+    private let hydrationQueue = DispatchQueue(label: "com.coverflowfinder.hydration", qos: .userInitiated)
     struct PhotoAssetDragInfo {
         let filename: String
         let uti: String
@@ -304,79 +315,174 @@ class FileBrowserViewModel: ObservableObject {
 
         isLoading = true
         items = []
+        hydratedURLs.removeAll()
+        pendingHydrationURLs.removeAll()
         let pathToLoad = currentPath
         let pendingURL = pendingSelectionURL  // Capture before async
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
         let showHiddenFiles = AppSettings.shared.showHiddenFiles
         let foldersFirst = AppSettings.shared.foldersFirst
+        let batchSize = directoryBatchSize
+        let loadToken = UUID()
+        directoryLoadToken = loadToken
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
 
             do {
-                // Use autoreleasepool to release temporary objects promptly
-                let fileItems: [FileItem] = try autoreleasepool {
-                    let contents = try FileManager.default.contentsOfDirectory(
+                // Phase 1: Get file list instantly (no stat calls)
+                let contents: [URL] = try autoreleasepool {
+                    try FileManager.default.contentsOfDirectory(
                         at: pathToLoad,
-                        includingPropertiesForKeys: [
-                            .isDirectoryKey,
-                            .contentTypeKey
-                        ],
+                        includingPropertiesForKeys: [.isDirectoryKey, .contentTypeKey],
                         options: showHiddenFiles ? [] : [.skipsHiddenFiles]
                     )
-
-                    // Build lightweight items - use reserveCapacity for better performance
-                    var items = [FileItem]()
-                    items.reserveCapacity(contents.count)
-                    for url in contents {
-                        items.append(FileItem(url: url, loadMetadata: true))
-                    }
-                    return items
                 }
 
-                // Calculate selection index on background thread to avoid main thread work
+                let totalCount = contents.count
+                let isLargeDirectory = totalCount > batchSize
+
+                // Phase 2: Create lightweight items WITHOUT metadata (instant)
+                // For small directories, load metadata upfront for better UX
+                // For large directories, defer metadata to visible rows only
+                let loadMetadataUpfront = !isLargeDirectory
+
+                var allItems = [FileItem]()
+                allItems.reserveCapacity(totalCount)
+
+                // First batch - create items and show immediately
+                let firstBatchCount = min(batchSize, totalCount)
+                for i in 0..<firstBatchCount {
+                    allItems.append(FileItem(url: contents[i], loadMetadata: loadMetadataUpfront))
+                }
+
+                // Calculate selection for first batch
                 var selectedIndex = 0
                 var selectedItem: FileItem?
-
                 if let pendingURL = pendingURL,
-                   let item = fileItems.first(where: { $0.url == pendingURL }) {
+                   let item = allItems.first(where: { $0.url == pendingURL }) {
                     selectedItem = item
-                    // Pre-sort on background thread using captured sort settings
-                    let sorted = sortItemsForBackground(fileItems, sortState: sortState, foldersFirst: foldersFirst)
+                    let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
                     if let index = sorted.firstIndex(of: item) {
                         selectedIndex = index
                     }
                 }
 
-                DispatchQueue.main.async {
-                    // Don't overwrite items if we've entered an archive while this async load was in progress
-                    guard !self.isInsideArchive else { return }
-
-                    // Don't overwrite if path changed while loading
-                    guard self.currentPath == pathToLoad else { return }
+                // Show first batch immediately
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self,
+                          self.directoryLoadToken == loadToken,
+                          !self.isInsideArchive,
+                          self.currentPath == pathToLoad else { return }
 
                     if let item = selectedItem {
                         self.coverFlowSelectedIndex = selectedIndex
                         self.selectedItems = [item]
                         self.pendingSelectionURL = nil
                     } else {
-                        let clamped = min(self.coverFlowSelectedIndex, max(0, fileItems.count - 1))
-                        self.coverFlowSelectedIndex = clamped
+                        self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
                     }
 
-                    // Set items AFTER index so SwiftUI sees both changes together
-                    self.items = fileItems
-                    self.isLoading = false
-                    // Increment navigation generation to force SwiftUI update
+                    self.items = allItems
+                    if !isLargeDirectory {
+                        self.isLoading = false
+                    }
                     self.navigationGeneration += 1
+
+                    // Track hydrated items if we loaded metadata upfront
+                    if loadMetadataUpfront {
+                        for item in allItems {
+                            self.hydratedURLs.insert(item.url)
+                        }
+                    }
+                }
+
+                // Phase 3: Load remaining batches progressively (for large directories)
+                if isLargeDirectory {
+                    for batchStart in stride(from: batchSize, to: totalCount, by: batchSize) {
+                        // Check if navigation changed
+                        guard DispatchQueue.main.sync(execute: { self.directoryLoadToken == loadToken }) else { return }
+
+                        let batchEnd = min(batchStart + batchSize, totalCount)
+                        var batchItems = [FileItem]()
+                        batchItems.reserveCapacity(batchEnd - batchStart)
+
+                        for i in batchStart..<batchEnd {
+                            batchItems.append(FileItem(url: contents[i], loadMetadata: false))
+                        }
+
+                        DispatchQueue.main.async { [weak self] in
+                            guard let self = self,
+                                  self.directoryLoadToken == loadToken,
+                                  !self.isInsideArchive,
+                                  self.currentPath == pathToLoad else { return }
+
+                            self.items.append(contentsOf: batchItems)
+
+                            // Mark loading complete after last batch
+                            if batchEnd >= totalCount {
+                                self.isLoading = false
+                            }
+                        }
+                    }
                 }
             } catch {
-                DispatchQueue.main.async {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
                     self.items = []
                     self.isLoading = false
                 }
             }
         }
+    }
+
+    // MARK: - Lazy Metadata Hydration
+
+    /// Request metadata loading for specific items (call from visible row detection)
+    func hydrateMetadata(for urls: [URL]) {
+        let urlsToHydrate = urls.filter { !hydratedURLs.contains($0) && !pendingHydrationURLs.contains($0) }
+        guard !urlsToHydrate.isEmpty else { return }
+
+        for url in urlsToHydrate {
+            pendingHydrationURLs.insert(url)
+        }
+
+        let loadToken = directoryLoadToken
+        hydrationQueue.async { [weak self] in
+            guard let self = self else { return }
+
+            var hydratedItems: [(url: URL, item: FileItem)] = []
+
+            for url in urlsToHydrate {
+                // Check if still valid
+                guard DispatchQueue.main.sync(execute: { self.directoryLoadToken == loadToken }) else { return }
+
+                // Load full metadata
+                let hydratedItem = FileItem(url: url, loadMetadata: true)
+                hydratedItems.append((url: url, item: hydratedItem))
+            }
+
+            // Batch update on main thread
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self,
+                      self.directoryLoadToken == loadToken else { return }
+
+                for (url, hydratedItem) in hydratedItems {
+                    self.pendingHydrationURLs.remove(url)
+                    self.hydratedURLs.insert(url)
+
+                    // Replace item in-place
+                    if let index = self.items.firstIndex(where: { $0.url == url }) {
+                        self.items[index] = hydratedItem
+                    }
+                }
+            }
+        }
+    }
+
+    /// Check if an item needs metadata hydration
+    func needsHydration(_ item: FileItem) -> Bool {
+        !item.hasMetadata && !hydratedURLs.contains(item.url)
     }
 
     /// Load contents from within a ZIP archive

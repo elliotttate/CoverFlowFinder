@@ -52,6 +52,12 @@ class ThumbnailCacheManager {
         for url: URL,
         maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize
     ) -> NSImage? {
+        // Check for cached directory icon first
+        let dirKey = "dir_\(url.path)" as NSString
+        if let cached = memoryCache.object(forKey: dirKey) {
+            return cached
+        }
+
         let key = cacheKey(for: url, maxPixelSize: maxPixelSize)
 
         // Check memory cache first
@@ -112,6 +118,22 @@ class ThumbnailCacheManager {
         completion: @escaping (URL, NSImage?) -> Void
     ) {
         let url = item.url
+
+        // Skip directories - QuickLook returns generic blue folder icons
+        // which loses custom folder colors. Use item.icon instead.
+        // Cache the icon to avoid repeated expensive lookups.
+        if item.isDirectory {
+            let cacheKey = "dir_\(url.path)" as NSString
+            if let cached = memoryCache.object(forKey: cacheKey) {
+                completion(url, cached)
+                return
+            }
+            let icon = item.icon
+            memoryCache.setObject(icon, forKey: cacheKey)
+            completion(url, icon)
+            return
+        }
+
         let targetSize = clampPixelSize(maxPixelSize)
         let cacheKey = cacheKey(for: url, maxPixelSize: targetSize)
 

@@ -73,6 +73,20 @@ struct FileTableView: NSViewRepresentable {
             object: tableView
         )
 
+        // Observe scroll for lazy metadata hydration
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(context.coordinator.scrollViewDidScroll(_:)),
+            name: NSScrollView.didLiveScrollNotification,
+            object: scrollView
+        )
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(context.coordinator.scrollViewDidEndScroll(_:)),
+            name: NSScrollView.didEndLiveScrollNotification,
+            object: scrollView
+        )
+
         // Setup header menu after a short delay to ensure view hierarchy is ready
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             context.coordinator.setupHeaderMenu()
@@ -97,6 +111,8 @@ struct FileTableView: NSViewRepresentable {
         let changed = oldItems.count != items.count || !oldItems.elementsEqual(items, by: { $0.id == $1.id })
         if changed {
             context.coordinator.tableView?.reloadData()
+            // Trigger hydration for newly visible rows
+            context.coordinator.hydrateVisibleRows()
         }
 
         // Sync columns if configuration changed
@@ -125,11 +141,25 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var lastSortColumn: ListColumn?
     private var lastSortDirection: SortDirection?
 
+    // Lazy loading state
+    private var lastVisibleRange: Range<Int>?
+    private var hydrationDebounceTimer: Timer?
+    private let hydrationDebounceInterval: TimeInterval = 0.05
+
+    // Thumbnail preheat state (like PHCachingImageManager)
+    private var lastPreheatRange: Range<Int>?
+    private var preheatBuffer = 20  // Rows to preheat beyond visible
+    private var preheatURLs: Set<URL> = []  // Currently preheating
+
     init(viewModel: FileBrowserViewModel, columnConfig: ListColumnConfigManager, appSettings: AppSettings) {
         self.viewModel = viewModel
         self.columnConfig = columnConfig
         self.appSettings = appSettings
         super.init()
+    }
+
+    deinit {
+        hydrationDebounceTimer?.invalidate()
     }
 
     // MARK: - Column Setup
@@ -412,6 +442,106 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         }
 
         columnConfig.columns = reorderedColumns
+    }
+
+    // MARK: - Scroll & Lazy Hydration
+
+    @objc func scrollViewDidScroll(_ notification: Notification) {
+        // Debounce hydration during active scrolling
+        hydrationDebounceTimer?.invalidate()
+        hydrationDebounceTimer = Timer.scheduledTimer(withTimeInterval: hydrationDebounceInterval, repeats: false) { [weak self] _ in
+            Task { @MainActor in
+                self?.hydrateVisibleRows()
+            }
+        }
+    }
+
+    @objc func scrollViewDidEndScroll(_ notification: Notification) {
+        // Immediately hydrate when scroll ends
+        hydrationDebounceTimer?.invalidate()
+        hydrateVisibleRows()
+    }
+
+    /// Hydrate metadata for currently visible rows
+    func hydrateVisibleRows() {
+        guard let tableView = tableView else { return }
+
+        let visibleRect = tableView.visibleRect
+        let visibleRows = tableView.rows(in: visibleRect)
+
+        guard visibleRows.location != NSNotFound else { return }
+
+        let start = visibleRows.location
+        let end = min(start + visibleRows.length, items.count)
+
+        // Extend range for metadata hydration
+        let hydrationBuffer = 10
+        let hydrationStart = max(0, start - hydrationBuffer)
+        let hydrationEnd = min(items.count, end + hydrationBuffer)
+
+        guard hydrationStart < hydrationEnd else { return }
+
+        // Check if range actually changed
+        let newRange = hydrationStart..<hydrationEnd
+        if newRange == lastVisibleRange { return }
+        lastVisibleRange = newRange
+
+        // Collect URLs that need hydration
+        var urlsToHydrate: [URL] = []
+        for i in hydrationStart..<hydrationEnd {
+            let item = items[i]
+            if viewModel.needsHydration(item) {
+                urlsToHydrate.append(item.url)
+            }
+        }
+
+        if !urlsToHydrate.isEmpty {
+            viewModel.hydrateMetadata(for: urlsToHydrate)
+        }
+
+        // Also preheat thumbnails
+        preheatThumbnails(visibleStart: start, visibleEnd: end)
+    }
+
+    /// Preheat thumbnails for rows coming into view (like PHCachingImageManager)
+    private func preheatThumbnails(visibleStart: Int, visibleEnd: Int) {
+        let preheatStart = max(0, visibleStart - preheatBuffer)
+        let preheatEnd = min(items.count, visibleEnd + preheatBuffer)
+
+        guard preheatStart < preheatEnd else { return }
+
+        let newPreheatRange = preheatStart..<preheatEnd
+
+        // Calculate what's added and removed
+        let oldPreheatRange = lastPreheatRange ?? 0..<0
+        lastPreheatRange = newPreheatRange
+
+        // Find items that entered the preheat zone
+        let addedURLs: [URL] = (preheatStart..<preheatEnd).compactMap { i in
+            guard !oldPreheatRange.contains(i) else { return nil }
+            let item = items[i]
+            guard !item.isDirectory && thumbnails[item.url] == nil else { return nil }
+            return item.url
+        }
+
+        // Find items that left the preheat zone (cancel their requests)
+        let removedURLs: [URL] = oldPreheatRange.compactMap { i in
+            guard !newPreheatRange.contains(i), i < items.count else { return nil }
+            return items[i].url
+        }
+
+        // Update preheat set
+        for url in removedURLs {
+            preheatURLs.remove(url)
+        }
+
+        // Start preheating new items
+        for url in addedURLs where !preheatURLs.contains(url) {
+            preheatURLs.insert(url)
+            if let item = items.first(where: { $0.url == url }) {
+                loadThumbnailIfNeeded(for: item)
+            }
+        }
     }
 
     // MARK: - Cell Factories

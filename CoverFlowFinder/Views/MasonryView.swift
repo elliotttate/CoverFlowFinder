@@ -89,7 +89,8 @@ struct MasonryView: View {
     }
 
     private func labelHeight(for item: FileItem) -> CGFloat {
-        settings.masonryShowFilenames || viewModel.renamingURL == item.url ? baseLabelHeight : 0
+        // Always show labels for folders, or when filenames setting is on, or when renaming
+        item.isDirectory || settings.masonryShowFilenames || viewModel.renamingURL == item.url ? baseLabelHeight : 0
     }
 
     private struct MasonryPosition {
@@ -147,7 +148,7 @@ struct MasonryView: View {
                                         columnWidth: columnWidth,
                                         imageHeight: imageHeight,
                                         labelHeight: labelHeight(for: item),
-                                        showLabels: settings.masonryShowFilenames || viewModel.renamingURL == item.url,
+                                        showLabels: item.isDirectory || settings.masonryShowFilenames || viewModel.renamingURL == item.url,
                                         dropTargetedItemID: $dropTargetedItemID,
                                         onSelect: { selectItem($0) }
                                     )
@@ -348,6 +349,15 @@ struct MasonryView: View {
     private func loadThumbnail(for item: FileItem) {
         let url = item.url
         let targetPixelSize = targetThumbnailPixelSize
+
+        // For folders, always use the file system icon (preserves custom folder colors)
+        // QuickLook returns a generic blue folder icon which loses custom colors
+        if item.isDirectory {
+            if thumbnails[url] == nil {
+                thumbnails[url] = item.icon
+            }
+            return
+        }
 
         if viewModel.isPhotosItem(item) {
             loadPhotosThumbnail(for: item, targetPixelSize: targetPixelSize)
