@@ -1,10 +1,10 @@
-# CoverFlowFinder
+# Flow Finder
 
 A beautiful macOS file browser that brings back the classic Cover Flow view from older versions of Finder.
 
-https://github.com/elliotttate/CoverFlowFinder/releases/download/v1.0.0/CoverFlowFinder-demo.mp4
+https://github.com/elliotttate/FlowFinder/releases/download/v1.0.0/FlowFinder-demo.mp4
 
-![CoverFlowFinder Screenshot](screenshots/coverflow-apps.png)
+![Flow Finder Screenshot](screenshots/coverflow-apps.png)
 
 ## Features
 
@@ -29,14 +29,14 @@ https://github.com/elliotttate/CoverFlowFinder/releases/download/v1.0.0/CoverFlo
 ## Installation
 
 ### Download
-Download the latest DMG from the [Releases](https://github.com/elliotttate/CoverFlowFinder/releases) page.
+Download the latest DMG from the [Releases](https://github.com/elliotttate/FlowFinder/releases) page.
 
 ### Build from Source
 1. Clone the repository:
    ```bash
-   git clone https://github.com/elliotttate/CoverFlowFinder.git
+   git clone https://github.com/elliotttate/FlowFinder.git
    ```
-2. Open `CoverFlowFinder.xcodeproj` in Xcode
+2. Open `FlowFinder.xcodeproj` in Xcode
 3. Build and run (⌘R)
 
 ## Development

@@ -5,22 +5,22 @@ It is geared toward experienced macOS developers who want to extend or refactor 
 
 ## Quick Start
 
-- Open `CoverFlowFinder.xcodeproj` in Xcode and build/run.
+- Open `FlowFinder.xcodeproj` in Xcode and build/run.
 - CLI build:
   ```bash
-  xcodebuild -project CoverFlowFinder.xcodeproj -scheme CoverFlowFinder -configuration Debug -destination "platform=macOS" build
+  xcodebuild -project FlowFinder.xcodeproj -scheme FlowFinder -configuration Debug -destination "platform=macOS" build
   ```
 
 ## Project Structure
 
-- `CoverFlowFinder/Models`
+- `FlowFinder/Models`
   - `FileItem` and `FileTagManager` (file metadata and tag caching)
   - `ListColumnConfigManager` (column visibility and `SortState`)
   - `ThumbnailCacheManager` (memory/disk thumbnail caching)
   - `ZipArchiveManager` (ZIP parsing and extraction)
-- `CoverFlowFinder/ViewModels`
+- `FlowFinder/ViewModels`
   - `FileBrowserViewModel` (navigation, selection, clipboard, archive state, file ops)
-- `CoverFlowFinder/Views`
+- `FlowFinder/Views`
   - SwiftUI view modes, plus AppKit-backed Cover Flow
   - `QuickLookControllerView` (single Quick Look controller)
 
@@ -44,8 +44,8 @@ It is geared toward experienced macOS developers who want to extend or refactor 
 
 ## View Mode Implementation Guide
 
-1. Add a new case to `ViewMode` in `CoverFlowFinder/ViewModels/FileBrowserViewModel.swift`.
-2. Add the view mode picker entry in `CoverFlowFinder/Views/ContentView.swift`.
+1. Add a new case to `ViewMode` in `FlowFinder/ViewModels/FileBrowserViewModel.swift`.
+2. Add the view mode picker entry in `FlowFinder/Views/ContentView.swift`.
 3. Update `TabContentWrapper.mainContentView` to render the new view.
 4. Use `viewModel.filteredItems` as input, not `items`.
 5. Use `viewModel.handleSelection` for click selection (Shift/Cmd support).

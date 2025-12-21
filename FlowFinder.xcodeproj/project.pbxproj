@@ -1,0 +1,513 @@
+// !$*UTF8*$!
+{
+	archiveVersion = 1;
+	classes = {
+	};
+	objectVersion = 56;
+	objects = {
+
+/* Begin PBXBuildFile section */
+		A1000033001 /* FlowFinder.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000033000 /* FlowFinder.icon */; };
+		A1000001001 /* FlowFinderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000001000 /* FlowFinderApp.swift */; };
+		A1000002001 /* FileItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002000 /* FileItem.swift */; };
+		A1000002003 /* ListColumnConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002002 /* ListColumnConfig.swift */; };
+		A1000003001 /* FileBrowserViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000003000 /* FileBrowserViewModel.swift */; };
+		A1000004001 /* ContentView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000004000 /* ContentView.swift */; };
+		A1000005001 /* CoverFlowView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000005000 /* CoverFlowView.swift */; };
+		A1000006001 /* SidebarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000006000 /* SidebarView.swift */; };
+		A1000007001 /* IconGridView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000007000 /* IconGridView.swift */; };
+		A1000008001 /* FileListView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000008000 /* FileListView.swift */; };
+		A1000009001 /* ColumnView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000009000 /* ColumnView.swift */; };
+		A100000A001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A100000A000 /* Assets.xcassets */; };
+		A100001E001 /* DualPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100001E000 /* DualPaneView.swift */; };
+		A100001F001 /* FileInfoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100001F000 /* FileInfoView.swift */; };
+		A1000020001 /* KeyboardHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000020000 /* KeyboardHandler.swift */; };
+		A1000021001 /* QuickLookController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000021000 /* QuickLookController.swift */; };
+		A1000023001 /* TabBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000023000 /* TabBarView.swift */; };
+		A1000024001 /* ThumbnailCacheManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000024000 /* ThumbnailCacheManager.swift */; };
+		A1000025001 /* QuadPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000025000 /* QuadPaneView.swift */; };
+		A1000026001 /* ZipArchiveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000026000 /* ZipArchiveManager.swift */; };
+		A1000027001 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000027000 /* AppSettings.swift */; };
+		A1000032001 /* FinderSoundEffects.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000032000 /* FinderSoundEffects.swift */; };
+		A1000028001 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000028000 /* SettingsView.swift */; };
+		A1000029001 /* MasonryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000029000 /* MasonryView.swift */; };
+		A100002A001 /* FileTableView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002A000 /* FileTableView.swift */; };
+		A100002B001 /* FileTableCellViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002B000 /* FileTableCellViews.swift */; };
+		A100002D001 /* PerFolderColumnState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002D000 /* PerFolderColumnState.swift */; };
+		A100002E001 /* UIConstants.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002E000 /* UIConstants.swift */; };
+		A100002F001 /* DropHelper.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002F000 /* DropHelper.swift */; };
+		A1000030001 /* ViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000030000 /* ViewModifiers.swift */; };
+		A1000031001 /* AsyncListIconView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000031000 /* AsyncListIconView.swift */; };
+/* End PBXBuildFile section */
+
+/* Begin PBXFileReference section */
+		A1000000000 /* FlowFinder.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FlowFinder.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		A1000001000 /* FlowFinderApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FlowFinderApp.swift; sourceTree = "<group>"; };
+		A1000002000 /* FileItem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileItem.swift; sourceTree = "<group>"; };
+		A1000002002 /* ListColumnConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ListColumnConfig.swift; sourceTree = "<group>"; };
+		A1000003000 /* FileBrowserViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileBrowserViewModel.swift; sourceTree = "<group>"; };
+		A1000004000 /* ContentView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContentView.swift; sourceTree = "<group>"; };
+		A1000005000 /* CoverFlowView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CoverFlowView.swift; sourceTree = "<group>"; };
+		A1000006000 /* SidebarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SidebarView.swift; sourceTree = "<group>"; };
+		A1000007000 /* IconGridView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IconGridView.swift; sourceTree = "<group>"; };
+		A1000008000 /* FileListView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileListView.swift; sourceTree = "<group>"; };
+		A1000009000 /* ColumnView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ColumnView.swift; sourceTree = "<group>"; };
+		A100000A000 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		A100000B000 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A100000C000 /* FlowFinder.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = FlowFinder.entitlements; sourceTree = "<group>"; };
+		A100001E000 /* DualPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DualPaneView.swift; sourceTree = "<group>"; };
+		A100001F000 /* FileInfoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileInfoView.swift; sourceTree = "<group>"; };
+		A1000020000 /* KeyboardHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardHandler.swift; sourceTree = "<group>"; };
+		A1000021000 /* QuickLookController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookController.swift; sourceTree = "<group>"; };
+		A1000023000 /* TabBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabBarView.swift; sourceTree = "<group>"; };
+		A1000024000 /* ThumbnailCacheManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailCacheManager.swift; sourceTree = "<group>"; };
+		A1000025000 /* QuadPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuadPaneView.swift; sourceTree = "<group>"; };
+		A1000026000 /* ZipArchiveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipArchiveManager.swift; sourceTree = "<group>"; };
+		A1000027000 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
+		A1000032000 /* FinderSoundEffects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderSoundEffects.swift; sourceTree = "<group>"; };
+		A1000028000 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
+		A1000029000 /* MasonryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MasonryView.swift; sourceTree = "<group>"; };
+		A100002A000 /* FileTableView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTableView.swift; sourceTree = "<group>"; };
+		A100002B000 /* FileTableCellViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTableCellViews.swift; sourceTree = "<group>"; };
+		A100002D000 /* PerFolderColumnState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerFolderColumnState.swift; sourceTree = "<group>"; };
+		A100002E000 /* UIConstants.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = UIConstants.swift; sourceTree = "<group>"; };
+		A100002F000 /* DropHelper.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DropHelper.swift; sourceTree = "<group>"; };
+		A1000030000 /* ViewModifiers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewModifiers.swift; sourceTree = "<group>"; };
+		A1000031000 /* AsyncListIconView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AsyncListIconView.swift; sourceTree = "<group>"; };
+		A1000033000 /* FlowFinder.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer; path = FlowFinder.icon; sourceTree = "<group>"; };
+/* End PBXFileReference section */
+
+/* Begin PBXFrameworksBuildPhase section */
+		A100000D000 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXFrameworksBuildPhase section */
+
+/* Begin PBXGroup section */
+		A100000E000 = {
+			isa = PBXGroup;
+			children = (
+				A100000F000 /* FlowFinder */,
+				A1000010000 /* Products */,
+			);
+			sourceTree = "<group>";
+		};
+		A100000F000 /* FlowFinder */ = {
+			isa = PBXGroup;
+			children = (
+				A1000001000 /* FlowFinderApp.swift */,
+				A1000011000 /* Models */,
+				A1000012000 /* ViewModels */,
+				A1000013000 /* Views */,
+				A100000A000 /* Assets.xcassets */,
+				A1000033000 /* FlowFinder.icon */,
+				A100000B000 /* Info.plist */,
+				A100000C000 /* FlowFinder.entitlements */,
+			);
+			path = FlowFinder;
+			sourceTree = "<group>";
+		};
+		A1000010000 /* Products */ = {
+			isa = PBXGroup;
+			children = (
+				A1000000000 /* FlowFinder.app */,
+			);
+			name = Products;
+			sourceTree = "<group>";
+		};
+		A1000011000 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				A1000027000 /* AppSettings.swift */,
+				A1000032000 /* FinderSoundEffects.swift */,
+				A1000002000 /* FileItem.swift */,
+				A1000002002 /* ListColumnConfig.swift */,
+				A100002D000 /* PerFolderColumnState.swift */,
+				A1000024000 /* ThumbnailCacheManager.swift */,
+				A100002E000 /* UIConstants.swift */,
+				A1000026000 /* ZipArchiveManager.swift */,
+			);
+			path = Models;
+			sourceTree = "<group>";
+		};
+		A1000012000 /* ViewModels */ = {
+			isa = PBXGroup;
+			children = (
+				A1000003000 /* FileBrowserViewModel.swift */,
+			);
+			path = ViewModels;
+			sourceTree = "<group>";
+		};
+		A1000013000 /* Views */ = {
+			isa = PBXGroup;
+			children = (
+				A100002C000 /* TableView */,
+				A1000031000 /* AsyncListIconView.swift */,
+				A1000004000 /* ContentView.swift */,
+				A1000005000 /* CoverFlowView.swift */,
+				A100002F000 /* DropHelper.swift */,
+				A1000006000 /* SidebarView.swift */,
+				A1000007000 /* IconGridView.swift */,
+				A1000008000 /* FileListView.swift */,
+				A1000009000 /* ColumnView.swift */,
+				A100001E000 /* DualPaneView.swift */,
+				A1000025000 /* QuadPaneView.swift */,
+				A100001F000 /* FileInfoView.swift */,
+				A1000020000 /* KeyboardHandler.swift */,
+				A1000021000 /* QuickLookController.swift */,
+				A1000023000 /* TabBarView.swift */,
+				A1000028000 /* SettingsView.swift */,
+				A1000029000 /* MasonryView.swift */,
+				A1000030000 /* ViewModifiers.swift */,
+			);
+			path = Views;
+			sourceTree = "<group>";
+		};
+		A100002C000 /* TableView */ = {
+			isa = PBXGroup;
+			children = (
+				A100002A000 /* FileTableView.swift */,
+				A100002B000 /* FileTableCellViews.swift */,
+			);
+			path = TableView;
+			sourceTree = "<group>";
+		};
+/* End PBXGroup section */
+
+/* Begin PBXNativeTarget section */
+		A1000014000 /* FlowFinder */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A1000015000 /* Build configuration list for PBXNativeTarget "FlowFinder" */;
+			buildPhases = (
+				A1000016000 /* Sources */,
+				A100000D000 /* Frameworks */,
+				A1000017000 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = FlowFinder;
+			productName = FlowFinder;
+			productReference = A1000000000 /* FlowFinder.app */;
+			productType = "com.apple.product-type.application";
+		};
+/* End PBXNativeTarget section */
+
+/* Begin PBXProject section */
+		A1000018000 /* Project object */ = {
+			isa = PBXProject;
+			attributes = {
+				BuildIndependentTargetsInParallel = 1;
+				LastSwiftUpdateCheck = 1500;
+				LastUpgradeCheck = 2620;
+				TargetAttributes = {
+					A1000014000 = {
+						CreatedOnToolsVersion = 15.0;
+					};
+				};
+			};
+			buildConfigurationList = A1000019000 /* Build configuration list for PBXProject "FlowFinder" */;
+			compatibilityVersion = "Xcode 14.0";
+			developmentRegion = en;
+			hasScannedForEncodings = 0;
+			knownRegions = (
+				en,
+				Base,
+			);
+			mainGroup = A100000E000;
+			productRefGroup = A1000010000 /* Products */;
+			projectDirPath = "";
+			projectRoot = "";
+			targets = (
+				A1000014000 /* FlowFinder */,
+			);
+		};
+/* End PBXProject section */
+
+/* Begin PBXResourcesBuildPhase section */
+		A1000017000 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A100000A001 /* Assets.xcassets in Resources */,
+				A1000033001 /* FlowFinder.icon in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXResourcesBuildPhase section */
+
+/* Begin PBXSourcesBuildPhase section */
+		A1000016000 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A1000001001 /* FlowFinderApp.swift in Sources */,
+				A1000002001 /* FileItem.swift in Sources */,
+				A1000002003 /* ListColumnConfig.swift in Sources */,
+				A1000003001 /* FileBrowserViewModel.swift in Sources */,
+				A1000004001 /* ContentView.swift in Sources */,
+				A1000005001 /* CoverFlowView.swift in Sources */,
+				A1000006001 /* SidebarView.swift in Sources */,
+				A1000007001 /* IconGridView.swift in Sources */,
+				A1000008001 /* FileListView.swift in Sources */,
+				A1000009001 /* ColumnView.swift in Sources */,
+				A100001E001 /* DualPaneView.swift in Sources */,
+				A1000025001 /* QuadPaneView.swift in Sources */,
+				A100001F001 /* FileInfoView.swift in Sources */,
+				A1000020001 /* KeyboardHandler.swift in Sources */,
+				A1000021001 /* QuickLookController.swift in Sources */,
+				A1000023001 /* TabBarView.swift in Sources */,
+				A1000024001 /* ThumbnailCacheManager.swift in Sources */,
+				A1000026001 /* ZipArchiveManager.swift in Sources */,
+				A1000027001 /* AppSettings.swift in Sources */,
+				A1000032001 /* FinderSoundEffects.swift in Sources */,
+				A1000028001 /* SettingsView.swift in Sources */,
+				A1000029001 /* MasonryView.swift in Sources */,
+				A100002A001 /* FileTableView.swift in Sources */,
+				A100002B001 /* FileTableCellViews.swift in Sources */,
+				A100002D001 /* PerFolderColumnState.swift in Sources */,
+				A100002E001 /* UIConstants.swift in Sources */,
+				A100002F001 /* DropHelper.swift in Sources */,
+				A1000030001 /* ViewModifiers.swift in Sources */,
+				A1000031001 /* AsyncListIconView.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXSourcesBuildPhase section */
+
+/* Begin XCBuildConfiguration section */
+		A100001A000 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = RH4U5VJHM6;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_TESTABILITY = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_DYNAMIC_NO_PIC = NO;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_OPTIMIZATION_LEVEL = 0;
+				GCC_PREPROCESSOR_DEFINITIONS = (
+					"DEBUG=1",
+					"$(inherited)",
+				);
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = INCLUDE_SOURCE;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = YES;
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
+				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
+			};
+			name = Debug;
+		};
+		A100001B000 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ALWAYS_SEARCH_USER_PATHS = NO;
+				ASSETCATALOG_COMPILER_GENERATE_SWIFT_ASSET_SYMBOL_EXTENSIONS = YES;
+				CLANG_ANALYZER_NONNULL = YES;
+				CLANG_ANALYZER_NUMBER_OBJECT_CONVERSION = YES_AGGRESSIVE;
+				CLANG_CXX_LANGUAGE_STANDARD = "gnu++20";
+				CLANG_ENABLE_MODULES = YES;
+				CLANG_ENABLE_OBJC_ARC = YES;
+				CLANG_ENABLE_OBJC_WEAK = YES;
+				CLANG_WARN_BLOCK_CAPTURE_AUTORELEASING = YES;
+				CLANG_WARN_BOOL_CONVERSION = YES;
+				CLANG_WARN_COMMA = YES;
+				CLANG_WARN_CONSTANT_CONVERSION = YES;
+				CLANG_WARN_DEPRECATED_OBJC_IMPLEMENTATIONS = YES;
+				CLANG_WARN_DIRECT_OBJC_ISA_USAGE = YES_ERROR;
+				CLANG_WARN_DOCUMENTATION_COMMENTS = YES;
+				CLANG_WARN_EMPTY_BODY = YES;
+				CLANG_WARN_ENUM_CONVERSION = YES;
+				CLANG_WARN_INFINITE_RECURSION = YES;
+				CLANG_WARN_INT_CONVERSION = YES;
+				CLANG_WARN_NON_LITERAL_NULL_CONVERSION = YES;
+				CLANG_WARN_OBJC_IMPLICIT_RETAIN_SELF = YES;
+				CLANG_WARN_OBJC_LITERAL_CONVERSION = YES;
+				CLANG_WARN_OBJC_ROOT_CLASS = YES_ERROR;
+				CLANG_WARN_QUOTED_INCLUDE_IN_FRAMEWORK_HEADER = YES;
+				CLANG_WARN_RANGE_LOOP_ANALYSIS = YES;
+				CLANG_WARN_STRICT_PROTOTYPES = YES;
+				CLANG_WARN_SUSPICIOUS_MOVE = YES;
+				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
+				CLANG_WARN_UNREACHABLE_CODE = YES;
+				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
+				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
+				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = RH4U5VJHM6;
+				ENABLE_NS_ASSERTIONS = NO;
+				ENABLE_STRICT_OBJC_MSGSEND = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				GCC_C_LANGUAGE_STANDARD = gnu17;
+				GCC_NO_COMMON_BLOCKS = YES;
+				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
+				GCC_WARN_ABOUT_RETURN_TYPE = YES_ERROR;
+				GCC_WARN_UNDECLARED_SELECTOR = YES;
+				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
+				GCC_WARN_UNUSED_FUNCTION = YES;
+				GCC_WARN_UNUSED_VARIABLE = YES;
+				MACOSX_DEPLOYMENT_TARGET = 13.0;
+				MTL_ENABLE_DEBUG_INFO = NO;
+				MTL_FAST_MATH = YES;
+				ONLY_ACTIVE_ARCH = NO;
+				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
+				SWIFT_COMPILATION_MODE = wholemodule;
+			};
+			name = Release;
+		};
+		A100001C000 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = FlowFinder;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				AUTOMATION_APPLE_EVENTS = NO;
+				CODE_SIGN_ENTITLEMENTS = FlowFinder/FlowFinder.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 3;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
+				"DEVELOPMENT_TEAM[sdk=macosx*]" = RH4U5VJHM6;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FlowFinder/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Flow Finder";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.20.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.flowfinder.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
+				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
+				RUNTIME_EXCEPTION_ALLOW_UNSIGNED_EXECUTABLE_MEMORY = NO;
+				RUNTIME_EXCEPTION_DEBUGGING_TOOL = NO;
+				RUNTIME_EXCEPTION_DISABLE_EXECUTABLE_PAGE_PROTECTION = NO;
+				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Debug;
+		};
+		A100001D000 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				ASSETCATALOG_COMPILER_APPICON_NAME = FlowFinder;
+				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				AUTOMATION_APPLE_EVENTS = NO;
+				CODE_SIGN_ENTITLEMENTS = FlowFinder/FlowFinder.entitlements;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
+				COMBINE_HIDPI_IMAGES = YES;
+				CURRENT_PROJECT_VERSION = 3;
+				DEAD_CODE_STRIPPING = YES;
+				DEVELOPMENT_TEAM = "";
+				"DEVELOPMENT_TEAM[sdk=macosx*]" = RH4U5VJHM6;
+				ENABLE_APP_SANDBOX = NO;
+				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = FlowFinder/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = "Flow Finder";
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
+				INFOPLIST_KEY_NSHumanReadableCopyright = "";
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/../Frameworks",
+				);
+				MARKETING_VERSION = 1.20.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.flowfinder.app;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
+				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
+				RUNTIME_EXCEPTION_ALLOW_UNSIGNED_EXECUTABLE_MEMORY = NO;
+				RUNTIME_EXCEPTION_DEBUGGING_TOOL = NO;
+				RUNTIME_EXCEPTION_DISABLE_EXECUTABLE_PAGE_PROTECTION = NO;
+				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = NO;
+				SWIFT_EMIT_LOC_STRINGS = YES;
+				SWIFT_VERSION = 5.0;
+			};
+			name = Release;
+		};
+/* End XCBuildConfiguration section */
+
+/* Begin XCConfigurationList section */
+		A1000015000 /* Build configuration list for PBXNativeTarget "FlowFinder" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A100001C000 /* Debug */,
+				A100001D000 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+		A1000019000 /* Build configuration list for PBXProject "FlowFinder" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A100001A000 /* Debug */,
+				A100001B000 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
+/* End XCConfigurationList section */
+	};
+	rootObject = A1000018000 /* Project object */;
+}
