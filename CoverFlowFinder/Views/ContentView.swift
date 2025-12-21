@@ -728,7 +728,9 @@ struct SearchField: NSViewRepresentable {
     }
 }
 
+#if DEBUG
 #Preview {
     ContentView()
         .environmentObject(AppSettings.shared)
 }
+#endif
