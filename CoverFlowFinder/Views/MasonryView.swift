@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Photos
 import Quartz
 
 struct MasonryView: View {
@@ -44,7 +45,7 @@ struct MasonryView: View {
         return max(1, width)
     }
 
-    private var labelHeight: CGFloat {
+    private var baseLabelHeight: CGFloat {
         max(26, CGFloat(settings.iconGridFontSize) * 2.4)
     }
 
@@ -84,7 +85,11 @@ struct MasonryView: View {
         let imageHeight = tileHeight(for: item)
         let tagHeight: CGFloat = settings.showItemTags && !item.tags.isEmpty ? 12 : 0
         let verticalPadding: CGFloat = 12
-        return imageHeight + labelHeight + tagHeight + verticalPadding
+        return imageHeight + labelHeight(for: item) + tagHeight + verticalPadding
+    }
+
+    private func labelHeight(for item: FileItem) -> CGFloat {
+        settings.masonryShowFilenames || viewModel.renamingURL == item.url ? baseLabelHeight : 0
     }
 
     private struct MasonryPosition {
@@ -141,7 +146,8 @@ struct MasonryView: View {
                                         thumbnail: thumbnails[item.url],
                                         columnWidth: columnWidth,
                                         imageHeight: imageHeight,
-                                        labelHeight: labelHeight,
+                                        labelHeight: labelHeight(for: item),
+                                        showLabels: settings.masonryShowFilenames || viewModel.renamingURL == item.url,
                                         dropTargetedItemID: $dropTargetedItemID,
                                         onSelect: { selectItem($0) }
                                     )
@@ -343,6 +349,11 @@ struct MasonryView: View {
         let url = item.url
         let targetPixelSize = targetThumbnailPixelSize
 
+        if viewModel.isPhotosItem(item) {
+            loadPhotosThumbnail(for: item, targetPixelSize: targetPixelSize)
+            return
+        }
+
         if let existing = thumbnails[url], imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
             return
         }
@@ -371,6 +382,25 @@ struct MasonryView: View {
                 } else {
                     thumbnails[url] = item.icon
                 }
+            }
+        }
+    }
+
+    private func loadPhotosThumbnail(for item: FileItem, targetPixelSize: CGFloat) {
+        let url = item.url
+
+        if let existing = thumbnails[url], imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
+            return
+        }
+
+        viewModel.requestPhotoThumbnail(for: item, targetPixelSize: targetPixelSize) { image, ratio in
+            if let image {
+                thumbnails[url] = image
+            } else {
+                thumbnails[url] = item.icon
+            }
+            if let ratio {
+                aspectRatios[url] = ratio
             }
         }
     }
@@ -437,6 +467,7 @@ struct MasonryItemView: View {
     let columnWidth: CGFloat
     let imageHeight: CGFloat
     let labelHeight: CGFloat
+    let showLabels: Bool
     @Binding var dropTargetedItemID: UUID?
     let onSelect: (FileItem) -> Void
 
@@ -477,20 +508,22 @@ struct MasonryItemView: View {
                     .opacity(dropTargetedItemID == item.id ? 1 : 0)
             )
 
-            InlineRenameField(
-                item: item,
-                viewModel: viewModel,
-                font: settings.iconGridFont,
-                alignment: .center,
-                lineLimit: 2
-            )
-            .frame(width: columnWidth - (labelPadding * 2), height: labelHeight, alignment: .center)
-            .padding(.horizontal, labelPadding)
-            .background(
-                RoundedRectangle(cornerRadius: 6)
-                    .fill(isSelected && viewModel.renamingURL != item.url ? Color.accentColor.opacity(0.9) : Color.clear)
-            )
-            .foregroundColor(isSelected && viewModel.renamingURL != item.url ? .white : .primary)
+            if showLabels {
+                InlineRenameField(
+                    item: item,
+                    viewModel: viewModel,
+                    font: settings.iconGridFont,
+                    alignment: .center,
+                    lineLimit: 2
+                )
+                .frame(width: columnWidth - (labelPadding * 2), height: labelHeight, alignment: .center)
+                .padding(.horizontal, labelPadding)
+                .background(
+                    RoundedRectangle(cornerRadius: 6)
+                        .fill(isSelected && viewModel.renamingURL != item.url ? Color.accentColor.opacity(0.9) : Color.clear)
+                )
+                .foregroundColor(isSelected && viewModel.renamingURL != item.url ? .white : .primary)
+            }
 
             if settings.showItemTags, !item.tags.isEmpty {
                 TagDotsView(tags: item.tags)
@@ -512,7 +545,7 @@ struct MasonryItemView: View {
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .onDrag {
             guard !item.isFromArchive else { return NSItemProvider() }
-            return NSItemProvider(object: item.url as NSURL)
+            return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
         }
         .onDrop(of: [.fileURL], delegate: FolderDropDelegate(
             item: item,
@@ -534,4 +567,950 @@ struct MasonryItemView: View {
             }
         }
     }
+}
+
+struct PhotosMasonryView: View {
+    @EnvironmentObject private var settings: AppSettings
+    @ObservedObject var viewModel: FileBrowserViewModel
+    let items: [FileItem]
+
+    @State private var pinchStartIconSize: Double?
+    @State private var pinchStartSpacing: Double?
+    @State private var pinchStartFontSize: Double?
+
+    var body: some View {
+        PhotosMasonryRepresentable(
+            viewModel: viewModel,
+            items: items,
+            iconSize: settings.iconGridIconSize,
+            spacing: settings.iconGridSpacing,
+            fontSize: settings.iconGridFontSize,
+            showFilenames: settings.masonryShowFilenames,
+            thumbnailQuality: settings.thumbnailQuality
+        )
+        .background(Color(nsColor: .controlBackgroundColor))
+        .simultaneousGesture(magnificationGesture)
+    }
+
+    private var magnificationGesture: some Gesture {
+        MagnificationGesture()
+            .onChanged { value in
+                if pinchStartIconSize == nil {
+                    pinchStartIconSize = settings.iconGridIconSize
+                    pinchStartSpacing = settings.iconGridSpacing
+                    pinchStartFontSize = settings.iconGridFontSize
+                }
+
+                let baseIcon = pinchStartIconSize ?? settings.iconGridIconSize
+                let baseSpacing = pinchStartSpacing ?? settings.iconGridSpacing
+                let baseFont = pinchStartFontSize ?? settings.iconGridFontSize
+
+                settings.iconGridIconSize = clamp(baseIcon * Double(value), range: 48...160)
+                settings.iconGridSpacing = clamp(baseSpacing * Double(value), range: 12...40)
+                settings.iconGridFontSize = clamp(baseFont * Double(value), range: 9...16)
+            }
+            .onEnded { _ in
+                pinchStartIconSize = nil
+                pinchStartSpacing = nil
+                pinchStartFontSize = nil
+            }
+    }
+
+    private func clamp(_ value: Double, range: ClosedRange<Double>) -> Double {
+        min(max(value, range.lowerBound), range.upperBound)
+    }
+}
+
+private struct PhotosMasonryRepresentable: NSViewRepresentable {
+    @ObservedObject var viewModel: FileBrowserViewModel
+    let items: [FileItem]
+    let iconSize: Double
+    let spacing: Double
+    let fontSize: Double
+    let showFilenames: Bool
+    let thumbnailQuality: Double
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(viewModel: viewModel)
+    }
+
+    @MainActor func makeNSView(context: Context) -> NSScrollView {
+        let layout = PhotosMasonryLayout()
+        layout.itemHeightProvider = { [weak coordinator = context.coordinator] indexPath, columnWidth in
+            guard let coordinator else { return columnWidth }
+            return coordinator.imageHeight(for: indexPath, columnWidth: columnWidth)
+        }
+
+        let collectionView = PhotosMasonryCollectionView()
+        collectionView.collectionViewLayout = layout
+        collectionView.backgroundColors = [.clear]
+        collectionView.isSelectable = true
+        collectionView.allowsMultipleSelection = true
+        collectionView.setDraggingSourceOperationMask(.copy, forLocal: true)
+        collectionView.setDraggingSourceOperationMask(.copy, forLocal: false)
+        collectionView.dataSource = context.coordinator
+        collectionView.delegate = context.coordinator
+        collectionView.register(PhotosMasonryItem.self, forItemWithIdentifier: PhotosMasonryItem.identifier)
+        collectionView.onOpen = { [weak coordinator = context.coordinator] in
+            coordinator?.openSelection()
+        }
+        collectionView.onQuickLook = { [weak coordinator = context.coordinator] in
+            coordinator?.toggleQuickLook()
+        }
+
+        let scrollView = NSScrollView()
+        scrollView.drawsBackground = false
+        scrollView.hasVerticalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.documentView = collectionView
+        scrollView.contentView.postsBoundsChangedNotifications = true
+
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.boundsDidChange(_:)),
+            name: NSView.boundsDidChangeNotification,
+            object: scrollView.contentView
+        )
+
+        context.coordinator.collectionView = collectionView
+        context.coordinator.scrollView = scrollView
+        context.coordinator.update(
+            viewModel: viewModel,
+            items: items,
+            iconSize: iconSize,
+            spacing: spacing,
+            fontSize: fontSize,
+            showFilenames: showFilenames,
+            thumbnailQuality: thumbnailQuality,
+            forceReload: true
+        )
+
+        return scrollView
+    }
+
+    @MainActor func updateNSView(_ nsView: NSScrollView, context: Context) {
+        context.coordinator.update(
+            viewModel: viewModel,
+            items: items,
+            iconSize: iconSize,
+            spacing: spacing,
+            fontSize: fontSize,
+            showFilenames: showFilenames,
+            thumbnailQuality: thumbnailQuality,
+            forceReload: false
+        )
+    }
+
+    @MainActor static func dismantleNSView(_ nsView: NSScrollView, coordinator: Coordinator) {
+        coordinator.teardown()
+    }
+
+    @MainActor
+    final class Coordinator: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegate, NSFilePromiseProviderDelegate {
+        private struct ItemsSignature: Equatable {
+            let count: Int
+            let firstID: UUID?
+            let lastID: UUID?
+        }
+        private struct PromiseInfo {
+            let item: FileItem
+            let filename: String
+        }
+
+        var viewModel: FileBrowserViewModel
+        weak var collectionView: PhotosMasonryCollectionView?
+        weak var scrollView: NSScrollView?
+
+        private var items: [FileItem] = []
+        private var itemIndexByID: [UUID: Int] = [:]
+        private var itemsSignature: ItemsSignature?
+
+        private var iconSize: CGFloat = 80
+        private var spacing: CGFloat = 24
+        private var fontSize: CGFloat = 12
+        private var showFilenames = false
+        private var thumbnailQuality: CGFloat = 1.0
+
+        private var targetPixelSize: CGFloat = 256
+        private var previousPreheatRect: NSRect = .zero
+        private var lastLayoutWidth: CGFloat = 0
+
+        private let thumbnailCache = NSCache<NSString, NSImage>()
+        private var pendingThumbnailKeys: Set<String> = []
+        private var aspectRatios: [String: CGFloat] = [:]
+
+        private var isUpdatingSelection = false
+
+        init(viewModel: FileBrowserViewModel) {
+            self.viewModel = viewModel
+            thumbnailCache.countLimit = 600
+        }
+
+        func update(
+            viewModel: FileBrowserViewModel,
+            items: [FileItem],
+            iconSize: Double,
+            spacing: Double,
+            fontSize: Double,
+            showFilenames: Bool,
+            thumbnailQuality: Double,
+            forceReload: Bool
+        ) {
+            self.viewModel = viewModel
+
+            let newSignature = ItemsSignature(
+                count: items.count,
+                firstID: items.first?.id,
+                lastID: items.last?.id
+            )
+
+            let settingsChanged = updateSettings(
+                iconSize: iconSize,
+                spacing: spacing,
+                fontSize: fontSize,
+                showFilenames: showFilenames,
+                thumbnailQuality: thumbnailQuality
+            )
+
+            updateLayoutForWidthIfNeeded()
+
+            let previousCount = self.items.count
+            let canAppend = !forceReload &&
+                itemsSignature?.firstID == newSignature.firstID &&
+                items.count > previousCount &&
+                (collectionView?.numberOfItems(inSection: 0) ?? previousCount) == previousCount
+
+            if canAppend {
+                itemsSignature = newSignature
+                self.items = items
+                for index in previousCount..<items.count {
+                    itemIndexByID[items[index].id] = index
+                }
+                let indexPaths = Set((previousCount..<items.count).map { IndexPath(item: $0, section: 0) })
+                collectionView?.insertItems(at: indexPaths)
+            } else if forceReload || itemsSignature != newSignature {
+                itemsSignature = newSignature
+                self.items = items
+                rebuildIndexMap()
+                collectionView?.reloadData()
+                resetPreheat()
+            } else if settingsChanged {
+                collectionView?.collectionViewLayout?.invalidateLayout()
+                refreshVisibleItems()
+            }
+
+            applySelectionFromViewModel()
+            if forceReload || itemsSignature != newSignature || canAppend || settingsChanged {
+                updatePreheat()
+            }
+        }
+
+        func teardown() {
+            if let contentView = scrollView?.contentView {
+                NotificationCenter.default.removeObserver(self, name: NSView.boundsDidChangeNotification, object: contentView)
+            }
+            viewModel.stopCachingAllPhotos()
+            pendingThumbnailKeys.removeAll()
+            thumbnailCache.removeAllObjects()
+        }
+
+        private func updateSettings(
+            iconSize: Double,
+            spacing: Double,
+            fontSize: Double,
+            showFilenames: Bool,
+            thumbnailQuality: Double
+        ) -> Bool {
+            let iconSize = CGFloat(iconSize)
+            let spacing = CGFloat(spacing)
+            let fontSize = CGFloat(fontSize)
+            let thumbnailQuality = CGFloat(thumbnailQuality)
+
+            let changed = self.iconSize != iconSize ||
+                self.spacing != spacing ||
+                self.fontSize != fontSize ||
+                self.showFilenames != showFilenames ||
+                self.thumbnailQuality != thumbnailQuality
+
+            guard changed else { return false }
+
+            self.iconSize = iconSize
+            self.spacing = spacing
+            self.fontSize = fontSize
+            self.showFilenames = showFilenames
+            self.thumbnailQuality = thumbnailQuality
+
+            updateLayoutSettings()
+            return true
+        }
+
+        private func updateLayoutSettings() {
+            guard let collectionView,
+                  let layout = collectionView.collectionViewLayout as? PhotosMasonryLayout else { return }
+
+            lastLayoutWidth = collectionView.bounds.width
+            layout.columnSpacing = max(12, spacing * 0.6)
+            layout.idealColumnWidth = max(180, iconSize * 2.4)
+            layout.contentInsets = NSEdgeInsets(top: 16, left: 16, bottom: 16, right: 16)
+            layout.labelHeight = showFilenames ? max(26, fontSize * 2.4) : 0
+            layout.showsLabels = showFilenames
+
+            let metrics = PhotosMasonryLayout.columnMetrics(
+                for: collectionView.bounds.width,
+                idealColumnWidth: layout.idealColumnWidth,
+                spacing: layout.columnSpacing,
+                insets: layout.contentInsets
+            )
+            let scale = collectionView.window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+            let newTarget = thumbnailPixelSize(columnWidth: metrics.width, scale: scale, quality: thumbnailQuality)
+
+            if abs(newTarget - targetPixelSize) >= 8 {
+                targetPixelSize = newTarget
+                thumbnailCache.removeAllObjects()
+                pendingThumbnailKeys.removeAll()
+                resetPreheat()
+            }
+        }
+
+        private func thumbnailPixelSize(columnWidth: CGFloat, scale: CGFloat, quality: CGFloat) -> CGFloat {
+            let target = columnWidth * scale * quality
+            let bucket = (target / 128).rounded() * 128
+            return min(1024, max(256, bucket))
+        }
+
+        private func rebuildIndexMap() {
+            itemIndexByID.removeAll(keepingCapacity: true)
+            for (index, item) in items.enumerated() {
+                itemIndexByID[item.id] = index
+            }
+        }
+
+        private func refreshVisibleItems() {
+            guard let collectionView,
+                  let layout = collectionView.collectionViewLayout as? PhotosMasonryLayout else { return }
+            let layoutAttributes = layout.layoutAttributesForElements(in: collectionView.visibleRect)
+            for attributes in layoutAttributes {
+                guard let indexPath = attributes.indexPath else { continue }
+                guard let item = collectionView.item(at: indexPath) as? PhotosMasonryItem else { continue }
+                configure(item: item, at: indexPath)
+            }
+        }
+
+        private func configure(item: PhotosMasonryItem, at indexPath: IndexPath) {
+            guard items.indices.contains(indexPath.item) else { return }
+            let fileItem = items[indexPath.item]
+            let columnWidth = (collectionView?.collectionViewLayout as? PhotosMasonryLayout)?.currentColumnWidth ?? max(1, collectionView?.bounds.width ?? 1)
+            let imageHeight = imageHeight(for: fileItem, columnWidth: columnWidth)
+            let labelHeight = showFilenames ? max(26, fontSize * 2.4) : 0
+            let image = thumbnail(for: fileItem)
+
+            item.configure(
+                item: fileItem,
+                image: image,
+                imageHeight: imageHeight,
+                labelHeight: labelHeight,
+                showTitle: showFilenames,
+                fontSize: fontSize
+            )
+        }
+
+        func imageHeight(for indexPath: IndexPath, columnWidth: CGFloat) -> CGFloat {
+            guard items.indices.contains(indexPath.item) else { return columnWidth }
+            return imageHeight(for: items[indexPath.item], columnWidth: columnWidth)
+        }
+
+        private func imageHeight(for item: FileItem, columnWidth: CGFloat) -> CGFloat {
+            let ratio = aspectRatio(for: item)
+            return max(1, columnWidth / ratio)
+        }
+
+        private func aspectRatio(for item: FileItem) -> CGFloat {
+            let key = item.url.absoluteString
+            if let cached = aspectRatios[key] {
+                return cached
+            }
+            if let ratio = viewModel.photosAssetAspectRatio(for: item) {
+                aspectRatios[key] = ratio
+                return ratio
+            }
+            return 4.0 / 3.0
+        }
+
+        private func thumbnail(for item: FileItem) -> NSImage? {
+            guard let identifier = viewModel.photosAssetIdentifier(for: item) else {
+                return item.icon
+            }
+
+            let cacheKey = "\(identifier)-\(Int(targetPixelSize))"
+            if let cached = thumbnailCache.object(forKey: cacheKey as NSString) {
+                return cached
+            }
+            if pendingThumbnailKeys.contains(cacheKey) {
+                return nil
+            }
+
+            pendingThumbnailKeys.insert(cacheKey)
+            let itemID = item.id
+            viewModel.requestPhotoThumbnail(for: item, targetPixelSize: targetPixelSize) { [weak self] image, _ in
+                guard let self else { return }
+                self.pendingThumbnailKeys.remove(cacheKey)
+
+                if let image {
+                    self.thumbnailCache.setObject(image, forKey: cacheKey as NSString)
+                }
+
+                guard let index = self.itemIndexByID[itemID] else { return }
+                let indexPath = IndexPath(item: index, section: 0)
+                guard let cell = self.collectionView?.item(at: indexPath) as? PhotosMasonryItem else { return }
+                cell.updateImage(image)
+            }
+
+            return nil
+        }
+
+        private func resetPreheat() {
+            previousPreheatRect = .zero
+            viewModel.stopCachingAllPhotos()
+        }
+
+        private func updateLayoutForWidthIfNeeded() {
+            guard let collectionView else { return }
+            let width = collectionView.bounds.width
+            guard width > 0, abs(width - lastLayoutWidth) > 1 else { return }
+            updateLayoutSettings()
+            collectionView.collectionViewLayout?.invalidateLayout()
+            refreshVisibleItems()
+        }
+
+        @objc func boundsDidChange(_ notification: Notification) {
+            updateLayoutForWidthIfNeeded()
+            updatePreheat()
+        }
+
+        private func updatePreheat() {
+            guard let scrollView else { return }
+
+            let visibleRect = scrollView.contentView.bounds
+            if visibleRect.isEmpty { return }
+
+            let preheatRect = visibleRect.insetBy(dx: 0, dy: -0.5 * visibleRect.height)
+            let delta = abs(preheatRect.midY - previousPreheatRect.midY)
+            if delta <= visibleRect.height / 3 {
+                return
+            }
+
+            let differences = differencesBetweenRects(previousPreheatRect, preheatRect)
+            let addedItems = differences.added.flatMap { items(in: $0) }
+            let removedItems = differences.removed.flatMap { items(in: $0) }
+
+            let targetSize = CGSize(width: targetPixelSize, height: targetPixelSize)
+            if !addedItems.isEmpty {
+                viewModel.startCachingPhotos(for: addedItems, targetSize: targetSize)
+            }
+            if !removedItems.isEmpty {
+                viewModel.stopCachingPhotos(for: removedItems, targetSize: targetSize)
+            }
+
+            previousPreheatRect = preheatRect
+        }
+
+        private func items(in rect: NSRect) -> [FileItem] {
+            guard let collectionView,
+                  let layout = collectionView.collectionViewLayout else { return [] }
+            let layoutAttributes = layout.layoutAttributesForElements(in: rect)
+            var results: [FileItem] = []
+            results.reserveCapacity(layoutAttributes.count)
+            for attributes in layoutAttributes {
+                guard let indexPath = attributes.indexPath else { continue }
+                let index = indexPath.item
+                if items.indices.contains(index) {
+                    results.append(items[index])
+                }
+            }
+            return results
+        }
+
+        private func differencesBetweenRects(_ old: NSRect, _ new: NSRect) -> (added: [NSRect], removed: [NSRect]) {
+            guard !old.isEmpty else {
+                return (added: [new], removed: [])
+            }
+
+            if new.intersects(old) {
+                var added: [NSRect] = []
+                if new.maxY > old.maxY {
+                    added.append(NSRect(x: new.minX, y: old.maxY, width: new.width, height: new.maxY - old.maxY))
+                }
+                if new.minY < old.minY {
+                    added.append(NSRect(x: new.minX, y: new.minY, width: new.width, height: old.minY - new.minY))
+                }
+
+                var removed: [NSRect] = []
+                if new.maxY < old.maxY {
+                    removed.append(NSRect(x: new.minX, y: new.maxY, width: new.width, height: old.maxY - new.maxY))
+                }
+                if new.minY > old.minY {
+                    removed.append(NSRect(x: new.minX, y: old.minY, width: new.width, height: new.minY - old.minY))
+                }
+                return (added, removed)
+            }
+
+            return (added: [new], removed: [old])
+        }
+
+        private func applySelectionFromViewModel() {
+            guard let collectionView else { return }
+            let desired = Set<IndexPath>(viewModel.selectedItems.compactMap { item in
+                guard let index = itemIndexByID[item.id] else { return nil }
+                return IndexPath(item: index, section: 0)
+            })
+            guard collectionView.selectionIndexPaths != desired else { return }
+
+            isUpdatingSelection = true
+            collectionView.selectionIndexPaths = desired
+            if let first = desired.sorted(by: { $0.item < $1.item }).first,
+               items.indices.contains(first.item) {
+                updateQuickLook(for: items[first.item])
+            } else {
+                updateQuickLook(for: nil)
+            }
+            isUpdatingSelection = false
+        }
+
+        func numberOfSections(in collectionView: NSCollectionView) -> Int {
+            1
+        }
+
+        func collectionView(_ collectionView: NSCollectionView, numberOfItemsInSection section: Int) -> Int {
+            items.count
+        }
+
+        func collectionView(_ collectionView: NSCollectionView, itemForRepresentedObjectAt indexPath: IndexPath) -> NSCollectionViewItem {
+            guard let item = collectionView.makeItem(withIdentifier: PhotosMasonryItem.identifier, for: indexPath) as? PhotosMasonryItem else {
+                return NSCollectionViewItem()
+            }
+
+            configure(item: item, at: indexPath)
+            return item
+        }
+
+        func collectionView(_ collectionView: NSCollectionView, pasteboardWriterForItemAt indexPath: IndexPath) -> NSPasteboardWriting? {
+            guard items.indices.contains(indexPath.item) else { return nil }
+            let item = items[indexPath.item]
+            guard let dragInfo = viewModel.photoAssetDragInfo(for: item) else { return nil }
+            let provider = NSFilePromiseProvider(fileType: dragInfo.uti, delegate: self)
+            provider.userInfo = PromiseInfo(item: item, filename: dragInfo.filename)
+            return provider
+        }
+
+        func collectionView(_ collectionView: NSCollectionView, didSelectItemsAt indexPaths: Set<IndexPath>) {
+            syncSelectionFromCollectionView()
+        }
+
+        func collectionView(_ collectionView: NSCollectionView, didDeselectItemsAt indexPaths: Set<IndexPath>) {
+            syncSelectionFromCollectionView()
+        }
+
+        private func syncSelectionFromCollectionView() {
+            guard let collectionView, !isUpdatingSelection else { return }
+            isUpdatingSelection = true
+            let selectedItems = collectionView.selectionIndexPaths.compactMap { indexPath -> FileItem? in
+                guard items.indices.contains(indexPath.item) else { return nil }
+                return items[indexPath.item]
+            }
+            let newSelection = Set(selectedItems)
+            if newSelection == viewModel.selectedItems {
+                isUpdatingSelection = false
+                return
+            }
+            viewModel.selectedItems = newSelection
+            if let first = collectionView.selectionIndexPaths.sorted(by: { $0.item < $1.item }).first,
+               items.indices.contains(first.item) {
+                viewModel.lastSelectedIndex = first.item
+                updateQuickLook(for: items[first.item])
+            } else {
+                updateQuickLook(for: nil)
+            }
+            isUpdatingSelection = false
+        }
+
+        @objc func handleDoubleClick(_ sender: NSClickGestureRecognizer) {
+            guard let collectionView else { return }
+            let point = sender.location(in: collectionView)
+            guard let indexPath = collectionView.indexPathForItem(at: point),
+                  items.indices.contains(indexPath.item) else { return }
+            viewModel.openItem(items[indexPath.item])
+        }
+
+        func openSelection() {
+            guard let indexPath = collectionView?.selectionIndexPaths.first,
+                  items.indices.contains(indexPath.item) else { return }
+            viewModel.openItem(items[indexPath.item])
+        }
+
+        func toggleQuickLook() {
+            guard let indexPath = collectionView?.selectionIndexPaths.first,
+                  items.indices.contains(indexPath.item) else { return }
+
+            let item = items[indexPath.item]
+            if let previewURL = viewModel.previewURL(for: item) {
+                QuickLookControllerView.shared.togglePreview(for: previewURL) { [weak self] offset in
+                    self?.navigateLinear(by: offset)
+                }
+                return
+            }
+
+            viewModel.exportPhotoAsset(for: item) { [weak self] url in
+                guard let url else {
+                    NSSound.beep()
+                    return
+                }
+                QuickLookControllerView.shared.togglePreview(for: url) { [weak self] offset in
+                    self?.navigateLinear(by: offset)
+                }
+            }
+        }
+
+        nonisolated func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, fileNameForType fileType: String) -> String {
+            guard let info = filePromiseProvider.userInfo as? PromiseInfo else {
+                return "Photo"
+            }
+            return info.filename
+        }
+
+        nonisolated func filePromiseProvider(_ filePromiseProvider: NSFilePromiseProvider, writePromiseTo url: URL, completionHandler: @escaping (Error?) -> Void) {
+            guard let info = filePromiseProvider.userInfo as? PromiseInfo else {
+                completionHandler(NSError(domain: "com.coverflowfinder.photos", code: 1))
+                return
+            }
+
+            let destinationURL: URL
+            if url.hasDirectoryPath || url.pathExtension.isEmpty {
+                destinationURL = url.appendingPathComponent(info.filename)
+            } else {
+                destinationURL = url
+            }
+            guard let identifier = photosAssetIdentifier(from: info.item),
+                  let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject,
+                  let resource = primaryResource(for: asset) else {
+                completionHandler(NSError(domain: "com.coverflowfinder.photos", code: 2))
+                return
+            }
+
+            let options = PHAssetResourceRequestOptions()
+            options.isNetworkAccessAllowed = true
+
+            try? FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? FileManager.default.removeItem(at: destinationURL)
+
+            PHAssetResourceManager.default().writeData(for: resource, toFile: destinationURL, options: options) { error in
+                completionHandler(error)
+            }
+        }
+
+        nonisolated private func photosAssetIdentifier(from item: FileItem) -> String? {
+            let url = item.url
+            guard url.scheme == "photos", url.host == "asset" else { return nil }
+            let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            return components?.queryItems?.first(where: { $0.name == "id" })?.value
+        }
+
+        nonisolated private func primaryResource(for asset: PHAsset) -> PHAssetResource? {
+            let resources = PHAssetResource.assetResources(for: asset)
+            if asset.mediaType == .video {
+                return resources.first { $0.type == .video || $0.type == .fullSizeVideo } ?? resources.first
+            }
+            return resources.first { $0.type == .photo || $0.type == .fullSizePhoto } ?? resources.first
+        }
+
+        private func updateQuickLook(for item: FileItem?) {
+            guard let item else {
+                QuickLookControllerView.shared.updatePreview(for: nil)
+                return
+            }
+
+            if let previewURL = viewModel.previewURL(for: item) {
+                QuickLookControllerView.shared.updatePreview(for: previewURL)
+            } else {
+                QuickLookControllerView.shared.updatePreview(for: nil)
+            }
+        }
+
+        private func navigateLinear(by offset: Int) {
+            guard !items.isEmpty else { return }
+            let currentIndex = collectionView?.selectionIndexPaths.first?.item ?? 0
+            let newIndex = max(0, min(items.count - 1, currentIndex + offset))
+            let newIndexPath = IndexPath(item: newIndex, section: 0)
+            viewModel.selectItem(items[newIndex])
+            collectionView?.selectionIndexPaths = [newIndexPath]
+            collectionView?.scrollToItems(at: [newIndexPath], scrollPosition: .centeredVertically)
+            updateQuickLook(for: items[newIndex])
+        }
+    }
+}
+
+private final class PhotosMasonryLayout: NSCollectionViewLayout {
+    var idealColumnWidth: CGFloat = 180 {
+        didSet { invalidateLayout() }
+    }
+    var columnSpacing: CGFloat = 12 {
+        didSet { invalidateLayout() }
+    }
+    var contentInsets: NSEdgeInsets = .init(top: 16, left: 16, bottom: 16, right: 16) {
+        didSet { invalidateLayout() }
+    }
+    var labelHeight: CGFloat = 0 {
+        didSet { invalidateLayout() }
+    }
+    var showsLabels = false {
+        didSet { invalidateLayout() }
+    }
+
+    var itemHeightProvider: ((IndexPath, CGFloat) -> CGFloat)?
+
+    private(set) var currentColumnWidth: CGFloat = 0
+    private var cachedAttributes: [IndexPath: NSCollectionViewLayoutAttributes] = [:]
+    private var contentHeight: CGFloat = 0
+
+    private let verticalPadding: CGFloat = 12
+    private let labelSpacing: CGFloat = 6
+
+    override func prepare() {
+        guard let collectionView else { return }
+        cachedAttributes.removeAll(keepingCapacity: true)
+        contentHeight = 0
+
+        let metrics = Self.columnMetrics(
+            for: collectionView.bounds.width,
+            idealColumnWidth: idealColumnWidth,
+            spacing: columnSpacing,
+            insets: contentInsets
+        )
+        currentColumnWidth = metrics.width
+
+        let columnCount = metrics.count
+        guard columnCount > 0, currentColumnWidth > 0 else { return }
+
+        var xOffsets: [CGFloat] = []
+        xOffsets.reserveCapacity(columnCount)
+        for column in 0..<columnCount {
+            let x = contentInsets.left + CGFloat(column) * (currentColumnWidth + columnSpacing)
+            xOffsets.append(x)
+        }
+
+        var yOffsets = Array(repeating: contentInsets.top, count: columnCount)
+
+        let itemCount = collectionView.numberOfItems(inSection: 0)
+        for item in 0..<itemCount {
+            let indexPath = IndexPath(item: item, section: 0)
+            let imageHeight = itemHeightProvider?(indexPath, currentColumnWidth) ?? currentColumnWidth
+            let labelStackHeight = showsLabels ? labelHeight + labelSpacing : 0
+            let itemHeight = imageHeight + labelStackHeight + verticalPadding
+
+            let column = yOffsets.enumerated().min(by: { $0.element < $1.element })?.offset ?? 0
+            let frame = NSRect(x: xOffsets[column], y: yOffsets[column], width: currentColumnWidth, height: itemHeight)
+            let attributes = NSCollectionViewLayoutAttributes(forItemWith: indexPath)
+            attributes.frame = frame
+            cachedAttributes[indexPath] = attributes
+            yOffsets[column] = frame.maxY + columnSpacing
+            contentHeight = max(contentHeight, yOffsets[column])
+        }
+
+        if itemCount == 0 {
+            contentHeight = contentInsets.top + contentInsets.bottom
+        } else {
+            contentHeight += contentInsets.bottom - columnSpacing
+        }
+    }
+
+    override var collectionViewContentSize: NSSize {
+        NSSize(width: collectionView?.bounds.width ?? 0, height: contentHeight)
+    }
+
+    override func layoutAttributesForElements(in rect: NSRect) -> [NSCollectionViewLayoutAttributes] {
+        cachedAttributes.values.filter { $0.frame.intersects(rect) }
+    }
+
+    override func layoutAttributesForItem(at indexPath: IndexPath) -> NSCollectionViewLayoutAttributes? {
+        cachedAttributes[indexPath]
+    }
+
+    override func shouldInvalidateLayout(forBoundsChange newBounds: NSRect) -> Bool {
+        guard let collectionView else { return false }
+        return newBounds.size.width != collectionView.bounds.size.width
+    }
+
+    static func columnMetrics(
+        for width: CGFloat,
+        idealColumnWidth: CGFloat,
+        spacing: CGFloat,
+        insets: NSEdgeInsets
+    ) -> (count: Int, width: CGFloat) {
+        let availableWidth = max(0, width - insets.left - insets.right)
+        let count = max(1, Int((availableWidth + spacing) / (idealColumnWidth + spacing)))
+        let totalSpacing = spacing * CGFloat(max(0, count - 1))
+        let columnWidth = max(1, (availableWidth - totalSpacing) / CGFloat(count))
+        return (count, columnWidth)
+    }
+}
+
+private final class PhotosMasonryCollectionView: NSCollectionView {
+    var onOpen: (@MainActor () -> Void)?
+    var onQuickLook: (@MainActor () -> Void)?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        if window?.firstResponder == nil {
+            window?.makeFirstResponder(self)
+        }
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        super.mouseUp(with: event)
+        if event.clickCount == 2 {
+            onOpen?()
+        }
+    }
+
+    override func keyDown(with event: NSEvent) {
+        switch event.keyCode {
+        case 36, 76:
+            onOpen?()
+        case 49:
+            onQuickLook?()
+        default:
+            super.keyDown(with: event)
+        }
+    }
+}
+
+private final class PhotosMasonryItem: NSCollectionViewItem {
+    static let identifier = NSUserInterfaceItemIdentifier("PhotosMasonryItem")
+
+    private let tileView = PhotosMasonryTileView()
+    private let titleField = NSTextField(labelWithString: "")
+    private let titleBackground = NSView()
+
+    private var imageHeight: CGFloat = 0
+    private var labelHeight: CGFloat = 0
+    private var showTitle = false
+
+    override func loadView() {
+        view = FlippedView()
+        view.wantsLayer = true
+        view.layer?.cornerRadius = 12
+        view.layer?.borderColor = NSColor.controlAccentColor.cgColor
+        view.layer?.borderWidth = 0
+        view.layer?.backgroundColor = NSColor.clear.cgColor
+
+        tileView.wantsLayer = true
+        tileView.layer?.cornerRadius = 10
+        tileView.layer?.masksToBounds = true
+        tileView.layer?.backgroundColor = NSColor.textBackgroundColor.withAlphaComponent(0.6).cgColor
+
+        titleField.alignment = .center
+        titleField.lineBreakMode = .byTruncatingMiddle
+        titleField.maximumNumberOfLines = 2
+        titleField.isSelectable = false
+
+        titleBackground.wantsLayer = true
+        titleBackground.layer?.cornerRadius = 6
+        titleBackground.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.9).cgColor
+        titleBackground.isHidden = true
+
+        view.addSubview(tileView)
+        view.addSubview(titleBackground)
+        view.addSubview(titleField)
+    }
+
+    override var isSelected: Bool {
+        didSet {
+            updateSelection()
+        }
+    }
+
+    func configure(
+        item: FileItem,
+        image: NSImage?,
+        imageHeight: CGFloat,
+        labelHeight: CGFloat,
+        showTitle: Bool,
+        fontSize: CGFloat
+    ) {
+        representedObject = item
+        tileView.image = image
+        self.imageHeight = imageHeight
+        self.labelHeight = labelHeight
+        self.showTitle = showTitle
+
+        titleField.stringValue = item.name
+        titleField.font = NSFont.systemFont(ofSize: fontSize)
+        titleField.isHidden = !showTitle
+        titleBackground.isHidden = !showTitle || !isSelected
+        titleField.textColor = isSelected ? .white : .labelColor
+
+        view.needsLayout = true
+        updateSelection()
+    }
+
+    func updateImage(_ image: NSImage?) {
+        tileView.image = image
+    }
+
+    override func viewDidLayout() {
+        super.viewDidLayout()
+        let width = view.bounds.width
+        tileView.frame = NSRect(x: 0, y: 0, width: width, height: imageHeight)
+
+        guard showTitle, labelHeight > 0 else { return }
+        let labelY = imageHeight + 6
+        let labelFrame = NSRect(x: 6, y: labelY, width: width - 12, height: labelHeight)
+        titleBackground.frame = labelFrame
+        titleField.frame = labelFrame
+    }
+
+    private func updateSelection() {
+        if isSelected {
+            view.layer?.borderWidth = 2
+            view.layer?.backgroundColor = NSColor.controlAccentColor.withAlphaComponent(0.15).cgColor
+            titleBackground.isHidden = !showTitle
+            titleField.textColor = .white
+        } else {
+            view.layer?.borderWidth = 0
+            view.layer?.backgroundColor = NSColor.clear.cgColor
+            titleBackground.isHidden = true
+            titleField.textColor = .labelColor
+        }
+    }
+}
+
+private final class PhotosMasonryTileView: NSView {
+    var image: NSImage? {
+        didSet {
+            layer?.contents = image
+        }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer?.contentsGravity = .resizeAspectFill
+        layer?.masksToBounds = true
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        wantsLayer = true
+        layer?.contentsGravity = .resizeAspectFill
+        layer?.masksToBounds = true
+    }
+}
+
+private final class FlippedView: NSView {
+    override var isFlipped: Bool { true }
 }

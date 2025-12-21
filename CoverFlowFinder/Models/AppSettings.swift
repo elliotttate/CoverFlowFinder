@@ -18,6 +18,7 @@ final class AppSettings: ObservableObject {
         static let sidebarShowTags = "settings.sidebarShowTags"
         static let sidebarFavorites = "settings.sidebarFavorites"
         static let thumbnailQuality = "settings.thumbnailQuality"
+        static let masonryShowFilenames = "settings.masonryShowFilenames"
 
         static let listFontSize = "settings.listFontSize"
         static let listIconSize = "settings.listIconSize"
@@ -63,6 +64,7 @@ final class AppSettings: ObservableObject {
             (try? JSONEncoder().encode(sidebarFavorites)) ?? Data()
         }()
         static let thumbnailQuality: Double = 1.15
+        static let masonryShowFilenames = false
 
         static let listFontSize: Double = 13
         static let listIconSize: Double = 20
@@ -125,6 +127,9 @@ final class AppSettings: ObservableObject {
     }
     @Published var thumbnailQuality: Double {
         didSet { defaults.set(thumbnailQuality, forKey: Keys.thumbnailQuality) }
+    }
+    @Published var masonryShowFilenames: Bool {
+        didSet { defaults.set(masonryShowFilenames, forKey: Keys.masonryShowFilenames) }
     }
 
     @Published var listFontSize: Double {
@@ -192,6 +197,7 @@ final class AppSettings: ObservableObject {
             Keys.sidebarShowTags: Defaults.sidebarShowTags,
             Keys.sidebarFavorites: Defaults.sidebarFavoritesData,
             Keys.thumbnailQuality: Defaults.thumbnailQuality,
+            Keys.masonryShowFilenames: Defaults.masonryShowFilenames,
             Keys.listFontSize: Defaults.listFontSize,
             Keys.listIconSize: Defaults.listIconSize,
             Keys.iconGridIconSize: Defaults.iconGridIconSize,
@@ -228,6 +234,7 @@ final class AppSettings: ObservableObject {
             return Defaults.sidebarFavorites
         }()
         thumbnailQuality = defaults.double(forKey: Keys.thumbnailQuality)
+        masonryShowFilenames = defaults.bool(forKey: Keys.masonryShowFilenames)
 
         listFontSize = defaults.double(forKey: Keys.listFontSize)
         listIconSize = defaults.double(forKey: Keys.listIconSize)
@@ -262,6 +269,7 @@ final class AppSettings: ObservableObject {
         sidebarShowTags = Defaults.sidebarShowTags
         sidebarFavorites = Defaults.sidebarFavorites
         thumbnailQuality = Defaults.thumbnailQuality
+        masonryShowFilenames = Defaults.masonryShowFilenames
 
         listFontSize = Defaults.listFontSize
         listIconSize = Defaults.listIconSize

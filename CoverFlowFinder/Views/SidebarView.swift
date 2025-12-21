@@ -47,7 +47,9 @@ struct SidebarOutlineView: NSViewRepresentable {
         outlineView.dataSource = context.coordinator
         outlineView.delegate = context.coordinator
 
-        outlineView.registerForDraggedTypes([.fileURL, context.coordinator.internalDragType])
+        var draggedTypes: [NSPasteboard.PasteboardType] = [.fileURL, context.coordinator.internalDragType]
+        draggedTypes.append(contentsOf: NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) })
+        outlineView.registerForDraggedTypes(draggedTypes)
         outlineView.setDraggingSourceOperationMask(.move, forLocal: true)
         outlineView.setDraggingSourceOperationMask(.copy, forLocal: false)
 
@@ -95,6 +97,7 @@ struct SidebarOutlineView: NSViewRepresentable {
                 favorites: appSettings.sidebarFavorites,
                 filterTag: viewModel.filterTag,
                 iCloudURL: context.iCloudURL,
+                photosLibraryInfo: context.photosLibraryInfo,
                 locations: context.locations
             )
 
@@ -158,19 +161,26 @@ struct SidebarOutlineView: NSViewRepresentable {
             guard let favoritesSection = favoritesSection() else { return [] }
 
             let isInternal = isInternalDrag(info)
-            let isExternal = info.draggingPasteboard.canReadObject(
-                forClasses: [NSURL.self],
-                options: [.urlReadingFileURLsOnly: true]
-            )
+            let hasURLs = hasFileURLs(info)
+            let hasPromises = hasFilePromises(info)
+            let isExternal = (hasURLs || hasPromises) && !isInternal
 
             guard isInternal || isExternal else { return [] }
 
-            guard let target = dropTarget(for: info, in: favoritesSection, isInternal: isInternal) else {
+            guard let target = dropTarget(
+                for: info,
+                in: favoritesSection,
+                isInternal: isInternal,
+                isExternal: isExternal
+            ) else {
                 return []
             }
 
             switch target {
             case .between(let sectionIndex, _):
+                if !isInternal && hasPromises && !hasURLs {
+                    return []
+                }
                 outlineView.setDropItem(favoritesSection, dropChildIndex: sectionIndex)
                 return isInternal ? .move : .copy
             case .onFavorite(let favoriteItem):
@@ -179,6 +189,9 @@ struct SidebarOutlineView: NSViewRepresentable {
                     return .move
                 }
                 return NSEvent.modifierFlags.contains(.option) ? .copy : .move
+            case .airDrop(let airDropItem):
+                outlineView.setDropItem(airDropItem, dropChildIndex: NSOutlineViewDropOnItemIndex)
+                return isExternal ? .copy : []
             }
         }
 
@@ -187,11 +200,21 @@ struct SidebarOutlineView: NSViewRepresentable {
                          item: Any?,
                          childIndex index: Int) -> Bool {
             guard let favoritesSection = favoritesSection() else { return false }
-            guard let target = dropTarget(for: info, in: favoritesSection, isInternal: isInternalDrag(info)) else {
+            let isInternal = isInternalDrag(info)
+            let hasURLs = hasFileURLs(info)
+            let hasPromises = hasFilePromises(info)
+            let isExternal = (hasURLs || hasPromises) && !isInternal
+
+            guard let target = dropTarget(
+                for: info,
+                in: favoritesSection,
+                isInternal: isInternal,
+                isExternal: isExternal
+            ) else {
                 return false
             }
 
-            if isInternalDrag(info) {
+            if isInternal {
                 let ids = draggingFavoriteIDs(from: info.draggingPasteboard)
                 guard !ids.isEmpty else { return false }
 
@@ -199,26 +222,57 @@ struct SidebarOutlineView: NSViewRepresentable {
                 case .between(_, let favoritesIndex):
                     moveFavorites(ids: ids, to: favoritesIndex)
                     return true
-                case .onFavorite:
+                case .onFavorite, .airDrop:
                     return false
                 }
             }
 
-            guard let urls = info.draggingPasteboard.readObjects(
+            if hasURLs,
+               let urls = info.draggingPasteboard.readObjects(
                 forClasses: [NSURL.self],
                 options: [.urlReadingFileURLsOnly: true]
-            ) as? [URL], !urls.isEmpty else {
-                return false
+               ) as? [URL],
+               !urls.isEmpty {
+                switch target {
+                case .between(_, let favoritesIndex):
+                    insertFavorites(urls: urls, at: favoritesIndex)
+                    return true
+                case .onFavorite(let favoriteItem):
+                    guard case let .favorite(resolvedFavorite) = favoriteItem.kind,
+                          let destination = resolvedFavorite.url else { return false }
+                    viewModel.handleDrop(urls: urls, to: destination)
+                    return true
+                case .airDrop:
+                    performAirDrop(urls: urls)
+                    return true
+                }
             }
 
+            guard hasPromises else { return false }
+
             switch target {
-            case .between(_, let favoritesIndex):
-                insertFavorites(urls: urls, at: favoritesIndex)
-                return true
+            case .between:
+                return false
             case .onFavorite(let favoriteItem):
                 guard case let .favorite(resolvedFavorite) = favoriteItem.kind,
                       let destination = resolvedFavorite.url else { return false }
-                viewModel.handleDrop(urls: urls, to: destination)
+                receiveFilePromises(from: info) { [weak self] urls, tempDirectory in
+                    guard let self, !urls.isEmpty else { return }
+                    self.viewModel.handleDrop(urls: urls, to: destination) {
+                        if let tempDirectory {
+                            try? FileManager.default.removeItem(at: tempDirectory)
+                        }
+                    }
+                }
+                return true
+            case .airDrop:
+                receiveFilePromises(from: info) { [weak self] urls, tempDirectory in
+                    guard let self, !urls.isEmpty else { return }
+                    self.performAirDrop(urls: urls)
+                    if let tempDirectory {
+                        try? FileManager.default.removeItem(at: tempDirectory)
+                    }
+                }
                 return true
             }
         }
@@ -287,10 +341,14 @@ struct SidebarOutlineView: NSViewRepresentable {
         private func handleSelection(for item: SidebarItem) {
             switch item.kind {
             case .airDrop:
-                openAirDrop()
+                triggerAirDropFromSelection()
             case .favorite(let resolvedFavorite):
                 guard resolvedFavorite.isAvailable, let url = resolvedFavorite.url else { return }
                 viewModel.navigateTo(url)
+            case .photosLibrary(let info, let isAvailable):
+                guard isAvailable, let info else { return }
+                viewModel.viewMode = .masonry
+                viewModel.navigateToPhotosLibrary(info)
             case .iCloud(let url, let isAvailable):
                 guard isAvailable, let url else { return }
                 viewModel.navigateTo(url)
@@ -370,10 +428,61 @@ struct SidebarOutlineView: NSViewRepresentable {
         private enum DropTarget {
             case between(sectionIndex: Int, favoritesIndex: Int)
             case onFavorite(SidebarItem)
+            case airDrop(SidebarItem)
         }
 
         private func isInternalDrag(_ info: NSDraggingInfo) -> Bool {
             info.draggingPasteboard.types?.contains(internalDragType) == true
+        }
+
+        private func hasFileURLs(_ info: NSDraggingInfo) -> Bool {
+            info.draggingPasteboard.canReadObject(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+            )
+        }
+
+        private func hasFilePromises(_ info: NSDraggingInfo) -> Bool {
+            info.draggingPasteboard.canReadObject(
+                forClasses: [NSFilePromiseReceiver.self],
+                options: nil
+            )
+        }
+
+        private func filePromiseReceivers(from pasteboard: NSPasteboard) -> [NSFilePromiseReceiver] {
+            (pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver]) ?? []
+        }
+
+        private func receiveFilePromises(from info: NSDraggingInfo, completion: @escaping ([URL], URL?) -> Void) {
+            let receivers = filePromiseReceivers(from: info.draggingPasteboard)
+            guard !receivers.isEmpty else {
+                completion([], nil)
+                return
+            }
+
+            let tempDirectory = FileManager.default.temporaryDirectory
+                .appendingPathComponent("CoverFlowFinderDrop-\(UUID().uuidString)", isDirectory: true)
+            try? FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
+
+            let group = DispatchGroup()
+            let lock = NSLock()
+            var receivedURLs: [URL] = []
+
+            for receiver in receivers {
+                group.enter()
+                receiver.receivePromisedFiles(atDestination: tempDirectory, options: [:], operationQueue: .main) { url, error in
+                    if error == nil {
+                        lock.lock()
+                        receivedURLs.append(url)
+                        lock.unlock()
+                    }
+                    group.leave()
+                }
+            }
+
+            group.notify(queue: .main) {
+                completion(receivedURLs, tempDirectory)
+            }
         }
 
         private func draggingFavoriteIDs(from pasteboard: NSPasteboard) -> [String] {
@@ -383,30 +492,29 @@ struct SidebarOutlineView: NSViewRepresentable {
 
         private func dropTarget(for info: NSDraggingInfo,
                                 in favoritesSection: SidebarSection,
-                                isInternal: Bool) -> DropTarget? {
+                                isInternal: Bool,
+                                isExternal: Bool) -> DropTarget? {
             guard let outlineView = outlineView else { return nil }
             let location = outlineView.convert(info.draggingLocation, from: nil)
             let row = outlineView.row(at: location)
 
-            let airDropOffset: Int
-            if let firstItem = favoritesSection.items.first, case .airDrop = firstItem.kind {
-                airDropOffset = 1
-            } else {
-                airDropOffset = 0
-            }
-            let minSectionIndex = airDropOffset
+            let minSectionIndex = firstFavoriteSectionIndex(in: favoritesSection)
             let maxSectionIndex = favoritesSection.items.count
 
             if row >= 0 {
                 if let section = outlineView.item(atRow: row) as? SidebarSection {
                     guard section.kind == .favorites else { return nil }
-                    let sectionIndex = minSectionIndex
-                    let favoritesIndex = max(0, sectionIndex - airDropOffset)
+                    let sectionIndex = maxSectionIndex
+                    let favoritesIndex = favoritesIndex(forSectionIndex: sectionIndex, in: favoritesSection)
                     return .between(sectionIndex: sectionIndex, favoritesIndex: favoritesIndex)
                 }
 
                 guard let item = outlineView.item(atRow: row) as? SidebarItem else { return nil }
                 guard item.sectionKind == .favorites else { return nil }
+
+                if case .airDrop = item.kind, isExternal {
+                    return .airDrop(item)
+                }
 
                 let rowRect = outlineView.rect(ofRow: row)
                 let yInRow = location.y - rowRect.minY
@@ -426,7 +534,7 @@ struct SidebarOutlineView: NSViewRepresentable {
 
                 let insertionIndex = (inBottomZone ? sectionIndex + 1 : sectionIndex)
                 let clampedSectionIndex = min(max(insertionIndex, minSectionIndex), maxSectionIndex)
-                let favoritesIndex = max(0, clampedSectionIndex - airDropOffset)
+                let favoritesIndex = favoritesIndex(forSectionIndex: clampedSectionIndex, in: favoritesSection)
                 return .between(sectionIndex: clampedSectionIndex, favoritesIndex: favoritesIndex)
             }
 
@@ -439,18 +547,37 @@ struct SidebarOutlineView: NSViewRepresentable {
 
                 if location.y < firstRect.minY {
                     let sectionIndex = minSectionIndex
-                    let favoritesIndex = max(0, sectionIndex - airDropOffset)
+                    let favoritesIndex = favoritesIndex(forSectionIndex: sectionIndex, in: favoritesSection)
                     return .between(sectionIndex: sectionIndex, favoritesIndex: favoritesIndex)
                 }
 
                 if location.y > lastRect.maxY {
                     let sectionIndex = maxSectionIndex
-                    let favoritesIndex = max(0, sectionIndex - airDropOffset)
+                    let favoritesIndex = favoritesIndex(forSectionIndex: sectionIndex, in: favoritesSection)
                     return .between(sectionIndex: sectionIndex, favoritesIndex: favoritesIndex)
                 }
             }
 
             return nil
+        }
+
+        private func firstFavoriteSectionIndex(in section: SidebarSection) -> Int {
+            for (index, item) in section.items.enumerated() {
+                if case .favorite = item.kind {
+                    return index
+                }
+            }
+            return section.items.count
+        }
+
+        private func favoritesIndex(forSectionIndex index: Int, in section: SidebarSection) -> Int {
+            let clamped = min(max(0, index), section.items.count)
+            return section.items.prefix(clamped).reduce(0) { count, item in
+                if case .favorite = item.kind {
+                    return count + 1
+                }
+                return count
+            }
         }
 
         private func firstRowIndex(for section: SidebarSection) -> Int? {
@@ -517,11 +644,69 @@ struct SidebarOutlineView: NSViewRepresentable {
         // MARK: - Data Building
 
         private func buildContext() -> SidebarBuildContext {
-            let iCloudURL = FileManager.default
-                .url(forUbiquityContainerIdentifier: nil)?
-                .appendingPathComponent("Documents")
+            let iCloudURL = iCloudDriveURL()
             let locations = volumeLocations()
-            return SidebarBuildContext(iCloudURL: iCloudURL, locations: locations)
+            let photosLibraryInfo = photosLibraryInfo()
+            return SidebarBuildContext(iCloudURL: iCloudURL, photosLibraryInfo: photosLibraryInfo, locations: locations)
+        }
+
+        private func iCloudDriveURL() -> URL? {
+            guard FileManager.default.ubiquityIdentityToken != nil else { return nil }
+
+            let homeURL = FileManager.default.homeDirectoryForCurrentUser
+            let cloudStorageURL = homeURL
+                .appendingPathComponent("Library", isDirectory: true)
+                .appendingPathComponent("CloudStorage", isDirectory: true)
+                .appendingPathComponent("iCloud Drive", isDirectory: true)
+
+            if FileManager.default.fileExists(atPath: cloudStorageURL.path) {
+                return cloudStorageURL
+            }
+
+            let mobileDocsURL = homeURL
+                .appendingPathComponent("Library", isDirectory: true)
+                .appendingPathComponent("Mobile Documents", isDirectory: true)
+                .appendingPathComponent("com~apple~CloudDocs", isDirectory: true)
+
+            if FileManager.default.fileExists(atPath: mobileDocsURL.path) {
+                return mobileDocsURL
+            }
+
+            return nil
+        }
+
+        private func photosLibraryInfo() -> PhotosLibraryInfo? {
+            let fm = FileManager.default
+            let picturesURL = fm.urls(for: .picturesDirectory, in: .userDomainMask).first
+                ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Pictures", isDirectory: true)
+
+            guard let contents = try? fm.contentsOfDirectory(
+                at: picturesURL,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: .skipsHiddenFiles
+            ) else { return nil }
+
+            let libraries = contents.filter { $0.pathExtension == "photoslibrary" }
+            guard !libraries.isEmpty else { return nil }
+
+            let preferred = libraries.first { $0.lastPathComponent == "Photos Library.photoslibrary" }
+                ?? libraries.sorted(by: { lhs, rhs in
+                    let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                    return lhsDate > rhsDate
+                }).first
+
+            guard let libraryURL = preferred else { return nil }
+
+            let imageFolderNames = ["originals", "Originals", "Masters"]
+            for folderName in imageFolderNames {
+                let candidate = libraryURL.appendingPathComponent(folderName, isDirectory: true)
+                if fm.fileExists(atPath: candidate.path) {
+                    return PhotosLibraryInfo(libraryURL: libraryURL, imagesURL: candidate)
+                }
+            }
+
+            return nil
         }
 
         private func buildSections(context: SidebarBuildContext) -> [SidebarSection] {
@@ -531,6 +716,14 @@ struct SidebarOutlineView: NSViewRepresentable {
                 let section = SidebarSection(kind: .favorites, title: "Favorites")
                 var items: [SidebarItem] = []
                 items.append(SidebarItem(kind: .airDrop, id: "airdrop", title: "AirDrop"))
+
+                let photosAvailable = context.photosLibraryInfo != nil
+                items.append(SidebarItem(
+                    kind: .photosLibrary(context.photosLibraryInfo, photosAvailable),
+                    id: "photosLibrary",
+                    title: "Photos Library",
+                    isEnabled: photosAvailable
+                ))
 
                 for favorite in appSettings.sidebarFavorites {
                     let resolved = resolveFavorite(favorite)
@@ -681,6 +874,14 @@ struct SidebarOutlineView: NSViewRepresentable {
                     accessory: nil,
                     isEnabled: resolvedFavorite.isAvailable
                 )
+            case .photosLibrary:
+                return SidebarItemPresentation(
+                    title: item.title,
+                    icon: photosLibraryIcon(),
+                    iconTint: .controlAccentColor,
+                    accessory: nil,
+                    isEnabled: item.isEnabled
+                )
             case .iCloud:
                 return SidebarItemPresentation(
                     title: item.title,
@@ -721,30 +922,74 @@ struct SidebarOutlineView: NSViewRepresentable {
         }
 
         private func symbolIcon(name: String) -> NSImage? {
-            NSImage(systemSymbolName: name, accessibilityDescription: nil)
+            let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+            image?.isTemplate = true
+            return image
         }
 
-        private func openAirDrop() {
-            let script = """
-            tell application "Finder"
-                activate
-                if exists window "AirDrop" then
-                    set index of window "AirDrop" to 1
-                else
-                    make new Finder window
-                    set target of Finder window 1 to (POSIX file "/System/Library/CoreServices/Finder.app/Contents/Applications/AirDrop.app")
-                end if
-            end tell
-            """
+        private func photosLibraryIcon() -> NSImage? {
+            symbolIcon(name: "photo")
+        }
 
-            if let appleScript = NSAppleScript(source: script) {
-                var error: NSDictionary?
-                appleScript.executeAndReturnError(&error)
-                if error != nil {
-                    if let url = URL(string: "nwnode://domain-AirDrop") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
+        private func triggerAirDropFromSelection() {
+            let urls = airDropURLsFromSelection()
+            guard !urls.isEmpty else {
+                showAirDropAlert(
+                    title: "AirDrop",
+                    message: "Select files in the main view or drop them onto AirDrop to send."
+                )
+                return
+            }
+
+            performAirDrop(urls: urls)
+        }
+
+        private func airDropURLsFromSelection() -> [URL] {
+            viewModel.selectedItems.compactMap { item in
+                guard !item.isFromArchive else { return nil }
+                return item.url
+            }
+        }
+
+        private func performAirDrop(urls: [URL]) {
+            let validURLs = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
+            guard !validURLs.isEmpty else {
+                showAirDropAlert(
+                    title: "AirDrop",
+                    message: "The selected items are not available to share."
+                )
+                return
+            }
+
+            guard let service = NSSharingService(named: .sendViaAirDrop) else {
+                showAirDropAlert(
+                    title: "AirDrop Unavailable",
+                    message: "AirDrop is not available on this Mac right now."
+                )
+                return
+            }
+
+            guard service.canPerform(withItems: validURLs) else {
+                showAirDropAlert(
+                    title: "AirDrop Unavailable",
+                    message: "AirDrop cannot share the selected items."
+                )
+                return
+            }
+
+            service.perform(withItems: validURLs)
+        }
+
+        private func showAirDropAlert(title: String, message: String) {
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = message
+            alert.alertStyle = .informational
+
+            if let window = outlineView?.window {
+                alert.beginSheetModal(for: window, completionHandler: nil)
+            } else {
+                alert.runModal()
             }
         }
     }
@@ -758,11 +1003,13 @@ private struct SidebarSnapshot: Equatable {
     let favorites: [SidebarFavorite]
     let filterTag: String?
     let iCloudURL: URL?
+    let photosLibraryInfo: PhotosLibraryInfo?
     let locations: [SidebarLocation]
 }
 
 private struct SidebarBuildContext {
     let iCloudURL: URL?
+    let photosLibraryInfo: PhotosLibraryInfo?
     let locations: [SidebarLocation]
 }
 
@@ -814,6 +1061,7 @@ private final class SidebarItem: NSObject {
     enum Kind {
         case airDrop
         case favorite(ResolvedFavorite)
+        case photosLibrary(PhotosLibraryInfo?, Bool)
         case iCloud(URL?, Bool)
         case location(SidebarLocation)
         case tag(FinderTag)
@@ -836,6 +1084,8 @@ private final class SidebarItem: NSObject {
         switch kind {
         case .favorite(let resolved):
             return resolved.url
+        case .photosLibrary(let info, _):
+            return info?.libraryURL
         case .iCloud(let url, _):
             return url
         case .location(let location):
@@ -847,7 +1097,7 @@ private final class SidebarItem: NSObject {
 
     var sectionKind: SidebarSection.Kind? {
         switch kind {
-        case .airDrop, .favorite:
+        case .airDrop, .favorite, .photosLibrary:
             return .favorites
         case .iCloud:
             return .icloud

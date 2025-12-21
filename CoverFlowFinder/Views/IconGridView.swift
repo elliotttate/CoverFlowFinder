@@ -68,7 +68,7 @@ struct IconGridView: View {
                             }
                             .onDrag {
                                 guard !item.isFromArchive else { return NSItemProvider() }
-                                return NSItemProvider(object: item.url as NSURL)
+                                return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
                             }
                             .onDrop(of: [.fileURL], delegate: IconFolderDropDelegate(
                                 item: item,

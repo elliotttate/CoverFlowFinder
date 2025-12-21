@@ -19,12 +19,12 @@
 		A1000009001 /* ColumnView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000009000 /* ColumnView.swift */; };
 		A100000A001 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = A100000A000 /* Assets.xcassets */; };
 		A100001E001 /* DualPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100001E000 /* DualPaneView.swift */; };
-		A1000025001 /* QuadPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000025000 /* QuadPaneView.swift */; };
 		A100001F001 /* FileInfoView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100001F000 /* FileInfoView.swift */; };
 		A1000020001 /* KeyboardHandler.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000020000 /* KeyboardHandler.swift */; };
 		A1000021001 /* QuickLookController.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000021000 /* QuickLookController.swift */; };
 		A1000023001 /* TabBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000023000 /* TabBarView.swift */; };
 		A1000024001 /* ThumbnailCacheManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000024000 /* ThumbnailCacheManager.swift */; };
+		A1000025001 /* QuadPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000025000 /* QuadPaneView.swift */; };
 		A1000026001 /* ZipArchiveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000026000 /* ZipArchiveManager.swift */; };
 		A1000027001 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000027000 /* AppSettings.swift */; };
 		A1000028001 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000028000 /* SettingsView.swift */; };
@@ -47,12 +47,12 @@
 		A100000B000 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A100000C000 /* CoverFlowFinder.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = CoverFlowFinder.entitlements; sourceTree = "<group>"; };
 		A100001E000 /* DualPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DualPaneView.swift; sourceTree = "<group>"; };
-		A1000025000 /* QuadPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuadPaneView.swift; sourceTree = "<group>"; };
 		A100001F000 /* FileInfoView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileInfoView.swift; sourceTree = "<group>"; };
 		A1000020000 /* KeyboardHandler.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeyboardHandler.swift; sourceTree = "<group>"; };
 		A1000021000 /* QuickLookController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickLookController.swift; sourceTree = "<group>"; };
 		A1000023000 /* TabBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabBarView.swift; sourceTree = "<group>"; };
 		A1000024000 /* ThumbnailCacheManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailCacheManager.swift; sourceTree = "<group>"; };
+		A1000025000 /* QuadPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuadPaneView.swift; sourceTree = "<group>"; };
 		A1000026000 /* ZipArchiveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipArchiveManager.swift; sourceTree = "<group>"; };
 		A1000027000 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		A1000028000 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -169,7 +169,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 1500;
-				LastUpgradeCheck = 1500;
+				LastUpgradeCheck = 2620;
 				TargetAttributes = {
 					A1000014000 = {
 						CreatedOnToolsVersion = 15.0;
@@ -271,7 +271,9 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = RH4U5VJHM6;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -294,6 +296,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -333,7 +336,9 @@
 				CLANG_WARN_UNREACHABLE_CODE = YES;
 				CLANG_WARN__DUPLICATE_METHOD_MATCH = YES;
 				COPY_PHASE_STRIP = NO;
+				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = RH4U5VJHM6;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
@@ -345,15 +350,12 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				ARCHS = (
-					arm64,
-					x86_64,
-				);
 				MACOSX_DEPLOYMENT_TARGET = 13.0;
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = NO;
 				SDKROOT = macosx;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 			};
 			name = Release;
@@ -363,12 +365,18 @@
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				AUTOMATION_APPLE_EVENTS = NO;
 				CODE_SIGN_ENTITLEMENTS = CoverFlowFinder/CoverFlowFinder.entitlements;
-				CODE_SIGN_STYLE = Automatic;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 2;
+				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "";
+				"DEVELOPMENT_TEAM[sdk=macosx*]" = RH4U5VJHM6;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CoverFlowFinder/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "CoverFlow Finder";
@@ -381,6 +389,13 @@
 				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.coverflowfinder.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
+				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
+				RUNTIME_EXCEPTION_ALLOW_UNSIGNED_EXECUTABLE_MEMORY = NO;
+				RUNTIME_EXCEPTION_DEBUGGING_TOOL = NO;
+				RUNTIME_EXCEPTION_DISABLE_EXECUTABLE_PAGE_PROTECTION = NO;
+				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 			};
@@ -389,18 +404,20 @@
 		A100001D000 /* Release */ = {
 			isa = XCBuildConfiguration;
 			buildSettings = {
-				ARCHS = (
-					arm64,
-					x86_64,
-				);
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
+				AUTOMATION_APPLE_EVENTS = NO;
 				CODE_SIGN_ENTITLEMENTS = CoverFlowFinder/CoverFlowFinder.entitlements;
-				CODE_SIGN_STYLE = Automatic;
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
+				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 2;
+				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "";
+				"DEVELOPMENT_TEAM[sdk=macosx*]" = RH4U5VJHM6;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
+				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = CoverFlowFinder/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = "CoverFlow Finder";
@@ -413,6 +430,13 @@
 				MARKETING_VERSION = 1.1.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.coverflowfinder.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
+				PROVISIONING_PROFILE_SPECIFIER = "";
+				RUNTIME_EXCEPTION_ALLOW_DYLD_ENVIRONMENT_VARIABLES = NO;
+				RUNTIME_EXCEPTION_ALLOW_JIT = NO;
+				RUNTIME_EXCEPTION_ALLOW_UNSIGNED_EXECUTABLE_MEMORY = NO;
+				RUNTIME_EXCEPTION_DEBUGGING_TOOL = NO;
+				RUNTIME_EXCEPTION_DISABLE_EXECUTABLE_PAGE_PROTECTION = NO;
+				RUNTIME_EXCEPTION_DISABLE_LIBRARY_VALIDATION = NO;
 				SWIFT_EMIT_LOC_STRINGS = YES;
 				SWIFT_VERSION = 5.0;
 			};

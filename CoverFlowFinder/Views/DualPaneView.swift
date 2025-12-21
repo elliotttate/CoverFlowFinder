@@ -460,7 +460,7 @@ struct PaneListView: View {
                     .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
                     .onDrag {
                         guard !item.isFromArchive else { return NSItemProvider() }
-                        return NSItemProvider(object: item.url as NSURL)
+                        return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
                     }
                     .onDrop(of: [.fileURL], delegate: DualPaneFolderDropDelegate(
                         item: item,
@@ -628,7 +628,7 @@ struct PaneIconView: View {
                             .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
                             .onDrag {
                                 guard !item.isFromArchive else { return NSItemProvider() }
-                                return NSItemProvider(object: item.url as NSURL)
+                                return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
                             }
                             .onDrop(of: [.fileURL], delegate: DualPaneFolderDropDelegate(
                                 item: item,
