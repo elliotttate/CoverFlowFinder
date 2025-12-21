@@ -56,6 +56,8 @@ struct SettingsView: View {
 
             Section("Sorting") {
                 Toggle("Keep folders on top", isOn: $settings.foldersFirst)
+                Toggle("Remember column settings per folder", isOn: $settings.usePerFolderColumnState)
+                    .help("When enabled, column widths, order, and sort settings are saved per folder (Finder behavior). When disabled, settings are global.")
             }
 
             Section("Thumbnails") {
