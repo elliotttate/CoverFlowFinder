@@ -919,11 +919,19 @@ class FileBrowserViewModel: ObservableObject {
 
     func navigateTo(_ url: URL) {
         guard url != currentPath else { return }
+
+        // Save column state for current folder before navigating
+        ListColumnConfigManager.shared.saveCurrentStateForFolder(currentPath, appSettings: AppSettings.shared)
+
         photosLibraryInfo = nil
         clearPhotosCaches()
         currentPath = url
         selectedItems.removeAll()
         coverFlowSelectedIndex = 0
+
+        // Apply column state for new folder
+        ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
+
         loadContents()
         addToHistory(.filesystem(url))
     }
@@ -931,6 +939,10 @@ class FileBrowserViewModel: ObservableObject {
     /// Navigate to a URL and select the folder we came from (for path bar navigation)
     func navigateToAndSelectCurrent(_ url: URL) {
         guard url != currentPath else { return }
+
+        // Save column state for current folder before navigating
+        ListColumnConfigManager.shared.saveCurrentStateForFolder(currentPath, appSettings: AppSettings.shared)
+
         photosLibraryInfo = nil
         clearPhotosCaches()
         // Remember current path to select it after navigating
@@ -938,6 +950,10 @@ class FileBrowserViewModel: ObservableObject {
         currentPath = url
         selectedItems.removeAll()
         // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
+
+        // Apply column state for new folder
+        ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
+
         loadContents()
         addToHistory(.filesystem(url))
     }

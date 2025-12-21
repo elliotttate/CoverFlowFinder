@@ -2055,7 +2055,7 @@ struct CoverFlowInfoHeightKey: PreferenceKey {
     }
 }
 
-// MARK: - File List Section
+// MARK: - File List Section (using NSTableView)
 
 struct FileListSection: View {
     let items: [FileItem]  // Already sorted by parent
@@ -2063,90 +2063,17 @@ struct FileListSection: View {
     let onSelect: (FileItem, Int) -> Void
     let onOpen: (FileItem) -> Void
     @ObservedObject var viewModel: FileBrowserViewModel
+    @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
     @State private var isDropTargeted = false
-    @State private var dropTargetedItemID: UUID?  // Track which folder row is being hovered
 
     var body: some View {
-        VStack(spacing: 0) {
-            // Column header
-            CoverFlowColumnHeader(columnConfig: columnConfig)
-
-            Divider()
-
-            // File list with native selection support
-            ScrollViewReader { scrollProxy in
-                List(selection: Binding(
-                    get: { Set(viewModel.selectedItems.map { $0.id }) },
-                    set: { ids in
-                        viewModel.selectedItems = Set(items.filter { ids.contains($0.id) })
-                    }
-                )) {
-                    ForEach(items) { item in
-                        CoverFlowFileRow(item: item, viewModel: viewModel, isSelected: selectedItems.contains(item), columnConfig: columnConfig)
-                            .tag(item.id)
-                            .id(item.id)
-                            .listRowInsets(EdgeInsets(top: 0, leading: 0, bottom: 0, trailing: 0))
-                            .listRowBackground(
-                                dropTargetedItemID == item.id
-                                    ? Color.accentColor.opacity(0.3)  // Drop target highlight
-                                    : (selectedItems.contains(item)
-                                        ? Color.accentColor.opacity(0.2)
-                                        : Color.clear)
-                            )
-                            .overlay(
-                                // Blue border when this folder is a drop target
-                                RoundedRectangle(cornerRadius: 4)
-                                    .stroke(Color.accentColor, lineWidth: 2)
-                                    .opacity(dropTargetedItemID == item.id ? 1 : 0)
-                            )
-                            .onDrag {
-                                if item.isFromArchive {
-                                    return NSItemProvider()
-                                }
-                                return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
-                            }
-                            .onDrop(of: [.fileURL], delegate: CoverFlowFolderDropDelegate(
-                                item: item,
-                                viewModel: viewModel,
-                                dropTargetedItemID: $dropTargetedItemID
-                            ))
-                            .instantTap(
-                                id: item.id,
-                                onSingleClick: {
-                                    if let index = items.firstIndex(of: item) {
-                                        let modifiers = NSEvent.modifierFlags
-                                        viewModel.handleSelection(
-                                            item: item,
-                                            index: index,
-                                            in: items,
-                                            withShift: modifiers.contains(.shift),
-                                            withCommand: modifiers.contains(.command)
-                                        )
-                                        onSelect(item, index)
-                                    }
-                                },
-                                onDoubleClick: {
-                                    onOpen(item)
-                                }
-                            )
-                            .contextMenu {
-                                FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                                    viewModel.renamingURL = item.url
-                                }
-                            }
-                    }
-                }
-                .listStyle(.plain)
-                .onChange(of: selectedItems) { newSelection in
-                    if let firstSelected = newSelection.first {
-                        withAnimation {
-                            scrollProxy.scrollTo(firstSelected.id)
-                        }
-                    }
-                }
-            }
-        }
+        FileTableView(
+            viewModel: viewModel,
+            columnConfig: columnConfig,
+            appSettings: appSettings,
+            items: items
+        )
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
             return true
@@ -2154,6 +2081,7 @@ struct FileListSection: View {
         .overlay(
             RoundedRectangle(cornerRadius: 4)
                 .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 2)
+                .allowsHitTesting(false)
         )
     }
 
@@ -2170,250 +2098,3 @@ struct FileListSection: View {
     }
 }
 
-// Column header for CoverFlow file list
-struct CoverFlowColumnHeader: View {
-    @EnvironmentObject private var appSettings: AppSettings
-    @ObservedObject var columnConfig: ListColumnConfigManager
-
-    var body: some View {
-        HStack(spacing: 0) {
-            ForEach(columnConfig.visibleColumns) { settings in
-                CoverFlowColumnHeaderCell(
-                    settings: settings,
-                    isSortColumn: columnConfig.sortColumn == settings.column,
-                    sortDirection: columnConfig.sortDirection,
-                    onSort: { columnConfig.setSortColumn(settings.column) },
-                    onResize: { delta in
-                        columnConfig.setColumnWidth(settings.column, width: settings.width + delta)
-                    }
-                )
-                .contextMenu {
-                    columnVisibilityMenu
-                }
-            }
-            Spacer()
-        }
-        .frame(height: 22) // Fixed header height
-        .padding(.horizontal, 8)
-        .background(Color(nsColor: .controlBackgroundColor))
-    }
-
-    @ViewBuilder
-    private var columnVisibilityMenu: some View {
-        Text("Columns")
-            .font(appSettings.listDetailFont)
-
-        Divider()
-
-        ForEach(ListColumn.allCases) { column in
-            let isVisible = columnConfig.columns.first(where: { $0.column == column })?.isVisible ?? false
-            Button {
-                columnConfig.toggleColumnVisibility(column)
-            } label: {
-                HStack {
-                    if isVisible {
-                        Image(systemName: "checkmark")
-                    }
-                    Text(column.rawValue)
-                }
-            }
-            .disabled(column == .name)
-        }
-
-        Divider()
-
-        Button("Reset to Defaults") {
-            columnConfig.resetToDefaults()
-        }
-    }
-}
-
-// Column header cell with resize handle for CoverFlow
-struct CoverFlowColumnHeaderCell: View {
-    @EnvironmentObject private var appSettings: AppSettings
-    let settings: ColumnSettings
-    let isSortColumn: Bool
-    let sortDirection: SortDirection
-    let onSort: () -> Void
-    let onResize: (CGFloat) -> Void
-
-    @State private var isHovering = false
-
-    var body: some View {
-        HStack(spacing: 0) {
-            Button(action: onSort) {
-                HStack(spacing: 4) {
-                    // Leading alignment: padding, content, spacer
-                    if settings.column.alignment == .leading {
-                        Color.clear.frame(width: 8) // Fixed left padding
-                        headerContent
-                        Spacer(minLength: 0)
-                    }
-                    // Trailing alignment: spacer, content, padding
-                    else if settings.column.alignment == .trailing {
-                        Spacer(minLength: 0)
-                        headerContent
-                        Color.clear.frame(width: 8) // Fixed right padding
-                    }
-                    // Center: spacers on both sides
-                    else {
-                        Spacer(minLength: 0)
-                        headerContent
-                        Spacer(minLength: 0)
-                    }
-                }
-            }
-            .buttonStyle(.plain)
-            .frame(maxWidth: .infinity)
-
-            // Resize handle
-            Rectangle()
-                .fill(isHovering ? Color.accentColor : Color.clear)
-                .frame(width: 4)
-                .contentShape(Rectangle().inset(by: -4))
-                .gesture(
-                    DragGesture()
-                        .onChanged { value in
-                            onResize(value.translation.width)
-                        }
-                )
-                .onHover { hovering in
-                    isHovering = hovering
-                    if hovering {
-                        NSCursor.resizeLeftRight.push()
-                    } else {
-                        NSCursor.pop()
-                    }
-                }
-        }
-        .frame(width: settings.width)
-    }
-
-    @ViewBuilder
-    private var headerContent: some View {
-        Text(settings.column.rawValue)
-            .font(appSettings.listDetailFont)
-            .fontWeight(.medium)
-            .foregroundColor(.secondary)
-            .lineLimit(1)
-
-        if isSortColumn {
-            Image(systemName: sortDirection == .ascending ? "chevron.up" : "chevron.down")
-                .font(appSettings.listDetailFont)
-                .foregroundColor(.secondary)
-        }
-    }
-}
-
-// File row for CoverFlow file list
-struct CoverFlowFileRow: View {
-    @EnvironmentObject private var appSettings: AppSettings
-    let item: FileItem
-    @ObservedObject var viewModel: FileBrowserViewModel
-    let isSelected: Bool
-    @ObservedObject var columnConfig: ListColumnConfigManager
-
-    var body: some View {
-        HStack(spacing: 0) {
-            ForEach(columnConfig.visibleColumns) { settings in
-                alignedCell(for: settings.column, width: settings.width, alignment: settings.column.alignment)
-            }
-            Spacer()
-        }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 4)
-        .frame(maxWidth: .infinity)
-        .contentShape(Rectangle())
-        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
-    }
-
-    @ViewBuilder
-    private func alignedCell(for column: ListColumn, width: CGFloat, alignment: Alignment) -> some View {
-        HStack(spacing: 0) {
-            if alignment == .leading {
-                Color.clear.frame(width: 8)
-                cellContent(for: column)
-                Spacer(minLength: 0)
-            } else if alignment == .trailing {
-                Spacer(minLength: 0)
-                cellContent(for: column)
-                Color.clear.frame(width: 8)
-            } else {
-                Spacer(minLength: 0)
-                cellContent(for: column)
-                Spacer(minLength: 0)
-            }
-        }
-        .frame(width: width)
-    }
-
-    @ViewBuilder
-    private func cellContent(for column: ListColumn) -> some View {
-        switch column {
-        case .name:
-            HStack(spacing: 8) {
-                Image(nsImage: item.icon)
-                    .resizable()
-                    .aspectRatio(contentMode: .fit)
-                    .frame(width: appSettings.listIconSizeValue, height: appSettings.listIconSizeValue)
-                InlineRenameField(item: item, viewModel: viewModel, font: appSettings.listFont, alignment: .leading, lineLimit: 1)
-                if appSettings.showItemTags, !item.tags.isEmpty {
-                    TagDotsView(tags: item.tags)
-                }
-            }
-        case .dateModified:
-            Text(item.formattedDate)
-                .foregroundColor(.secondary)
-                .font(appSettings.listDetailFont)
-        case .dateCreated:
-            Text(formattedCreationDate)
-                .foregroundColor(.secondary)
-                .font(appSettings.listDetailFont)
-        case .size:
-            Text(item.formattedSize)
-                .foregroundColor(.secondary)
-                .font(appSettings.listDetailFont)
-        case .kind:
-            Text(item.kindDescription)
-                .foregroundColor(.secondary)
-                .font(appSettings.listDetailFont)
-        case .tags:
-            CoverFlowTagsView(url: item.url)
-        }
-    }
-
-    private var formattedCreationDate: String {
-        guard let date = item.creationDate else { return "--" }
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
-    }
-
-}
-
-struct CoverFlowTagsView: View {
-    @EnvironmentObject private var appSettings: AppSettings
-    let url: URL
-    @State private var tags: [String] = []
-
-    var body: some View {
-        Group {
-            if appSettings.showItemTags {
-                HStack(spacing: 4) {
-                    ForEach(tags.prefix(3), id: \.self) { tag in
-                        TagBadge(name: tag)
-                    }
-                    if tags.count > 3 {
-                        Text("+\(tags.count - 3)")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-            }
-        }
-        .onAppear {
-            tags = FileTagManager.getTags(for: url)
-        }
-    }
-}

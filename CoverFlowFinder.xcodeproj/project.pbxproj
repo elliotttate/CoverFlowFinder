@@ -29,6 +29,9 @@
 		A1000027001 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000027000 /* AppSettings.swift */; };
 		A1000028001 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000028000 /* SettingsView.swift */; };
 		A1000029001 /* MasonryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000029000 /* MasonryView.swift */; };
+		A100002A001 /* FileTableView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002A000 /* FileTableView.swift */; };
+		A100002B001 /* FileTableCellViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002B000 /* FileTableCellViews.swift */; };
+		A100002D001 /* PerFolderColumnState.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100002D000 /* PerFolderColumnState.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -57,6 +60,9 @@
 		A1000027000 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		A1000028000 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		A1000029000 /* MasonryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MasonryView.swift; sourceTree = "<group>"; };
+		A100002A000 /* FileTableView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTableView.swift; sourceTree = "<group>"; };
+		A100002B000 /* FileTableCellViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FileTableCellViews.swift; sourceTree = "<group>"; };
+		A100002D000 /* PerFolderColumnState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PerFolderColumnState.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -106,6 +112,7 @@
 				A1000027000 /* AppSettings.swift */,
 				A1000002000 /* FileItem.swift */,
 				A1000002002 /* ListColumnConfig.swift */,
+				A100002D000 /* PerFolderColumnState.swift */,
 				A1000024000 /* ThumbnailCacheManager.swift */,
 				A1000026000 /* ZipArchiveManager.swift */,
 			);
@@ -123,6 +130,7 @@
 		A1000013000 /* Views */ = {
 			isa = PBXGroup;
 			children = (
+				A100002C000 /* TableView */,
 				A1000004000 /* ContentView.swift */,
 				A1000005000 /* CoverFlowView.swift */,
 				A1000006000 /* SidebarView.swift */,
@@ -139,6 +147,15 @@
 				A1000029000 /* MasonryView.swift */,
 			);
 			path = Views;
+			sourceTree = "<group>";
+		};
+		A100002C000 /* TableView */ = {
+			isa = PBXGroup;
+			children = (
+				A100002A000 /* FileTableView.swift */,
+				A100002B000 /* FileTableCellViews.swift */,
+			);
+			path = TableView;
 			sourceTree = "<group>";
 		};
 /* End PBXGroup section */
@@ -231,6 +248,9 @@
 				A1000027001 /* AppSettings.swift in Sources */,
 				A1000028001 /* SettingsView.swift in Sources */,
 				A1000029001 /* MasonryView.swift in Sources */,
+				A100002A001 /* FileTableView.swift in Sources */,
+				A100002B001 /* FileTableCellViews.swift in Sources */,
+				A100002D001 /* PerFolderColumnState.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

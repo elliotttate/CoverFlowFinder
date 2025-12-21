@@ -35,18 +35,11 @@ enum ListColumn: String, CaseIterable, Codable, Identifiable {
     }
 
     var alignment: Alignment {
-        switch self {
-        case .name: return .leading
-        case .size: return .trailing
-        default: return .leading
-        }
+        return .leading
     }
 
     var textAlignment: TextAlignment {
-        switch self {
-        case .size: return .trailing
-        default: return .leading
-        }
+        return .leading
     }
 }
 
