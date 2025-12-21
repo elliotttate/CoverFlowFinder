@@ -117,6 +117,7 @@ private class IconCache {
     private let genericVideoIcon: NSImage
     private let genericAudioIcon: NSImage
     private let genericFolderIcon: NSImage
+    private let genericApplicationIcon: NSImage
 
     // File extensions that should use generic icons for speed
     private let imageExtensions: Set<String> = ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp", "raw", "cr2", "nef", "arw", "dng"]
@@ -131,6 +132,7 @@ private class IconCache {
         genericVideoIcon = NSWorkspace.shared.icon(for: .movie)
         genericAudioIcon = NSWorkspace.shared.icon(for: .audio)
         genericFolderIcon = NSWorkspace.shared.icon(for: .folder)
+        genericApplicationIcon = NSWorkspace.shared.icon(for: .application)
     }
 
     func icon(for url: URL, isPlainFolder: Bool = false) -> NSImage {
@@ -170,6 +172,7 @@ private class IconCache {
         case .video: return genericVideoIcon
         case .audio: return genericAudioIcon
         case .folder: return genericFolderIcon
+        case .application: return genericApplicationIcon
         default: return NSWorkspace.shared.icon(for: .data)
         }
     }
@@ -218,6 +221,12 @@ struct FileItem: Identifiable, Hashable, Transferable {
         // Folders can have custom colors that might change
         let isPlainFolder = fileType == .folder
         return IconCache.shared.icon(for: url, isPlainFolder: isPlainFolder)
+    }
+
+    /// Fast placeholder icon - returns instantly without filesystem access
+    /// Use this for initial display while the real icon loads asynchronously
+    var placeholderIcon: NSImage {
+        IconCache.shared.genericIcon(for: fileType)
     }
 
     /// Check if this item is a ZIP archive that can be browsed

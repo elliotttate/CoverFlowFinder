@@ -5,6 +5,7 @@ import Combine
 import UniformTypeIdentifiers
 import Photos
 import os
+import CoreServices
 
 extension Notification.Name {
     static let showGetInfo = Notification.Name("showGetInfo")
@@ -135,6 +136,11 @@ class FileBrowserViewModel: ObservableObject {
     /// Queue for metadata hydration requests
     private var pendingHydrationURLs: Set<URL> = []
     private let hydrationQueue = DispatchQueue(label: "com.coverflowfinder.hydration", qos: .userInitiated)
+    private var directoryWatcher: DirectoryWatcher?
+    private var watchingDirectoryURL: URL?
+    private var pendingDirectoryEventURLs: Set<URL> = []
+    private var directoryEventWorkItem: DispatchWorkItem?
+    private let directoryEventDebounce: TimeInterval = 0.25
     struct PhotoAssetDragInfo {
         let filename: String
         let uti: String
@@ -304,14 +310,17 @@ class FileBrowserViewModel: ObservableObject {
     func loadContents() {
         // If we're inside an archive, load archive contents instead
         if isInsideArchive {
+            stopDirectoryWatcher()
             loadArchiveContents()
             return
         }
         if let photosLibraryInfo {
             photosLogger.info("loadContents routing to Photos library for path: \(self.currentPath.path, privacy: .public)")
+            stopDirectoryWatcher()
             loadPhotosLibraryContents(info: photosLibraryInfo)
             return
         }
+        startDirectoryWatcher(for: currentPath)
 
         isLoading = true
         items = []
@@ -447,6 +456,7 @@ class FileBrowserViewModel: ObservableObject {
             pendingHydrationURLs.insert(url)
         }
 
+        let idByURL = Dictionary(uniqueKeysWithValues: items.map { ($0.url, $0.id) })
         let loadToken = directoryLoadToken
         hydrationQueue.async { [weak self] in
             guard let self = self else { return }
@@ -458,7 +468,8 @@ class FileBrowserViewModel: ObservableObject {
                 guard DispatchQueue.main.sync(execute: { self.directoryLoadToken == loadToken }) else { return }
 
                 // Load full metadata
-                let hydratedItem = FileItem(url: url, loadMetadata: true)
+                let existingID = idByURL[url]
+                let hydratedItem = FileItem(url: url, id: existingID ?? UUID(), loadMetadata: true)
                 hydratedItems.append((url: url, item: hydratedItem))
             }
 
@@ -483,6 +494,140 @@ class FileBrowserViewModel: ObservableObject {
     /// Check if an item needs metadata hydration
     func needsHydration(_ item: FileItem) -> Bool {
         !item.hasMetadata && !hydratedURLs.contains(item.url)
+    }
+
+    // MARK: - Directory Watching
+
+    private func startDirectoryWatcher(for url: URL) {
+        if watchingDirectoryURL == url, directoryWatcher != nil { return }
+        if directoryWatcher == nil {
+            directoryWatcher = DirectoryWatcher { [weak self] urls in
+                guard let self else { return }
+                Task { @MainActor in
+                    self.queueDirectoryEvents(urls)
+                }
+            }
+        }
+        watchingDirectoryURL = url
+        directoryWatcher?.start(watching: url)
+    }
+
+    private func stopDirectoryWatcher() {
+        watchingDirectoryURL = nil
+        directoryEventWorkItem?.cancel()
+        directoryEventWorkItem = nil
+        pendingDirectoryEventURLs.removeAll()
+        directoryWatcher?.stop()
+    }
+
+    private func queueDirectoryEvents(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        guard !isInsideArchive, photosLibraryInfo == nil else { return }
+        guard let watchURL = watchingDirectoryURL, watchURL == currentPath else { return }
+
+        let filtered = urls.filter { url in
+            url.deletingLastPathComponent() == watchURL || url == watchURL
+        }
+        guard !filtered.isEmpty else { return }
+
+        pendingDirectoryEventURLs.formUnion(filtered)
+        directoryEventWorkItem?.cancel()
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.processDirectoryEvents()
+        }
+        directoryEventWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + directoryEventDebounce, execute: workItem)
+    }
+
+    private func processDirectoryEvents() {
+        if isLoading {
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.processDirectoryEvents()
+            }
+            directoryEventWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + directoryEventDebounce, execute: workItem)
+            return
+        }
+        let urls = pendingDirectoryEventURLs
+        pendingDirectoryEventURLs.removeAll()
+        applyDirectoryEventUpdates(for: urls)
+    }
+
+    private func applyDirectoryEventUpdates(for urls: Set<URL>) {
+        guard let watchURL = watchingDirectoryURL, watchURL == currentPath else { return }
+        guard !urls.isEmpty else { return }
+
+        let showHidden = AppSettings.shared.showHiddenFiles
+        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let shouldLoadMetadata = items.count <= directoryBatchSize || sortStateRequiresMetadata(sortState)
+
+        var updatedItems = items
+        var updatedSelection = selectedItems
+        var indicesByURL = Dictionary(uniqueKeysWithValues: updatedItems.enumerated().map { ($0.element.url, $0.offset) })
+        var indicesToRemove: [Int] = []
+        var urlsToUpdate: [URL] = []
+        var urlsToAdd: [URL] = []
+
+        for url in urls {
+            if url == watchURL { continue }
+            guard url.deletingLastPathComponent() == watchURL else { continue }
+
+            if !showHidden, url.lastPathComponent.hasPrefix(".") {
+                if let idx = indicesByURL[url] {
+                    indicesToRemove.append(idx)
+                }
+                continue
+            }
+
+            var isDir: ObjCBool = false
+            let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
+            if exists {
+                if indicesByURL[url] != nil {
+                    urlsToUpdate.append(url)
+                } else {
+                    urlsToAdd.append(url)
+                }
+            } else if let idx = indicesByURL[url] {
+                indicesToRemove.append(idx)
+            }
+        }
+
+        if indicesToRemove.isEmpty && urlsToUpdate.isEmpty && urlsToAdd.isEmpty { return }
+
+        for idx in indicesToRemove.sorted(by: >) {
+            let removed = updatedItems.remove(at: idx)
+            updatedSelection.remove(removed)
+            hydratedURLs.remove(removed.url)
+            pendingHydrationURLs.remove(removed.url)
+        }
+
+        indicesByURL = Dictionary(uniqueKeysWithValues: updatedItems.enumerated().map { ($0.element.url, $0.offset) })
+
+        for url in urlsToUpdate {
+            guard let idx = indicesByURL[url] else { continue }
+            let existing = updatedItems[idx]
+            let loadMetadata = existing.hasMetadata || shouldLoadMetadata
+            updatedItems[idx] = FileItem(url: url, id: existing.id, loadMetadata: loadMetadata)
+        }
+
+        for url in urlsToAdd {
+            let newItem = FileItem(url: url, loadMetadata: shouldLoadMetadata)
+            updatedItems.append(newItem)
+        }
+
+        items = updatedItems
+        selectedItems = updatedSelection
+        navigationGeneration &+= 1
+    }
+
+    private func sortStateRequiresMetadata(_ sortState: SortState) -> Bool {
+        switch sortState.column {
+        case .dateModified, .dateCreated, .size:
+            return true
+        default:
+            return false
+        }
     }
 
     /// Load contents from within a ZIP archive
@@ -1880,5 +2025,73 @@ class FileBrowserViewModel: ObservableObject {
                 throw error
             }
         }
+    }
+}
+
+private final class DirectoryWatcher {
+    private var stream: FSEventStreamRef?
+    private let queue = DispatchQueue(label: "com.coverflowfinder.directorywatcher", qos: .utility)
+    private let callback: ([URL]) -> Void
+    private var watchedPath: String?
+
+    init(callback: @escaping ([URL]) -> Void) {
+        self.callback = callback
+    }
+
+    func start(watching url: URL) {
+        let path = url.path
+        if watchedPath == path { return }
+        stop()
+        watchedPath = path
+
+        var context = FSEventStreamContext(
+            version: 0,
+            info: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()),
+            retain: nil,
+            release: nil,
+            copyDescription: nil
+        )
+
+        let flags = FSEventStreamCreateFlags(
+            kFSEventStreamCreateFlagUseCFTypes |
+            kFSEventStreamCreateFlagFileEvents |
+            kFSEventStreamCreateFlagNoDefer
+        )
+
+        let pathsToWatch = [path] as CFArray
+        stream = FSEventStreamCreate(
+            kCFAllocatorDefault,
+            DirectoryWatcher.eventCallback,
+            &context,
+            pathsToWatch,
+            FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
+            0.2,
+            flags
+        )
+
+        if let stream {
+            FSEventStreamSetDispatchQueue(stream, queue)
+            FSEventStreamStart(stream)
+        }
+    }
+
+    func stop() {
+        guard let stream else { return }
+        FSEventStreamStop(stream)
+        FSEventStreamInvalidate(stream)
+        FSEventStreamRelease(stream)
+        self.stream = nil
+    }
+
+    deinit {
+        stop()
+    }
+
+    private static let eventCallback: FSEventStreamCallback = { _, clientInfo, numEvents, eventPaths, _, _ in
+        guard let clientInfo else { return }
+        let watcher = Unmanaged<DirectoryWatcher>.fromOpaque(clientInfo).takeUnretainedValue()
+        let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
+        let urls = paths.map { URL(fileURLWithPath: $0) }
+        watcher.callback(urls)
     }
 }

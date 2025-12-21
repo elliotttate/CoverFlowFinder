@@ -16,6 +16,9 @@ struct IconGridView: View {
     // Thumbnail loading
     @State private var thumbnails: [URL: NSImage] = [:]
     private let thumbnailCache = ThumbnailCacheManager.shared
+    @State private var visibleItemIDs: Set<UUID> = []
+    @State private var hydrationWorkItem: DispatchWorkItem?
+    @State private var lastHydratedRange: Range<Int>?
 
     private var cellWidth: CGFloat {
         let iconSize = settings.iconGridIconSizeValue
@@ -65,6 +68,10 @@ struct IconGridView: View {
                             )
                             .onAppear {
                                 loadThumbnail(for: item)
+                                updateVisibility(for: item, isVisible: true)
+                            }
+                            .onDisappear {
+                                updateVisibility(for: item, isVisible: false)
                             }
                             .onDrag {
                                 guard !item.isFromArchive else { return NSItemProvider() }
@@ -157,6 +164,10 @@ struct IconGridView: View {
             DispatchQueue.main.async {
                 thumbnails.removeAll()
                 thumbnailCache.clearForNewFolder()
+                visibleItemIDs.removeAll()
+                lastHydratedRange = nil
+                hydrationWorkItem?.cancel()
+                hydrationWorkItem = nil
             }
         }
         .onChange(of: settings.thumbnailQuality) { _ in
@@ -225,6 +236,58 @@ struct IconGridView: View {
         } else {
             QuickLookControllerView.shared.updatePreview(for: nil)
         }
+    }
+
+    private func updateVisibility(for item: FileItem, isVisible: Bool) {
+        if isVisible {
+            visibleItemIDs.insert(item.id)
+        } else {
+            visibleItemIDs.remove(item.id)
+        }
+        scheduleHydration()
+    }
+
+    private func scheduleHydration() {
+        hydrationWorkItem?.cancel()
+        let itemsSnapshot = items
+        let visibleSnapshot = visibleItemIDs
+        let columnCount = calculatedColumns
+        let workItem = DispatchWorkItem { [itemsSnapshot, visibleSnapshot, columnCount] in
+            guard !visibleSnapshot.isEmpty else { return }
+            let visibleIndices = itemsSnapshot.enumerated().compactMap { index, item in
+                visibleSnapshot.contains(item.id) ? index : nil
+            }
+            guard let minIndex = visibleIndices.min(),
+                  let maxIndex = visibleIndices.max() else { return }
+            let buffer = max(8, columnCount * 2)
+            let start = max(0, minIndex - buffer)
+            let end = min(itemsSnapshot.count - 1, maxIndex + buffer)
+            let range = start..<(end + 1)
+            DispatchQueue.main.async {
+                if range == self.lastHydratedRange { return }
+                self.lastHydratedRange = range
+                var urlsToHydrate: [URL] = []
+                urlsToHydrate.reserveCapacity(range.count)
+                for index in range {
+                    let item = itemsSnapshot[index]
+                    if self.viewModel.needsHydration(item) {
+                        urlsToHydrate.append(item.url)
+                    }
+                }
+                if !urlsToHydrate.isEmpty {
+                    self.viewModel.hydrateMetadata(for: urlsToHydrate)
+                }
+                for index in range {
+                    let item = itemsSnapshot[index]
+                    guard !item.isDirectory else { continue }
+                    if self.thumbnails[item.url] == nil {
+                        self.loadThumbnail(for: item)
+                    }
+                }
+            }
+        }
+        hydrationWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05, execute: workItem)
     }
 
     private func loadThumbnail(for item: FileItem) {

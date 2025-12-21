@@ -21,6 +21,8 @@ struct CoverFlowView: View {
     @State private var lastThumbnailLoadTime: Date = .distantPast
     @State private var thumbnailLoadTimer: Timer?
     private let thumbnailLoadThrottle: TimeInterval = 0.016
+    @State private var lastHydrationRange: Range<Int>? = nil
+    @State private var itemsToken: Int = 0
 
     private var coverFlowThumbnailPixelSize: CGFloat {
         let base = 192 * settings.coverFlowScaleValue * settings.thumbnailQualityValue
@@ -62,6 +64,7 @@ struct CoverFlowView: View {
             VStack(spacing: 0) {
                 CoverFlowContainer(
                     items: sortedItemsCache,
+                    itemsToken: itemsToken,
                     selectedIndex: $viewModel.coverFlowSelectedIndex,
                     thumbnails: thumbnails,
                     thumbnailCount: thumbnails.count,
@@ -219,6 +222,10 @@ struct CoverFlowView: View {
                 updateQuickLookForSelection()
             }
         }
+        .onChange(of: viewModel.selectedItems) { _ in
+            // Sync Cover Flow selection when file list selection changes
+            syncSelection()
+        }
         .onPreferenceChange(CoverFlowInfoHeightKey.self) { newValue in
             if newValue > 0 {
                 infoPanelHeight = newValue
@@ -253,12 +260,22 @@ struct CoverFlowView: View {
 
     private func updateSortedItems() {
         sortedItemsCache = items
+        itemsToken = itemsTokenFor(items)
         if let selected = viewModel.selectedItems.first,
            let index = sortedItemsCache.firstIndex(of: selected) {
             viewModel.coverFlowSelectedIndex = index
         } else {
             viewModel.coverFlowSelectedIndex = min(viewModel.coverFlowSelectedIndex, max(0, sortedItemsCache.count - 1))
         }
+    }
+
+    private func itemsTokenFor(_ items: [FileItem]) -> Int {
+        var hasher = Hasher()
+        hasher.combine(items.count)
+        for item in items {
+            hasher.combine(item.id)
+        }
+        return hasher.finalize()
     }
 
     private func syncSelection() {
@@ -334,6 +351,26 @@ struct CoverFlowView: View {
         let preloadRange = min(visibleRange * preloadRangeMultiplier, thumbnailWindowSize)
         let preloadStart = max(0, selected - preloadRange)
         let preloadEnd = min(sortedItemsCache.count - 1, selected + preloadRange)
+
+        if preloadStart <= preloadEnd {
+            let hydrationEnd = min(sortedItemsCache.count, preloadEnd + 1)
+            let hydrationRange = preloadStart..<hydrationEnd
+            if hydrationRange != lastHydrationRange {
+                lastHydrationRange = hydrationRange
+                var urlsToHydrate: [URL] = []
+                urlsToHydrate.reserveCapacity(hydrationRange.count)
+                for index in hydrationRange {
+                    let item = sortedItemsCache[index]
+                    if viewModel.needsHydration(item) {
+                        urlsToHydrate.append(item.url)
+                    }
+                }
+                if !urlsToHydrate.isEmpty {
+                    viewModel.hydrateMetadata(for: urlsToHydrate)
+                }
+            }
+        }
+
         var keepURLs = Set<URL>()
         for i in windowStart...windowEnd {
             keepURLs.insert(sortedItemsCache[i].url)
@@ -356,7 +393,7 @@ struct CoverFlowView: View {
             if hasRealThumbnail {
                 continue
             } else if thumbnailCache.hasFailed(url: item.url) {
-                thumbnailUpdates[item.url] = item.icon
+                thumbnailUpdates[item.url] = item.placeholderIcon
                 placeholdersToRemove.insert(item.url)
             } else {
                 if let cachedHigh = thumbnailCache.getCachedThumbnail(for: item.url, maxPixelSize: thumbnailPixelSize) {
@@ -372,7 +409,7 @@ struct CoverFlowView: View {
                         placeholdersToAdd.insert(item.url)
                     }
                 } else if thumbnails[item.url] == nil {
-                    thumbnailUpdates[item.url] = item.icon
+                    thumbnailUpdates[item.url] = item.placeholderIcon
                     placeholdersToAdd.insert(item.url)
                 }
 
@@ -465,10 +502,10 @@ struct CoverFlowView: View {
                     if thumbnails[url] != nil && !iconPlaceholders.contains(url) {
                         return
                     }
-                    thumbnails[url] = image ?? item.icon
+                    thumbnails[url] = image ?? item.placeholderIcon
                     iconPlaceholders.insert(url)
                 } else {
-                    thumbnails[url] = image ?? item.icon
+                    thumbnails[url] = image ?? item.placeholderIcon
                     iconPlaceholders.remove(url)
                 }
 
@@ -511,6 +548,7 @@ struct CoverFlowView: View {
 
 struct CoverFlowContainer: NSViewRepresentable {
     let items: [FileItem]
+    let itemsToken: Int
     @Binding var selectedIndex: Int
     let thumbnails: [URL: NSImage]
     let thumbnailCount: Int  // Explicit count to force SwiftUI updates
@@ -548,7 +586,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.selectedItems = selectedItems
         view.coverScale = coverScale
         view.scrollSensitivity = scrollSensitivity
-        view.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
+        view.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
         return view
     }
 
@@ -569,7 +607,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         nsView.selectedItems = selectedItems
         nsView.coverScale = coverScale
         nsView.scrollSensitivity = scrollSensitivity
-        nsView.updateItems(items, thumbnails: thumbnails, selectedIndex: selectedIndex)
+        nsView.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
     }
 }
 
@@ -586,6 +624,7 @@ class CoverFlowNSView: NSView {
     var selectedItems: Set<FileItem> = []  // Track multi-selection for drag
 
     private var items: [FileItem] = []
+    private var itemsToken: Int = 0
     private var thumbnails: [URL: NSImage] = [:]
     private var selectedIndex: Int = 0
     private var coverLayers: [CALayer] = []
@@ -680,21 +719,11 @@ class CoverFlowNSView: NSView {
         menu.popUp(positioning: nil, at: location, in: self)
     }
 
-    func updateItems(_ items: [FileItem], thumbnails: [URL: NSImage], selectedIndex: Int) {
-        // More robust items comparison - check first, last, and a sample from middle
-        let itemsChanged: Bool = {
-            if self.items.count != items.count { return true }
-            if self.items.first?.id != items.first?.id { return true }
-            if self.items.last?.id != items.last?.id { return true }
-            // Also check a middle element if there are enough items
-            if items.count > 2 {
-                let midIdx = items.count / 2
-                if self.items[midIdx].id != items[midIdx].id { return true }
-            }
-            return false
-        }()
+    func updateItems(_ items: [FileItem], itemsToken: Int, thumbnails: [URL: NSImage], selectedIndex: Int) {
+        let itemsChanged = self.items.count != items.count || self.itemsToken != itemsToken
 
         self.items = items
+        self.itemsToken = itemsToken
         self.thumbnails = thumbnails
 
         let indexChanged = self.selectedIndex != selectedIndex
@@ -779,7 +808,8 @@ class CoverFlowNSView: NSView {
         if let thumbnail {
             return ObjectIdentifier(thumbnail).hashValue
         }
-        return ObjectIdentifier(item.icon).hashValue
+        // Use placeholderIcon for fast hash - avoids expensive icon lookup
+        return ObjectIdentifier(item.placeholderIcon).hashValue
     }
 
     private func rebuildCovers() {
@@ -917,8 +947,8 @@ class CoverFlowNSView: NSView {
             // For thumbnails, CGImage is fine
             imageContent = thumb.cgImage(forProposedRect: nil, context: nil, hints: nil) ?? thumb
         } else {
-            // For icons, use NSImage directly (CGImage loses transparency)
-            imageContent = item.icon
+            // Use fast placeholder - real icon will load async
+            imageContent = item.placeholderIcon
         }
 
         // Update image layer - match createCoverLayer (y: 0, not offset)
@@ -1006,9 +1036,8 @@ class CoverFlowNSView: NSView {
                 imageLayer.contents = thumbnail
             }
         } else {
-            // For icons, use NSImage directly to preserve transparency
-            // CGImage conversion can lose alpha channel for system icons
-            imageLayer.contents = item.icon
+            // Use fast placeholder - real icon will load async
+            imageLayer.contents = item.placeholderIcon
         }
         imageLayer.contentsGravity = .resizeAspect
         container.addSublayer(imageLayer)
@@ -2097,4 +2126,3 @@ struct FileListSection: View {
         }
     }
 }
-
