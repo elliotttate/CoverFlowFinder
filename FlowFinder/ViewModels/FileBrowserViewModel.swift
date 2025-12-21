@@ -7,6 +7,8 @@ import Photos
 import os
 import CoreServices
 
+private let zipNavLogger = Logger(subsystem: "com.flowfinder.app", category: "ZipNav")
+
 // Notification names are defined in UIConstants.swift
 
 enum ViewMode: String, CaseIterable {
@@ -250,8 +252,8 @@ class FileBrowserViewModel: ObservableObject {
             }
         }
 
-        // Filter by tag
-        if let tag = filterTag {
+        // Filter by tag - skip for archive items since they have no tags
+        if let tag = filterTag, !isInsideArchive {
             filtered = filtered.filter { item in
                 item.tags.contains(tag)
             }
@@ -787,6 +789,7 @@ class FileBrowserViewModel: ObservableObject {
         // Get entries at the current path within the archive
         let entriesAtPath = ZipArchiveManager.shared.entriesAtPath(currentArchivePath, in: archiveEntries)
         var fileItems = ZipArchiveManager.shared.fileItems(from: entriesAtPath, archiveURL: archiveURL)
+
         let showHiddenFiles = AppSettings.shared.showHiddenFiles
         let foldersFirst = AppSettings.shared.foldersFirst
         if !showHiddenFiles {
@@ -796,7 +799,7 @@ class FileBrowserViewModel: ObservableObject {
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
         let sorted = sortItemsForBackground(fileItems, sortState: sortState, foldersFirst: foldersFirst)
 
-        items = fileItems
+        items = sorted
         coverFlowSelectedIndex = min(coverFlowSelectedIndex, max(0, sorted.count - 1))
         isLoading = false
         navigationGeneration += 1
@@ -1422,7 +1425,7 @@ class FileBrowserViewModel: ObservableObject {
                 coverFlowSelectedIndex = 0
                 loadContents()
             } catch {
-                print("Failed to restore archive state: \(error)")
+                zipNavLogger.error("Failed to restore archive state: \(error.localizedDescription)")
                 isInsideArchive = false
                 currentArchiveURL = nil
                 currentArchivePath = ""
@@ -1507,6 +1510,15 @@ class FileBrowserViewModel: ObservableObject {
             currentArchivePath = ""
             isInsideArchive = true
 
+            // Clear search text and tag filter when entering an archive
+            // since we're now browsing different content
+            if !searchText.isEmpty {
+                searchText = ""
+            }
+            if filterTag != nil {
+                filterTag = nil
+            }
+
             // Remember where we came from for back navigation
             enteredFolderURL = url
 
@@ -1519,6 +1531,7 @@ class FileBrowserViewModel: ObservableObject {
             addToHistory(.archive(archiveURL: url, internalPath: ""))
         } catch {
             // Fall back to opening with default app
+            zipNavLogger.error("Error reading archive: \(error.localizedDescription)")
             NSWorkspace.shared.open(url)
         }
     }
@@ -1529,7 +1542,6 @@ class FileBrowserViewModel: ObservableObject {
 
         // Ensure path ends with / for directories
         let normalizedPath = path.hasSuffix("/") ? String(path.dropLast()) : path
-
         currentArchivePath = normalizedPath
         selectedItems.removeAll()
         coverFlowSelectedIndex = 0

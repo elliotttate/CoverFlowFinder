@@ -121,6 +121,12 @@ class ThumbnailCacheManager {
     ) {
         let url = item.url
 
+        // Handle archive items specially - need to extract before thumbnailing
+        if item.isFromArchive {
+            generateArchiveThumbnail(for: item, maxPixelSize: maxPixelSize, completion: completion)
+            return
+        }
+
         // Skip directories - QuickLook returns generic blue folder icons
         // which loses custom folder colors. Use item.icon instead.
         // Cache the icon at the requested size for high-resolution display.
@@ -356,6 +362,211 @@ class ThumbnailCacheManager {
                     completion(url, item.placeholderIcon)
                 }
             }
+        }
+    }
+
+    // MARK: - Archive Thumbnail Generation
+
+    /// File types that benefit from thumbnail extraction
+    private static let thumbnailableExtensions: Set<String> = [
+        "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp",
+        "mp4", "mov", "avi", "mkv", "m4v", "pdf", "psd", "ai", "eps", "svg"
+    ]
+
+    private func generateArchiveThumbnail(
+        for item: FileItem,
+        maxPixelSize: CGFloat,
+        completion: @escaping (URL, NSImage?) -> Void
+    ) {
+        let url = item.url
+
+        guard let archiveURL = item.archiveURL,
+              let archivePath = item.archivePath else {
+            completion(url, item.placeholderIcon)
+            return
+        }
+
+        // Skip directories
+        if item.isDirectory {
+            completion(url, item.placeholderIcon)
+            return
+        }
+
+        // Only extract for file types that benefit from thumbnails
+        let ext = (item.name as NSString).pathExtension.lowercased()
+        guard Self.thumbnailableExtensions.contains(ext) else {
+            completion(url, item.placeholderIcon)
+            return
+        }
+
+        let targetSize = clampPixelSize(maxPixelSize)
+        let cacheKey = archiveCacheKey(archiveURL: archiveURL, archivePath: archivePath, maxPixelSize: targetSize)
+
+        // Check if already failed
+        let alreadyFailed = queue.sync { failedURLs.contains(url) }
+        guard !alreadyFailed else {
+            completion(url, item.placeholderIcon)
+            return
+        }
+
+        // Check if already pending
+        let alreadyPending = queue.sync { pendingRequests[cacheKey] != nil }
+        guard !alreadyPending else {
+            return
+        }
+
+        // Check caches
+        if let cached = memoryCache.object(forKey: cacheKey as NSString) {
+            completion(url, cached)
+            return
+        }
+        if let diskImage = loadFromDisk(key: cacheKey) {
+            let cost = estimateCost(for: diskImage)
+            memoryCache.setObject(diskImage, forKey: cacheKey as NSString, cost: cost)
+            completion(url, diskImage)
+            return
+        }
+
+        // Track this request
+        let generation: Int = queue.sync {
+            pendingRequests[cacheKey] = currentGeneration
+            return currentGeneration
+        }
+
+        // Extract and generate thumbnail on background queue
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            // Check if still valid
+            let isValid = self.queue.sync { self.pendingRequests[cacheKey] == generation }
+            guard isValid else {
+                _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
+                return
+            }
+
+            do {
+                // Extract file to temp location
+                let extractedURL = try ZipArchiveManager.shared.extractByPath(archivePath, from: archiveURL)
+
+                // Check if still valid after extraction
+                let stillValid = self.queue.sync { self.pendingRequests[cacheKey] == generation }
+                guard stillValid else {
+                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
+                    return
+                }
+
+                // Generate thumbnail from extracted file
+                self.generateThumbnailFromExtractedFile(
+                    extractedURL: extractedURL,
+                    originalURL: url,
+                    cacheKey: cacheKey,
+                    generation: generation,
+                    maxPixelSize: targetSize,
+                    placeholder: item.placeholderIcon,
+                    completion: completion
+                )
+            } catch {
+                DispatchQueue.main.async {
+                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
+                    _ = self.queue.sync { self.failedURLs.insert(url) }
+                    completion(url, item.placeholderIcon)
+                }
+            }
+        }
+    }
+
+    private func generateThumbnailFromExtractedFile(
+        extractedURL: URL,
+        originalURL: URL,
+        cacheKey: String,
+        generation: Int,
+        maxPixelSize: CGFloat,
+        placeholder: NSImage,
+        completion: @escaping (URL, NSImage?) -> Void
+    ) {
+        // Determine if it's an image (load directly) or use QuickLook
+        let imageExtensions = Set(["png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp"])
+        let ext = extractedURL.pathExtension.lowercased()
+
+        if imageExtensions.contains(ext) {
+            // Use ImageIO for images
+            let options: [CFString: Any] = [
+                kCGImageSourceThumbnailMaxPixelSize: Int(maxPixelSize),
+                kCGImageSourceCreateThumbnailFromImageIfAbsent: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceShouldCache: false
+            ]
+
+            if let imageSource = CGImageSourceCreateWithURL(extractedURL as CFURL, nil),
+               let cgImage = CGImageSourceCreateThumbnailAtIndex(imageSource, 0, options as CFDictionary) {
+                let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
+
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
+                    let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
+                    guard stillValid else { return }
+
+                    self.cacheArchiveImage(image, cacheKey: cacheKey)
+                    completion(originalURL, image)
+                }
+            } else {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self = self else { return }
+                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
+                    _ = self.queue.sync { self.failedURLs.insert(originalURL) }
+                    completion(originalURL, placeholder)
+                }
+            }
+        } else {
+            // Use QuickLook for other file types (PDFs, videos, etc.)
+            let size = CGSize(width: maxPixelSize, height: maxPixelSize)
+            let request = QLThumbnailGenerator.Request(
+                fileAt: extractedURL,
+                size: size,
+                scale: 1.0,
+                representationTypes: [.thumbnail, .icon]
+            )
+
+            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] thumbnail, error in
+                guard let self = self else { return }
+
+                DispatchQueue.main.async {
+                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
+                    let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
+                    guard stillValid else { return }
+
+                    if let thumbnail = thumbnail {
+                        let image = thumbnail.nsImage
+                        self.cacheArchiveImage(image, cacheKey: cacheKey)
+                        completion(originalURL, image)
+                    } else {
+                        _ = self.queue.sync { self.failedURLs.insert(originalURL) }
+                        completion(originalURL, placeholder)
+                    }
+                }
+            }
+        }
+    }
+
+    private func archiveCacheKey(archiveURL: URL, archivePath: String, maxPixelSize: CGFloat) -> String {
+        let sizeBucket = Int(clampPixelSize(maxPixelSize).rounded(.toNearestOrAwayFromZero))
+        var keyString = "archive_\(archiveURL.path)_\(archivePath)_\(sizeBucket)"
+        if let mtime = try? archiveURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
+            keyString += "_\(mtime.timeIntervalSince1970)"
+        }
+
+        let hash = SHA256.hash(data: Data(keyString.utf8))
+        return hash.compactMap { String(format: "%02x", $0) }.joined()
+    }
+
+    private func cacheArchiveImage(_ image: NSImage, cacheKey: String) {
+        let cost = estimateCost(for: image)
+        memoryCache.setObject(image, forKey: cacheKey as NSString, cost: cost)
+
+        // Disk cache (async)
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            self?.saveToDisk(image: image, key: cacheKey)
         }
     }
 
