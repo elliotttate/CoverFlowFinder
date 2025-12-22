@@ -16,6 +16,7 @@ struct IconGridView: View {
     // Thumbnail loading
     @State private var thumbnails: [URL: NSImage] = [:]
     private let thumbnailCache = ThumbnailCacheManager.shared
+    @State private var itemsToken: Int = 0
     @State private var visibleItemIDs: Set<UUID> = []
     @State private var hydrationWorkItem: DispatchWorkItem?
     @State private var lastHydratedRange: Range<Int>?
@@ -157,14 +158,21 @@ struct IconGridView: View {
                 viewModel.showInFinder()
             }
         }
-        .onChange(of: items) { _ in
-            DispatchQueue.main.async {
-                thumbnails.removeAll()
-                thumbnailCache.clearForNewFolder()
-                visibleItemIDs.removeAll()
-                lastHydratedRange = nil
-                hydrationWorkItem?.cancel()
-                hydrationWorkItem = nil
+        .onChange(of: items) { newItems in
+            let oldToken = itemsToken
+            let newToken = itemsTokenFor(newItems)
+
+            // Only clear thumbnails if items actually changed
+            if oldToken != newToken {
+                DispatchQueue.main.async {
+                    itemsToken = newToken
+                    thumbnails.removeAll()
+                    thumbnailCache.clearForNewFolder()
+                    visibleItemIDs.removeAll()
+                    lastHydratedRange = nil
+                    hydrationWorkItem?.cancel()
+                    hydrationWorkItem = nil
+                }
             }
         }
         .onChange(of: settings.thumbnailQuality) { _ in
@@ -393,6 +401,19 @@ struct IconGridView: View {
     private func imageSatisfiesMinimum(_ image: NSImage, minPixelSize: CGFloat) -> Bool {
         let maxDimension = max(image.size.width, image.size.height)
         return maxDimension >= minPixelSize * 0.9
+    }
+
+    private func itemsTokenFor(_ items: [FileItem]) -> Int {
+        // Use a simple count + set of URL paths for stable comparison
+        // This ignores order changes which happen frequently during sorting
+        var hasher = Hasher()
+        hasher.combine(items.count)
+        // Sort URLs to make hash order-independent
+        let sortedPaths = items.map { $0.url.path }.sorted()
+        for path in sortedPaths {
+            hasher.combine(path)
+        }
+        return hasher.finalize()
     }
 
     private var magnificationGesture: some Gesture {

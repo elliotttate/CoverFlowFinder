@@ -24,6 +24,40 @@ struct CoverFlowView: View {
     @State private var lastHydrationRange: Range<Int>? = nil
     @State private var itemsToken: Int = 0
 
+    // Pending thumbnail updates - batched to reduce re-renders
+    @State private var pendingThumbnailUpdates: [URL: NSImage] = [:]
+    @State private var thumbnailBatchTimer: Timer?
+    private let thumbnailBatchInterval: TimeInterval = 0.1
+
+    // Debug logging (set to false for release)
+    private static var debugEnabled = false
+    private static var lastBodyTime: Date = .distantPast
+    private static var bodyCallCount = 0
+    private static let debugLogURL = FileManager.default.temporaryDirectory.appendingPathComponent("flowfinder_debug.log")
+    private static var debugLogHandle: FileHandle? = {
+        FileManager.default.createFile(atPath: debugLogURL.path, contents: nil)
+        return try? FileHandle(forWritingTo: debugLogURL)
+    }()
+
+    static func debugLog(_ message: String) {
+        guard debugEnabled else { return }
+        let line = "\(Date()): \(message)\n"
+        if let data = line.data(using: .utf8) {
+            debugLogHandle?.write(data)
+        }
+    }
+
+    private func logBodyCall() {
+        guard Self.debugEnabled else { return }
+        Self.bodyCallCount += 1
+        let now = Date()
+        let interval = now.timeIntervalSince(Self.lastBodyTime)
+        Self.lastBodyTime = now
+        if interval < 0.5 {
+            Self.debugLog("[CoverFlow] BODY #\(Self.bodyCallCount) - \(String(format: "%.3f", interval))s | thumbs:\(thumbnails.count) pending:\(pendingThumbnailUpdates.count) items:\(sortedItemsCache.count)")
+        }
+    }
+
     private var coverFlowThumbnailPixelSize: CGFloat {
         let base = 192 * settings.coverFlowScaleValue * settings.thumbnailQualityValue
         let bucket = (base / 64).rounded() * 64
@@ -43,6 +77,7 @@ struct CoverFlowView: View {
     private let thumbnailCache = ThumbnailCacheManager.shared
 
     var body: some View {
+        let _ = logBodyCall()
         GeometryReader { geometry in
             let handleHeight: CGFloat = 8
             let minCoverFlowHeight: CGFloat = 250
@@ -122,15 +157,18 @@ struct CoverFlowView: View {
                         viewModel.deleteSelectedItems()
                     },
                     onQuickLook: { item in
-                        guard let previewURL = viewModel.previewURL(for: item) else {
-                            NSSound.beep()
-                            return
-                        }
-                        QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
-                            navigateSelection(by: offset)
+                        viewModel.previewURL(for: item) { previewURL in
+                            guard let previewURL = previewURL else {
+                                NSSound.beep()
+                                return
+                            }
+                            QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
+                                navigateSelection(by: offset)
+                            }
                         }
                     }
                 )
+                .id("coverFlowContainer")  // Stable identity to prevent view recreation
                 .frame(height: coverFlowHeight)
 
                 if settings.coverFlowShowInfo,
@@ -204,16 +242,30 @@ struct CoverFlowView: View {
         .onDisappear {
             thumbnailLoadTimer?.invalidate()
             thumbnailLoadTimer = nil
+            thumbnailBatchTimer?.invalidate()
+            thumbnailBatchTimer = nil
         }
-        .onChange(of: items) { _ in
-            DispatchQueue.main.async {
-                thumbnails.removeAll()
-                iconPlaceholders.removeAll()
-                thumbnailLoadGeneration += 1
-                thumbnailCache.clearForNewFolder()
-                updateSortedItems()
-                loadVisibleThumbnails()
-                syncSelection()
+        .onChange(of: items) { newItems in
+            let oldCount = sortedItemsCache.count
+            let newCount = newItems.count
+            let oldToken = itemsToken
+            let newToken = itemsTokenFor(newItems)
+            Self.debugLog("[CoverFlow] onChange(items) FIRED! old:\(oldCount) new:\(newCount) oldToken:\(oldToken) newToken:\(newToken) tokenMatch:\(oldToken == newToken)")
+
+            // Only clear thumbnails if items actually changed
+            if oldToken != newToken {
+                Self.debugLog("[CoverFlow] Items actually changed - clearing thumbnails")
+                DispatchQueue.main.async {
+                    thumbnails.removeAll()
+                    iconPlaceholders.removeAll()
+                    thumbnailLoadGeneration += 1
+                    thumbnailCache.clearForNewFolder()
+                    updateSortedItems()
+                    loadVisibleThumbnails()
+                    syncSelection()
+                }
+            } else {
+                Self.debugLog("[CoverFlow] Items unchanged (same token) - skipping clear")
             }
         }
         .onChange(of: viewModel.coverFlowSelectedIndex) { _ in
@@ -270,12 +322,23 @@ struct CoverFlowView: View {
     }
 
     private func itemsTokenFor(_ items: [FileItem]) -> Int {
+        // Use a simple count + set of URL paths for stable comparison
+        // This ignores order changes which happen frequently during sorting
         var hasher = Hasher()
         hasher.combine(items.count)
-        for item in items {
-            hasher.combine(item.id)
+        // Sort URLs to make hash order-independent
+        let sortedPaths = items.map { $0.url.path }.sorted()
+        for path in sortedPaths {
+            hasher.combine(path)
         }
-        return hasher.finalize()
+        let result = hasher.finalize()
+        return result
+    }
+
+    private func logTokenState(_ context: String) {
+        if Self.debugEnabled {
+            Self.debugLog("[CoverFlow] TOKEN \(context): itemsToken=\(itemsToken), items=\(sortedItemsCache.count)")
+        }
     }
 
     private func syncSelection() {
@@ -330,8 +393,14 @@ struct CoverFlowView: View {
 
     private let thumbnailWindowSize = 100
 
+    private static var loadVisibleCount = 0
+
     private func loadVisibleThumbnails() {
         guard !sortedItemsCache.isEmpty else { return }
+        Self.loadVisibleCount += 1
+        if Self.debugEnabled {
+            Self.debugLog("[CoverFlow] loadVisibleThumbnails #\(Self.loadVisibleCount) - items:\(sortedItemsCache.count) scrolling:\(isCoverFlowScrolling)")
+        }
         // Allow limited loading during scroll for smoother experience
         let isScrolling = isCoverFlowScrolling
         let thumbnailPixelSize = coverFlowThumbnailPixelSize
@@ -461,19 +530,34 @@ struct CoverFlowView: View {
         let hasMoreToLoad = itemsToLoadHigh.count > highLimit || itemsToLoadLow.count > lowLimit
 
         DispatchQueue.main.async { [self] in
+            // Evict old thumbnails
+            if !urlsToEvict.isEmpty && Self.debugEnabled {
+                Self.debugLog("[CoverFlow] EVICTING \(urlsToEvict.count) thumbnails, keeping window \(windowStart)...\(windowEnd) around selected \(selected)")
+            }
             for url in urlsToEvict {
                 thumbnails.removeValue(forKey: url)
+                pendingThumbnailUpdates.removeValue(forKey: url)
                 iconPlaceholders.remove(url)
             }
-            for (url, image) in thumbnailUpdates {
-                thumbnails[url] = image
+
+            // Apply cached thumbnails directly (they're already ready)
+            if !thumbnailUpdates.isEmpty {
+                if Self.debugEnabled {
+                    Self.debugLog("[CoverFlow] APPLYING \(thumbnailUpdates.count) cached thumbnails")
+                }
+                for (url, image) in thumbnailUpdates {
+                    thumbnails[url] = image
+                }
             }
+
             for url in placeholdersToAdd {
                 iconPlaceholders.insert(url)
             }
             for url in placeholdersToRemove {
                 iconPlaceholders.remove(url)
             }
+
+            // Start async thumbnail generation
             for (item, _) in loadHighItems {
                 generateHighThumbnail(for: item)
             }
@@ -482,8 +566,9 @@ struct CoverFlowView: View {
             }
 
             // If there are more items to load and we're not scrolling, schedule another pass
+            // Use longer delay to prevent rapid cascading updates that cause UI flashing
             if hasMoreToLoad && !isCoverFlowScrolling {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [self] in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
                     loadVisibleThumbnails()
                 }
             }
@@ -504,28 +589,68 @@ struct CoverFlowView: View {
         placeholder: Bool,
         refreshAfter: Bool
     ) {
+        // Skip archive items entirely - no closure creation, no dispatch
+        if item.isFromArchive {
+            let url = item.url
+            pendingThumbnailUpdates[url] = item.placeholderIcon
+            if placeholder {
+                iconPlaceholders.insert(url)
+            }
+            scheduleThumbnailBatch()
+            return
+        }
+
         let currentGen = thumbnailLoadGeneration
 
         thumbnailCache.generateThumbnail(for: item, maxPixelSize: maxPixelSize) { url, image in
             DispatchQueue.main.async { [self] in
                 guard currentGen == thumbnailLoadGeneration else { return }
 
+                let finalImage = image ?? item.placeholderIcon
+
                 if placeholder {
                     if thumbnails[url] != nil && !iconPlaceholders.contains(url) {
                         return
                     }
-                    thumbnails[url] = image ?? item.placeholderIcon
+                    pendingThumbnailUpdates[url] = finalImage
                     iconPlaceholders.insert(url)
                 } else {
-                    thumbnails[url] = image ?? item.placeholderIcon
+                    pendingThumbnailUpdates[url] = finalImage
                     iconPlaceholders.remove(url)
                 }
 
-                if refreshAfter {
-                    loadVisibleThumbnails()
-                }
+                // Schedule batch apply instead of immediate state update
+                scheduleThumbnailBatch()
+                _ = refreshAfter
             }
         }
+    }
+
+    private func scheduleThumbnailBatch() {
+        // If timer already scheduled, let it handle the batch
+        guard thumbnailBatchTimer == nil else { return }
+
+        thumbnailBatchTimer = Timer.scheduledTimer(withTimeInterval: thumbnailBatchInterval, repeats: false) { [self] _ in
+            flushPendingThumbnails()
+        }
+    }
+
+    private func flushPendingThumbnails() {
+        thumbnailBatchTimer?.invalidate()
+        thumbnailBatchTimer = nil
+
+        guard !pendingThumbnailUpdates.isEmpty else { return }
+
+        let count = pendingThumbnailUpdates.count
+        if Self.debugEnabled {
+            Self.debugLog("[CoverFlow] FLUSH \(count) pending thumbnails")
+        }
+
+        // Apply all pending updates in one batch
+        for (url, image) in pendingThumbnailUpdates {
+            thumbnails[url] = image
+        }
+        pendingThumbnailUpdates.removeAll()
     }
 
     private func updateCoverFlowHeight(
@@ -580,7 +705,11 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onDelete: () -> Void
     let onQuickLook: (FileItem) -> Void
 
+    private static var viewInstanceCount = 0
+
     func makeNSView(context: Context) -> CoverFlowNSView {
+        Self.viewInstanceCount += 1
+        CoverFlowView.debugLog("[Container] makeNSView called - instance #\(Self.viewInstanceCount)")
         let view = CoverFlowNSView()
         view.onSelect = onSelect
         view.onOpen = onOpen
@@ -603,6 +732,9 @@ struct CoverFlowContainer: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: CoverFlowNSView, context: Context) {
+        // Preserve first responder status during updates
+        let wasFirstResponder = nsView.window?.firstResponder === nsView
+
         nsView.onSelect = onSelect
         nsView.onOpen = onOpen
         nsView.onRightClick = { index, _ in
@@ -620,6 +752,15 @@ struct CoverFlowContainer: NSViewRepresentable {
         nsView.coverScale = coverScale
         nsView.scrollSensitivity = scrollSensitivity
         nsView.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
+
+        // Restore first responder if it was lost during update
+        if wasFirstResponder && nsView.window?.firstResponder !== nsView {
+            CoverFlowView.debugLog("[Container] Focus lost during updateNSView - restoring")
+            nsView.window?.makeFirstResponder(nsView)
+        } else if nsView.window?.isKeyWindow == true {
+            // Also check and restore if window is key but we don't have focus
+            nsView.ensureFirstResponder()
+        }
     }
 }
 
@@ -731,8 +872,27 @@ class CoverFlowNSView: NSView {
         menu.popUp(positioning: nil, at: location, in: self)
     }
 
+    private static var updateItemsCount = 0
+    private static var lastUpdateTime: Date = .distantPast
+
     func updateItems(_ items: [FileItem], itemsToken: Int, thumbnails: [URL: NSImage], selectedIndex: Int) {
-        let itemsChanged = self.items.count != items.count || self.itemsToken != itemsToken
+        Self.updateItemsCount += 1
+        let now = Date()
+        let interval = now.timeIntervalSince(Self.lastUpdateTime)
+        Self.lastUpdateTime = now
+
+        let countChanged = self.items.count != items.count
+        let tokenChanged = self.itemsToken != itemsToken
+        let itemsChanged = countChanged || tokenChanged
+        let thumbnailsChanged = self.thumbnails.count != thumbnails.count
+
+        if interval < 0.5 {
+            if itemsChanged {
+                CoverFlowView.debugLog("[NSView] updateItems #\(Self.updateItemsCount) - \(String(format: "%.3f", interval))s | ITEMS CHANGED! countChanged:\(countChanged) tokenChanged:\(tokenChanged) oldToken:\(self.itemsToken) newToken:\(itemsToken) oldCount:\(self.items.count) newCount:\(items.count)")
+            } else {
+                CoverFlowView.debugLog("[NSView] updateItems #\(Self.updateItemsCount) - \(String(format: "%.3f", interval))s | thumbsChanged:\(thumbnailsChanged) thumbs:\(thumbnails.count)")
+            }
+        }
 
         self.items = items
         self.itemsToken = itemsToken
@@ -745,6 +905,7 @@ class CoverFlowNSView: NSView {
         }
 
         if itemsChanged {
+            CoverFlowView.debugLog("[NSView] REBUILD covers - items changed")
             rebuildCovers()
             layer?.setNeedsLayout()
             layer?.layoutIfNeeded()
@@ -828,6 +989,7 @@ class CoverFlowNSView: NSView {
     }
 
     private func rebuildCovers() {
+        CoverFlowView.debugLog("[NSView] rebuildCovers called - \(items.count) items")
         coverLayers.forEach { $0.removeFromSuperlayer() }
         coverLayers.removeAll()
 
@@ -941,6 +1103,11 @@ class CoverFlowNSView: NSView {
         }
 
         CATransaction.commit()
+
+        // Ensure focus is maintained after animation updates
+        DispatchQueue.main.async { [weak self] in
+            self?.ensureFirstResponder()
+        }
     }
 
     // Update existing layer with new item data (for recycling)
@@ -1180,6 +1347,31 @@ class CoverFlowNSView: NSView {
 
     override var acceptsFirstResponder: Bool { true }
 
+    override func becomeFirstResponder() -> Bool {
+        hadFocus = true
+        CoverFlowView.debugLog("[NSView] becomeFirstResponder called - hadFocus set to true")
+        return super.becomeFirstResponder()
+    }
+
+    override func resignFirstResponder() -> Bool {
+        // Check what's taking focus
+        if let newResponder = window?.firstResponder {
+            let responderType = String(describing: type(of: newResponder))
+            let responderAddress = Unmanaged.passUnretained(newResponder).toOpaque()
+            let selfAddress = Unmanaged.passUnretained(self).toOpaque()
+            let isSameView = newResponder === self
+            CoverFlowView.debugLog("[NSView] resignFirstResponder - new responder: \(responderType) addr:\(responderAddress) self:\(selfAddress) isSame:\(isSameView)")
+            if !isSameView {
+                // Log stack trace when losing focus to a different view
+                let symbols = Thread.callStackSymbols.prefix(10).joined(separator: "\n")
+                CoverFlowView.debugLog("[NSView] resignFirstResponder stack:\n\(symbols)")
+            }
+        } else {
+            CoverFlowView.debugLog("[NSView] resignFirstResponder - no new responder")
+        }
+        return super.resignFirstResponder()
+    }
+
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
         return true
     }
@@ -1384,6 +1576,72 @@ class CoverFlowNSView: NSView {
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         requestFocus()
+
+        // Observe first responder changes to debug focus loss
+        if let window = window {
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowDidUpdate(_:)),
+                name: NSWindow.didUpdateNotification,
+                object: window
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowDidBecomeKey(_:)),
+                name: NSWindow.didBecomeKeyNotification,
+                object: window
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowDidResignKey(_:)),
+                name: NSWindow.didResignKeyNotification,
+                object: window
+            )
+        }
+    }
+
+    @objc private func windowDidUpdate(_ notification: Notification) {
+        // Check if we lost focus
+        if let window = window, window.firstResponder !== self {
+            let responderType = String(describing: type(of: window.firstResponder))
+            // Only log if we had focus before (track with instance variable)
+            if hadFocus {
+                hadFocus = false
+                CoverFlowView.debugLog("[NSView] FOCUS LOST via windowDidUpdate! New responder: \(responderType)")
+                // Log the call stack to find the culprit
+                let symbols = Thread.callStackSymbols.prefix(15).joined(separator: "\n")
+                CoverFlowView.debugLog("[NSView] Stack trace:\n\(symbols)")
+            }
+        } else if window?.firstResponder === self && !hadFocus {
+            hadFocus = true
+            CoverFlowView.debugLog("[NSView] FOCUS GAINED via windowDidUpdate")
+        }
+    }
+
+    private var hadFocus = false
+
+    @objc private func windowDidBecomeKey(_ notification: Notification) {
+        let isFirst = window?.firstResponder === self
+        CoverFlowView.debugLog("[NSView] WINDOW became key - isFirstResponder: \(isFirst)")
+        // Proactively restore focus when window becomes key
+        if !isFirst {
+            CoverFlowView.debugLog("[NSView] Re-requesting focus after window became key")
+            requestFocus()
+        }
+    }
+
+    @objc private func windowDidResignKey(_ notification: Notification) {
+        CoverFlowView.debugLog("[NSView] WINDOW resigned key")
+    }
+
+    /// Ensure we maintain first responder status - called periodically during scroll and after updates
+    func ensureFirstResponder() {
+        guard let window = window else { return }
+        if window.isKeyWindow && window.firstResponder !== self {
+            let currentResponder = String(describing: type(of: window.firstResponder))
+            CoverFlowView.debugLog("[NSView] ensureFirstResponder - lost to \(currentResponder), reclaiming")
+            window.makeFirstResponder(self)
+        }
     }
 
     func requestFocus() {
@@ -1547,6 +1805,9 @@ class CoverFlowNSView: NSView {
         onSelect?(selectedIndex)
         setScrolling(false)
 
+        // Ensure we maintain focus after scroll completes
+        ensureFirstResponder()
+
         // Re-enable reflections on all visible covers
         for coverLayer in coverLayers {
             if let reflectionContainer = coverLayer.sublayers?.first(where: { $0.name == "reflectionContainer" }),
@@ -1707,6 +1968,7 @@ class CoverFlowNSView: NSView {
         momentumTimer?.invalidate()
         typeAheadTimer?.invalidate()
         scrollSettleTimer?.invalidate()
+        NotificationCenter.default.removeObserver(self)
     }
 
     // MARK: - NSDraggingSource

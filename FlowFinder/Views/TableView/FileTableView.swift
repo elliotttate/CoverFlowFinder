@@ -439,13 +439,19 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     // MARK: - Keyboard Actions
 
     func triggerQuickLook() {
-        guard let item = viewModel.selectedItems.first,
-              let previewURL = viewModel.previewURL(for: item) else {
+        guard let item = viewModel.selectedItems.first else {
             NSSound.beep()
             return
         }
-        QuickLookControllerView.shared.togglePreview(for: previewURL) { [weak self] offset in
-            self?.navigateSelection(by: offset)
+        // Use async version to avoid blocking main thread during archive extraction
+        viewModel.previewURL(for: item) { [weak self] previewURL in
+            guard let previewURL = previewURL else {
+                NSSound.beep()
+                return
+            }
+            QuickLookControllerView.shared.togglePreview(for: previewURL) { [weak self] offset in
+                self?.navigateSelection(by: offset)
+            }
         }
     }
 

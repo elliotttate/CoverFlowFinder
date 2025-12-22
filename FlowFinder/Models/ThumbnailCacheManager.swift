@@ -2,6 +2,10 @@ import Foundation
 import AppKit
 import QuickLookThumbnailing
 import CryptoKit
+import os.log
+import AVFoundation
+
+private let cacheLog = OSLog(subsystem: "com.flowfinder", category: "ThumbnailCache")
 
 /// Manages thumbnail generation with disk cache, memory cache, and request cancellation
 class ThumbnailCacheManager {
@@ -52,6 +56,13 @@ class ThumbnailCacheManager {
         for url: URL,
         maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize
     ) -> NSImage? {
+        // Skip archive items - they use generateArchiveThumbnail with different cache keys
+        // Archive items have virtual URLs with # in the path
+        // Use fast ASCII check instead of String.contains which is slow
+        if url.path.utf8.contains(35) {  // 35 is ASCII code for '#'
+            return nil
+        }
+
         // Check for cached directory icon first (size-aware)
         let targetSize = clampPixelSize(maxPixelSize)
         let sizeBucket = Int(targetSize)
@@ -90,6 +101,12 @@ class ThumbnailCacheManager {
         url: URL,
         maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize
     ) -> Bool {
+        // Archive items use different cache keys - just return false here
+        // The actual pending check happens in generateArchiveThumbnail
+        // Use fast ASCII check instead of String.contains which is slow
+        if url.path.utf8.contains(35) {  // 35 is ASCII code for '#'
+            return false
+        }
         let key = cacheKey(for: url, maxPixelSize: maxPixelSize)
         return queue.sync {
             pendingRequests[key] != nil
@@ -113,6 +130,140 @@ class ThumbnailCacheManager {
         // Don't clear memory cache - thumbnails might be reused if user navigates back
     }
 
+    // MARK: - Fast Image Dimensions
+
+    /// Memory cache for image dimensions (very small, just CGSize)
+    private var dimensionsCache: [URL: CGSize] = [:]
+    private let dimensionsCacheLock = NSLock()
+
+    /// Video file extensions
+    private static let videoExtensions: Set<String> = ["mp4", "mov", "m4v", "avi", "mkv", "webm", "wmv", "flv"]
+
+    /// Get image/video dimensions from file metadata without loading the full file.
+    /// This is very fast as it only reads the file header.
+    /// Returns nil for unsupported files or if dimensions can't be determined.
+    func getImageDimensions(for url: URL) -> CGSize? {
+        let filename = url.lastPathComponent
+        let ext = url.pathExtension.lowercased()
+
+        // Check cache first
+        dimensionsCacheLock.lock()
+        if let cached = dimensionsCache[url] {
+            dimensionsCacheLock.unlock()
+            os_log(.debug, log: cacheLog, "getImageDimensions [%{public}@]: CACHE HIT %.0fx%.0f", filename, cached.width, cached.height)
+            return cached
+        }
+        dimensionsCacheLock.unlock()
+
+        // Check if it's a video file
+        if Self.videoExtensions.contains(ext) {
+            return getVideoDimensions(for: url)
+        }
+
+        // Use ImageIO to read just the metadata for images
+        guard let imageSource = CGImageSourceCreateWithURL(url as CFURL, nil) else {
+            os_log(.debug, log: cacheLog, "getImageDimensions [%{public}@]: failed to create image source", filename)
+            return nil
+        }
+
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(imageSource, 0, nil) as? [CFString: Any] else {
+            os_log(.debug, log: cacheLog, "getImageDimensions [%{public}@]: failed to get properties", filename)
+            return nil
+        }
+
+        // Get pixel dimensions
+        guard let width = properties[kCGImagePropertyPixelWidth] as? CGFloat,
+              let height = properties[kCGImagePropertyPixelHeight] as? CGFloat,
+              width > 0, height > 0 else {
+            os_log(.debug, log: cacheLog, "getImageDimensions [%{public}@]: no valid dimensions in properties", filename)
+            return nil
+        }
+
+        // Check for orientation that swaps dimensions
+        var finalWidth = width
+        var finalHeight = height
+        if let orientation = properties[kCGImagePropertyOrientation] as? Int {
+            // Orientations 5, 6, 7, 8 swap width and height
+            if orientation >= 5 && orientation <= 8 {
+                finalWidth = height
+                finalHeight = width
+                os_log(.debug, log: cacheLog, "getImageDimensions [%{public}@]: orientation %d swapped to %.0fx%.0f", filename, orientation, finalWidth, finalHeight)
+            }
+        }
+
+        let size = CGSize(width: finalWidth, height: finalHeight)
+
+        // Cache the result
+        dimensionsCacheLock.lock()
+        dimensionsCache[url] = size
+        dimensionsCacheLock.unlock()
+
+        os_log(.debug, log: cacheLog, "getImageDimensions [%{public}@]: READ from file %.0fx%.0f", filename, finalWidth, finalHeight)
+        return size
+    }
+
+    /// Get video dimensions using AVAsset (fast, reads only header)
+    private func getVideoDimensions(for url: URL) -> CGSize? {
+        let filename = url.lastPathComponent
+        let asset = AVURLAsset(url: url, options: [AVURLAssetPreferPreciseDurationAndTimingKey: false])
+
+        guard let track = asset.tracks(withMediaType: .video).first else {
+            os_log(.debug, log: cacheLog, "getImageDimensions [%{public}@]: no video track found", filename)
+            return nil
+        }
+
+        let naturalSize = track.naturalSize
+        let transform = track.preferredTransform
+
+        // Apply transform to get actual display size (handles rotation)
+        let transformedSize = naturalSize.applying(transform)
+        let width = abs(transformedSize.width)
+        let height = abs(transformedSize.height)
+
+        guard width > 0, height > 0 else {
+            os_log(.debug, log: cacheLog, "getImageDimensions [%{public}@]: invalid video dimensions", filename)
+            return nil
+        }
+
+        let size = CGSize(width: width, height: height)
+
+        // Cache the result
+        dimensionsCacheLock.lock()
+        dimensionsCache[url] = size
+        dimensionsCacheLock.unlock()
+
+        os_log(.debug, log: cacheLog, "getImageDimensions [%{public}@]: VIDEO dimensions %.0fx%.0f", filename, width, height)
+        return size
+    }
+
+    /// Batch fetch dimensions for multiple URLs (runs on background queue)
+    func prefetchImageDimensions(for urls: [URL], completion: @escaping ([URL: CGSize]) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else {
+                DispatchQueue.main.async { completion([:]) }
+                return
+            }
+
+            var results: [URL: CGSize] = [:]
+            for url in urls {
+                if let size = self.getImageDimensions(for: url) {
+                    results[url] = size
+                }
+            }
+
+            DispatchQueue.main.async {
+                completion(results)
+            }
+        }
+    }
+
+    /// Clear dimensions cache (call when navigating to new folder)
+    func clearDimensionsCache() {
+        dimensionsCacheLock.lock()
+        dimensionsCache.removeAll()
+        dimensionsCacheLock.unlock()
+    }
+
     /// Generate thumbnail with caching and cancellation support
     func generateThumbnail(
         for item: FileItem,
@@ -121,9 +272,9 @@ class ThumbnailCacheManager {
     ) {
         let url = item.url
 
-        // Handle archive items specially - need to extract before thumbnailing
+        // Skip archive items entirely - extraction causes freezes
         if item.isFromArchive {
-            generateArchiveThumbnail(for: item, maxPixelSize: maxPixelSize, completion: completion)
+            completion(url, item.placeholderIcon)
             return
         }
 
@@ -395,6 +546,13 @@ class ThumbnailCacheManager {
         // Only extract for file types that benefit from thumbnails
         let ext = (item.name as NSString).pathExtension.lowercased()
         guard Self.thumbnailableExtensions.contains(ext) else {
+            completion(url, item.placeholderIcon)
+            return
+        }
+
+        // Skip files larger than 50MB to avoid slow extraction
+        let maxExtractSize: Int64 = 50 * 1024 * 1024
+        guard item.size < maxExtractSize else {
             completion(url, item.placeholderIcon)
             return
         }
