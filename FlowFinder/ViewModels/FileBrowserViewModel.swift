@@ -8,6 +8,7 @@ import os
 import CoreServices
 
 private let zipNavLogger = Logger(subsystem: "com.flowfinder.app", category: "ZipNav")
+private let sortLogger = Logger(subsystem: "com.flowfinder.app", category: "Sorting")
 
 // Notification names are defined in UIConstants.swift
 
@@ -140,6 +141,8 @@ class FileBrowserViewModel: ObservableObject {
     private var directoryLoadToken = UUID()
     /// Track which items have had their metadata loaded
     private var hydratedURLs: Set<URL> = []
+    /// Flag to prevent redundant reloads during navigation
+    private var isNavigating = false
     /// Queue for metadata hydration requests
     private var pendingHydrationURLs: Set<URL> = []
     private let hydrationQueue = DispatchQueue(label: "com.coverflowfinder.hydration", qos: .userInitiated)
@@ -293,8 +296,25 @@ class FileBrowserViewModel: ObservableObject {
 
         let columnConfig = ListColumnConfigManager.shared
         columnConfig.$sortColumn
-            .sink { [weak self] _ in
-                self?.objectWillChange.send()
+            .dropFirst() // Skip initial value
+            .sink { [weak self] newColumn in
+                guard let self else { return }
+                self.objectWillChange.send()
+
+                // Skip reload during navigation - loadContents will be called with correct sort state
+                guard !self.isNavigating else { return }
+
+                // If the new sort column requires metadata (date/size) and items don't have it,
+                // we need to reload the directory to get proper sorting
+                let sortRequiresMetadata = self.sortStateRequiresMetadata(SortState(column: newColumn, direction: .descending))
+                if sortRequiresMetadata && !self.items.isEmpty {
+                    // Check if items have metadata by looking at hydratedURLs
+                    // If fewer items are hydrated than total items, we need to reload
+                    let itemsNeedMetadata = self.hydratedURLs.count < self.items.count
+                    if itemsNeedMetadata {
+                        self.loadContents()
+                    }
+                }
             }
             .store(in: &cancellables)
 
@@ -405,67 +425,78 @@ class FileBrowserViewModel: ObservableObject {
                     }
                 }
 
-                // Show first batch immediately
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self,
-                          self.directoryLoadToken == loadToken,
-                          !self.isInsideArchive,
-                          self.currentPath == pathToLoad else { return }
+                // Show first batch immediately (unless large directory - we'll show all at once to prevent jumping)
+                if !isLargeDirectory {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self,
+                              self.directoryLoadToken == loadToken,
+                              !self.isInsideArchive,
+                              self.currentPath == pathToLoad else { return }
 
-                    if let item = selectedItem {
-                        self.coverFlowSelectedIndex = selectedIndex
-                        self.selectedItems = [item]
-                        self.pendingSelectionURL = nil
-                    } else {
-                        self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
-                    }
+                        if let item = selectedItem {
+                            self.coverFlowSelectedIndex = selectedIndex
+                            self.selectedItems = [item]
+                            self.pendingSelectionURL = nil
+                        } else {
+                            self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
+                        }
 
-                    self.items = allItems
-                    if !isLargeDirectory {
-                        self.isLoading = false
-                    }
-                    self.navigationGeneration += 1
+                        self.items = allItems
+                        if !isLargeDirectory {
+                            self.isLoading = false
+                        }
+                        self.navigationGeneration += 1
 
-                    // Track hydrated items if we loaded metadata upfront
-                    if loadMetadataUpfront {
-                        for item in allItems {
-                            self.hydratedURLs.insert(item.url)
+                        if loadMetadataUpfront {
+                            for item in allItems {
+                                self.hydratedURLs.insert(item.url)
+                            }
                         }
                     }
                 }
 
-                // Phase 3: Load remaining batches progressively (for large directories)
+                // Phase 3: Load remaining batches for large directories
+                // Always collect ALL items before displaying to prevent visual jumping
+                // as items get re-sorted after each batch append
                 if isLargeDirectory {
+                    // Collect remaining items without updating UI until complete
                     for batchStart in stride(from: batchSize, to: totalCount, by: batchSize) {
-                        // Check if navigation changed
                         guard DispatchQueue.main.sync(execute: { self.directoryLoadToken == loadToken }) else { return }
 
                         let batchEnd = min(batchStart + batchSize, totalCount)
-                        var batchItems = [FileItem]()
-                        batchItems.reserveCapacity(batchEnd - batchStart)
-
                         for i in batchStart..<batchEnd {
-                            batchItems.append(FileItem(url: contents[i], loadMetadata: loadMetadataUpfront))
+                            allItems.append(FileItem(url: contents[i], loadMetadata: loadMetadataUpfront))
+                        }
+                    }
+
+                    // Now update UI with complete list
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self = self,
+                              self.directoryLoadToken == loadToken,
+                              !self.isInsideArchive,
+                              self.currentPath == pathToLoad else { return }
+
+                        // Handle selection
+                        if let pendingURL = pendingURL,
+                           let item = allItems.first(where: { $0.url == pendingURL }) {
+                            let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
+                            if let index = sorted.firstIndex(of: item) {
+                                self.coverFlowSelectedIndex = index
+                            }
+                            self.selectedItems = [item]
+                            self.pendingSelectionURL = nil
+                        } else {
+                            self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
                         }
 
-                        DispatchQueue.main.async { [weak self] in
-                            guard let self = self,
-                                  self.directoryLoadToken == loadToken,
-                                  !self.isInsideArchive,
-                                  self.currentPath == pathToLoad else { return }
+                        self.items = allItems
+                        self.isLoading = false
+                        self.navigationGeneration += 1
 
-                            self.items.append(contentsOf: batchItems)
-
-                            // Track hydrated items if we loaded metadata upfront
-                            if loadMetadataUpfront {
-                                for item in batchItems {
-                                    self.hydratedURLs.insert(item.url)
-                                }
-                            }
-
-                            // Mark loading complete after last batch
-                            if batchEnd >= totalCount {
-                                self.isLoading = false
+                        // Track hydrated items
+                        if loadMetadataUpfront {
+                            for item in allItems {
+                                self.hydratedURLs.insert(item.url)
                             }
                         }
                     }
@@ -1412,8 +1443,10 @@ class FileBrowserViewModel: ObservableObject {
         selectedItems.removeAll()
         coverFlowSelectedIndex = 0
 
-        // Apply column state for new folder
+        // Apply column state for new folder (set flag to prevent redundant reload from sortColumn sink)
+        isNavigating = true
         ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
+        isNavigating = false
 
         loadContents()
         addToHistory(.filesystem(url))
@@ -1434,8 +1467,10 @@ class FileBrowserViewModel: ObservableObject {
         selectedItems.removeAll()
         // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
 
-        // Apply column state for new folder
+        // Apply column state for new folder (set flag to prevent redundant reload from sortColumn sink)
+        isNavigating = true
         ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
+        isNavigating = false
 
         loadContents()
         addToHistory(.filesystem(url))
@@ -2059,7 +2094,43 @@ class FileBrowserViewModel: ObservableObject {
             return
         }
 
-        selectedItems.removeAll()
+        // Find the URL to select after deletion (next item, or previous if at end)
+        let currentItems = filteredItems
+        let deletedURLs = Set(itemsToDelete.map { $0.url })
+        var nextSelectionURL: URL? = nil
+        var nextSelectionIndex: Int = 0
+
+        // Find the first item that's NOT being deleted, preferring items after the deleted ones
+        if let firstDeletedIndex = currentItems.firstIndex(where: { deletedURLs.contains($0.url) }) {
+            // Look for first non-deleted item after the deleted range
+            for i in firstDeletedIndex..<currentItems.count {
+                if !deletedURLs.contains(currentItems[i].url) {
+                    nextSelectionURL = currentItems[i].url
+                    // Calculate what index this will be after deletion
+                    let deletedBefore = currentItems[0..<i].filter { deletedURLs.contains($0.url) }.count
+                    nextSelectionIndex = i - deletedBefore
+                    break
+                }
+            }
+
+            // If no item after, look before
+            if nextSelectionURL == nil && firstDeletedIndex > 0 {
+                for i in stride(from: firstDeletedIndex - 1, through: 0, by: -1) {
+                    if !deletedURLs.contains(currentItems[i].url) {
+                        nextSelectionURL = currentItems[i].url
+                        let deletedBefore = currentItems[0..<i].filter { deletedURLs.contains($0.url) }.count
+                        nextSelectionIndex = i - deletedBefore
+                        break
+                    }
+                }
+            }
+        }
+
+        // Store the target index to use after refresh - this prevents race conditions
+        let targetIndex = nextSelectionIndex
+
+        // DON'T clear selectedItems here - it triggers syncSelection which re-selects
+        // the about-to-be-deleted item. We'll clear it in the async block instead.
 
         fileOperationQueue.async {
             let fileManager = FileManager.default
@@ -2074,7 +2145,19 @@ class FileBrowserViewModel: ObservableObject {
             }
 
             DispatchQueue.main.async { [weak self] in
-                self?.refresh()
+                guard let self = self else { return }
+
+                // Set the target index BEFORE refresh so CoverFlowView knows where to position
+                self.coverFlowSelectedIndex = targetIndex
+
+                // Clear selectedItems so syncSelection will auto-select at coverFlowSelectedIndex
+                // when items are reloaded. This must happen BEFORE refresh so the index is set first.
+                self.selectedItems.removeAll()
+
+                // Refresh to get updated file list - items load asynchronously
+                // CoverFlowView's syncSelection will auto-select at coverFlowSelectedIndex when items arrive
+                self.refresh()
+
                 if didTrashAny {
                     FinderSoundEffects.shared.play(.moveToTrash)
                 }

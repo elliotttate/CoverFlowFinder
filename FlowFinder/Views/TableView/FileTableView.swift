@@ -368,6 +368,11 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
         // Set menu on table view for row right-click
         tableView.menu = menu
+
+        // Also set on enclosing scroll view for when table is empty
+        if let scrollView = tableView.enclosingScrollView {
+            scrollView.menu = menu
+        }
     }
 
     func ensureHeaderMenu() {
@@ -465,16 +470,17 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         let newIndexSet = IndexSet(rowsToSelect)
         let currentSelection = tableView.selectedRowIndexes
 
+        // Only update selection and scroll if selection actually changed
+        // This prevents scroll jumping when user is manually scrolling the list
         if newIndexSet != currentSelection {
             isUpdatingSelection = true
             tableView.selectRowIndexes(newIndexSet, byExtendingSelection: false)
             isUpdatingSelection = false
-        }
 
-        // Always scroll to make the first selected row visible
-        // This ensures the list follows cover flow selection even during rapid browsing
-        if let firstSelectedRow = rowsToSelect.first {
-            tableView.scrollRowToVisible(firstSelectedRow)
+            // Only scroll to selection when selection changed (e.g., from cover flow navigation)
+            if let firstSelectedRow = rowsToSelect.first {
+                tableView.scrollRowToVisible(firstSelectedRow)
+            }
         }
     }
 

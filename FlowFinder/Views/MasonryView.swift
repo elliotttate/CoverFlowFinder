@@ -306,6 +306,13 @@ struct MasonryView: View {
                     refreshThumbnailTargetSize()
                     layoutNeedsUpdate = true
                     recalculateLayout()
+                    // Scroll to selected item when view appears (e.g., when switching view modes)
+                    if let firstSelected = viewModel.selectedItems.first {
+                        // Use DispatchQueue to ensure layout is complete before scrolling
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                        }
+                    }
                     needsScrollToSelection = true
                 }
                 .onChange(of: geometry.size.width) { newWidth in

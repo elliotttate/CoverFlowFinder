@@ -83,6 +83,13 @@ struct ColumnView: View {
             onPaste: { viewModel.paste() },
             onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
+        .onAppear {
+            // Sync viewModel's selection to local columnSelections when view appears
+            if let firstSelected = viewModel.selectedItems.first,
+               items.contains(firstSelected) {
+                columnSelections[viewModel.currentPath] = firstSelected
+            }
+        }
     }
 
     private var lastSelectedItem: FileItem? {
@@ -339,6 +346,14 @@ struct SingleColumnView: View {
                 RoundedRectangle(cornerRadius: 4)
                     .stroke(isColumnDropTargeted && dropTargetedItemID == nil ? Color.accentColor : Color.clear, lineWidth: 2)
             )
+            .onAppear {
+                // Scroll to selected item when view appears (e.g., when switching view modes)
+                if let selected = selectedItem {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        scrollProxy.scrollTo(selected.id, anchor: .center)
+                    }
+                }
+            }
             .onChange(of: selectedItem) { newSelection in
                 if let selected = newSelection {
                     withAnimation {
