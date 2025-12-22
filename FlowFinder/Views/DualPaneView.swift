@@ -497,6 +497,14 @@ struct PaneListView: View {
                 }
             }
             .listStyle(.plain)
+            .onAppear {
+                // Scroll to selected item when view appears (e.g., when switching view modes)
+                if let firstSelected = viewModel.selectedItems.first {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                        scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                    }
+                }
+            }
             .onChange(of: viewModel.selectedItems) { newSelection in
                 if let firstSelected = newSelection.first {
                     withAnimation {
@@ -662,6 +670,12 @@ struct PaneIconView: View {
                 }
                 .onAppear {
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
+                    // Scroll to selected item when view appears (e.g., when switching view modes)
+                    if let firstSelected = viewModel.selectedItems.first {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                            scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                        }
+                    }
                 }
                 .onChange(of: geometry.size.width) { newWidth in
                     onColumnsCalculated(calculateColumns(width: newWidth))
