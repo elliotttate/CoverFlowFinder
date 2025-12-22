@@ -129,6 +129,9 @@ class FileBrowserViewModel: ObservableObject {
     private var networkServiceBrowser: NetworkServiceBrowser?
     private var networkServiceIDs: [String: UUID] = [:]
     private var isNetworkBrowsing = false
+    private var smbSubnetScanner: SMBSubnetScanner?
+    private var discoveredSMBHosts: [SMBHostInfo] = []
+    private var smbScanComplete = false
 
     // MARK: - Lazy Metadata Loading
     /// Batch size for progressive loading of large directories
@@ -374,10 +377,12 @@ class FileBrowserViewModel: ObservableObject {
                 let totalCount = contents.count
                 let isLargeDirectory = totalCount > batchSize
 
-                // Phase 2: Create lightweight items WITHOUT metadata (instant)
+                // Phase 2: Create items with or without metadata
                 // For small directories, load metadata upfront for better UX
-                // For large directories, defer metadata to visible rows only
-                let loadMetadataUpfront = !isLargeDirectory
+                // For large directories, check if sorting requires metadata (date/size columns)
+                // If sorting by date or size, we MUST load metadata to sort correctly
+                let sortRequiresMetadata = self.sortStateRequiresMetadata(sortState)
+                let loadMetadataUpfront = !isLargeDirectory || sortRequiresMetadata
 
                 var allItems = [FileItem]()
                 allItems.reserveCapacity(totalCount)
@@ -440,7 +445,7 @@ class FileBrowserViewModel: ObservableObject {
                         batchItems.reserveCapacity(batchEnd - batchStart)
 
                         for i in batchStart..<batchEnd {
-                            batchItems.append(FileItem(url: contents[i], loadMetadata: false))
+                            batchItems.append(FileItem(url: contents[i], loadMetadata: loadMetadataUpfront))
                         }
 
                         DispatchQueue.main.async { [weak self] in
@@ -450,6 +455,13 @@ class FileBrowserViewModel: ObservableObject {
                                   self.currentPath == pathToLoad else { return }
 
                             self.items.append(contentsOf: batchItems)
+
+                            // Track hydrated items if we loaded metadata upfront
+                            if loadMetadataUpfront {
+                                for item in batchItems {
+                                    self.hydratedURLs.insert(item.url)
+                                }
+                            }
 
                             // Mark loading complete after last batch
                             if batchEnd >= totalCount {
@@ -476,12 +488,22 @@ class FileBrowserViewModel: ObservableObject {
         hydratedURLs.removeAll()
         pendingHydrationURLs.removeAll()
         navigationGeneration += 1
+        discoveredSMBHosts = []
+        smbScanComplete = false
 
+        // Start Bonjour discovery (finds Macs and other Bonjour-advertising devices)
         if networkServiceBrowser == nil {
             networkServiceBrowser = NetworkServiceBrowser(delegate: self)
         }
         networkServiceBrowser?.start()
 
+        // Start SMB subnet scan (finds Windows PCs and other SMB servers)
+        if smbSubnetScanner == nil {
+            smbSubnetScanner = SMBSubnetScanner(delegate: self)
+        }
+        smbSubnetScanner?.start()
+
+        // Show initial results after short delay (Bonjour results usually come fast)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             guard let self else { return }
             guard self.isNetworkBrowsing, self.currentPath.path == "/Network" else { return }
@@ -495,39 +517,93 @@ class FileBrowserViewModel: ObservableObject {
         guard isNetworkBrowsing else { return }
         isNetworkBrowsing = false
         networkServiceBrowser?.stop()
+        smbSubnetScanner?.stop()
         networkServiceIDs.removeAll()
+        discoveredSMBHosts.removeAll()
+        lastBonjourServices.removeAll()
     }
+
+    private var lastBonjourServices: [NetworkServiceInfo] = []
 
     private func updateNetworkItems(from services: [NetworkServiceInfo], isFinal: Bool) {
         guard isNetworkBrowsing, currentPath.path == "/Network" else { return }
+        lastBonjourServices = services
+        rebuildNetworkItems()
+        if isLoading && (isFinal || !items.isEmpty) {
+            isLoading = false
+        }
+    }
 
-        var deduped: [String: NetworkServiceInfo] = [:]
-        for info in services {
+    private func rebuildNetworkItems() {
+        guard isNetworkBrowsing, currentPath.path == "/Network" else { return }
+
+        // Collect hosts from Bonjour services
+        var hostsByKey: [String: (name: String, scheme: String, host: String, port: Int, priority: Int)] = [:]
+
+        for info in lastBonjourServices {
             guard let host = normalizedHostName(info.hostName) else { continue }
             let hostKey = host.lowercased()
-            if let existing = deduped[hostKey], existing.priority >= info.priority {
+            if let existing = hostsByKey[hostKey], existing.priority >= info.priority {
                 continue
             }
-            deduped[hostKey] = NetworkServiceInfo(
-                key: info.key,
+            hostsByKey[hostKey] = (
                 name: info.name,
                 scheme: info.scheme,
-                hostName: host,
+                host: host,
                 port: info.port,
                 priority: info.priority
             )
         }
 
-        let sortedServices = deduped.sorted { lhs, rhs in
+        // Add SMB hosts discovered via subnet scan (only if not already found via Bonjour)
+        for smbHost in discoveredSMBHosts {
+            // Use IP address or resolved hostname as key
+            let hostKey = smbHost.ipAddress.lowercased()
+            let nameKey = smbHost.name.lowercased()
+
+            // Skip if we already have this host from Bonjour (by IP or name)
+            let existingKeys = hostsByKey.keys
+            let alreadyExists = existingKeys.contains(hostKey) ||
+                                existingKeys.contains(nameKey) ||
+                                existingKeys.contains(where: { $0.contains(nameKey) || nameKey.contains($0) })
+
+            if !alreadyExists {
+                // SMB scan results have lower priority than Bonjour (priority -1)
+                hostsByKey[hostKey] = (
+                    name: smbHost.name,
+                    scheme: "smb",
+                    host: smbHost.ipAddress,
+                    port: smbHost.port,
+                    priority: -1
+                )
+            }
+        }
+
+        // Sort by name
+        let sortedHosts = hostsByKey.sorted { lhs, rhs in
             lhs.value.name.localizedCaseInsensitiveCompare(rhs.value.name) == .orderedAscending
         }
 
+        // Build FileItems
         var nextItems: [FileItem] = []
-        nextItems.reserveCapacity(sortedServices.count)
-        for (hostKey, info) in sortedServices {
-            guard let url = networkServiceURL(for: info) else { continue }
+        nextItems.reserveCapacity(sortedHosts.count)
+
+        for (hostKey, info) in sortedHosts {
+            var components = URLComponents()
+            components.scheme = info.scheme
+            components.host = info.host
+
+            // Add port if non-standard
+            let defaultPort: Int? = info.scheme == "smb" ? 445 : (info.scheme == "afp" ? 548 : nil)
+            if info.port > 0, let defaultPort, info.port != defaultPort {
+                components.port = info.port
+            }
+
+            guard let url = components.url else { continue }
+
             let id = networkServiceIDs[hostKey] ?? UUID()
             networkServiceIDs[hostKey] = id
+
             let item = FileItem(
                 id: id,
                 url: url,
@@ -542,9 +618,6 @@ class FileBrowserViewModel: ObservableObject {
         }
 
         items = nextItems
-        if isLoading && (isFinal || !nextItems.isEmpty) {
-            isLoading = false
-        }
     }
 
     private func normalizedHostName(_ hostName: String?) -> String? {
@@ -622,14 +695,25 @@ class FileBrowserViewModel: ObservableObject {
                 guard let self = self,
                       self.directoryLoadToken == loadToken else { return }
 
+                var updatedItems = self.items
+                let indicesByURL = Dictionary(uniqueKeysWithValues: updatedItems.enumerated().map { ($0.element.url, $0.offset) })
+                var didUpdate = false
+
                 for (url, hydratedItem) in hydratedItems {
                     self.pendingHydrationURLs.remove(url)
                     self.hydratedURLs.insert(url)
 
                     // Replace item in-place
-                    if let index = self.items.firstIndex(where: { $0.url == url }) {
-                        self.items[index] = hydratedItem
+                    if let index = indicesByURL[url] {
+                        updatedItems[index] = hydratedItem
+                        didUpdate = true
                     }
+                }
+
+                if didUpdate {
+                    self.items = updatedItems
+                    // Post notification so table view can force reload of visible rows
+                    NotificationCenter.default.post(name: .metadataHydrationCompleted, object: nil)
                 }
             }
         }
@@ -2216,6 +2300,25 @@ extension FileBrowserViewModel: NetworkServiceBrowserDelegate {
     }
 }
 
+extension FileBrowserViewModel: SMBSubnetScannerDelegate {
+    fileprivate func smbSubnetScanner(_ scanner: SMBSubnetScanner, didDiscover hosts: [SMBHostInfo]) {
+        guard isNetworkBrowsing, currentPath.path == "/Network" else { return }
+        discoveredSMBHosts = hosts
+        rebuildNetworkItems()
+        if isLoading && !items.isEmpty {
+            isLoading = false
+        }
+    }
+
+    fileprivate func smbSubnetScannerDidFinish(_ scanner: SMBSubnetScanner) {
+        smbScanComplete = true
+        // Ensure we rebuild one final time with all results
+        if isNetworkBrowsing, currentPath.path == "/Network" {
+            rebuildNetworkItems()
+        }
+    }
+}
+
 fileprivate struct NetworkServiceInfo: Hashable {
     let key: String
     let name: String
@@ -2400,5 +2503,256 @@ private final class DirectoryWatcher {
         let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
         let urls = paths.map { URL(fileURLWithPath: $0) }
         watcher.callback(urls)
+    }
+}
+
+// MARK: - SMB Network Scanner
+
+fileprivate struct SMBHostInfo: Hashable {
+    let ipAddress: String
+    let name: String
+    let port: Int
+}
+
+fileprivate protocol SMBSubnetScannerDelegate: AnyObject {
+    func smbSubnetScanner(_ scanner: SMBSubnetScanner, didDiscover hosts: [SMBHostInfo])
+    func smbSubnetScannerDidFinish(_ scanner: SMBSubnetScanner)
+}
+
+/// Scans the local subnet for SMB hosts (port 445)
+fileprivate final class SMBSubnetScanner {
+    private weak var delegate: SMBSubnetScannerDelegate?
+    private let scanQueue = DispatchQueue(label: "com.flowfinder.smbscanner", qos: .utility, attributes: .concurrent)
+    private let resultQueue = DispatchQueue(label: "com.flowfinder.smbscanner.results", qos: .utility)
+    private var discoveredHosts: [SMBHostInfo] = []
+    private var isScanning = false
+    private var scanWorkItem: DispatchWorkItem?
+    private let smbPort: UInt16 = 445
+    private let connectionTimeout: TimeInterval = 0.3
+
+    init(delegate: SMBSubnetScannerDelegate) {
+        self.delegate = delegate
+    }
+
+    func start() {
+        guard !isScanning else { return }
+        isScanning = true
+        discoveredHosts = []
+
+        // Get local network info
+        guard let (localIP, netmask) = getLocalNetworkInfo() else {
+            finishScanning()
+            return
+        }
+
+        // Calculate subnet range
+        let ipRange = calculateIPRange(localIP: localIP, netmask: netmask)
+        guard !ipRange.isEmpty else {
+            finishScanning()
+            return
+        }
+
+        let workItem = DispatchWorkItem { [weak self] in
+            self?.scanIPRange(ipRange, localIP: localIP)
+        }
+        scanWorkItem = workItem
+        scanQueue.async(execute: workItem)
+    }
+
+    func stop() {
+        scanWorkItem?.cancel()
+        scanWorkItem = nil
+        isScanning = false
+    }
+
+    private func getLocalNetworkInfo() -> (ip: String, netmask: String)? {
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
+        defer { freeifaddrs(ifaddr) }
+
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let interface = ptr.pointee
+            let addrFamily = interface.ifa_addr.pointee.sa_family
+
+            guard addrFamily == UInt8(AF_INET) else { continue }
+
+            let name = String(cString: interface.ifa_name)
+            // Look for common interface names (en0 is usually WiFi, en1 ethernet)
+            guard name.hasPrefix("en") else { continue }
+
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            var netmaskHost = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+
+            // Get IP address
+            getnameinfo(interface.ifa_addr, socklen_t(interface.ifa_addr.pointee.sa_len),
+                       &hostname, socklen_t(hostname.count),
+                       nil, 0, NI_NUMERICHOST)
+
+            // Get netmask
+            if let netmask = interface.ifa_netmask {
+                getnameinfo(netmask, socklen_t(netmask.pointee.sa_len),
+                           &netmaskHost, socklen_t(netmaskHost.count),
+                           nil, 0, NI_NUMERICHOST)
+            }
+
+            let ip = String(cString: hostname)
+            let mask = String(cString: netmaskHost)
+
+            // Skip loopback and link-local addresses
+            guard !ip.hasPrefix("127.") && !ip.hasPrefix("169.254.") else { continue }
+            guard !ip.isEmpty && !mask.isEmpty else { continue }
+
+            return (ip, mask)
+        }
+        return nil
+    }
+
+    private func calculateIPRange(localIP: String, netmask: String) -> [String] {
+        let ipParts = localIP.split(separator: ".").compactMap { UInt32($0) }
+        let maskParts = netmask.split(separator: ".").compactMap { UInt32($0) }
+
+        guard ipParts.count == 4, maskParts.count == 4 else { return [] }
+
+        let ip = (ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]
+        let mask = (maskParts[0] << 24) | (maskParts[1] << 16) | (maskParts[2] << 8) | maskParts[3]
+
+        let network = ip & mask
+        let broadcast = network | ~mask
+
+        // Limit scan to /24 or smaller to avoid scanning huge ranges
+        let hostCount = broadcast - network
+        guard hostCount > 0 && hostCount <= 254 else {
+            // For larger networks, just scan first 254 hosts
+            var range: [String] = []
+            for i: UInt32 in 1...254 {
+                let hostIP = network + i
+                let a = (hostIP >> 24) & 0xFF
+                let b = (hostIP >> 16) & 0xFF
+                let c = (hostIP >> 8) & 0xFF
+                let d = hostIP & 0xFF
+                range.append("\(a).\(b).\(c).\(d)")
+            }
+            return range
+        }
+
+        var range: [String] = []
+        for hostIP in (network + 1)..<broadcast {
+            let a = (hostIP >> 24) & 0xFF
+            let b = (hostIP >> 16) & 0xFF
+            let c = (hostIP >> 8) & 0xFF
+            let d = hostIP & 0xFF
+            range.append("\(a).\(b).\(c).\(d)")
+        }
+        return range
+    }
+
+    private func scanIPRange(_ ips: [String], localIP: String) {
+        let group = DispatchGroup()
+
+        for ip in ips {
+            guard isScanning else { break }
+            // Skip our own IP
+            guard ip != localIP else { continue }
+
+            group.enter()
+            scanQueue.async { [weak self] in
+                defer { group.leave() }
+                guard let self, self.isScanning else { return }
+
+                if self.checkSMBPort(ip: ip) {
+                    let hostName = self.resolveHostName(ip: ip) ?? ip
+                    let hostInfo = SMBHostInfo(ipAddress: ip, name: hostName, port: Int(self.smbPort))
+
+                    self.resultQueue.async {
+                        self.discoveredHosts.append(hostInfo)
+                        // Notify delegate of progress
+                        DispatchQueue.main.async {
+                            self.delegate?.smbSubnetScanner(self, didDiscover: self.discoveredHosts)
+                        }
+                    }
+                }
+            }
+        }
+
+        group.notify(queue: .main) { [weak self] in
+            self?.finishScanning()
+        }
+    }
+
+    private func checkSMBPort(ip: String) -> Bool {
+        let socket = Darwin.socket(AF_INET, SOCK_STREAM, 0)
+        guard socket >= 0 else { return false }
+        defer { Darwin.close(socket) }
+
+        // Set non-blocking
+        let flags = fcntl(socket, F_GETFL, 0)
+        _ = fcntl(socket, F_SETFL, flags | O_NONBLOCK)
+
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        addr.sin_port = smbPort.bigEndian
+        inet_pton(AF_INET, ip, &addr.sin_addr)
+
+        let result = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                Darwin.connect(socket, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+
+        if result == 0 {
+            return true
+        }
+
+        if errno == EINPROGRESS {
+            // Use poll to wait for connection with timeout
+            var pfd = pollfd(fd: socket, events: Int16(POLLOUT), revents: 0)
+            let timeoutMs = Int32(connectionTimeout * 1000)
+            let pollResult = poll(&pfd, 1, timeoutMs)
+
+            if pollResult > 0 && (pfd.revents & Int16(POLLOUT)) != 0 {
+                var error: Int32 = 0
+                var len = socklen_t(MemoryLayout<Int32>.size)
+                getsockopt(socket, SOL_SOCKET, SO_ERROR, &error, &len)
+                return error == 0
+            }
+        }
+
+        return false
+    }
+
+    private func resolveHostName(ip: String) -> String? {
+        var addr = sockaddr_in()
+        addr.sin_family = sa_family_t(AF_INET)
+        inet_pton(AF_INET, ip, &addr.sin_addr)
+
+        var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let result = withUnsafePointer(to: &addr) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getnameinfo($0, socklen_t(MemoryLayout<sockaddr_in>.size),
+                           &hostname, socklen_t(hostname.count),
+                           nil, 0, 0)
+            }
+        }
+
+        if result == 0 {
+            let name = String(cString: hostname)
+            // Remove .local suffix if present
+            if name.hasSuffix(".local") {
+                return String(name.dropLast(6))
+            }
+            // Don't return if it's just the IP address
+            if name != ip {
+                return name
+            }
+        }
+        return nil
+    }
+
+    private func finishScanning() {
+        isScanning = false
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.delegate?.smbSubnetScannerDidFinish(self)
+        }
     }
 }
