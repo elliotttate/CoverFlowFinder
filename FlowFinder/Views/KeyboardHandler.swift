@@ -258,10 +258,13 @@ extension FileBrowserViewModel {
             return
         }
 
-        if let previewURL = previewURL(for: item) {
-            QuickLookControllerView.shared.updatePreview(for: previewURL)
-        } else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
+        // Use async version to avoid blocking during archive extraction
+        previewURL(for: item) { previewURL in
+            if let previewURL = previewURL {
+                QuickLookControllerView.shared.updatePreview(for: previewURL)
+            } else {
+                QuickLookControllerView.shared.updatePreview(for: nil)
+            }
         }
     }
 
@@ -269,12 +272,14 @@ extension FileBrowserViewModel {
     func toggleQuickLookForSelection(onNavigate: @escaping (Int) -> Void) {
         guard let selectedItem = selectedItems.first else { return }
 
-        guard let previewURL = previewURL(for: selectedItem) else {
-            NSSound.beep()
-            return
+        // Use async version to avoid blocking during archive extraction
+        previewURL(for: selectedItem) { previewURL in
+            guard let previewURL = previewURL else {
+                NSSound.beep()
+                return
+            }
+            QuickLookControllerView.shared.togglePreview(for: previewURL, navigate: onNavigate)
         }
-
-        QuickLookControllerView.shared.togglePreview(for: previewURL, navigate: onNavigate)
     }
 }
 

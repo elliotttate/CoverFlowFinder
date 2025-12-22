@@ -764,7 +764,8 @@ class FileBrowserViewModel: ObservableObject {
 
         items = updatedItems
         selectedItems = updatedSelection
-        navigationGeneration &+= 1
+        // NOTE: Don't increment navigationGeneration here - incremental updates
+        // should not cause full view recreation which loses scroll position
     }
 
     private func sortStateRequiresMetadata(_ sortState: SortState) -> Bool {
@@ -1598,17 +1599,25 @@ class FileBrowserViewModel: ObservableObject {
     /// Extract and open a file from the archive
     private func openArchiveItem(_ item: FileItem) {
         guard let archiveURL = item.archiveURL,
-              let entry = archiveEntry(for: item) else {
+              let archivePath = item.archivePath else {
             return
         }
 
-        guard !entry.isDirectory else { return }
+        guard !item.isDirectory else { return }
 
-        do {
-            let tempURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
-            NSWorkspace.shared.open(tempURL)
-        } catch {
-            print("Failed to extract file: \(error.localizedDescription)")
+        // Extract on background thread to avoid blocking UI
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                let tempURL = try ZipArchiveManager.shared.extractByPath(archivePath, from: archiveURL)
+                DispatchQueue.main.async {
+                    NSWorkspace.shared.open(tempURL)
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    NSSound.beep()
+                }
+                print("Failed to extract file: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1628,18 +1637,25 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     func previewURL(for item: FileItem) -> URL? {
+        // For archive items, return nil - caller should use async version
         if item.isFromArchive {
-            guard !item.isDirectory,
-                  let archiveURL = item.archiveURL,
-                  let entry = archiveEntry(for: item) else {
-                return nil
-            }
-            return try? ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
+            return nil
         }
         if let identifier = photosAssetIdentifier(from: item.url) {
             return photosExportCache[identifier]
         }
         return item.url
+    }
+
+    /// Async version for archive items - extracts on background thread
+    func previewURL(for item: FileItem, completion: @escaping (URL?) -> Void) {
+        if item.isFromArchive {
+            // TEMP: Skip archive preview entirely to diagnose freeze
+            completion(nil)
+            return
+        }
+        // Non-archive items return immediately
+        completion(previewURL(for: item))
     }
 
     // Track anchor index for Shift+click range selection
