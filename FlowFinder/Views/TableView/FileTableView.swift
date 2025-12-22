@@ -88,6 +88,14 @@ struct FileTableView: NSViewRepresentable {
             object: scrollView
         )
 
+        // Observe hydration completion to refresh visible rows with metadata
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(context.coordinator.handleHydrationCompleted(_:)),
+            name: .metadataHydrationCompleted,
+            object: nil
+        )
+
         // Setup header menu after a short delay to ensure view hierarchy is ready
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             context.coordinator.setupHeaderMenu()
@@ -104,17 +112,43 @@ struct FileTableView: NSViewRepresentable {
         // Ensure header menu is set up (in case it wasn't ready before)
         context.coordinator.ensureHeaderMenu()
 
+        // Check metadata status of incoming items vs what we already have
+        let incomingMetadataCount = items.filter { $0.hasMetadata }.count
+        let currentMetadataCount = context.coordinator.items.filter { $0.hasMetadata }.count
+
+        // If SwiftUI is passing stale items (less metadata than what hydration gave us), reject the update
+        // This happens because SwiftUI's update cycle captures data before our hydration notification runs
+        if items.count == context.coordinator.items.count &&
+           incomingMetadataCount < context.coordinator.lastHydrationItemCount &&
+           currentMetadataCount >= context.coordinator.lastHydrationItemCount {
+            // Still sync columns and selection
+            context.coordinator.syncColumnsIfNeeded()
+            context.coordinator.syncSelectionFromViewModel()
+            return
+        }
+
         // Update items
         let oldItems = context.coordinator.items
         context.coordinator.items = items
 
         // Check if items actually changed (not just reference)
         let changed = oldItems.count != items.count || !oldItems.elementsEqual(items, by: { $0.id == $1.id })
+
         if changed {
             context.coordinator.resetThumbnailState()
+            // Reset lastVisibleRange so hydration can trigger
+            context.coordinator.resetHydrationRange()
+            // Reset hydration tracking since we have new items
+            context.coordinator.lastHydrationItemCount = 0
             context.coordinator.tableView?.reloadData()
             // Trigger hydration for newly visible rows
             context.coordinator.hydrateVisibleRows()
+            // Retry after layout settles to ensure visible rows are detected
+            DispatchQueue.main.async { [weak coordinator = context.coordinator] in
+                coordinator?.hydrateVisibleRows()
+            }
+        } else {
+            context.coordinator.reloadVisibleRowsIfNeeded(previousItems: oldItems)
         }
 
         // Sync columns if configuration changed
@@ -169,6 +203,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var hydrationDebounceTimer: Timer?
     private let hydrationDebounceInterval: TimeInterval = 0.05
     private var isLiveScrolling = false
+    var lastHydrationItemCount: Int = 0  // Track items with metadata after hydration (public for updateNSView access)
 
     // Thumbnail preheat state (like PHCachingImageManager)
     private var lastPreheatRange: Range<Int>?
@@ -346,9 +381,9 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         case .name:
             cellView = makeNameCell(for: item, tableView: tableView)
         case .dateModified:
-            cellView = makeDateCell(for: item.modificationDate, tableView: tableView, identifier: columnID)
+            cellView = makeDateCell(for: item.modificationDate, tableView: tableView, identifier: columnID, itemName: item.name)
         case .dateCreated:
-            cellView = makeDateCell(for: item.creationDate, tableView: tableView, identifier: columnID)
+            cellView = makeDateCell(for: item.creationDate, tableView: tableView, identifier: columnID, itemName: item.name)
         case .size:
             cellView = makeSizeCell(for: item, tableView: tableView)
         case .kind:
@@ -534,6 +569,22 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         flushPendingThumbnailRowReloads()
     }
 
+    @objc func handleHydrationCompleted(_ notification: Notification) {
+        // Fetch fresh items from the view model (bypasses SwiftUI caching)
+        let freshItems = viewModel.filteredItems
+        let freshMetadataCount = freshItems.filter { $0.hasMetadata }.count
+
+        // Update coordinator's items with fresh data
+        items = freshItems
+        // Track the hydrated count so we can reject stale SwiftUI updates
+        lastHydrationItemCount = freshMetadataCount
+
+        // Reload all data since hydrated items may be at any index
+        // (user may have scrolled since hydration was requested)
+        guard let tableView = tableView else { return }
+        tableView.reloadData()
+    }
+
     /// Hydrate metadata for currently visible rows
     func hydrateVisibleRows() {
         guard let tableView = tableView else { return }
@@ -573,6 +624,50 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
         // Also preheat thumbnails
         preheatThumbnails(visibleStart: start, visibleEnd: end)
+    }
+
+    func reloadVisibleRowsIfNeeded(previousItems: [FileItem]) {
+        guard let tableView = tableView else { return }
+        guard previousItems.count == items.count else { return }
+
+        let visibleRect = tableView.visibleRect
+        let visibleRows = tableView.rows(in: visibleRect)
+
+        guard visibleRows.location != NSNotFound else { return }
+
+        let start = visibleRows.location
+        let end = min(start + visibleRows.length, items.count)
+        guard start < end else { return }
+
+        var rowsToReload = IndexSet()
+        for row in start..<end {
+            let oldItem = previousItems[row]
+            let newItem = items[row]
+            if needsRowReload(oldItem: oldItem, newItem: newItem) {
+                rowsToReload.insert(row)
+            }
+        }
+
+        guard !rowsToReload.isEmpty else { return }
+        let columnCount = tableView.numberOfColumns
+        guard columnCount > 0 else { return }
+        tableView.reloadData(
+            forRowIndexes: rowsToReload,
+            columnIndexes: IndexSet(integersIn: 0..<columnCount)
+        )
+    }
+
+    private func needsRowReload(oldItem: FileItem, newItem: FileItem) -> Bool {
+        if oldItem.id != newItem.id { return true }
+        if oldItem.url != newItem.url { return true }
+        if oldItem.name != newItem.name { return true }
+        if oldItem.isDirectory != newItem.isDirectory { return true }
+        if oldItem.fileType != newItem.fileType { return true }
+        if oldItem.hasMetadata != newItem.hasMetadata { return true }
+        if oldItem.size != newItem.size { return true }
+        if oldItem.modificationDate != newItem.modificationDate { return true }
+        if oldItem.creationDate != newItem.creationDate { return true }
+        return false
     }
 
     private func loadThumbnailsForVisibleRows() {
@@ -651,7 +746,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         return cell
     }
 
-    private func makeDateCell(for date: Date?, tableView: NSTableView, identifier: String) -> NSTableCellView {
+    private func makeDateCell(for date: Date?, tableView: NSTableView, identifier: String, itemName: String = "") -> NSTableCellView {
         let id = NSUserInterfaceItemIdentifier(identifier + "Cell")
         let cell = tableView.makeView(withIdentifier: id, owner: nil) as? DateCellView
             ?? DateCellView()
@@ -731,6 +826,10 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     func resetThumbnailState() {
         pendingThumbnailRows.removeAll()
         isLiveScrolling = false
+    }
+
+    func resetHydrationRange() {
+        lastVisibleRange = nil
     }
 
     private func queueThumbnailRowReload(for url: URL) {

@@ -235,7 +235,7 @@ struct CoverFlowView: View {
         }
         .onAppear {
             KeyboardManager.shared.clearHandler()
-            updateSortedItems()
+            updateSortedItems(using: items, updateToken: true)
             loadVisibleThumbnails()
             syncSelection()
         }
@@ -250,22 +250,52 @@ struct CoverFlowView: View {
             let newCount = newItems.count
             let oldToken = itemsToken
             let newToken = itemsTokenFor(newItems)
+            let oldOrder = sortedItemsCache.map { $0.url }
+            let newOrder = newItems.map { $0.url }
+            let orderChanged = oldOrder != newOrder
+            let tokenChanged = oldToken != newToken
             Self.debugLog("[CoverFlow] onChange(items) FIRED! old:\(oldCount) new:\(newCount) oldToken:\(oldToken) newToken:\(newToken) tokenMatch:\(oldToken == newToken)")
 
             // Only clear thumbnails if items actually changed
-            if oldToken != newToken {
+            if tokenChanged {
                 Self.debugLog("[CoverFlow] Items actually changed - clearing thumbnails")
                 DispatchQueue.main.async {
                     thumbnails.removeAll()
                     iconPlaceholders.removeAll()
                     thumbnailLoadGeneration += 1
                     thumbnailCache.clearForNewFolder()
-                    updateSortedItems()
+                    updateSortedItems(using: newItems, updateToken: true)
                     loadVisibleThumbnails()
                     syncSelection()
                 }
             } else {
                 Self.debugLog("[CoverFlow] Items unchanged (same token) - skipping clear")
+                DispatchQueue.main.async {
+                    updateSortedItems(using: newItems, updateToken: false)
+                    if orderChanged {
+                        loadVisibleThumbnails()
+                    }
+                    syncSelection()
+                }
+            }
+        }
+        .onReceive(viewModel.$items) { _ in
+            let newItems = viewModel.filteredItems
+            guard newItems.count == sortedItemsCache.count else { return }
+
+            let oldURLs = Set(sortedItemsCache.map { $0.url })
+            let newURLs = Set(newItems.map { $0.url })
+            guard oldURLs == newURLs else { return }
+
+            let oldOrder = sortedItemsCache.map { $0.url }
+            let newOrder = newItems.map { $0.url }
+            let orderChanged = oldOrder != newOrder
+            DispatchQueue.main.async {
+                updateSortedItems(using: newItems, updateToken: false)
+                if orderChanged {
+                    loadVisibleThumbnails()
+                }
+                syncSelection()
             }
         }
         .onChange(of: viewModel.coverFlowSelectedIndex) { _ in
@@ -310,14 +340,16 @@ struct CoverFlowView: View {
         }
     }
 
-    private func updateSortedItems() {
-        sortedItemsCache = items
-        itemsToken = itemsTokenFor(items)
+    private func updateSortedItems(using newItems: [FileItem], updateToken: Bool) {
+        sortedItemsCache = newItems
+        if updateToken {
+            itemsToken = itemsTokenFor(newItems)
+        }
         if let selected = viewModel.selectedItems.first,
-           let index = sortedItemsCache.firstIndex(of: selected) {
+           let index = newItems.firstIndex(of: selected) {
             viewModel.coverFlowSelectedIndex = index
         } else {
-            viewModel.coverFlowSelectedIndex = min(viewModel.coverFlowSelectedIndex, max(0, sortedItemsCache.count - 1))
+            viewModel.coverFlowSelectedIndex = min(viewModel.coverFlowSelectedIndex, max(0, newItems.count - 1))
         }
     }
 
