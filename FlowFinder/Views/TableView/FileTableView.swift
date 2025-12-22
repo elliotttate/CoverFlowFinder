@@ -96,9 +96,10 @@ struct FileTableView: NSViewRepresentable {
             object: nil
         )
 
-        // Setup header menu after a short delay to ensure view hierarchy is ready
+        // Setup menus after a short delay to ensure view hierarchy is ready
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             context.coordinator.setupHeaderMenu()
+            context.coordinator.setupRowMenu()
         }
 
         return scrollView
@@ -336,20 +337,37 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     // MARK: - Header Menu
 
     private var headerMenuSet = false
+    private var headerMenu: NSMenu?
+    private var rowMenu: NSMenu?
 
     func setupHeaderMenu() {
         guard !headerMenuSet else { return }
         guard let tableView = tableView,
               let headerView = tableView.headerView else { return }
 
-        // Create menu for header - this is the right-click context menu
+        // Create menu for header - this is the right-click context menu for columns
         let menu = NSMenu(title: "Columns")
         menu.delegate = self
         menu.autoenablesItems = false
+        headerMenu = menu
 
         // Set menu on header view for right-click
         headerView.menu = menu
         headerMenuSet = true
+    }
+
+    func setupRowMenu() {
+        guard let tableView = tableView else { return }
+        guard rowMenu == nil else { return }
+
+        // Create menu for rows - context menu for file items
+        let menu = NSMenu(title: "File Actions")
+        menu.delegate = self
+        menu.autoenablesItems = false
+        rowMenu = menu
+
+        // Set menu on table view for row right-click
+        tableView.menu = menu
     }
 
     func ensureHeaderMenu() {
@@ -875,12 +893,21 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 }
 
-// MARK: - NSMenuDelegate for Header Menu
+// MARK: - NSMenuDelegate for Menus
 
 extension FileTableCoordinator: NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
+        // Determine which menu is being updated
+        if menu === headerMenu {
+            buildHeaderMenu(menu)
+        } else if menu === rowMenu {
+            buildRowMenu(menu)
+        }
+    }
+
+    private func buildHeaderMenu(_ menu: NSMenu) {
         let titleItem = NSMenuItem(title: "Columns", action: nil, keyEquivalent: "")
         titleItem.isEnabled = false
         menu.addItem(titleItem)
@@ -911,6 +938,141 @@ extension FileTableCoordinator: NSMenuDelegate {
         menu.addItem(resetItem)
     }
 
+    private func buildRowMenu(_ menu: NSMenu) {
+        guard let tableView = tableView else { return }
+        let clickedRow = tableView.clickedRow
+
+        // If clicked on empty space, show folder-level menu
+        guard clickedRow >= 0, clickedRow < items.count else {
+            buildEmptySpaceMenu(menu)
+            return
+        }
+
+        let item = items[clickedRow]
+
+        // Select the clicked row if not already selected
+        if !tableView.selectedRowIndexes.contains(clickedRow) {
+            tableView.selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
+            viewModel.selectedItems = [item]
+        }
+
+        let isFromArchive = item.isFromArchive
+
+        // Open
+        let openItem = NSMenuItem(title: "Open", action: #selector(menuOpen(_:)), keyEquivalent: "")
+        openItem.target = self
+        menu.addItem(openItem)
+
+        // Open With...
+        let openWithItem = NSMenuItem(title: "Open With...", action: #selector(menuOpenWith(_:)), keyEquivalent: "")
+        openWithItem.target = self
+        openWithItem.isEnabled = !isFromArchive
+        menu.addItem(openWithItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Get Info
+        let getInfoItem = NSMenuItem(title: "Get Info", action: #selector(menuGetInfo(_:)), keyEquivalent: "")
+        getInfoItem.target = self
+        getInfoItem.isEnabled = !isFromArchive
+        menu.addItem(getInfoItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Tags submenu (only for non-archive items)
+        if !isFromArchive {
+            let tagsMenu = NSMenu(title: "Tags")
+            for tag in FinderTag.allTags {
+                let tagItem = NSMenuItem(title: tag.name, action: #selector(menuToggleTag(_:)), keyEquivalent: "")
+                tagItem.target = self
+                tagItem.representedObject = tag.name
+                tagItem.state = item.tags.contains(tag.name) ? .on : .off
+
+                // Add color indicator
+                let colorImage = NSImage(size: NSSize(width: 12, height: 12))
+                colorImage.lockFocus()
+                NSColor(tag.color).setFill()
+                NSBezierPath(ovalIn: NSRect(x: 0, y: 0, width: 12, height: 12)).fill()
+                colorImage.unlockFocus()
+                tagItem.image = colorImage
+
+                tagsMenu.addItem(tagItem)
+            }
+
+            if !item.tags.isEmpty {
+                tagsMenu.addItem(NSMenuItem.separator())
+                let removeAllItem = NSMenuItem(title: "Remove All Tags", action: #selector(menuRemoveAllTags(_:)), keyEquivalent: "")
+                removeAllItem.target = self
+                tagsMenu.addItem(removeAllItem)
+            }
+
+            let tagsMenuItem = NSMenuItem(title: "Tags", action: nil, keyEquivalent: "")
+            tagsMenuItem.submenu = tagsMenu
+            menu.addItem(tagsMenuItem)
+
+            menu.addItem(NSMenuItem.separator())
+        }
+
+        // Copy
+        let copyItem = NSMenuItem(title: "Copy", action: #selector(menuCopy(_:)), keyEquivalent: "")
+        copyItem.target = self
+        menu.addItem(copyItem)
+
+        // Cut
+        let cutItem = NSMenuItem(title: "Cut", action: #selector(menuCut(_:)), keyEquivalent: "")
+        cutItem.target = self
+        menu.addItem(cutItem)
+
+        // Duplicate
+        let duplicateItem = NSMenuItem(title: "Duplicate", action: #selector(menuDuplicate(_:)), keyEquivalent: "")
+        duplicateItem.target = self
+        duplicateItem.isEnabled = !isFromArchive
+        menu.addItem(duplicateItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Rename
+        let renameItem = NSMenuItem(title: "Rename", action: #selector(menuRename(_:)), keyEquivalent: "")
+        renameItem.target = self
+        renameItem.isEnabled = !isFromArchive
+        menu.addItem(renameItem)
+
+        // Move to Trash
+        let trashItem = NSMenuItem(title: "Move to Trash", action: #selector(menuMoveToTrash(_:)), keyEquivalent: "")
+        trashItem.target = self
+        trashItem.isEnabled = !isFromArchive
+        menu.addItem(trashItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Show in Finder
+        let finderItem = NSMenuItem(title: "Show in Finder", action: #selector(menuShowInFinder(_:)), keyEquivalent: "")
+        finderItem.target = self
+        menu.addItem(finderItem)
+    }
+
+    private func buildEmptySpaceMenu(_ menu: NSMenu) {
+        // New Folder
+        let newFolderItem = NSMenuItem(title: "New Folder", action: #selector(menuNewFolder(_:)), keyEquivalent: "")
+        newFolderItem.target = self
+        menu.addItem(newFolderItem)
+
+        // Paste (if clipboard has files)
+        let pasteItem = NSMenuItem(title: "Paste", action: #selector(menuPaste(_:)), keyEquivalent: "")
+        pasteItem.target = self
+        pasteItem.isEnabled = viewModel.canPaste
+        menu.addItem(pasteItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        // Show in Finder
+        let finderItem = NSMenuItem(title: "Show in Finder", action: #selector(menuShowCurrentFolderInFinder(_:)), keyEquivalent: "")
+        finderItem.target = self
+        menu.addItem(finderItem)
+    }
+
+    // MARK: - Header Menu Actions
+
     @objc private func toggleColumnVisibility(_ sender: NSMenuItem) {
         guard let column = sender.representedObject as? ListColumn else { return }
         columnConfig.toggleColumnVisibility(column)
@@ -922,6 +1084,86 @@ extension FileTableCoordinator: NSMenuDelegate {
         columnConfig.resetToDefaults()
         setupColumns()
         tableView?.reloadData()
+    }
+
+    // MARK: - Row Menu Actions
+
+    @objc private func menuOpen(_ sender: NSMenuItem) {
+        guard let tableView = tableView else { return }
+        let row = tableView.clickedRow
+        guard row >= 0, row < items.count else { return }
+        viewModel.openItem(items[row])
+    }
+
+    @objc private func menuOpenWith(_ sender: NSMenuItem) {
+        guard let tableView = tableView else { return }
+        let row = tableView.clickedRow
+        guard row >= 0, row < items.count else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([items[row].url])
+    }
+
+    @objc private func menuGetInfo(_ sender: NSMenuItem) {
+        viewModel.getInfo()
+    }
+
+    @objc private func menuToggleTag(_ sender: NSMenuItem) {
+        guard let tagName = sender.representedObject as? String else { return }
+        guard let tableView = tableView else { return }
+        let row = tableView.clickedRow
+        guard row >= 0, row < items.count else { return }
+
+        let item = items[row]
+        FileTagManager.toggleTag(tagName, on: item.url)
+        viewModel.refreshTags(for: [item.url])
+    }
+
+    @objc private func menuRemoveAllTags(_ sender: NSMenuItem) {
+        guard let tableView = tableView else { return }
+        let row = tableView.clickedRow
+        guard row >= 0, row < items.count else { return }
+
+        let item = items[row]
+        FileTagManager.setTags([], for: item.url)
+        viewModel.refreshTags(for: [item.url])
+    }
+
+    @objc private func menuCopy(_ sender: NSMenuItem) {
+        viewModel.copySelectedItems()
+    }
+
+    @objc private func menuCut(_ sender: NSMenuItem) {
+        viewModel.cutSelectedItems()
+    }
+
+    @objc private func menuDuplicate(_ sender: NSMenuItem) {
+        viewModel.duplicateSelectedItems()
+    }
+
+    @objc private func menuRename(_ sender: NSMenuItem) {
+        guard let tableView = tableView else { return }
+        let row = tableView.clickedRow
+        guard row >= 0, row < items.count else { return }
+        viewModel.renamingURL = items[row].url
+    }
+
+    @objc private func menuMoveToTrash(_ sender: NSMenuItem) {
+        viewModel.deleteSelectedItems()
+    }
+
+    @objc private func menuShowInFinder(_ sender: NSMenuItem) {
+        viewModel.showInFinder()
+    }
+
+    @objc private func menuNewFolder(_ sender: NSMenuItem) {
+        viewModel.createNewFolder()
+    }
+
+    @objc private func menuPaste(_ sender: NSMenuItem) {
+        viewModel.paste()
+    }
+
+    @objc private func menuShowCurrentFolderInFinder(_ sender: NSMenuItem) {
+        NSWorkspace.shared.activateFileViewerSelecting([viewModel.currentPath])
     }
 }
 
