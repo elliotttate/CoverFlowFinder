@@ -236,6 +236,36 @@ struct ContentView: View {
                     SearchField(text: searchTextBinding, placeholder: viewModel.searchMode.placeholder)
                         .frame(width: 180)
 
+                    // Sort picker for Everything/Finder search results
+                    if viewModel.searchMode != .filter && !viewModel.searchText.isEmpty {
+                        Menu {
+                            ForEach(SearchSortOption.allCases, id: \.self) { option in
+                                Button {
+                                    if viewModel.searchSortOption == option {
+                                        viewModel.searchSortAscending.toggle()
+                                    } else {
+                                        viewModel.searchSortOption = option
+                                        viewModel.searchSortAscending = true
+                                    }
+                                } label: {
+                                    HStack {
+                                        Label(option.rawValue, systemImage: option.systemImage)
+                                        if viewModel.searchSortOption == option {
+                                            Spacer()
+                                            Image(systemName: viewModel.searchSortAscending ? "chevron.up" : "chevron.down")
+                                        }
+                                    }
+                                }
+                            }
+                        } label: {
+                            Label(viewModel.searchSortOption.rawValue, systemImage: viewModel.searchSortAscending ? "chevron.up" : "chevron.down")
+                                .labelStyle(.iconOnly)
+                        }
+                        .menuStyle(.borderlessButton)
+                        .frame(width: 24)
+                        .help("Sort by: \(viewModel.searchSortOption.rawValue) (\(viewModel.searchSortAscending ? "ascending" : "descending"))")
+                    }
+
                     // Loading indicator
                     if viewModel.isSearching {
                         ProgressView()
