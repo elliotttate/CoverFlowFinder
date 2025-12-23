@@ -218,6 +218,15 @@ final class KeyboardTableView: NSTableView {
     }
 }
 
+// MARK: - Custom Row View with Always-Emphasized Selection
+
+final class EmphasizedTableRowView: NSTableRowView {
+    override var isEmphasized: Bool {
+        get { true }
+        set { /* Always emphasized */ }
+    }
+}
+
 // MARK: - Coordinator (NSTableViewDataSource & NSTableViewDelegate)
 
 @MainActor
@@ -534,6 +543,10 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         }
 
         return cellView
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        return EmphasizedTableRowView()
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
