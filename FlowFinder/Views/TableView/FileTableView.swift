@@ -1251,7 +1251,7 @@ extension FileTableCoordinator: NSMenuDelegate {
         guard row >= 0, row < items.count else { return }
 
         let item = items[row]
-        FileTagManager.toggleTag(tagName, on: item.url)
+        viewModel.toggleTag(tagName, for: item.url, invalidateCache: false)
 
         // Directly reconfigure the Name cell which shows tag dots
         let nameColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
@@ -1267,10 +1267,7 @@ extension FileTableCoordinator: NSMenuDelegate {
             tagsCell.configure(item: item, appSettings: appSettings)
         }
 
-        // NOTE: We do NOT call viewModel.refreshTags here because:
-        // 1. We've already reconfigured the cell directly above
-        // 2. refreshTags invalidates the cache and triggers a full table reload
-        // 3. The filesystem (URLResourceValues) lags behind xattr writes, causing stale reads
+        // refreshTags is triggered by the view model using the cached tag values.
     }
 
     @objc private func menuRemoveAllTags(_ sender: NSMenuItem) {
@@ -1279,7 +1276,7 @@ extension FileTableCoordinator: NSMenuDelegate {
         guard row >= 0, row < items.count else { return }
 
         let item = items[row]
-        FileTagManager.setTags([], for: item.url)
+        viewModel.setTags([], for: item.url, invalidateCache: false)
 
         // Directly reconfigure the Name cell which shows tag dots
         let nameColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
@@ -1295,7 +1292,7 @@ extension FileTableCoordinator: NSMenuDelegate {
             tagsCell.configure(item: item, appSettings: appSettings)
         }
 
-        // NOTE: We do NOT call viewModel.refreshTags here - cell is already updated
+        // refreshTags is triggered by the view model using the cached tag values.
     }
 
     @objc private func menuCopy(_ sender: NSMenuItem) {

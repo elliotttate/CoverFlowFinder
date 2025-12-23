@@ -6,6 +6,13 @@ struct FlowFinderApp: App {
     @StateObject private var settings = AppSettings.shared
     @StateObject private var soundEffectsMonitor = FinderSoundEffectsMonitor()
 
+    init() {
+        // Start building the search index in the background
+        Task { @MainActor in
+            SearchIndexManager.shared.startIndexing()
+        }
+    }
+
     var body: some Scene {
         WindowGroup {
             ContentView()
