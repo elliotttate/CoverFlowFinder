@@ -57,6 +57,24 @@ enum SearchMode: String, CaseIterable {
     }
 }
 
+enum SearchSortOption: String, CaseIterable {
+    case name = "Name"
+    case dateModified = "Date Modified"
+    case dateCreated = "Date Created"
+    case size = "Size"
+    case kind = "Kind"
+
+    var systemImage: String {
+        switch self {
+        case .name: return "textformat"
+        case .dateModified: return "clock"
+        case .dateCreated: return "calendar"
+        case .size: return "externaldrive"
+        case .kind: return "doc"
+        }
+    }
+}
+
 struct PhotosLibraryInfo: Equatable {
     let libraryURL: URL
     let imagesURL: URL
@@ -94,12 +112,43 @@ class FileBrowserViewModel: ObservableObject {
     @Published var viewMode: ViewMode = .coverFlow
     @Published var searchText: String = ""
     @Published var searchMode: SearchMode = .filter
+    @Published var searchSortOption: SearchSortOption = .name
+    @Published var searchSortAscending: Bool = true
     @Published var filterTag: String? = nil
     @Published var isLoading: Bool = false
     @Published var isSearching: Bool = false
 
     // Search results for Finder and Everything modes
     @Published var searchResults: [FileItem] = []
+
+    /// Sorted search results based on current sort option
+    var sortedSearchResults: [FileItem] {
+        let items = searchResults
+        guard !items.isEmpty else { return items }
+
+        let sorted: [FileItem]
+        switch searchSortOption {
+        case .name:
+            sorted = items.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        case .dateModified:
+            sorted = items.sorted { ($0.modificationDate ?? .distantPast) < ($1.modificationDate ?? .distantPast) }
+        case .dateCreated:
+            sorted = items.sorted { ($0.creationDate ?? .distantPast) < ($1.creationDate ?? .distantPast) }
+        case .size:
+            sorted = items.sorted { $0.size < $1.size }
+        case .kind:
+            sorted = items.sorted {
+                let ext0 = $0.url.pathExtension.lowercased()
+                let ext1 = $1.url.pathExtension.lowercased()
+                if ext0 != ext1 {
+                    return ext0 < ext1
+                }
+                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+        }
+
+        return searchSortAscending ? sorted : sorted.reversed()
+    }
     private var searchTask: Task<Void, Never>?
     private var metadataQuery: NSMetadataQuery?
     @Published var navigationHistory: [NavigationLocation] = []
@@ -275,13 +324,13 @@ class FileBrowserViewModel: ObservableObject {
                 print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, empty searchText, returning filterCurrentDirectoryItems()")
                 return filterCurrentDirectoryItems()
             }
-            print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults")
+            print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults (sorted by \(self.searchSortOption.rawValue))")
             searchDebugLogger.notice("📋 filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults")
             if searchResults.isEmpty {
                 print("⚠️ [FileBrowserVM] filteredItems: searchResults is EMPTY for query '\(self.searchText)'")
                 searchDebugLogger.warning("⚠️ filteredItems: searchResults is EMPTY for query '\(self.searchText)'")
             }
-            return searchResults
+            return sortedSearchResults
 
         case .filter:
             // Don't log filter mode to reduce noise
