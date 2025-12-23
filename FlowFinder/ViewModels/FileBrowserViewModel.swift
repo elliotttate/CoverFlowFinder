@@ -9,6 +9,7 @@ import CoreServices
 
 private let zipNavLogger = Logger(subsystem: "com.flowfinder.app", category: "ZipNav")
 private let sortLogger = Logger(subsystem: "com.flowfinder.app", category: "Sorting")
+private let searchDebugLogger = Logger(subsystem: "com.flowfinder.app", category: "SearchDebug")
 
 // Notification names are defined in UIConstants.swift
 
@@ -30,6 +31,28 @@ enum ViewMode: String, CaseIterable {
         case .columns: return "rectangle.split.3x1"
         case .dualPane: return "rectangle.split.2x1"
         case .quadPane: return "rectangle.grid.2x2"
+        }
+    }
+}
+
+enum SearchMode: String, CaseIterable {
+    case filter = "Filter"
+    case finder = "Finder"
+    case everything = "Everything"
+
+    var placeholder: String {
+        switch self {
+        case .filter: return "Filter"
+        case .finder: return "Search in Finder"
+        case .everything: return "Search everywhere..."
+        }
+    }
+
+    var systemImage: String {
+        switch self {
+        case .filter: return "line.3.horizontal.decrease"
+        case .finder: return "magnifyingglass"
+        case .everything: return "sparkle.magnifyingglass"
         }
     }
 }
@@ -70,8 +93,15 @@ class FileBrowserViewModel: ObservableObject {
     @Published var selectedItems: Set<FileItem> = []
     @Published var viewMode: ViewMode = .coverFlow
     @Published var searchText: String = ""
+    @Published var searchMode: SearchMode = .filter
     @Published var filterTag: String? = nil
     @Published var isLoading: Bool = false
+    @Published var isSearching: Bool = false
+
+    // Search results for Finder and Everything modes
+    @Published var searchResults: [FileItem] = []
+    private var searchTask: Task<Void, Never>?
+    private var metadataQuery: NSMetadataQuery?
     @Published var navigationHistory: [NavigationLocation] = []
     @Published var historyIndex: Int = -1
     @Published var coverFlowSelectedIndex: Int = 0
@@ -79,6 +109,7 @@ class FileBrowserViewModel: ObservableObject {
     // Navigation generation counter - forces SwiftUI to update on navigation
     @Published var navigationGeneration: Int = 0
     @Published var tagRefreshToken: Int = 0
+    weak var undoManager: UndoManager?
 
     // Track click timing for Finder-style rename triggering
     private var lastClickedURL: URL?
@@ -92,6 +123,18 @@ class FileBrowserViewModel: ObservableObject {
     private var pendingSelectionURL: URL?
 
     private let fileOperationQueue = DispatchQueue(label: "com.coverflowfinder.fileops", qos: .userInitiated)
+    private struct MoveRecord {
+        let from: URL
+        let to: URL
+    }
+    private struct CopyRecord {
+        let from: URL
+        let to: URL
+    }
+    private struct TrashRecord {
+        let original: URL
+        let trashed: URL
+    }
 
     // Clipboard state
     @Published var clipboardItems: [URL] = []
@@ -223,11 +266,36 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     var filteredItems: [FileItem] {
+        // For Finder and Everything search modes, return search results
+        switch searchMode {
+        case .finder, .everything:
+            // When in search mode, return the search results
+            // If search text is empty, show current directory items
+            if searchText.isEmpty {
+                print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, empty searchText, returning filterCurrentDirectoryItems()")
+                return filterCurrentDirectoryItems()
+            }
+            print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults")
+            searchDebugLogger.notice("📋 filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults")
+            if searchResults.isEmpty {
+                print("⚠️ [FileBrowserVM] filteredItems: searchResults is EMPTY for query '\(self.searchText)'")
+                searchDebugLogger.warning("⚠️ filteredItems: searchResults is EMPTY for query '\(self.searchText)'")
+            }
+            return searchResults
+
+        case .filter:
+            // Don't log filter mode to reduce noise
+            return filterCurrentDirectoryItems()
+        }
+    }
+
+    /// Filter items in the current directory (original filter behavior)
+    private func filterCurrentDirectoryItems() -> [FileItem] {
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
         let foldersFirst = AppSettings.shared.foldersFirst
         let cacheKey = FilteredItemsCacheKey(
             itemsRevision: itemsRevision,
-            searchText: searchText,
+            searchText: searchMode == .filter ? searchText : "",
             filterTag: filterTag,
             sortState: sortState,
             foldersFirst: foldersFirst
@@ -251,8 +319,8 @@ class FileBrowserViewModel: ObservableObject {
 
         var filtered = items
 
-        // Filter by search text
-        if !searchText.isEmpty {
+        // Filter by search text (only in filter mode)
+        if searchMode == .filter && !searchText.isEmpty {
             filtered = filtered.filter {
                 $0.name.localizedCaseInsensitiveContains(searchText)
             }
@@ -280,10 +348,43 @@ class FileBrowserViewModel: ObservableObject {
         loadContents()
         addToHistory(.filesystem(initialPath))
 
+        // Observe search text changes
         $searchText
-            .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
-            .sink { [weak self] _ in
-                self?.objectWillChange.send()
+            .debounce(for: .milliseconds(200), scheduler: RunLoop.main)
+            .sink { [weak self] newText in
+                guard let self else { return }
+                print("📝 [FileBrowserVM] searchText changed to: '\(newText)', mode: \(self.searchMode.rawValue)")
+                searchDebugLogger.notice("📝 searchText changed to: '\(newText)', mode: \(self.searchMode.rawValue)")
+                self.objectWillChange.send()
+                // Trigger search for Finder/Everything modes
+                if self.searchMode != .filter {
+                    print("📝 [FileBrowserVM] Triggering performSearch for non-filter mode")
+                    searchDebugLogger.notice("📝 Triggering performSearch for non-filter mode")
+                    self.performSearch(query: newText)
+                } else {
+                    print("📝 [FileBrowserVM] Filter mode - not calling performSearch")
+                    searchDebugLogger.notice("📝 Filter mode - not calling performSearch")
+                }
+            }
+            .store(in: &cancellables)
+
+        // Observe search mode changes
+        $searchMode
+            .dropFirst()
+            .sink { [weak self] newMode in
+                guard let self else { return }
+                print("🔄 [FileBrowserVM] searchMode changed to: \(newMode.rawValue), searchText: '\(self.searchText)'")
+                searchDebugLogger.notice("🔄 searchMode changed to: \(newMode.rawValue), searchText: '\(self.searchText)'")
+                // Clear search results when changing modes
+                self.searchResults = []
+                self.cancelSearch()
+                // If switching to a search mode with existing text, trigger search
+                if newMode != .filter && !self.searchText.isEmpty {
+                    print("🔄 [FileBrowserVM] Triggering performSearch for existing text")
+                    searchDebugLogger.notice("🔄 Triggering performSearch for existing text")
+                    self.performSearch(query: self.searchText)
+                }
+                self.objectWillChange.send()
             }
             .store(in: &cancellables)
 
@@ -1883,13 +1984,251 @@ class FileBrowserViewModel: ObservableObject {
         loadContents()
     }
 
-    func refreshTags(for urls: [URL]) {
-        for url in urls {
-            FileTagManager.invalidateCache(for: url)
+    func refreshTags(for urls: [URL], invalidateCache: Bool = true) {
+        if invalidateCache {
+            for url in urls {
+                FileTagManager.invalidateCache(for: url)
+            }
         }
         tagRefreshToken &+= 1
         // Force UI refresh by sending objectWillChange
         objectWillChange.send()
+    }
+
+    func setUndoManager(_ undoManager: UndoManager?) {
+        self.undoManager = undoManager
+    }
+
+    // MARK: - Undo Support
+
+    private func performMoves(
+        _ moves: [MoveRecord],
+        actionName: String,
+        registerUndo: Bool,
+        resolveCollisions: Bool,
+        refreshAfter: Bool = true,
+        completion: (([MoveRecord]) -> Void)? = nil
+    ) {
+        guard !moves.isEmpty else { return }
+        fileOperationQueue.async { [weak self, moves] in
+            guard let self else { return }
+            let fileManager = FileManager.default
+            var completed: [MoveRecord] = []
+            completed.reserveCapacity(moves.count)
+
+            for move in moves {
+                let destination = resolveCollisions ? self.uniqueDestinationURL(for: move.to) : move.to
+                do {
+                    try self.moveItemWithFallback(fileManager, from: move.from, to: destination)
+                    completed.append(MoveRecord(from: move.from, to: destination))
+                } catch {
+                    print("Failed to move \(move.from.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if registerUndo, !completed.isEmpty {
+                    let inverse = completed.map { MoveRecord(from: $0.to, to: $0.from) }
+                    self.undoManager?.registerUndo(withTarget: self) { target in
+                        target.performMoves(
+                            inverse,
+                            actionName: actionName,
+                            registerUndo: true,
+                            resolveCollisions: true
+                        )
+                    }
+                    self.undoManager?.setActionName(actionName)
+                }
+                completion?(completed)
+                if refreshAfter {
+                    self.refresh()
+                }
+            }
+        }
+    }
+
+    private func performCopies(
+        _ copies: [CopyRecord],
+        actionName: String,
+        registerUndo: Bool,
+        resolveCollisions: Bool = true,
+        refreshAfter: Bool = true,
+        completion: (([CopyRecord]) -> Void)? = nil
+    ) {
+        guard !copies.isEmpty else { return }
+        fileOperationQueue.async { [weak self, copies] in
+            guard let self else { return }
+            let fileManager = FileManager.default
+            var completed: [CopyRecord] = []
+            completed.reserveCapacity(copies.count)
+
+            for copy in copies {
+                let destination = resolveCollisions ? self.uniqueDestinationURL(for: copy.to) : copy.to
+                do {
+                    try fileManager.copyItem(at: copy.from, to: destination)
+                    completed.append(CopyRecord(from: copy.from, to: destination))
+                } catch {
+                    print("Failed to copy \(copy.from.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if registerUndo, !completed.isEmpty {
+                    let copiedURLs = completed.map { $0.to }
+                    self.undoManager?.registerUndo(withTarget: self) { target in
+                        target.performTrash(
+                            copiedURLs,
+                            actionName: actionName,
+                            registerUndo: true,
+                            playSound: false
+                        )
+                    }
+                    self.undoManager?.setActionName(actionName)
+                }
+                completion?(completed)
+                if refreshAfter {
+                    self.refresh()
+                }
+            }
+        }
+    }
+
+    private func performTrash(
+        _ urls: [URL],
+        actionName: String,
+        registerUndo: Bool,
+        refreshAfter: Bool = true,
+        playSound: Bool = false,
+        completion: (([TrashRecord]) -> Void)? = nil
+    ) {
+        guard !urls.isEmpty else { return }
+        fileOperationQueue.async { [weak self, urls] in
+            guard let self else { return }
+            let fileManager = FileManager.default
+            var completed: [TrashRecord] = []
+            completed.reserveCapacity(urls.count)
+
+            for url in urls {
+                var trashedURL: NSURL?
+                do {
+                    try fileManager.trashItem(at: url, resultingItemURL: &trashedURL)
+                    if let trashedURL = trashedURL as URL? {
+                        completed.append(TrashRecord(original: url, trashed: trashedURL))
+                    }
+                } catch {
+                    print("Failed to move \(url.lastPathComponent) to Trash: \(error.localizedDescription)")
+                }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if registerUndo, !completed.isEmpty {
+                    self.undoManager?.registerUndo(withTarget: self) { target in
+                        target.performRestoreFromTrash(
+                            completed,
+                            actionName: actionName,
+                            registerUndo: true
+                        )
+                    }
+                    self.undoManager?.setActionName(actionName)
+                }
+                completion?(completed)
+                if refreshAfter {
+                    self.refresh()
+                }
+                if playSound, !completed.isEmpty {
+                    FinderSoundEffects.shared.play(.moveToTrash)
+                }
+            }
+        }
+    }
+
+    private func performRestoreFromTrash(
+        _ records: [TrashRecord],
+        actionName: String,
+        registerUndo: Bool,
+        refreshAfter: Bool = true
+    ) {
+        guard !records.isEmpty else { return }
+        fileOperationQueue.async { [weak self, records] in
+            guard let self else { return }
+            let fileManager = FileManager.default
+            var restoredURLs: [URL] = []
+            restoredURLs.reserveCapacity(records.count)
+
+            for record in records {
+                let destination = self.uniqueDestinationURL(for: record.original)
+                do {
+                    try self.moveItemWithFallback(fileManager, from: record.trashed, to: destination)
+                    restoredURLs.append(destination)
+                } catch {
+                    print("Failed to restore \(record.original.lastPathComponent): \(error.localizedDescription)")
+                }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                if registerUndo, !restoredURLs.isEmpty {
+                    self.undoManager?.registerUndo(withTarget: self) { target in
+                        target.performTrash(
+                            restoredURLs,
+                            actionName: actionName,
+                            registerUndo: true,
+                            playSound: false
+                        )
+                    }
+                    self.undoManager?.setActionName(actionName)
+                }
+                if refreshAfter {
+                    self.refresh()
+                }
+            }
+        }
+    }
+
+    private func applyTags(
+        _ tags: [String],
+        to url: URL,
+        actionName: String,
+        registerUndo: Bool,
+        invalidateCache: Bool
+    ) {
+        let beforeTags = FileTagManager.getTags(for: url)
+        guard beforeTags != tags else { return }
+        FileTagManager.setTags(tags, for: url)
+
+        if registerUndo {
+            let beforeSnapshot = beforeTags
+            self.undoManager?.registerUndo(withTarget: self) { target in
+                target.applyTags(
+                    beforeSnapshot,
+                    to: url,
+                    actionName: actionName,
+                    registerUndo: true,
+                    invalidateCache: invalidateCache
+                )
+            }
+            self.undoManager?.setActionName(actionName)
+        }
+
+        refreshTags(for: [url], invalidateCache: invalidateCache)
+    }
+
+    func toggleTag(_ tagName: String, for url: URL, invalidateCache: Bool = true) {
+        let currentTags = FileTagManager.getTags(for: url)
+        var updatedTags = currentTags
+        if let index = updatedTags.firstIndex(of: tagName) {
+            updatedTags.remove(at: index)
+        } else {
+            updatedTags.append(tagName)
+        }
+        applyTags(updatedTags, to: url, actionName: "Tags", registerUndo: true, invalidateCache: invalidateCache)
+    }
+
+    func setTags(_ tags: [String], for url: URL, invalidateCache: Bool = true) {
+        applyTags(tags, to: url, actionName: "Tags", registerUndo: true, invalidateCache: invalidateCache)
     }
 
     // MARK: - Clipboard Operations
@@ -2056,36 +2395,23 @@ class FileBrowserViewModel: ObservableObject {
 
         let destinationPath = currentPath
 
-        fileOperationQueue.async { [urlsToPaste, operationIsCut, destinationPath] in
-            let fileManager = FileManager.default
-            var didPasteAny = false
-            for sourceURL in urlsToPaste {
-                let destinationURL = destinationPath.appendingPathComponent(sourceURL.lastPathComponent)
-                let finalDestination = self.uniqueDestinationURL(for: destinationURL)
-
-                do {
-                    if operationIsCut {
-                        try self.moveItemWithFallback(fileManager, from: sourceURL, to: finalDestination)
-                    } else {
-                        try fileManager.copyItem(at: sourceURL, to: finalDestination)
-                    }
-                    didPasteAny = true
-                } catch {
-                    print("Failed to paste \(sourceURL.lastPathComponent): \(error.localizedDescription)")
-                }
+        if operationIsCut {
+            let moves = urlsToPaste.map {
+                MoveRecord(from: $0, to: destinationPath.appendingPathComponent($0.lastPathComponent))
             }
-
-            DispatchQueue.main.async { [weak self] in
+            performMoves(moves, actionName: "Move", registerUndo: true, resolveCollisions: true) { [weak self] completed in
                 guard let self else { return }
-                if operationIsCut && didPasteAny {
-                    self.clipboardItems.removeAll()
-                    // Clear the cut marker from pasteboard to prevent re-pasting moved files
-                    let pasteboard = NSPasteboard.general
-                    pasteboard.clearContents()
-                }
-
-                self.refresh()
+                guard !completed.isEmpty else { return }
+                self.clipboardItems.removeAll()
+                // Clear the cut marker from pasteboard to prevent re-pasting moved files
+                let pasteboard = NSPasteboard.general
+                pasteboard.clearContents()
             }
+        } else {
+            let copies = urlsToPaste.map {
+                CopyRecord(from: $0, to: destinationPath.appendingPathComponent($0.lastPathComponent))
+            }
+            performCopies(copies, actionName: "Copy", registerUndo: true, resolveCollisions: true)
         }
     }
 
@@ -2133,37 +2459,21 @@ class FileBrowserViewModel: ObservableObject {
 
         // DON'T clear selectedItems here - it triggers syncSelection which re-selects
         // the about-to-be-deleted item. We'll clear it in the async block instead.
+        performTrash(
+            itemsToDelete.map { $0.url },
+            actionName: "Move to Trash",
+            registerUndo: true,
+            playSound: true
+        ) { [weak self] records in
+            guard let self else { return }
+            guard !records.isEmpty else { return }
 
-        fileOperationQueue.async {
-            let fileManager = FileManager.default
-            var didTrashAny = false
-            for item in itemsToDelete {
-                do {
-                    try fileManager.trashItem(at: item.url, resultingItemURL: nil)
-                    didTrashAny = true
-                } catch {
-                    print("Failed to delete \(item.name): \(error.localizedDescription)")
-                }
-            }
+            // Set the target index BEFORE refresh so CoverFlowView knows where to position
+            self.coverFlowSelectedIndex = targetIndex
 
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-
-                // Set the target index BEFORE refresh so CoverFlowView knows where to position
-                self.coverFlowSelectedIndex = targetIndex
-
-                // Clear selectedItems so syncSelection will auto-select at coverFlowSelectedIndex
-                // when items are reloaded. This must happen BEFORE refresh so the index is set first.
-                self.selectedItems.removeAll()
-
-                // Refresh to get updated file list - items load asynchronously
-                // CoverFlowView's syncSelection will auto-select at coverFlowSelectedIndex when items arrive
-                self.refresh()
-
-                if didTrashAny {
-                    FinderSoundEffects.shared.play(.moveToTrash)
-                }
-            }
+            // Clear selectedItems so syncSelection will auto-select at coverFlowSelectedIndex
+            // when items are reloaded. This must happen BEFORE refresh so the index is set first.
+            self.selectedItems.removeAll()
         }
     }
 
@@ -2177,29 +2487,24 @@ class FileBrowserViewModel: ObservableObject {
         // Finder behavior: Drag = Move, Option+Drag = Copy
         let shouldCopy = NSEvent.modifierFlags.contains(.option)
         let destinationPath = destination
+        let filteredURLs = urls.filter { $0.deletingLastPathComponent() != destinationPath }
+        guard !filteredURLs.isEmpty else {
+            completion?()
+            return
+        }
 
-        fileOperationQueue.async { [urls, shouldCopy, destinationPath] in
-            let fileManager = FileManager.default
-
-            for sourceURL in urls {
-                if sourceURL.deletingLastPathComponent() == destinationPath { continue }
-
-                let destURL = destinationPath.appendingPathComponent(sourceURL.lastPathComponent)
-                let finalURL = self.uniqueDestinationURL(for: destURL)
-
-                do {
-                    if shouldCopy {
-                        try fileManager.copyItem(at: sourceURL, to: finalURL)
-                    } else {
-                        try self.moveItemWithFallback(fileManager, from: sourceURL, to: finalURL)
-                    }
-                } catch {
-                    print("Failed to \(shouldCopy ? "copy" : "move") \(sourceURL.lastPathComponent): \(error)")
-                }
+        if shouldCopy {
+            let copies = filteredURLs.map {
+                CopyRecord(from: $0, to: destinationPath.appendingPathComponent($0.lastPathComponent))
             }
-
-            DispatchQueue.main.async { [weak self] in
-                self?.refresh()
+            performCopies(copies, actionName: "Copy", registerUndo: true, resolveCollisions: true) { _ in
+                completion?()
+            }
+        } else {
+            let moves = filteredURLs.map {
+                MoveRecord(from: $0, to: destinationPath.appendingPathComponent($0.lastPathComponent))
+            }
+            performMoves(moves, actionName: "Move", registerUndo: true, resolveCollisions: true) { _ in
                 completion?()
             }
         }
@@ -2218,34 +2523,24 @@ class FileBrowserViewModel: ObservableObject {
         }
 
         let destinationPath = currentPath
+        let fileManager = FileManager.default
+        let copies: [CopyRecord] = itemsToDuplicate.map { item in
+            let baseName = item.url.deletingPathExtension().lastPathComponent
+            let ext = item.url.pathExtension
+            var copyName = ext.isEmpty ? "\(baseName) copy" : "\(baseName) copy.\(ext)"
+            var destinationURL = destinationPath.appendingPathComponent(copyName)
 
-        fileOperationQueue.async { [itemsToDuplicate, destinationPath] in
-            let fileManager = FileManager.default
-            for item in itemsToDuplicate {
-                let baseName = item.url.deletingPathExtension().lastPathComponent
-                let ext = item.url.pathExtension
-                var copyName = ext.isEmpty ? "\(baseName) copy" : "\(baseName) copy.\(ext)"
-                var destinationURL = destinationPath.appendingPathComponent(copyName)
-
-                // Handle existing copies
-                var copyNumber = 2
-                while fileManager.fileExists(atPath: destinationURL.path) {
-                    copyName = ext.isEmpty ? "\(baseName) copy \(copyNumber)" : "\(baseName) copy \(copyNumber).\(ext)"
-                    destinationURL = destinationPath.appendingPathComponent(copyName)
-                    copyNumber += 1
-                }
-
-                do {
-                    try fileManager.copyItem(at: item.url, to: destinationURL)
-                } catch {
-                    print("Failed to duplicate \(item.name): \(error.localizedDescription)")
-                }
+            // Handle existing copies
+            var copyNumber = 2
+            while fileManager.fileExists(atPath: destinationURL.path) {
+                copyName = ext.isEmpty ? "\(baseName) copy \(copyNumber)" : "\(baseName) copy \(copyNumber).\(ext)"
+                destinationURL = destinationPath.appendingPathComponent(copyName)
+                copyNumber += 1
             }
 
-            DispatchQueue.main.async { [weak self] in
-                self?.refresh()
-            }
+            return CopyRecord(from: item.url, to: destinationURL)
         }
+        performCopies(copies, actionName: "Duplicate", registerUndo: true, resolveCollisions: false)
     }
 
     func renameItem(_ item: FileItem, to newName: String) {
@@ -2258,16 +2553,8 @@ class FileBrowserViewModel: ObservableObject {
 
         guard newURL != item.url else { return }
 
-        fileOperationQueue.async {
-            do {
-                try FileManager.default.moveItem(at: item.url, to: newURL)
-                DispatchQueue.main.async { [weak self] in
-                    self?.refresh()
-                }
-            } catch {
-                print("Failed to rename \(item.name): \(error.localizedDescription)")
-            }
-        }
+        let move = MoveRecord(from: item.url, to: newURL)
+        performMoves([move], actionName: "Rename", registerUndo: true, resolveCollisions: false)
     }
 
     func moveSelectedItemsToTrash() {
@@ -2332,7 +2619,17 @@ class FileBrowserViewModel: ObservableObject {
             do {
                 try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
                 DispatchQueue.main.async { [weak self] in
-                    self?.refresh()
+                    guard let self else { return }
+                    self.undoManager?.registerUndo(withTarget: self) { target in
+                        target.performTrash(
+                            [folderURL],
+                            actionName: "New Folder",
+                            registerUndo: true,
+                            playSound: false
+                        )
+                    }
+                    self.undoManager?.setActionName("New Folder")
+                    self.refresh()
                 }
             } catch {
                 print("Failed to create folder: \(error.localizedDescription)")
@@ -2376,6 +2673,282 @@ class FileBrowserViewModel: ObservableObject {
                 throw error
             }
         }
+    }
+
+    // MARK: - Search
+
+    /// Perform search based on current search mode
+    func performSearch(query: String) {
+        print("🔍 [FileBrowserVM] performSearch() called with query: '\(query)', mode: \(self.searchMode.rawValue)")
+        searchDebugLogger.notice("🔍 performSearch() called with query: '\(query)', mode: \(self.searchMode.rawValue)")
+
+        // Cancel any existing search
+        cancelSearch()
+
+        guard !query.isEmpty else {
+            print("🔍 [FileBrowserVM] performSearch: empty query, clearing results")
+            searchDebugLogger.notice("🔍 performSearch: empty query, clearing results")
+            searchResults = []
+            isSearching = false
+            return
+        }
+
+        isSearching = true
+
+        switch searchMode {
+        case .filter:
+            // Filter mode doesn't use async search
+            print("🔍 [FileBrowserVM] performSearch: Filter mode, skipping async search")
+            searchDebugLogger.notice("🔍 performSearch: Filter mode, skipping async search")
+            isSearching = false
+            return
+
+        case .finder:
+            print("🔍 [FileBrowserVM] performSearch: Calling performFinderSearch")
+            searchDebugLogger.notice("🔍 performSearch: Calling performFinderSearch")
+            performFinderSearch(query: query)
+
+        case .everything:
+            print("🔍 [FileBrowserVM] performSearch: Calling performEverythingSearch")
+            searchDebugLogger.notice("🔍 performSearch: Calling performEverythingSearch")
+            performEverythingSearch(query: query)
+        }
+    }
+
+    /// Cancel any ongoing search
+    func cancelSearch() {
+        searchTask?.cancel()
+        searchTask = nil
+        metadataQuery?.stop()
+        metadataQuery = nil
+    }
+
+    /// Perform Finder search using NSMetadataQuery (Spotlight)
+    private func performFinderSearch(query: String) {
+        searchDebugLogger.info("🔎 performFinderSearch() starting for query: '\(query)'")
+        searchDebugLogger.info("🔎 Search scope: \(self.currentPath.path)")
+
+        let mdQuery = NSMetadataQuery()
+        self.metadataQuery = mdQuery
+
+        // Build predicate for filename search
+        let predicate = NSPredicate(format: "kMDItemFSName CONTAINS[cd] %@", query)
+        mdQuery.predicate = predicate
+        searchDebugLogger.info("🔎 Predicate: \(predicate)")
+
+        // Search in current directory and subdirectories
+        mdQuery.searchScopes = [currentPath]
+
+        // Observe results
+        NotificationCenter.default.addObserver(
+            forName: .NSMetadataQueryDidFinishGathering,
+            object: mdQuery,
+            queue: .main
+        ) { [weak self] _ in
+            searchDebugLogger.info("🔎 NSMetadataQueryDidFinishGathering received")
+            Task { @MainActor in
+                self?.handleFinderSearchResults()
+            }
+        }
+
+        // Also handle updates during gathering
+        NotificationCenter.default.addObserver(
+            forName: .NSMetadataQueryDidUpdate,
+            object: mdQuery,
+            queue: .main
+        ) { [weak self] _ in
+            searchDebugLogger.info("🔎 NSMetadataQueryDidUpdate received")
+            Task { @MainActor in
+                self?.handleFinderSearchResults()
+            }
+        }
+
+        searchDebugLogger.info("🔎 Starting NSMetadataQuery...")
+        mdQuery.start()
+    }
+
+    /// Handle results from NSMetadataQuery
+    private func handleFinderSearchResults() {
+        searchDebugLogger.info("🔎 handleFinderSearchResults() called")
+        guard let mdQuery = metadataQuery else {
+            searchDebugLogger.error("❌ handleFinderSearchResults: metadataQuery is nil!")
+            return
+        }
+
+        mdQuery.disableUpdates()
+        defer { mdQuery.enableUpdates() }
+
+        searchDebugLogger.info("🔎 NSMetadataQuery resultCount: \(mdQuery.resultCount)")
+
+        var results: [FileItem] = []
+        for i in 0..<mdQuery.resultCount {
+            guard let item = mdQuery.result(at: i) as? NSMetadataItem,
+                  let path = item.value(forAttribute: kMDItemPath as String) as? String else {
+                continue
+            }
+
+            let url = URL(fileURLWithPath: path)
+            if let fileItem = createFileItem(from: url) {
+                results.append(fileItem)
+            }
+        }
+
+        searchDebugLogger.info("🔎 Finder search found \(results.count) results")
+        if results.count > 0 {
+            searchDebugLogger.info("🔎 First few results: \(results.prefix(3).map { $0.name })")
+        }
+
+        searchResults = results
+        isSearching = false
+        searchDebugLogger.info("🔎 searchResults updated, isSearching=false")
+    }
+
+    /// Create a FileItem from a URL (for search results)
+    private func createFileItem(from url: URL) -> FileItem? {
+        guard let resourceValues = try? url.resourceValues(forKeys: [
+            .isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey
+        ]) else {
+            return nil
+        }
+
+        let isDirectory = resourceValues.isDirectory ?? false
+        let size = Int64(resourceValues.fileSize ?? 0)
+        let modDate = resourceValues.contentModificationDate
+        let createDate = resourceValues.creationDate
+        let contentType = resourceValues.contentType
+
+        return FileItem(
+            url: url,
+            name: url.lastPathComponent,
+            isDirectory: isDirectory,
+            size: size,
+            modificationDate: modDate,
+            creationDate: createDate,
+            contentType: contentType
+        )
+    }
+
+    /// Perform Everything-style indexed search
+    private func performEverythingSearch(query: String) {
+        print("⚡ [FileBrowserVM] performEverythingSearch() starting for query: '\(query)'")
+        searchDebugLogger.notice("⚡ performEverythingSearch() starting for query: '\(query)'")
+
+        searchTask = Task { [weak self] in
+            guard let self else {
+                print("❌ [FileBrowserVM] performEverythingSearch: self was nil")
+                searchDebugLogger.error("❌ performEverythingSearch: self was nil")
+                return
+            }
+
+            // Use SearchIndexManager if index is ready, otherwise fall back to recursive search
+            let indexManager = SearchIndexManager.shared
+            let indexedFileCount = indexManager.indexedFileCount
+            let isIndexing = indexManager.isIndexing
+            let isIndexReady = indexManager.isIndexReady
+
+            print("⚡ [FileBrowserVM] Index state: indexedFileCount=\(indexedFileCount), isIndexing=\(isIndexing), isIndexReady=\(isIndexReady)")
+            searchDebugLogger.notice("⚡ Index state: indexedFileCount=\(indexedFileCount), isIndexing=\(isIndexing), isIndexReady=\(isIndexReady)")
+
+            let results: [FileItem]
+            if isIndexReady {
+                // Use the pre-built index for fast search
+                print("⚡ [FileBrowserVM] Using pre-built index for search")
+                searchDebugLogger.notice("⚡ Using pre-built index for search")
+                let indexedResults = indexManager.searchAdvanced(query: query)
+                print("⚡ [FileBrowserVM] searchAdvanced returned \(indexedResults.count) IndexedFile results")
+                searchDebugLogger.notice("⚡ searchAdvanced returned \(indexedResults.count) IndexedFile results")
+                results = indexedResults.map { $0.toFileItem() }
+                print("⚡ [FileBrowserVM] Converted to \(results.count) FileItem results")
+                searchDebugLogger.notice("⚡ Converted to \(results.count) FileItem results")
+            } else {
+                // Fall back to recursive search if index not ready
+                print("⚠️ [FileBrowserVM] Index not ready (isIndexing=\(isIndexing), count=\(indexedFileCount)), falling back to recursive search")
+                searchDebugLogger.warning("⚠️ Index not ready (count=\(indexedFileCount)), falling back to recursive search")
+                let searchPath = self.currentPath
+                results = await Task.detached {
+                    self.searchFilesRecursively(query: query, searchPath: searchPath)
+                }.value
+                print("⚡ [FileBrowserVM] Recursive search found \(results.count) results")
+                searchDebugLogger.notice("⚡ Recursive search found \(results.count) results")
+            }
+
+            if !Task.isCancelled {
+                print("⚡ [FileBrowserVM] Updating searchResults with \(results.count) items")
+                searchDebugLogger.notice("⚡ Updating searchResults with \(results.count) items")
+                if results.count > 0 {
+                    print("⚡ [FileBrowserVM] First few results: \(results.prefix(3).map { $0.name })")
+                    searchDebugLogger.notice("⚡ First few results: \(results.prefix(3).map { $0.name })")
+                }
+                self.searchResults = results
+                self.isSearching = false
+                print("⚡ [FileBrowserVM] searchResults updated, isSearching=false, searchResults.count=\(self.searchResults.count)")
+                searchDebugLogger.notice("⚡ searchResults updated, isSearching=false")
+            } else {
+                print("⚡ [FileBrowserVM] Task was cancelled, not updating results")
+                searchDebugLogger.notice("⚡ Task was cancelled, not updating results")
+            }
+        }
+    }
+
+    /// Recursive file search (placeholder until SearchIndexManager is implemented)
+    nonisolated private func searchFilesRecursively(query: String, searchPath: URL) -> [FileItem] {
+        // Check if SearchIndexManager is available, otherwise use fallback
+        // For now, just search the current directory to avoid performance issues
+        // The real implementation will use the pre-built index
+
+        var results: [FileItem] = []
+        let fileManager = FileManager.default
+        let queryLower = query.lowercased()
+
+        // Limit search to avoid hanging - real implementation uses index
+        let maxResults = 1000
+
+        // Search current directory and subdirectories
+        guard let enumerator = fileManager.enumerator(
+            at: searchPath,
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey],
+            options: [.skipsHiddenFiles]
+        ) else {
+            return results
+        }
+
+        for case let url as URL in enumerator {
+            if results.count >= maxResults { break }
+
+            let name = url.lastPathComponent
+            if name.lowercased().contains(queryLower) {
+                if let item = createFileItemSync(from: url) {
+                    results.append(item)
+                }
+            }
+        }
+
+        return results
+    }
+
+    /// Create a FileItem from a URL synchronously (nonisolated version for background search)
+    nonisolated private func createFileItemSync(from url: URL) -> FileItem? {
+        guard let resourceValues = try? url.resourceValues(forKeys: [
+            .isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey
+        ]) else {
+            return nil
+        }
+
+        let isDirectory = resourceValues.isDirectory ?? false
+        let size = Int64(resourceValues.fileSize ?? 0)
+        let modDate = resourceValues.contentModificationDate
+        let createDate = resourceValues.creationDate
+        let contentType = resourceValues.contentType
+
+        return FileItem(
+            url: url,
+            name: url.lastPathComponent,
+            isDirectory: isDirectory,
+            size: size,
+            modificationDate: modDate,
+            creationDate: createDate,
+            contentType: contentType
+        )
     }
 }
 

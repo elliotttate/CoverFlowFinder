@@ -3,6 +3,7 @@ import AppKit
 
 struct ContentView: View {
     @EnvironmentObject private var settings: AppSettings
+    @Environment(\.undoManager) private var undoManager
     @State private var tabs: [BrowserTab] = [BrowserTab()]
     @State private var selectedTabId: UUID = UUID()
 
@@ -52,6 +53,13 @@ struct ContentView: View {
         Binding(
             get: { viewModel.searchText },
             set: { viewModel.searchText = $0 }
+        )
+    }
+
+    private var searchModeBinding: Binding<SearchMode> {
+        Binding(
+            get: { viewModel.searchMode },
+            set: { viewModel.searchMode = $0 }
         )
     }
 
@@ -194,9 +202,30 @@ struct ContentView: View {
                 }
                 .help("Actions")
 
-                // Search field with clear button
-                SearchField(text: searchTextBinding)
-                    .frame(width: 180)
+                // Search mode picker and search field
+                HStack(spacing: 4) {
+                    // Search mode picker
+                    Picker("", selection: searchModeBinding) {
+                        ForEach(SearchMode.allCases, id: \.self) { mode in
+                            Label(mode.rawValue, systemImage: mode.systemImage)
+                                .tag(mode)
+                        }
+                    }
+                    .pickerStyle(.menu)
+                    .frame(width: 110)
+                    .help("Search mode: \(viewModel.searchMode.rawValue)")
+
+                    // Search field
+                    SearchField(text: searchTextBinding, placeholder: viewModel.searchMode.placeholder)
+                        .frame(width: 180)
+
+                    // Loading indicator
+                    if viewModel.isSearching {
+                        ProgressView()
+                            .scaleEffect(0.6)
+                            .frame(width: 16, height: 16)
+                    }
+                }
             }
         }
         .navigationTitle(viewModel.currentPath.lastPathComponent)
@@ -226,10 +255,12 @@ struct ContentView: View {
         .onChange(of: selectedTabId) { _ in
             currentViewMode = viewModel.viewMode
             syncNavigationState()
+            assignUndoManager()
         }
         .onAppear {
             currentViewMode = viewModel.viewMode
             syncNavigationState()
+            assignUndoManager()
         }
         .onChange(of: settings.showHiddenFiles) { _ in
             refreshAllViewModels()
@@ -248,6 +279,7 @@ struct ContentView: View {
 
     private func addNewTab() {
         let newTab = BrowserTab(initialPath: viewModel.currentPath)
+        newTab.viewModel.setUndoManager(undoManager)
         tabs.append(newTab)
         selectedTabId = newTab.id
     }
@@ -291,6 +323,16 @@ struct ContentView: View {
         bottomLeftPaneViewModel.refresh()
         bottomRightPaneViewModel.refresh()
     }
+
+    private func assignUndoManager() {
+        let manager = undoManager
+        for tab in tabs {
+            tab.viewModel.setUndoManager(manager)
+        }
+        rightPaneViewModel.setUndoManager(manager)
+        bottomLeftPaneViewModel.setUndoManager(manager)
+        bottomRightPaneViewModel.setUndoManager(manager)
+    }
 }
 
 // MARK: - Context Menu for File Items
@@ -326,8 +368,7 @@ struct FileItemContextMenu: View {
                 Menu("Tags") {
                     ForEach(FinderTag.allTags) { tag in
                         Button {
-                            FileTagManager.toggleTag(tag.name, on: item.url)
-                            viewModel.refreshTags(for: [item.url])
+                            viewModel.toggleTag(tag.name, for: item.url)
                         } label: {
                             HStack {
                                 Circle()
@@ -345,8 +386,7 @@ struct FileItemContextMenu: View {
                     if !item.tags.isEmpty {
                         Divider()
                         Button("Remove All Tags") {
-                            FileTagManager.setTags([], for: item.url)
-                            viewModel.refreshTags(for: [item.url])
+                            viewModel.setTags([], for: item.url)
                         }
                     }
                 }
@@ -694,10 +734,11 @@ extension FocusedValues {
 // Native macOS search field
 struct SearchField: NSViewRepresentable {
     @Binding var text: String
+    var placeholder: String = "Search"
 
     func makeNSView(context: Context) -> NSSearchField {
         let searchField = NSSearchField()
-        searchField.placeholderString = "Search"
+        searchField.placeholderString = placeholder
         searchField.delegate = context.coordinator
         searchField.target = context.coordinator
         searchField.action = #selector(Coordinator.searchFieldAction(_:))
@@ -709,6 +750,10 @@ struct SearchField: NSViewRepresentable {
     func updateNSView(_ nsView: NSSearchField, context: Context) {
         if nsView.stringValue != text {
             nsView.stringValue = text
+        }
+        // Update placeholder if it changed
+        if nsView.placeholderString != placeholder {
+            nsView.placeholderString = placeholder
         }
     }
 
