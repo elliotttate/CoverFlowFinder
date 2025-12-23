@@ -14,7 +14,8 @@ struct FileListView: View {
             viewModel: viewModel,
             columnConfig: columnConfig,
             appSettings: settings,
-            items: items
+            items: items,
+            tagRefreshToken: viewModel.tagRefreshToken
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in

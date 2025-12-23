@@ -1888,6 +1888,8 @@ class FileBrowserViewModel: ObservableObject {
             FileTagManager.invalidateCache(for: url)
         }
         tagRefreshToken &+= 1
+        // Force UI refresh by sending objectWillChange
+        objectWillChange.send()
     }
 
     // MARK: - Clipboard Operations

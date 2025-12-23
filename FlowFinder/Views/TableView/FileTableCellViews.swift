@@ -3,10 +3,19 @@ import SwiftUI
 
 // MARK: - File Name Cell View
 
-final class FileNameCellView: NSTableCellView {
+protocol FileNameCellViewDelegate: AnyObject {
+    func fileNameCellView(_ cell: FileNameCellView, didRenameItem item: FileItem, to newName: String)
+    func fileNameCellViewDidCancelRename(_ cell: FileNameCellView)
+}
+
+final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
     private let iconView = NSImageView()
-    private let nameLabel = NSTextField(labelWithString: "")
+    private let nameTextField = EditableTextField()
     private let tagDotsStack = NSStackView()
+
+    weak var delegate: FileNameCellViewDelegate?
+    private var currentItem: FileItem?
+    private(set) var isEditing = false
 
     override init(frame frameRect: NSRect) {
         super.init(frame: frameRect)
@@ -23,11 +32,20 @@ final class FileNameCellView: NSTableCellView {
         iconView.imageScaling = .scaleProportionallyUpOrDown
         addSubview(iconView)
 
-        nameLabel.translatesAutoresizingMaskIntoConstraints = false
-        nameLabel.lineBreakMode = .byTruncatingTail
-        nameLabel.cell?.truncatesLastVisibleLine = true
-        nameLabel.maximumNumberOfLines = 1
-        addSubview(nameLabel)
+        nameTextField.translatesAutoresizingMaskIntoConstraints = false
+        nameTextField.isBordered = false
+        nameTextField.drawsBackground = false
+        nameTextField.isEditable = false  // Start non-editable
+        nameTextField.isSelectable = false
+        nameTextField.lineBreakMode = .byTruncatingTail
+        nameTextField.cell?.truncatesLastVisibleLine = true
+        nameTextField.maximumNumberOfLines = 1
+        nameTextField.focusRingType = .exterior
+        nameTextField.delegate = self
+        addSubview(nameTextField)
+
+        // Set as the textField for the cell view (important for NSTableView editing)
+        self.textField = nameTextField
 
         tagDotsStack.translatesAutoresizingMaskIntoConstraints = false
         tagDotsStack.orientation = .horizontal
@@ -41,20 +59,22 @@ final class FileNameCellView: NSTableCellView {
             iconView.widthAnchor.constraint(equalToConstant: 16),
             iconView.heightAnchor.constraint(equalToConstant: 16),
 
-            nameLabel.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 6),
-            nameLabel.centerYAnchor.constraint(equalTo: centerYAnchor),
+            nameTextField.leadingAnchor.constraint(equalTo: iconView.trailingAnchor, constant: 6),
+            nameTextField.trailingAnchor.constraint(lessThanOrEqualTo: tagDotsStack.leadingAnchor, constant: -4),
+            nameTextField.centerYAnchor.constraint(equalTo: centerYAnchor),
 
-            tagDotsStack.leadingAnchor.constraint(equalTo: nameLabel.trailingAnchor, constant: 6),
+            tagDotsStack.leadingAnchor.constraint(greaterThanOrEqualTo: nameTextField.trailingAnchor, constant: 6),
             tagDotsStack.centerYAnchor.constraint(equalTo: centerYAnchor),
             tagDotsStack.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -4),
         ])
 
         // Allow name label to compress but keep minimum
-        nameLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        nameTextField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         tagDotsStack.setContentHuggingPriority(.required, for: .horizontal)
     }
 
     func configure(item: FileItem, thumbnail: NSImage?, appSettings: AppSettings) {
+        currentItem = item
         iconView.image = thumbnail ?? item.icon
 
         let iconSize = appSettings.listIconSizeValue
@@ -64,9 +84,12 @@ final class FileNameCellView: NSTableCellView {
             }
         }
 
-        nameLabel.stringValue = item.name
-        nameLabel.font = NSFont.systemFont(ofSize: appSettings.listFontSize)
-        nameLabel.textColor = .labelColor
+        // Only update text if not currently editing
+        if !isEditing {
+            nameTextField.stringValue = item.name
+        }
+        nameTextField.font = NSFont.systemFont(ofSize: appSettings.listFontSize)
+        nameTextField.textColor = .labelColor
 
         // Setup tag dots
         tagDotsStack.arrangedSubviews.forEach { $0.removeFromSuperview() }
@@ -91,6 +114,129 @@ final class FileNameCellView: NSTableCellView {
         }
 
         tagDotsStack.isHidden = tagDotsStack.arrangedSubviews.isEmpty
+    }
+
+    // MARK: - Inline Editing
+
+    func startEditing() {
+        guard let item = currentItem, !isEditing else { return }
+
+        isEditing = true
+
+        // Set up for editing
+        let nameWithoutExt = item.isDirectory ? item.name : item.url.deletingPathExtension().lastPathComponent
+        nameTextField.stringValue = nameWithoutExt
+        nameTextField.isEditable = true
+        nameTextField.isSelectable = true
+        nameTextField.isBordered = true
+        nameTextField.drawsBackground = true
+        nameTextField.backgroundColor = .textBackgroundColor
+
+        // Find the parent table view and block it from stealing focus
+        var tableView: NSTableView? = nil
+        var view: NSView? = self.superview
+        while view != nil {
+            if let tv = view as? NSTableView {
+                tableView = tv
+                break
+            }
+            view = view?.superview
+        }
+
+        // Block table view from accepting first responder
+        if let keyboardTableView = tableView as? KeyboardTableView {
+            keyboardTableView.shouldRefuseFirstResponder = true
+        }
+
+        // Become first responder - use selectText which properly activates the field editor
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self, self.isEditing else { return }
+
+            // First, end any existing editing in the window
+            self.window?.endEditing(for: nil)
+
+            // Now start editing our field
+            self.nameTextField.selectText(nil)
+        }
+    }
+
+    func cancelEditing() {
+        guard isEditing else { return }
+
+        endEditingMode()
+
+        // Restore original name
+        if let item = currentItem {
+            nameTextField.stringValue = item.name
+        }
+
+        delegate?.fileNameCellViewDidCancelRename(self)
+    }
+
+    private func endEditingMode() {
+        isEditing = false
+        nameTextField.isEditable = false
+        nameTextField.isSelectable = false
+        nameTextField.isBordered = false
+        nameTextField.drawsBackground = false
+
+        // Restore table view's ability to accept first responder
+        var view: NSView? = self.superview
+        while view != nil {
+            if let keyboardTableView = view as? KeyboardTableView {
+                keyboardTableView.shouldRefuseFirstResponder = false
+                break
+            }
+            view = view?.superview
+        }
+    }
+
+    private func commitEditing() {
+        guard isEditing, let item = currentItem else { return }
+
+        let trimmedName = nameTextField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let originalNameWithoutExt = item.isDirectory ? item.name : item.url.deletingPathExtension().lastPathComponent
+
+        endEditingMode()
+
+        // Only rename if name actually changed and is not empty
+        if !trimmedName.isEmpty && trimmedName != originalNameWithoutExt {
+            // Reconstruct full name with extension
+            let ext = item.url.pathExtension
+            let newName = ext.isEmpty ? trimmedName : "\(trimmedName).\(ext)"
+            delegate?.fileNameCellView(self, didRenameItem: item, to: newName)
+        } else {
+            // Restore original name
+            nameTextField.stringValue = item.name
+            delegate?.fileNameCellViewDidCancelRename(self)
+        }
+    }
+
+    // MARK: - NSTextFieldDelegate
+
+    func controlTextDidEndEditing(_ obj: Notification) {
+        // Only handle notifications from our text field
+        guard obj.object as AnyObject === nameTextField else { return }
+        guard isEditing else { return }
+
+        commitEditing()
+    }
+
+    func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+            // Escape key pressed
+            cancelEditing()
+            return true
+        }
+        return false
+    }
+}
+
+// MARK: - Editable TextField that properly handles focus
+
+final class EditableTextField: NSTextField {
+    override var acceptsFirstResponder: Bool {
+        return isEditable
     }
 }
 

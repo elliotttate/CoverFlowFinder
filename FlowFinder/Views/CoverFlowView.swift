@@ -30,7 +30,7 @@ struct CoverFlowView: View {
     private let thumbnailBatchInterval: TimeInterval = 0.1
 
     // Debug logging (set to false for release)
-    private static var debugEnabled = false
+    private static var debugEnabled = true
     private static var lastBodyTime: Date = .distantPast
     private static var bodyCallCount = 0
     private static let debugLogURL = FileManager.default.temporaryDirectory.appendingPathComponent("flowfinder_debug.log")
@@ -341,16 +341,36 @@ struct CoverFlowView: View {
     }
 
     private func updateSortedItems(using newItems: [FileItem], updateToken: Bool) {
+        let oldIndex = viewModel.coverFlowSelectedIndex
+        Self.debugLog("[SELECTION] updateSortedItems called: newItems.count=\(newItems.count), currentIndex=\(oldIndex), updateToken=\(updateToken)")
+
         sortedItemsCache = newItems
         if updateToken {
             itemsToken = itemsTokenFor(newItems)
         }
+
+        // Don't adjust selection when items become empty - this is a transient state during refresh
+        // The deletion code will set the proper selection after items are reloaded
+        guard !newItems.isEmpty else {
+            Self.debugLog("[SELECTION] updateSortedItems: newItems is EMPTY, preserving index \(oldIndex)")
+            return
+        }
+
         if let selected = viewModel.selectedItems.first,
            let index = newItems.firstIndex(of: selected) {
+            Self.debugLog("[SELECTION] updateSortedItems: found selected item at index \(index), was \(oldIndex)")
             viewModel.coverFlowSelectedIndex = index
         } else {
-            viewModel.coverFlowSelectedIndex = min(viewModel.coverFlowSelectedIndex, max(0, newItems.count - 1))
+            // Only clamp if index is out of bounds, don't reset unnecessarily
+            if viewModel.coverFlowSelectedIndex >= newItems.count {
+                let newIndex = max(0, newItems.count - 1)
+                Self.debugLog("[SELECTION] updateSortedItems: index \(viewModel.coverFlowSelectedIndex) out of bounds, clamping to \(newIndex)")
+                viewModel.coverFlowSelectedIndex = newIndex
+            } else {
+                Self.debugLog("[SELECTION] updateSortedItems: index \(viewModel.coverFlowSelectedIndex) is valid, no change needed")
+            }
         }
+        Self.debugLog("[SELECTION] updateSortedItems done: finalIndex=\(viewModel.coverFlowSelectedIndex)")
     }
 
     private func itemsTokenFor(_ items: [FileItem]) -> Int {
@@ -374,12 +394,30 @@ struct CoverFlowView: View {
     }
 
     private func syncSelection() {
-        guard !sortedItemsCache.isEmpty && viewModel.coverFlowSelectedIndex < sortedItemsCache.count else { return }
+        Self.debugLog("[SELECTION] syncSelection called: sortedItemsCache.count=\(sortedItemsCache.count), coverFlowSelectedIndex=\(viewModel.coverFlowSelectedIndex), selectedItems.count=\(viewModel.selectedItems.count)")
+
+        // Don't sync selection when items are empty (transient state during refresh)
+        guard !sortedItemsCache.isEmpty else {
+            Self.debugLog("[SELECTION] syncSelection: sortedItemsCache is EMPTY, skipping")
+            return
+        }
+
+        // Clamp index to valid range
+        let safeIndex = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
+        if safeIndex != viewModel.coverFlowSelectedIndex {
+            Self.debugLog("[SELECTION] syncSelection: clamping index from \(viewModel.coverFlowSelectedIndex) to \(safeIndex)")
+            viewModel.coverFlowSelectedIndex = safeIndex
+        }
+
         if let selected = viewModel.selectedItems.first,
            let index = sortedItemsCache.firstIndex(of: selected) {
+            Self.debugLog("[SELECTION] syncSelection: found selected item '\(selected.name)' at index \(index), setting coverFlowSelectedIndex")
             viewModel.coverFlowSelectedIndex = index
-        } else if viewModel.selectedItems.isEmpty {
-            let item = sortedItemsCache[viewModel.coverFlowSelectedIndex]
+        } else {
+            // selectedItems is empty OR has an item that's not in sortedItemsCache (e.g., deleted)
+            // Auto-select the item at coverFlowSelectedIndex
+            let item = sortedItemsCache[safeIndex]
+            Self.debugLog("[SELECTION] syncSelection: auto-selecting item '\(item.name)' at index \(safeIndex) (selectedItems.isEmpty=\(viewModel.selectedItems.isEmpty))")
             viewModel.selectedItems = [item]
             updateQuickLook(for: item)
         }
@@ -785,13 +823,11 @@ struct CoverFlowContainer: NSViewRepresentable {
         nsView.scrollSensitivity = scrollSensitivity
         nsView.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
 
-        // Restore first responder if it was lost during update
+        // Restore first responder only if CoverFlowNSView was the first responder before update
+        // Don't steal focus from other views like the search field
         if wasFirstResponder && nsView.window?.firstResponder !== nsView {
             CoverFlowView.debugLog("[Container] Focus lost during updateNSView - restoring")
             nsView.window?.makeFirstResponder(nsView)
-        } else if nsView.window?.isKeyWindow == true {
-            // Also check and restore if window is key but we don't have focus
-            nsView.ensureFirstResponder()
         }
     }
 }
@@ -932,15 +968,23 @@ class CoverFlowNSView: NSView {
 
         let shouldSyncSelection = itemsChanged || !isScrolling
         let indexChanged = self.selectedIndex != selectedIndex
+        CoverFlowView.debugLog("[NSView-SELECTION] updateItems: incoming selectedIndex=\(selectedIndex), current self.selectedIndex=\(self.selectedIndex), shouldSync=\(shouldSyncSelection), itemsChanged=\(itemsChanged), items.count=\(items.count)")
         if shouldSyncSelection {
+            CoverFlowView.debugLog("[NSView-SELECTION] updateItems: SYNCING self.selectedIndex from \(self.selectedIndex) to \(selectedIndex)")
             self.selectedIndex = selectedIndex
         }
 
         if itemsChanged {
-            CoverFlowView.debugLog("[NSView] REBUILD covers - items changed")
-            rebuildCovers()
-            layer?.setNeedsLayout()
-            layer?.layoutIfNeeded()
+            // Don't rebuild when items become empty - this is a transient state during refresh
+            // Keep existing covers visible to avoid black flash
+            if !items.isEmpty {
+                CoverFlowView.debugLog("[NSView] REBUILD covers - items changed, selectedIndex=\(self.selectedIndex)")
+                rebuildCovers()
+                layer?.setNeedsLayout()
+                layer?.layoutIfNeeded()
+            } else {
+                CoverFlowView.debugLog("[NSView] SKIPPING rebuild - items empty (transient state)")
+            }
         } else if indexChanged && shouldSyncSelection {
             animateToSelection()
             DispatchQueue.main.async {
@@ -1667,9 +1711,22 @@ class CoverFlowNSView: NSView {
     }
 
     /// Ensure we maintain first responder status - called periodically during scroll and after updates
+    /// Only takes focus if no text field or search field currently has focus
     func ensureFirstResponder() {
         guard let window = window else { return }
-        if window.isKeyWindow && window.firstResponder !== self {
+        guard window.isKeyWindow else { return }
+
+        // Don't steal focus from text fields, search fields, or other text input views
+        if let currentResponder = window.firstResponder {
+            if currentResponder is NSTextView ||
+               currentResponder is NSTextField ||
+               currentResponder is NSSearchField ||
+               String(describing: type(of: currentResponder)).contains("FieldEditor") {
+                return
+            }
+        }
+
+        if window.firstResponder !== self {
             let currentResponder = String(describing: type(of: window.firstResponder))
             CoverFlowView.debugLog("[NSView] ensureFirstResponder - lost to \(currentResponder), reclaiming")
             window.makeFirstResponder(self)
@@ -2355,7 +2412,8 @@ struct FileListSection: View {
             viewModel: viewModel,
             columnConfig: columnConfig,
             appSettings: appSettings,
-            items: items
+            items: items,
+            tagRefreshToken: viewModel.tagRefreshToken
         )
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)

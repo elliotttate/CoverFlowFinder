@@ -323,12 +323,71 @@ struct SidebarOutlineView: NSViewRepresentable {
             let row = outlineView.clickedRow
             guard row >= 0, let item = outlineView.item(atRow: row) as? SidebarItem else { return }
 
-            guard case let .favorite(resolvedFavorite) = item.kind else { return }
+            switch item.kind {
+            case .favorite(let resolvedFavorite):
+                let removeItem = NSMenuItem(title: "Remove from Favorites", action: #selector(removeFavoriteFromMenu(_:)), keyEquivalent: "")
+                removeItem.representedObject = resolvedFavorite.favorite.id
+                removeItem.target = self
+                menu.addItem(removeItem)
 
-            let removeItem = NSMenuItem(title: "Remove from Favorites", action: #selector(removeFavoriteFromMenu(_:)), keyEquivalent: "")
-            removeItem.representedObject = resolvedFavorite.favorite.id
-            removeItem.target = self
-            menu.addItem(removeItem)
+            case .location(let location):
+                // Check if this is an ejectable volume
+                if isEjectableVolume(at: location.url) {
+                    let ejectItem = NSMenuItem(title: "Eject \"\(location.name)\"", action: #selector(ejectVolumeFromMenu(_:)), keyEquivalent: "")
+                    ejectItem.representedObject = location.url
+                    ejectItem.target = self
+                    menu.addItem(ejectItem)
+                }
+
+            default:
+                break
+            }
+        }
+
+        private func isEjectableVolume(at url: URL) -> Bool {
+            // Check if this is a mounted volume that can be ejected
+            let path = url.path
+
+            // Must be in /Volumes to be ejectable (except root volume)
+            guard path.hasPrefix("/Volumes/") else { return false }
+
+            // Check if it's actually mounted
+            let fileManager = FileManager.default
+            guard fileManager.fileExists(atPath: path) else { return false }
+
+            // Try to get volume info to see if it's ejectable
+            do {
+                let resourceValues = try url.resourceValues(forKeys: [.volumeIsEjectableKey, .volumeIsRemovableKey])
+                let isEjectable = resourceValues.volumeIsEjectable ?? false
+                let isRemovable = resourceValues.volumeIsRemovable ?? false
+                return isEjectable || isRemovable
+            } catch {
+                // If we can't determine, assume volumes in /Volumes/ are ejectable (except system volumes)
+                // This covers DMGs and most external drives
+                return true
+            }
+        }
+
+        @objc private func ejectVolumeFromMenu(_ sender: NSMenuItem) {
+            guard let url = sender.representedObject as? URL else { return }
+
+            // Play eject sound
+            FinderSoundEffects.shared.play(.volumeUnmount)
+
+            // Eject the volume
+            do {
+                try NSWorkspace.shared.unmountAndEjectDevice(at: url)
+                // Refresh sidebar immediately to remove the ejected volume
+                refreshIfNeeded(force: true)
+            } catch {
+                NSSound.beep()
+                let alert = NSAlert()
+                alert.messageText = "Failed to Eject"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
         }
 
         @objc private func removeFavoriteFromMenu(_ sender: NSMenuItem) {

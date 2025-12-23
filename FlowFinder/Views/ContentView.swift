@@ -575,6 +575,8 @@ struct StatusBarView: View {
 }
 
 struct EmptyFolderView: View {
+    @ObservedObject var viewModel: FileBrowserViewModel
+
     var body: some View {
         VStack(spacing: 16) {
             Image(systemName: "folder")
@@ -586,6 +588,23 @@ struct EmptyFolderView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
+        .contextMenu {
+            Button("New Folder") {
+                viewModel.createNewFolder()
+            }
+
+            if viewModel.canPaste {
+                Button("Paste") {
+                    viewModel.paste()
+                }
+            }
+
+            Divider()
+
+            Button("Show in Finder") {
+                NSWorkspace.shared.activateFileViewerSelecting([viewModel.currentPath])
+            }
+        }
     }
 }
 
@@ -609,7 +628,7 @@ struct TabContentWrapper: View {
                     ProgressView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if viewModel.filteredItems.isEmpty {
-                    EmptyFolderView()
+                    EmptyFolderView(viewModel: viewModel)
                 } else {
                     mainContentView
                 }

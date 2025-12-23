@@ -44,24 +44,29 @@ enum FileTagManager {
               let tags = resourceValues.tagNames else {
             return []
         }
-        cacheQueue.async {
+        cacheQueue.sync {
             tagCache[url] = tags
         }
         return tags
     }
 
-    /// Set tags on a file URL using xattr (works on all macOS versions)
+    /// Set tags on a file URL using xattr (compatible with Finder on all macOS versions)
     static func setTags(_ tags: [String], for url: URL) {
-        // Use xattr command to set tags (macOS stores tags as a plist in extended attributes)
-        let tagsWithNewlines = tags.map { $0 + "\n" }
-        if let plistData = try? PropertyListSerialization.data(fromPropertyList: tagsWithNewlines, format: .binary, options: 0) {
+        // Finder stores tags in the extended attribute as a binary plist array
+        // Each tag name has a newline suffix (e.g., "Red\n", "Blue\n")
+        // Empty array removes all tags
+        if tags.isEmpty {
+            // Remove the attribute entirely when no tags
             url.withUnsafeFileSystemRepresentation { fileSystemPath in
                 guard let path = fileSystemPath else { return }
-                let result = plistData.withUnsafeBytes { bytes in
-                    setxattr(path, tagAttributeName, bytes.baseAddress, bytes.count, 0, 0)
-                }
-                if result != 0 {
-                    // If setxattr fails, try removing the attribute first
+                removexattr(path, tagAttributeName, 0)
+            }
+        } else {
+            let tagsWithNewlines = tags.map { $0 + "\n" }
+            if let plistData = try? PropertyListSerialization.data(fromPropertyList: tagsWithNewlines, format: .binary, options: 0) {
+                url.withUnsafeFileSystemRepresentation { fileSystemPath in
+                    guard let path = fileSystemPath else { return }
+                    // Remove existing attribute first to ensure clean write
                     removexattr(path, tagAttributeName, 0)
                     _ = plistData.withUnsafeBytes { bytes in
                         setxattr(path, tagAttributeName, bytes.baseAddress, bytes.count, 0, 0)
@@ -69,7 +74,8 @@ enum FileTagManager {
                 }
             }
         }
-        cacheQueue.async {
+        // Update cache synchronously so immediate reads get the new value
+        cacheQueue.sync {
             tagCache[url] = tags
         }
     }
@@ -101,7 +107,7 @@ enum FileTagManager {
     }
 
     static func invalidateCache(for url: URL) {
-        cacheQueue.async {
+        cacheQueue.sync {
             tagCache.removeValue(forKey: url)
         }
     }
