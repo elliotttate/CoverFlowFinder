@@ -33,6 +33,7 @@ struct ContentView: View {
     @FocusState private var isSearchFocused: Bool
     @State private var navHistoryIndex: Int = 0
     @State private var navHistoryCount: Int = 1
+    @State private var showingEverythingSearchAlert: Bool = false
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
 
     private var viewModel: FileBrowserViewModel {
@@ -205,13 +206,29 @@ struct ContentView: View {
                 // Search mode picker and search field
                 HStack(spacing: 4) {
                     // Search mode picker
-                    Picker("", selection: searchModeBinding) {
+                    Menu {
                         ForEach(SearchMode.allCases, id: \.self) { mode in
-                            Label(mode.rawValue, systemImage: mode.systemImage)
-                                .tag(mode)
+                            if mode != .everything || settings.everythingSearchEnabled {
+                                Button {
+                                    viewModel.searchMode = mode
+                                } label: {
+                                    Label(mode.rawValue, systemImage: mode.systemImage)
+                                }
+                            }
                         }
+
+                        if !settings.everythingSearchEnabled {
+                            Divider()
+                            Button {
+                                showingEverythingSearchAlert = true
+                            } label: {
+                                Label("Enable Everything Search...", systemImage: "sparkle.magnifyingglass")
+                            }
+                        }
+                    } label: {
+                        Label(viewModel.searchMode.rawValue, systemImage: viewModel.searchMode.systemImage)
+                            .frame(width: 90, alignment: .leading)
                     }
-                    .pickerStyle(.menu)
                     .frame(width: 110)
                     .help("Search mode: \(viewModel.searchMode.rawValue)")
 
@@ -232,6 +249,16 @@ struct ContentView: View {
         .focusedSceneValue(\.viewModel, viewModel)
         .sheet(item: $showingInfoItem) { item in
             FileInfoView(item: item)
+        }
+        .alert("Enable Everything Search", isPresented: $showingEverythingSearchAlert) {
+            Button("Enable") {
+                settings.everythingSearchEnabled = true
+                // Open Settings to Search tab so user can monitor progress
+                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("Everything Search indexes your entire filesystem for instant searches.\n\nThis requires a one-time indexing process that runs in the background. You can monitor progress in Settings > Search.")
         }
         .onReceive(NotificationCenter.default.publisher(for: .showGetInfo)) { notification in
             if let item = notification.object as? FileItem {

@@ -7,9 +7,11 @@ struct FlowFinderApp: App {
     @StateObject private var soundEffectsMonitor = FinderSoundEffectsMonitor()
 
     init() {
-        // Start building the search index in the background
+        // Only start indexing if Everything Search is enabled
         Task { @MainActor in
-            SearchIndexManager.shared.startIndexing()
+            if AppSettings.shared.everythingSearchEnabled {
+                SearchIndexManager.shared.startIndexing()
+            }
         }
     }
 

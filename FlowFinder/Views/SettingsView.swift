@@ -39,9 +39,41 @@ struct SettingsView: View {
                 .tabItem {
                     Label("Sidebar", systemImage: "sidebar.left")
                 }
+
+            searchTab
+                .tabItem {
+                    Label("Search", systemImage: "magnifyingglass")
+                }
         }
         .padding(20)
         .frame(width: 520, height: 520)
+    }
+
+    private var searchTab: some View {
+        Form {
+            Section("Everything Search") {
+                Toggle("Enable Everything Search", isOn: $settings.everythingSearchEnabled)
+                    .help("Everything Search indexes your entire filesystem for instant searches. Requires initial indexing time.")
+
+                if settings.everythingSearchEnabled {
+                    EverythingSearchStatusView()
+                }
+            }
+
+            if settings.everythingSearchEnabled {
+                Section("Index Management") {
+                    Button("Rebuild Index") {
+                        SearchIndexManager.shared.rebuildIndex()
+                    }
+                    .disabled(SearchIndexManager.shared.isIndexing)
+
+                    Button("Clear Index") {
+                        SearchIndexManager.shared.clearIndex()
+                        settings.everythingSearchEnabled = false
+                    }
+                }
+            }
+        }
     }
 
     private var generalTab: some View {
@@ -250,5 +282,75 @@ struct SettingsSliderRow: View {
                 .frame(width: 70, alignment: .trailing)
                 .foregroundColor(.secondary)
         }
+    }
+}
+
+struct EverythingSearchStatusView: View {
+    @ObservedObject private var indexManager = SearchIndexManager.shared
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if indexManager.isIndexing {
+                HStack {
+                    ProgressView()
+                        .scaleEffect(0.7)
+                    Text("Indexing...")
+                        .foregroundColor(.secondary)
+                }
+
+                ProgressView(value: indexManager.indexProgress)
+                    .progressViewStyle(.linear)
+
+                Text("\(formatNumber(indexManager.indexedFileCount)) files indexed")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else if indexManager.indexedFileCount > 0 {
+                HStack {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundColor(.green)
+                    Text("Index ready")
+                        .foregroundColor(.secondary)
+                }
+
+                HStack {
+                    Text("\(formatNumber(indexManager.indexedFileCount)) files")
+                    Text("•")
+                        .foregroundColor(.secondary)
+                    Text("\(formatNumber(indexManager.uniqueNameCount)) unique names")
+                }
+                .font(.caption)
+                .foregroundColor(.secondary)
+
+                if let lastIndexTime = indexManager.lastIndexTime {
+                    Text("Last indexed: \(lastIndexTime, formatter: relativeDateFormatter)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                HStack {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundColor(.orange)
+                    Text("Index not built")
+                        .foregroundColor(.secondary)
+                }
+
+                Text("Enable to start indexing your filesystem")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.vertical, 4)
+    }
+
+    private func formatNumber(_ number: Int) -> String {
+        let formatter = NumberFormatter()
+        formatter.numberStyle = .decimal
+        return formatter.string(from: NSNumber(value: number)) ?? "\(number)"
+    }
+
+    private var relativeDateFormatter: RelativeDateTimeFormatter {
+        let formatter = RelativeDateTimeFormatter()
+        formatter.unitsStyle = .abbreviated
+        return formatter
     }
 }

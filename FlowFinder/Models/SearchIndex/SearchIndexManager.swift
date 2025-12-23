@@ -105,6 +105,11 @@ final class SearchIndexManager: ObservableObject {
         !isIndexing && !nameIndex.isEmpty
     }
 
+    /// Number of unique filenames in the index
+    var uniqueNameCount: Int {
+        nameIndex.count
+    }
+
     // MARK: - Index Data Structures
 
     /// Maps lowercase filename → list of indexed files with that name
@@ -250,6 +255,23 @@ final class SearchIndexManager: ObservableObject {
         cancellationRequested = true
         indexingTask?.cancel()
         indexingTask = nil
+    }
+
+    /// Clear the index and remove cached data
+    func clearIndex() {
+        cancelIndexing()
+
+        nameIndex.removeAll()
+        pathIndex.removeAll()
+        rootNode = nil
+        indexedFileCount = 0
+        indexProgress = 0
+        lastIndexTime = nil
+        indexError = nil
+
+        // Remove cached index file
+        try? FileManager.default.removeItem(at: cacheURL)
+        searchLogger.info("Index cleared")
     }
 
     /// Search the index for files matching the query
