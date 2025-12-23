@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import Combine
 
 // MARK: - NSViewRepresentable Wrapper
 
@@ -8,6 +9,7 @@ struct FileTableView: NSViewRepresentable {
     @ObservedObject var columnConfig: ListColumnConfigManager
     @ObservedObject var appSettings: AppSettings
     let items: [FileItem]
+    let tagRefreshToken: Int
 
     func makeCoordinator() -> FileTableCoordinator {
         FileTableCoordinator(
@@ -113,6 +115,11 @@ struct FileTableView: NSViewRepresentable {
         // Ensure header menu is set up (in case it wasn't ready before)
         context.coordinator.ensureHeaderMenu()
 
+        // Check if we're currently editing - if so, skip most updates to avoid disrupting focus
+        if context.coordinator.isCurrentlyEditing {
+            return
+        }
+
         // Check metadata status of incoming items vs what we already have
         let incomingMetadataCount = items.filter { $0.hasMetadata }.count
         let currentMetadataCount = context.coordinator.items.filter { $0.hasMetadata }.count
@@ -125,8 +132,13 @@ struct FileTableView: NSViewRepresentable {
             // Still sync columns and selection
             context.coordinator.syncColumnsIfNeeded()
             context.coordinator.syncSelectionFromViewModel()
+            context.coordinator.checkForPendingRename()
             return
         }
+
+        // Check if tags were refreshed (force reload visible rows to show new tags)
+        let tagsRefreshed = tagRefreshToken != context.coordinator.lastTagRefreshToken
+        context.coordinator.lastTagRefreshToken = tagRefreshToken
 
         // Update items
         let oldItems = context.coordinator.items
@@ -148,6 +160,9 @@ struct FileTableView: NSViewRepresentable {
             DispatchQueue.main.async { [weak coordinator = context.coordinator] in
                 coordinator?.hydrateVisibleRows()
             }
+        } else if tagsRefreshed {
+            // Tags changed but items didn't - reload visible rows to update tag display
+            context.coordinator.tableView?.reloadData()
         } else {
             context.coordinator.reloadVisibleRowsIfNeeded(previousItems: oldItems)
         }
@@ -157,6 +172,9 @@ struct FileTableView: NSViewRepresentable {
 
         // Sync selection from SwiftUI to NSTableView
         context.coordinator.syncSelectionFromViewModel()
+
+        // Check if we need to start editing (triggered by renamingURL)
+        context.coordinator.checkForPendingRename()
     }
 }
 
@@ -165,6 +183,14 @@ struct FileTableView: NSViewRepresentable {
 @MainActor
 final class KeyboardTableView: NSTableView {
     weak var coordinator: FileTableCoordinator?
+    var shouldRefuseFirstResponder = false
+
+    override var acceptsFirstResponder: Bool {
+        if shouldRefuseFirstResponder {
+            return false
+        }
+        return super.acceptsFirstResponder
+    }
 
     override func keyDown(with event: NSEvent) {
         switch event.keyCode {
@@ -178,12 +204,24 @@ final class KeyboardTableView: NSTableView {
             super.keyDown(with: event)
         }
     }
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        let clickedRow = row(at: point)
+
+        // Call coordinator's handleClick before super to capture pre-selection state
+        if clickedRow >= 0 {
+            coordinator?.handleRowClick(row: clickedRow, event: event)
+        }
+
+        super.mouseDown(with: event)
+    }
 }
 
 // MARK: - Coordinator (NSTableViewDataSource & NSTableViewDelegate)
 
 @MainActor
-final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate {
+final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, FileNameCellViewDelegate {
     var viewModel: FileBrowserViewModel
     var columnConfig: ListColumnConfigManager
     var appSettings: AppSettings
@@ -205,11 +243,20 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private let hydrationDebounceInterval: TimeInterval = 0.05
     private var isLiveScrolling = false
     var lastHydrationItemCount: Int = 0  // Track items with metadata after hydration (public for updateNSView access)
+    var lastTagRefreshToken: Int = 0  // Track tag changes for UI refresh
 
     // Thumbnail preheat state (like PHCachingImageManager)
     private var lastPreheatRange: Range<Int>?
     private var preheatBuffer = 20  // Rows to preheat beyond visible
     private var preheatURLs: Set<URL> = []  // Currently preheating
+
+    // Renaming state
+    private var lastProcessedRenamingURL: URL?
+    private weak var currentEditingCell: FileNameCellView?
+
+    var isCurrentlyEditing: Bool {
+        return currentEditingCell?.isEditing ?? false
+    }
 
     init(viewModel: FileBrowserViewModel, columnConfig: ListColumnConfigManager, appSettings: AppSettings) {
         self.viewModel = viewModel
@@ -220,6 +267,77 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     deinit {
         hydrationDebounceTimer?.invalidate()
+    }
+
+    /// Called from updateNSView to check if we should start editing
+    func checkForPendingRename() {
+        guard let renamingURL = viewModel.renamingURL else {
+            lastProcessedRenamingURL = nil
+            return
+        }
+
+        // Don't re-process the same URL
+        guard renamingURL != lastProcessedRenamingURL else { return }
+
+        // Don't start if we're already editing
+        guard !isCurrentlyEditing else { return }
+
+        lastProcessedRenamingURL = renamingURL
+
+        // Find the row for this URL
+        guard let row = items.firstIndex(where: { $0.url == renamingURL }),
+              let tableView = tableView else { return }
+
+        // Find the name column index
+        let nameColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
+        guard nameColumnIndex >= 0 else { return }
+
+        // Scroll to make the row visible
+        tableView.scrollRowToVisible(row)
+
+        // Get or create the cell and start editing after a delay for view to settle
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            guard let self = self,
+                  let tableView = self.tableView,
+                  let cell = tableView.view(atColumn: nameColumnIndex, row: row, makeIfNecessary: true) as? FileNameCellView else {
+                return
+            }
+            self.currentEditingCell = cell
+            cell.delegate = self
+            cell.startEditing()
+        }
+    }
+
+    // MARK: - FileNameCellViewDelegate
+
+    func fileNameCellView(_ cell: FileNameCellView, didRenameItem item: FileItem, to newName: String) {
+        currentEditingCell = nil
+        lastProcessedRenamingURL = nil
+        viewModel.renameItem(item, to: newName)
+        viewModel.renamingURL = nil
+    }
+
+    func fileNameCellViewDidCancelRename(_ cell: FileNameCellView) {
+        currentEditingCell = nil
+        lastProcessedRenamingURL = nil
+        viewModel.renamingURL = nil
+    }
+
+    // MARK: - Click Handling for Rename
+
+    func handleRowClick(row: Int, event: NSEvent) {
+        guard row >= 0, row < items.count else { return }
+        let item = items[row]
+
+        // Use handleSelection to get Finder-style click-to-rename behavior
+        let modifiers = event.modifierFlags
+        viewModel.handleSelection(
+            item: item,
+            index: row,
+            in: items,
+            withShift: modifiers.contains(.shift),
+            withCommand: modifiers.contains(.command)
+        )
     }
 
     // MARK: - Column Setup
@@ -760,6 +878,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         let cell = tableView.makeView(withIdentifier: identifier, owner: nil) as? FileNameCellView
             ?? FileNameCellView()
         cell.identifier = identifier
+        cell.delegate = self
 
         let thumbnail = thumbnails[item.url] ?? (isLiveScrolling ? item.placeholderIcon : item.icon)
         cell.configure(item: item, thumbnail: thumbnail, appSettings: appSettings)
@@ -1120,7 +1239,25 @@ extension FileTableCoordinator: NSMenuDelegate {
 
         let item = items[row]
         FileTagManager.toggleTag(tagName, on: item.url)
-        viewModel.refreshTags(for: [item.url])
+
+        // Directly reconfigure the Name cell which shows tag dots
+        let nameColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
+        if nameColumnIndex >= 0,
+           let nameCell = tableView.view(atColumn: nameColumnIndex, row: row, makeIfNecessary: false) as? FileNameCellView {
+            nameCell.configure(item: item, thumbnail: thumbnails[item.url], appSettings: appSettings)
+        }
+
+        // Also try Tags column if it exists
+        let tagsColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.tags.rawValue))
+        if tagsColumnIndex >= 0,
+           let tagsCell = tableView.view(atColumn: tagsColumnIndex, row: row, makeIfNecessary: false) as? TagsCellView {
+            tagsCell.configure(item: item, appSettings: appSettings)
+        }
+
+        // NOTE: We do NOT call viewModel.refreshTags here because:
+        // 1. We've already reconfigured the cell directly above
+        // 2. refreshTags invalidates the cache and triggers a full table reload
+        // 3. The filesystem (URLResourceValues) lags behind xattr writes, causing stale reads
     }
 
     @objc private func menuRemoveAllTags(_ sender: NSMenuItem) {
@@ -1130,7 +1267,22 @@ extension FileTableCoordinator: NSMenuDelegate {
 
         let item = items[row]
         FileTagManager.setTags([], for: item.url)
-        viewModel.refreshTags(for: [item.url])
+
+        // Directly reconfigure the Name cell which shows tag dots
+        let nameColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
+        if nameColumnIndex >= 0,
+           let nameCell = tableView.view(atColumn: nameColumnIndex, row: row, makeIfNecessary: false) as? FileNameCellView {
+            nameCell.configure(item: item, thumbnail: thumbnails[item.url], appSettings: appSettings)
+        }
+
+        // Also try Tags column if it exists
+        let tagsColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.tags.rawValue))
+        if tagsColumnIndex >= 0,
+           let tagsCell = tableView.view(atColumn: tagsColumnIndex, row: row, makeIfNecessary: false) as? TagsCellView {
+            tagsCell.configure(item: item, appSettings: appSettings)
+        }
+
+        // NOTE: We do NOT call viewModel.refreshTags here - cell is already updated
     }
 
     @objc private func menuCopy(_ sender: NSMenuItem) {
