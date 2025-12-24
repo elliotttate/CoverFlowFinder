@@ -161,7 +161,7 @@ verify_signature() {
     print_step "Verifying code signature..."
 
     # Check signature
-    if codesign -dv "$APP_PATH" 2>&1 | grep -q "Developer ID Application"; then
+    if codesign -dvv "$APP_PATH" 2>&1 | grep -q "Developer ID Application"; then
         print_success "Signed with Developer ID"
     else
         print_error "Not properly signed!"
