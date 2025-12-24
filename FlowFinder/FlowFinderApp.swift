@@ -7,7 +7,8 @@ struct FlowFinderApp: App {
     @StateObject private var soundEffectsMonitor = FinderSoundEffectsMonitor()
 
     init() {
-        // Only start indexing if Everything Search is enabled
+        // Start indexing in background on app launch if Everything Search is enabled
+        // This loads async so it won't block the UI
         Task { @MainActor in
             if AppSettings.shared.everythingSearchEnabled {
                 SearchIndexManager.shared.startIndexing()

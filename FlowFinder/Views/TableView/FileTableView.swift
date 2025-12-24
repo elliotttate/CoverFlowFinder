@@ -144,8 +144,21 @@ struct FileTableView: NSViewRepresentable {
         let oldItems = context.coordinator.items
         context.coordinator.items = items
 
-        // Check if items actually changed (not just reference)
-        let changed = oldItems.count != items.count || !oldItems.elementsEqual(items, by: { $0.id == $1.id })
+        // Check if items actually changed (including order change from sorting)
+        let changed: Bool
+        if oldItems.count != items.count {
+            changed = true
+        } else {
+            // Check if order changed (important for sorting)
+            var orderChanged = false
+            for i in 0..<items.count {
+                if oldItems[i].id != items[i].id {
+                    orderChanged = true
+                    break
+                }
+            }
+            changed = orderChanged
+        }
 
         if changed {
             context.coordinator.resetThumbnailState()

@@ -2,6 +2,21 @@ import SwiftUI
 import AppKit
 
 struct ContentView: View {
+
+    static func debugLog(_ message: String) {
+        let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/flowfinder_searchmode.log")
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let logMessage = "[\(timestamp)] \(message)\n"
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            if let handle = try? FileHandle(forWritingTo: logURL) {
+                handle.seekToEndOfFile()
+                handle.write(logMessage.data(using: .utf8)!)
+                handle.closeFile()
+            }
+        } else {
+            try? logMessage.data(using: .utf8)?.write(to: logURL)
+        }
+    }
     @EnvironmentObject private var settings: AppSettings
     @Environment(\.undoManager) private var undoManager
     @State private var tabs: [BrowserTab] = [BrowserTab()]
@@ -35,6 +50,7 @@ struct ContentView: View {
     @State private var navHistoryCount: Int = 1
     @State private var showingEverythingSearchAlert: Bool = false
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
+    @ObservedObject private var searchIndexManager = SearchIndexManager.shared
 
     private var viewModel: FileBrowserViewModel {
         tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
@@ -126,6 +142,16 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
+            // Indexing overlay temporarily disabled - runs fine in background
+            // .overlay {
+            //     if searchIndexManager.isIndexing && viewModel.searchMode == .everything {
+            //         IndexingOverlayView(
+            //             progress: searchIndexManager.indexProgress,
+            //             fileCount: searchIndexManager.indexedFileCount,
+            //             isLoadingCache: searchIndexManager.isLoadingCache
+            //         )
+            //     }
+            // }
         }
         .toolbar {
             ToolbarItem(placement: .navigation) {
@@ -204,13 +230,16 @@ struct ContentView: View {
                 .help("Actions")
 
                 // Search mode picker and search field
-                HStack(spacing: 4) {
+                HStack(spacing: 2) {
                     // Search mode picker
+                    let _ = Self.debugLog("🔄 Rendering HStack with searchMode: \(viewModel.searchMode.rawValue)")
                     Menu {
                         ForEach(SearchMode.allCases, id: \.self) { mode in
                             if mode != .everything || settings.everythingSearchEnabled {
                                 Button {
+                                    Self.debugLog("🔘 Button tapped for mode: \(mode.rawValue)")
                                     viewModel.searchMode = mode
+                                    Self.debugLog("🔘 After setting, viewModel.searchMode is: \(viewModel.searchMode.rawValue)")
                                 } label: {
                                     Label(mode.rawValue, systemImage: mode.systemImage)
                                 }
@@ -226,45 +255,18 @@ struct ContentView: View {
                             }
                         }
                     } label: {
+                        let _ = Self.debugLog("🏷️ Menu label body rendering: \(viewModel.searchMode.rawValue)")
                         Label(viewModel.searchMode.rawValue, systemImage: viewModel.searchMode.systemImage)
-                            .frame(width: 90, alignment: .leading)
+                            .labelStyle(.titleAndIcon)
                     }
-                    .frame(width: 110)
+                    .id("search-mode-\(viewModel.searchMode.rawValue)")
+                    .fixedSize()
                     .help("Search mode: \(viewModel.searchMode.rawValue)")
 
-                    // Search field
+                    // Search field - stable ID prevents recreation during view updates
                     SearchField(text: searchTextBinding, placeholder: viewModel.searchMode.placeholder)
                         .frame(width: 180)
-
-                    // Sort picker for Everything/Finder search results
-                    if viewModel.searchMode != .filter && !viewModel.searchText.isEmpty {
-                        Menu {
-                            ForEach(SearchSortOption.allCases, id: \.self) { option in
-                                Button {
-                                    if viewModel.searchSortOption == option {
-                                        viewModel.searchSortAscending.toggle()
-                                    } else {
-                                        viewModel.searchSortOption = option
-                                        viewModel.searchSortAscending = true
-                                    }
-                                } label: {
-                                    HStack {
-                                        Label(option.rawValue, systemImage: option.systemImage)
-                                        if viewModel.searchSortOption == option {
-                                            Spacer()
-                                            Image(systemName: viewModel.searchSortAscending ? "chevron.up" : "chevron.down")
-                                        }
-                                    }
-                                }
-                            }
-                        } label: {
-                            Label(viewModel.searchSortOption.rawValue, systemImage: viewModel.searchSortAscending ? "chevron.up" : "chevron.down")
-                                .labelStyle(.iconOnly)
-                        }
-                        .menuStyle(.borderlessButton)
-                        .frame(width: 24)
-                        .help("Sort by: \(viewModel.searchSortOption.rawValue) (\(viewModel.searchSortAscending ? "ascending" : "descending"))")
-                    }
+                        .id("main-search-field")
 
                     // Loading indicator
                     if viewModel.isSearching {
@@ -739,10 +741,11 @@ struct TabContentWrapper: View {
         }
     }
 
-    // Generate a unique ID for view refresh that includes archive state
+    // Generate a unique ID for view refresh that includes archive state and search results
     private var contentViewId: String {
         let archiveId = viewModel.isInsideArchive ? "-archive-\(viewModel.currentArchivePath)" : ""
-        return "\(viewModel.currentPath.path)-\(selectedTabId)\(archiveId)-\(viewModel.navigationGeneration)"
+        let searchId = "-\(viewModel.searchMode.rawValue)-\(viewModel.searchResults.count)"
+        return "\(viewModel.currentPath.path)-\(selectedTabId)\(archiveId)\(searchId)-\(viewModel.navigationGeneration)"
     }
 
     @ViewBuilder
@@ -788,6 +791,46 @@ extension FocusedValues {
 
 // Tab notification names are defined in UIConstants.swift
 
+// Indexing progress overlay
+struct IndexingOverlayView: View {
+    let progress: Double
+    let fileCount: Int
+    let isLoadingCache: Bool
+
+    var body: some View {
+        VStack(spacing: 16) {
+            ProgressView()
+                .scaleEffect(1.5)
+
+            Text(isLoadingCache ? "Loading Search Index..." : "Building Search Index...")
+                .font(.headline)
+
+            if isLoadingCache {
+                Text("Please wait while the index loads")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+            } else {
+                Text("\(fileCount.formatted()) files indexed")
+                    .font(.subheadline)
+                    .foregroundColor(.secondary)
+
+                if progress > 0 && progress < 1 {
+                    ProgressView(value: progress)
+                        .frame(width: 200)
+                }
+
+                Text("Search will be available once indexing completes.\nYou can monitor progress in Settings > Search.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .padding(32)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
+        .shadow(radius: 10)
+    }
+}
+
 // Native macOS search field
 struct SearchField: NSViewRepresentable {
     @Binding var text: String
@@ -805,7 +848,10 @@ struct SearchField: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSSearchField, context: Context) {
-        if nsView.stringValue != text {
+        // Only update text if different AND the field is not being actively edited
+        // This prevents interference with user typing
+        let isFirstResponder = nsView.window?.firstResponder == nsView.currentEditor()
+        if nsView.stringValue != text && !isFirstResponder {
             nsView.stringValue = text
         }
         // Update placeholder if it changed
