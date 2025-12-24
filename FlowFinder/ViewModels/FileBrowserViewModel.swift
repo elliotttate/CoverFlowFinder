@@ -37,13 +37,13 @@ enum ViewMode: String, CaseIterable {
 
 enum SearchMode: String, CaseIterable {
     case filter = "Filter"
-    case finder = "Finder"
+    case finder = "Spotlight"
     case everything = "Everything"
 
     var placeholder: String {
         switch self {
         case .filter: return "Filter"
-        case .finder: return "Search in Finder"
+        case .finder: return "Spotlight search..."
         case .everything: return "Search everywhere..."
         }
     }
@@ -53,24 +53,6 @@ enum SearchMode: String, CaseIterable {
         case .filter: return "line.3.horizontal.decrease"
         case .finder: return "magnifyingglass"
         case .everything: return "sparkle.magnifyingglass"
-        }
-    }
-}
-
-enum SearchSortOption: String, CaseIterable {
-    case name = "Name"
-    case dateModified = "Date Modified"
-    case dateCreated = "Date Created"
-    case size = "Size"
-    case kind = "Kind"
-
-    var systemImage: String {
-        switch self {
-        case .name: return "textformat"
-        case .dateModified: return "clock"
-        case .dateCreated: return "calendar"
-        case .size: return "externaldrive"
-        case .kind: return "doc"
         }
     }
 }
@@ -111,9 +93,51 @@ class FileBrowserViewModel: ObservableObject {
     @Published var selectedItems: Set<FileItem> = []
     @Published var viewMode: ViewMode = .coverFlow
     @Published var searchText: String = ""
-    @Published var searchMode: SearchMode = .filter
-    @Published var searchSortOption: SearchSortOption = .name
-    @Published var searchSortAscending: Bool = true
+    @Published var searchMode: SearchMode = .filter {
+        didSet {
+            Self.searchModeLog("✅ didSet: oldValue=\(oldValue.rawValue), newValue=\(searchMode.rawValue)")
+            // Trigger indexing lazily when user switches to Everything mode
+            if searchMode == .everything && AppSettings.shared.everythingSearchEnabled {
+                Task { @MainActor in
+                    if !SearchIndexManager.shared.isIndexing && SearchIndexManager.shared.indexedFileCount == 0 {
+                        SearchIndexManager.shared.startIndexing()
+                    }
+                }
+            }
+            // Force objectWillChange to ensure SwiftUI updates
+            Self.searchModeLog("✅ Sending objectWillChange")
+            objectWillChange.send()
+        }
+    }
+
+    private static func searchModeLog(_ message: String) {
+        let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/flowfinder_searchmode.log")
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let logMessage = "[\(timestamp)] [VM] \(message)\n"
+        if FileManager.default.fileExists(atPath: logURL.path) {
+            if let handle = try? FileHandle(forWritingTo: logURL) {
+                handle.seekToEndOfFile()
+                handle.write(logMessage.data(using: .utf8)!)
+                handle.closeFile()
+            }
+        } else {
+            try? logMessage.data(using: .utf8)?.write(to: logURL)
+        }
+    }
+    /// Debug logging for sort functionality
+    static func sortDebugLog(_ message: String) {
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let logMessage = "[\(timestamp)] 🔀 [Sort] \(message)\n"
+        let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("flowfinder_sort.log")
+        if let handle = try? FileHandle(forWritingTo: logURL) {
+            handle.seekToEndOfFile()
+            handle.write(logMessage.data(using: .utf8)!)
+            handle.closeFile()
+        } else {
+            try? logMessage.data(using: .utf8)?.write(to: logURL)
+        }
+        print("🔀 [Sort] \(message)")
+    }
     @Published var filterTag: String? = nil
     @Published var isLoading: Bool = false
     @Published var isSearching: Bool = false
@@ -121,33 +145,23 @@ class FileBrowserViewModel: ObservableObject {
     // Search results for Finder and Everything modes
     @Published var searchResults: [FileItem] = []
 
-    /// Sorted search results based on current sort option
+    /// Sorted search results - uses ListColumnConfigManager for consistency with normal file sorting
+    /// This means clicking column headers in List View sorts search results too
     var sortedSearchResults: [FileItem] {
         let items = searchResults
         guard !items.isEmpty else { return items }
 
-        let sorted: [FileItem]
-        switch searchSortOption {
-        case .name:
-            sorted = items.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
-        case .dateModified:
-            sorted = items.sorted { ($0.modificationDate ?? .distantPast) < ($1.modificationDate ?? .distantPast) }
-        case .dateCreated:
-            sorted = items.sorted { ($0.creationDate ?? .distantPast) < ($1.creationDate ?? .distantPast) }
-        case .size:
-            sorted = items.sorted { $0.size < $1.size }
-        case .kind:
-            sorted = items.sorted {
-                let ext0 = $0.url.pathExtension.lowercased()
-                let ext1 = $1.url.pathExtension.lowercased()
-                if ext0 != ext1 {
-                    return ext0 < ext1
-                }
-                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
-            }
-        }
+        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let foldersFirst = AppSettings.shared.foldersFirst
 
-        return searchSortAscending ? sorted : sorted.reversed()
+        Self.sortDebugLog("sortedSearchResults called: \(items.count) items, sortBy: \(sortState.column.rawValue), direction: \(sortState.direction), foldersFirst: \(foldersFirst)")
+
+        let result = ListColumnConfigManager.sortedItems(items, sortState: sortState, foldersFirst: foldersFirst)
+
+        if let first = result.first, let last = result.last {
+            Self.sortDebugLog("Result: first=\(first.name), last=\(last.name)")
+        }
+        return result
     }
     private var searchTask: Task<Void, Never>?
     private var metadataQuery: NSMetadataQuery?
@@ -324,7 +338,7 @@ class FileBrowserViewModel: ObservableObject {
                 print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, empty searchText, returning filterCurrentDirectoryItems()")
                 return filterCurrentDirectoryItems()
             }
-            print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults (sorted by \(self.searchSortOption.rawValue))")
+            print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults (sorted by \(ListColumnConfigManager.shared.sortColumn.rawValue))")
             searchDebugLogger.notice("📋 filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults")
             if searchResults.isEmpty {
                 print("⚠️ [FileBrowserVM] filteredItems: searchResults is EMPTY for query '\(self.searchText)'")
@@ -1759,6 +1773,11 @@ class FileBrowserViewModel: ObservableObject {
         }
 
         if item.isDirectory {
+            // Clear search when navigating to a folder from search results
+            if searchMode != .filter && !searchText.isEmpty {
+                searchText = ""
+                searchResults = []
+            }
             enteredFolderURL = item.url
             navigateTo(item.url)
         } else {

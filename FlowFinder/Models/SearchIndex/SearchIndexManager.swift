@@ -97,6 +97,7 @@ final class SearchIndexManager: ObservableObject {
     @Published private(set) var indexProgress: Double = 0
     @Published private(set) var indexedFileCount: Int = 0
     @Published private(set) var isIndexing: Bool = false
+    @Published private(set) var isLoadingCache: Bool = false  // True when loading from cache, false when building new index
     @Published private(set) var lastIndexTime: Date?
     @Published private(set) var indexError: String?
 
@@ -188,18 +189,38 @@ final class SearchIndexManager: ObservableObject {
             return
         }
 
-        // Try to load from cache first
+        // Set loading state immediately so UI shows loading indicator
+        isIndexing = true
+        isLoadingCache = true  // Assume loading from cache first
+        indexProgress = 0
+
+        // Load cache asynchronously to avoid blocking main thread
         print("📂 [SearchIndexManager] Checking for cached index at: \(self.cacheURL.path)")
         searchLogger.notice("📂 Checking for cached index at: \(self.cacheURL.path)")
-        if loadFromCache() {
-            print("✅ [SearchIndexManager] Loaded index from cache with \(self.indexedFileCount) files, \(self.nameIndex.count) unique names")
-            searchLogger.notice("✅ Loaded index from cache with \(self.indexedFileCount) files, \(self.nameIndex.count) unique names")
-            return
-        }
 
-        print("📂 [SearchIndexManager] No valid cache found, starting fresh index build")
-        searchLogger.notice("📂 No valid cache found, starting fresh index build")
-        rebuildIndex()
+        indexingTask = Task(priority: .userInitiated) { [weak self] in
+            guard let self else { return }
+
+            // Try loading from cache on background thread
+            let cacheResult = await self.loadFromCacheAsync()
+
+            await MainActor.run {
+                if cacheResult {
+                    print("✅ [SearchIndexManager] Loaded index from cache with \(self.indexedFileCount) files, \(self.nameIndex.count) unique names")
+                    searchLogger.notice("✅ Loaded index from cache with \(self.indexedFileCount) files, \(self.nameIndex.count) unique names")
+                    self.isIndexing = false
+                    self.isLoadingCache = false
+                    self.lastIndexTime = Date()
+                } else {
+                    print("📂 [SearchIndexManager] No valid cache found, starting fresh index build")
+                    searchLogger.notice("📂 No valid cache found, starting fresh index build")
+                    // Start fresh build (this will set its own isIndexing state)
+                    self.isIndexing = false  // Reset so rebuildIndex can set it
+                    self.isLoadingCache = false
+                    self.rebuildIndex()
+                }
+            }
+        }
     }
 
     /// Rebuild the index from scratch
@@ -540,6 +561,51 @@ final class SearchIndexManager: ObservableObject {
             debugLog("❌ [SearchIndexManager] Failed to save cache: \(error.localizedDescription)")
             searchLogger.error("Failed to save index cache: \(error.localizedDescription)")
         }
+    }
+
+    /// Load cache asynchronously on a background thread to avoid blocking UI
+    private func loadFromCacheAsync() async -> Bool {
+        let cacheURL = self.cacheURL
+
+        // Perform heavy I/O on background thread using Task.detached
+        let result: (success: Bool, nameIndex: [String: [IndexedFile]], pathIndex: [String: IndexedFile], indexedAt: Date?) = await Task.detached(priority: .userInitiated) {
+            guard FileManager.default.fileExists(atPath: cacheURL.path) else {
+                debugLog("📖 [SearchIndexManager] No cache file found")
+                return (false, [:], [:], nil)
+            }
+
+            do {
+                debugLog("📖 [SearchIndexManager] Loading cache file...")
+                let data = try Data(contentsOf: cacheURL)
+                debugLog("📖 [SearchIndexManager] Cache file loaded (\(data.count) bytes), decoding...")
+
+                let decoder = JSONDecoder()
+                let cacheData = try decoder.decode(IndexCacheData.self, from: data)
+                debugLog("📖 [SearchIndexManager] Cache decoded: \(cacheData.pathIndex.count) files")
+
+                // Check if cache is too old (older than 24 hours)
+                if let indexedAt = cacheData.indexedAt,
+                   Date().timeIntervalSince(indexedAt) > 86400 {
+                    debugLog("📖 [SearchIndexManager] Cache is stale")
+                    return (false, [:], [:], nil)
+                }
+
+                return (true, cacheData.nameIndex, cacheData.pathIndex, cacheData.indexedAt)
+            } catch {
+                debugLog("📖 [SearchIndexManager] Cache load error: \(error.localizedDescription)")
+                return (false, [:], [:], nil)
+            }
+        }.value
+
+        // Update state on main actor
+        if result.success {
+            self.nameIndex = result.nameIndex
+            self.pathIndex = result.pathIndex
+            self.indexedFileCount = result.pathIndex.count
+            self.lastIndexTime = result.indexedAt
+        }
+
+        return result.success
     }
 
     private func loadFromCache() -> Bool {
