@@ -6,15 +6,6 @@ struct FlowFinderApp: App {
     @StateObject private var settings = AppSettings.shared
     @StateObject private var soundEffectsMonitor = FinderSoundEffectsMonitor()
 
-    init() {
-        // Start indexing in background on app launch if Everything Search is enabled
-        // This loads async so it won't block the UI
-        Task { @MainActor in
-            if AppSettings.shared.everythingSearchEnabled {
-                SearchIndexManager.shared.startIndexing()
-            }
-        }
-    }
 
     var body: some Scene {
         WindowGroup {
@@ -85,7 +76,15 @@ struct FlowFinderApp: App {
                 Divider()
 
                 Button("Select All") {
-                    viewModel?.selectAll()
+                    // Check if a text field is being edited - if so, let it handle Cmd+A
+                    if let window = NSApp.keyWindow,
+                       let firstResponder = window.firstResponder,
+                       firstResponder is NSTextView || firstResponder is NSText {
+                        // Send selectAll to the text field instead
+                        NSApp.sendAction(#selector(NSText.selectAll(_:)), to: nil, from: nil)
+                    } else {
+                        viewModel?.selectAll()
+                    }
                 }
                 .keyboardShortcut("a", modifiers: .command)
 
@@ -107,6 +106,11 @@ struct FlowFinderApp: App {
             // View menu commands
             CommandGroup(after: .toolbar) {
                 Divider()
+
+                Button("Find") {
+                    NotificationCenter.default.post(name: .focusSearch, object: nil)
+                }
+                .keyboardShortcut("f", modifiers: .command)
 
                 Button("Refresh") {
                     viewModel?.refresh()

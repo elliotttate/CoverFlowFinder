@@ -1351,6 +1351,22 @@ extension FileTableCoordinator: NSMenuDelegate {
 // MARK: - Drag and Drop
 
 extension FileTableCoordinator {
+    // Use writeRowsWith for explicit multi-selection drag support
+    func tableView(_ tableView: NSTableView, writeRowsWith rowIndexes: IndexSet, to pboard: NSPasteboard) -> Bool {
+        let urls = rowIndexes.compactMap { row -> URL? in
+            guard row < items.count else { return nil }
+            let item = items[row]
+            guard !item.isFromArchive else { return nil }
+            return item.url
+        }
+
+        guard !urls.isEmpty else { return false }
+
+        pboard.clearContents()
+        pboard.writeObjects(urls as [NSURL])
+        return true
+    }
+
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         guard row < items.count else { return nil }
         let item = items[row]

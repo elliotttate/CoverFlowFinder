@@ -20,7 +20,6 @@ final class AppSettings: ObservableObject {
         static let sidebarFavorites = "settings.sidebarFavorites"
         static let thumbnailQuality = "settings.thumbnailQuality"
         static let masonryShowFilenames = "settings.masonryShowFilenames"
-        static let everythingSearchEnabled = "settings.everythingSearchEnabled"
 
         static let listFontSize = "settings.listFontSize"
         static let listIconSize = "settings.listIconSize"
@@ -69,7 +68,6 @@ final class AppSettings: ObservableObject {
         }()
         static let thumbnailQuality: Double = 1.15
         static let masonryShowFilenames = false
-        static let everythingSearchEnabled = false  // Disabled by default for better first-time experience
 
         static let listFontSize: Double = 13
         static let listIconSize: Double = 20
@@ -139,15 +137,6 @@ final class AppSettings: ObservableObject {
     }
     @Published var masonryShowFilenames: Bool {
         didSet { defaults.set(masonryShowFilenames, forKey: Keys.masonryShowFilenames) }
-    }
-    @Published var everythingSearchEnabled: Bool {
-        didSet {
-            defaults.set(everythingSearchEnabled, forKey: Keys.everythingSearchEnabled)
-            // Start indexing when enabled for the first time
-            if everythingSearchEnabled {
-                SearchIndexManager.shared.startIndexing()
-            }
-        }
     }
 
     @Published var listFontSize: Double {
@@ -220,7 +209,6 @@ final class AppSettings: ObservableObject {
             Keys.sidebarFavorites: Defaults.sidebarFavoritesData,
             Keys.thumbnailQuality: Defaults.thumbnailQuality,
             Keys.masonryShowFilenames: Defaults.masonryShowFilenames,
-            Keys.everythingSearchEnabled: Defaults.everythingSearchEnabled,
             Keys.listFontSize: Defaults.listFontSize,
             Keys.listIconSize: Defaults.listIconSize,
             Keys.iconGridIconSize: Defaults.iconGridIconSize,
@@ -260,7 +248,6 @@ final class AppSettings: ObservableObject {
         }()
         thumbnailQuality = defaults.double(forKey: Keys.thumbnailQuality)
         masonryShowFilenames = defaults.bool(forKey: Keys.masonryShowFilenames)
-        everythingSearchEnabled = defaults.bool(forKey: Keys.everythingSearchEnabled)
 
         listFontSize = defaults.double(forKey: Keys.listFontSize)
         listIconSize = defaults.double(forKey: Keys.listIconSize)
@@ -298,7 +285,6 @@ final class AppSettings: ObservableObject {
         sidebarFavorites = Defaults.sidebarFavorites
         thumbnailQuality = Defaults.thumbnailQuality
         masonryShowFilenames = Defaults.masonryShowFilenames
-        everythingSearchEnabled = Defaults.everythingSearchEnabled
 
         listFontSize = Defaults.listFontSize
         listIconSize = Defaults.listIconSize

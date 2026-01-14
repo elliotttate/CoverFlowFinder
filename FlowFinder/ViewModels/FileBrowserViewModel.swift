@@ -38,13 +38,11 @@ enum ViewMode: String, CaseIterable {
 enum SearchMode: String, CaseIterable {
     case filter = "Filter"
     case finder = "Spotlight"
-    case everything = "Everything"
 
     var placeholder: String {
         switch self {
         case .filter: return "Filter"
         case .finder: return "Spotlight search..."
-        case .everything: return "Search everywhere..."
         }
     }
 
@@ -52,7 +50,6 @@ enum SearchMode: String, CaseIterable {
         switch self {
         case .filter: return "line.3.horizontal.decrease"
         case .finder: return "magnifyingglass"
-        case .everything: return "sparkle.magnifyingglass"
         }
     }
 }
@@ -96,14 +93,6 @@ class FileBrowserViewModel: ObservableObject {
     @Published var searchMode: SearchMode = .filter {
         didSet {
             Self.searchModeLog("✅ didSet: oldValue=\(oldValue.rawValue), newValue=\(searchMode.rawValue)")
-            // Trigger indexing lazily when user switches to Everything mode
-            if searchMode == .everything && AppSettings.shared.everythingSearchEnabled {
-                Task { @MainActor in
-                    if !SearchIndexManager.shared.isIndexing && SearchIndexManager.shared.indexedFileCount == 0 {
-                        SearchIndexManager.shared.startIndexing()
-                    }
-                }
-            }
             // Force objectWillChange to ensure SwiftUI updates
             Self.searchModeLog("✅ Sending objectWillChange")
             objectWillChange.send()
@@ -329,9 +318,9 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     var filteredItems: [FileItem] {
-        // For Finder and Everything search modes, return search results
+        // For Finder search mode, return search results
         switch searchMode {
-        case .finder, .everything:
+        case .finder:
             // When in search mode, return the search results
             // If search text is empty, show current directory items
             if searchText.isEmpty {
@@ -1974,7 +1963,7 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     /// Handle selection with all modifier combinations
-    func handleSelection(item: FileItem, index: Int, in items: [FileItem], withShift: Bool, withCommand: Bool) {
+    func handleSelection(item: FileItem, index: Int, in items: [FileItem], withShift: Bool, withCommand: Bool, allowRename: Bool = true) {
         let now = Date()
         cancelPendingRename()
 
@@ -2005,7 +1994,8 @@ class FileBrowserViewModel: ObservableObject {
 
             // If clicking the only selected item after the system double-click interval,
             // schedule rename with a short delay to avoid double-click collisions.
-            if wasOnlySelected && isSameItem && timeSinceLastClick > doubleClickInterval && timeSinceLastClick < 3.0 && renamingURL == nil {
+            // Skip rename trigger if allowRename is false (e.g., for CoverFlow view)
+            if allowRename && wasOnlySelected && isSameItem && timeSinceLastClick > doubleClickInterval && timeSinceLastClick < 3.0 && renamingURL == nil {
                 if item.isFromArchive {
                     NSSound.beep()
                 } else {
@@ -2493,7 +2483,7 @@ class FileBrowserViewModel: ObservableObject {
         // Find the URL to select after deletion (next item, or previous if at end)
         let currentItems = filteredItems
         let deletedURLs = Set(itemsToDelete.map { $0.url })
-        var nextSelectionURL: URL? = nil
+        var nextSelectionItem: FileItem? = nil
         var nextSelectionIndex: Int = 0
 
         // Find the first item that's NOT being deleted, preferring items after the deleted ones
@@ -2501,7 +2491,7 @@ class FileBrowserViewModel: ObservableObject {
             // Look for first non-deleted item after the deleted range
             for i in firstDeletedIndex..<currentItems.count {
                 if !deletedURLs.contains(currentItems[i].url) {
-                    nextSelectionURL = currentItems[i].url
+                    nextSelectionItem = currentItems[i]
                     // Calculate what index this will be after deletion
                     let deletedBefore = currentItems[0..<i].filter { deletedURLs.contains($0.url) }.count
                     nextSelectionIndex = i - deletedBefore
@@ -2510,10 +2500,10 @@ class FileBrowserViewModel: ObservableObject {
             }
 
             // If no item after, look before
-            if nextSelectionURL == nil && firstDeletedIndex > 0 {
+            if nextSelectionItem == nil && firstDeletedIndex > 0 {
                 for i in stride(from: firstDeletedIndex - 1, through: 0, by: -1) {
                     if !deletedURLs.contains(currentItems[i].url) {
-                        nextSelectionURL = currentItems[i].url
+                        nextSelectionItem = currentItems[i]
                         let deletedBefore = currentItems[0..<i].filter { deletedURLs.contains($0.url) }.count
                         nextSelectionIndex = i - deletedBefore
                         break
@@ -2522,26 +2512,45 @@ class FileBrowserViewModel: ObservableObject {
             }
         }
 
-        // Store the target index to use after refresh - this prevents race conditions
+        // Store selection info to use after deletion
         let targetIndex = nextSelectionIndex
+        let targetItem = nextSelectionItem
 
-        // DON'T clear selectedItems here - it triggers syncSelection which re-selects
-        // the about-to-be-deleted item. We'll clear it in the async block instead.
         performTrash(
             itemsToDelete.map { $0.url },
             actionName: "Move to Trash",
             registerUndo: true,
+            refreshAfter: false,  // Don't do full refresh - we'll update incrementally
             playSound: true
         ) { [weak self] records in
             guard let self else { return }
             guard !records.isEmpty else { return }
 
-            // Set the target index BEFORE refresh so CoverFlowView knows where to position
-            self.coverFlowSelectedIndex = targetIndex
+            // Remove deleted items from the items array directly (incremental update)
+            let trashedURLs = Set(records.map { $0.original })
+            self.items.removeAll { trashedURLs.contains($0.url) }
 
-            // Clear selectedItems so syncSelection will auto-select at coverFlowSelectedIndex
-            // when items are reloaded. This must happen BEFORE refresh so the index is set first.
-            self.selectedItems.removeAll()
+            // Update selection to the next/previous item
+            self.coverFlowSelectedIndex = min(targetIndex, max(0, self.items.count - 1))
+            if let targetItem = targetItem {
+                self.selectedItems = [targetItem]
+            } else if !self.items.isEmpty {
+                // Select item at the target index if original target was deleted
+                let safeIndex = min(targetIndex, self.items.count - 1)
+                if safeIndex >= 0 {
+                    self.selectedItems = [self.items[safeIndex]]
+                } else {
+                    self.selectedItems.removeAll()
+                }
+            } else {
+                self.selectedItems.removeAll()
+            }
+
+            // Clean up hydration tracking
+            for url in trashedURLs {
+                self.hydratedURLs.remove(url)
+                self.pendingHydrationURLs.remove(url)
+            }
         }
     }
 
@@ -2775,11 +2784,6 @@ class FileBrowserViewModel: ObservableObject {
             print("🔍 [FileBrowserVM] performSearch: Calling performFinderSearch")
             searchDebugLogger.notice("🔍 performSearch: Calling performFinderSearch")
             performFinderSearch(query: query)
-
-        case .everything:
-            print("🔍 [FileBrowserVM] performSearch: Calling performEverythingSearch")
-            searchDebugLogger.notice("🔍 performSearch: Calling performEverythingSearch")
-            performEverythingSearch(query: query)
         }
     }
 
@@ -2896,128 +2900,6 @@ class FileBrowserViewModel: ObservableObject {
         )
     }
 
-    /// Perform Everything-style indexed search
-    private func performEverythingSearch(query: String) {
-        print("⚡ [FileBrowserVM] performEverythingSearch() starting for query: '\(query)'")
-        searchDebugLogger.notice("⚡ performEverythingSearch() starting for query: '\(query)'")
-
-        searchTask = Task { [weak self] in
-            guard let self else {
-                print("❌ [FileBrowserVM] performEverythingSearch: self was nil")
-                searchDebugLogger.error("❌ performEverythingSearch: self was nil")
-                return
-            }
-
-            // Use SearchIndexManager if index is ready, otherwise fall back to recursive search
-            let indexManager = SearchIndexManager.shared
-            let indexedFileCount = indexManager.indexedFileCount
-            let isIndexing = indexManager.isIndexing
-            let isIndexReady = indexManager.isIndexReady
-
-            print("⚡ [FileBrowserVM] Index state: indexedFileCount=\(indexedFileCount), isIndexing=\(isIndexing), isIndexReady=\(isIndexReady)")
-            searchDebugLogger.notice("⚡ Index state: indexedFileCount=\(indexedFileCount), isIndexing=\(isIndexing), isIndexReady=\(isIndexReady)")
-
-            let results: [FileItem]
-            if isIndexReady {
-                // Use the pre-built index for fast search
-                print("⚡ [FileBrowserVM] Using pre-built index for search")
-                searchDebugLogger.notice("⚡ Using pre-built index for search")
-                let indexedResults = indexManager.searchAdvanced(query: query)
-                print("⚡ [FileBrowserVM] searchAdvanced returned \(indexedResults.count) IndexedFile results")
-                searchDebugLogger.notice("⚡ searchAdvanced returned \(indexedResults.count) IndexedFile results")
-                results = indexedResults.map { $0.toFileItem() }
-                print("⚡ [FileBrowserVM] Converted to \(results.count) FileItem results")
-                searchDebugLogger.notice("⚡ Converted to \(results.count) FileItem results")
-            } else {
-                // Fall back to recursive search if index not ready
-                print("⚠️ [FileBrowserVM] Index not ready (isIndexing=\(isIndexing), count=\(indexedFileCount)), falling back to recursive search")
-                searchDebugLogger.warning("⚠️ Index not ready (count=\(indexedFileCount)), falling back to recursive search")
-                let searchPath = self.currentPath
-                results = await Task.detached {
-                    self.searchFilesRecursively(query: query, searchPath: searchPath)
-                }.value
-                print("⚡ [FileBrowserVM] Recursive search found \(results.count) results")
-                searchDebugLogger.notice("⚡ Recursive search found \(results.count) results")
-            }
-
-            if !Task.isCancelled {
-                print("⚡ [FileBrowserVM] Updating searchResults with \(results.count) items")
-                searchDebugLogger.notice("⚡ Updating searchResults with \(results.count) items")
-                if results.count > 0 {
-                    print("⚡ [FileBrowserVM] First few results: \(results.prefix(3).map { $0.name })")
-                    searchDebugLogger.notice("⚡ First few results: \(results.prefix(3).map { $0.name })")
-                }
-                self.searchResults = results
-                self.isSearching = false
-                print("⚡ [FileBrowserVM] searchResults updated, isSearching=false, searchResults.count=\(self.searchResults.count)")
-                searchDebugLogger.notice("⚡ searchResults updated, isSearching=false")
-            } else {
-                print("⚡ [FileBrowserVM] Task was cancelled, not updating results")
-                searchDebugLogger.notice("⚡ Task was cancelled, not updating results")
-            }
-        }
-    }
-
-    /// Recursive file search (placeholder until SearchIndexManager is implemented)
-    nonisolated private func searchFilesRecursively(query: String, searchPath: URL) -> [FileItem] {
-        // Check if SearchIndexManager is available, otherwise use fallback
-        // For now, just search the current directory to avoid performance issues
-        // The real implementation will use the pre-built index
-
-        var results: [FileItem] = []
-        let fileManager = FileManager.default
-        let queryLower = query.lowercased()
-
-        // Limit search to avoid hanging - real implementation uses index
-        let maxResults = 1000
-
-        // Search current directory and subdirectories
-        guard let enumerator = fileManager.enumerator(
-            at: searchPath,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return results
-        }
-
-        for case let url as URL in enumerator {
-            if results.count >= maxResults { break }
-
-            let name = url.lastPathComponent
-            if name.lowercased().contains(queryLower) {
-                if let item = createFileItemSync(from: url) {
-                    results.append(item)
-                }
-            }
-        }
-
-        return results
-    }
-
-    /// Create a FileItem from a URL synchronously (nonisolated version for background search)
-    nonisolated private func createFileItemSync(from url: URL) -> FileItem? {
-        guard let resourceValues = try? url.resourceValues(forKeys: [
-            .isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey
-        ]) else {
-            return nil
-        }
-
-        let isDirectory = resourceValues.isDirectory ?? false
-        let size = Int64(resourceValues.fileSize ?? 0)
-        let modDate = resourceValues.contentModificationDate
-        let createDate = resourceValues.creationDate
-        let contentType = resourceValues.contentType
-
-        return FileItem(
-            url: url,
-            name: url.lastPathComponent,
-            isDirectory: isDirectory,
-            size: size,
-            modificationDate: modDate,
-            creationDate: createDate,
-            contentType: contentType
-        )
-    }
 }
 
 extension FileBrowserViewModel: NetworkServiceBrowserDelegate {

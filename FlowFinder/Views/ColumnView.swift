@@ -299,6 +299,21 @@ struct SingleColumnView: View {
                     )
                     .onDrag {
                         guard !item.isFromArchive else { return NSItemProvider() }
+
+                        // Check if this item is part of a multi-selection
+                        let itemsToDrag: [FileItem]
+                        if viewModel.selectedItems.contains(item) && viewModel.selectedItems.count > 1 {
+                            itemsToDrag = Array(viewModel.selectedItems).filter { !$0.isFromArchive }
+                        } else {
+                            itemsToDrag = [item]
+                        }
+
+                        // Write all URLs to the pasteboard for multi-selection drag
+                        let urls = itemsToDrag.map { $0.url as NSURL }
+                        let pasteboard = NSPasteboard(name: .drag)
+                        pasteboard.clearContents()
+                        pasteboard.writeObjects(urls)
+
                         return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
                     }
                     .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
