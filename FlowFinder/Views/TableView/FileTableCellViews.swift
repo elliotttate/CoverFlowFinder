@@ -175,19 +175,32 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
 
     private func endEditingMode() {
         isEditing = false
+
+        // End editing at window level first to properly dismiss field editor
+        window?.endEditing(for: nil)
+
         nameTextField.isEditable = false
         nameTextField.isSelectable = false
         nameTextField.isBordered = false
         nameTextField.drawsBackground = false
 
-        // Restore table view's ability to accept first responder
+        // Restore table view's ability to accept first responder and make it first responder
+        var tableView: KeyboardTableView? = nil
         var view: NSView? = self.superview
         while view != nil {
             if let keyboardTableView = view as? KeyboardTableView {
+                tableView = keyboardTableView
                 keyboardTableView.shouldRefuseFirstResponder = false
                 break
             }
             view = view?.superview
+        }
+
+        // Make table view first responder so keyboard navigation works
+        if let tableView = tableView {
+            DispatchQueue.main.async {
+                tableView.window?.makeFirstResponder(tableView)
+            }
         }
     }
 
