@@ -72,4 +72,5 @@ extension Notification.Name {
     static let previousTab = Notification.Name("previousTab")
     static let showGetInfo = Notification.Name("showGetInfo")
     static let metadataHydrationCompleted = Notification.Name("metadataHydrationCompleted")
+    static let focusSearch = Notification.Name("focusSearch")
 }

@@ -117,7 +117,8 @@ struct CoverFlowView: View {
                                 index: index,
                                 in: sortedItemsCache,
                                 withShift: modifiers.contains(.shift),
-                                withCommand: modifiers.contains(.command)
+                                withCommand: modifiers.contains(.command),
+                                allowRename: false  // Disable click-to-rename in CoverFlow
                             )
                             updateQuickLook(for: item)
                         }

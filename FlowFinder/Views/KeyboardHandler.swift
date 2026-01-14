@@ -93,6 +93,14 @@ struct KeyboardNavigable: ViewModifier {
     private func registerHandler() {
         KeyboardManager.shared.setHandler { [onUpArrow, onDownArrow, onLeftArrow, onRightArrow, onReturn, onSpace, onDelete, onCopy, onCut, onPaste, onTypeAhead] in
             guard let event = NSApp.currentEvent else { return false }
+
+            // Don't intercept keyboard events if a text field has focus
+            if let window = NSApp.keyWindow,
+               let firstResponder = window.firstResponder,
+               firstResponder is NSTextView || firstResponder is NSText {
+                return false
+            }
+
             let modifiers = event.modifierFlags
 
             // Don't intercept if command key is held (except for specific shortcuts)

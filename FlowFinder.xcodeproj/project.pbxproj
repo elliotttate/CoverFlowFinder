@@ -8,8 +8,6 @@
 
 /* Begin PBXBuildFile section */
 		A1000033001 /* FlowFinder.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000033000 /* FlowFinder.icon */; };
-		A1000034001 /* SearchIndexManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000034000 /* SearchIndexManager.swift */; };
-		A1000035001 /* SearchQuery.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000035000 /* SearchQuery.swift */; };
 		A1000001001 /* FlowFinderApp.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000001000 /* FlowFinderApp.swift */; };
 		A1000002001 /* FileItem.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002000 /* FileItem.swift */; };
 		A1000002003 /* ListColumnConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000002002 /* ListColumnConfig.swift */; };
@@ -77,8 +75,6 @@
 		A1000030000 /* ViewModifiers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewModifiers.swift; sourceTree = "<group>"; };
 		A1000031000 /* AsyncListIconView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AsyncListIconView.swift; sourceTree = "<group>"; };
 		A1000033000 /* FlowFinder.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer; path = FlowFinder.icon; sourceTree = "<group>"; };
-		A1000034000 /* SearchIndexManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchIndexManager.swift; sourceTree = "<group>"; };
-		A1000035000 /* SearchQuery.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchQuery.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -126,7 +122,6 @@
 		A1000011000 /* Models */ = {
 			isa = PBXGroup;
 			children = (
-				A1000036000 /* SearchIndex */,
 				A1000027000 /* AppSettings.swift */,
 				A1000032000 /* FinderSoundEffects.swift */,
 				A1000002000 /* FileItem.swift */,
@@ -137,15 +132,6 @@
 				A1000026000 /* ZipArchiveManager.swift */,
 			);
 			path = Models;
-			sourceTree = "<group>";
-		};
-		A1000036000 /* SearchIndex */ = {
-			isa = PBXGroup;
-			children = (
-				A1000034000 /* SearchIndexManager.swift */,
-				A1000035000 /* SearchQuery.swift */,
-			);
-			path = SearchIndex;
 			sourceTree = "<group>";
 		};
 		A1000012000 /* ViewModels */ = {
@@ -260,8 +246,6 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				A1000034001 /* SearchIndexManager.swift in Sources */,
-				A1000035001 /* SearchQuery.swift in Sources */,
 				A1000001001 /* FlowFinderApp.swift in Sources */,
 				A1000002001 /* FileItem.swift in Sources */,
 				A1000002003 /* ListColumnConfig.swift in Sources */,

@@ -48,9 +48,7 @@ struct ContentView: View {
     @FocusState private var isSearchFocused: Bool
     @State private var navHistoryIndex: Int = 0
     @State private var navHistoryCount: Int = 1
-    @State private var showingEverythingSearchAlert: Bool = false
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
-    @ObservedObject private var searchIndexManager = SearchIndexManager.shared
 
     private var viewModel: FileBrowserViewModel {
         tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
@@ -142,16 +140,6 @@ struct ContentView: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
             }
-            // Indexing overlay temporarily disabled - runs fine in background
-            // .overlay {
-            //     if searchIndexManager.isIndexing && viewModel.searchMode == .everything {
-            //         IndexingOverlayView(
-            //             progress: searchIndexManager.indexProgress,
-            //             fileCount: searchIndexManager.indexedFileCount,
-            //             isLoadingCache: searchIndexManager.isLoadingCache
-            //         )
-            //     }
-            // }
         }
         .toolbar {
             ToolbarItem(placement: .navigation) {
@@ -235,23 +223,12 @@ struct ContentView: View {
                     let _ = Self.debugLog("🔄 Rendering HStack with searchMode: \(viewModel.searchMode.rawValue)")
                     Menu {
                         ForEach(SearchMode.allCases, id: \.self) { mode in
-                            if mode != .everything || settings.everythingSearchEnabled {
-                                Button {
-                                    Self.debugLog("🔘 Button tapped for mode: \(mode.rawValue)")
-                                    viewModel.searchMode = mode
-                                    Self.debugLog("🔘 After setting, viewModel.searchMode is: \(viewModel.searchMode.rawValue)")
-                                } label: {
-                                    Label(mode.rawValue, systemImage: mode.systemImage)
-                                }
-                            }
-                        }
-
-                        if !settings.everythingSearchEnabled {
-                            Divider()
                             Button {
-                                showingEverythingSearchAlert = true
+                                Self.debugLog("🔘 Button tapped for mode: \(mode.rawValue)")
+                                viewModel.searchMode = mode
+                                Self.debugLog("🔘 After setting, viewModel.searchMode is: \(viewModel.searchMode.rawValue)")
                             } label: {
-                                Label("Enable Everything Search...", systemImage: "sparkle.magnifyingglass")
+                                Label(mode.rawValue, systemImage: mode.systemImage)
                             }
                         }
                     } label: {
@@ -281,16 +258,6 @@ struct ContentView: View {
         .focusedSceneValue(\.viewModel, viewModel)
         .sheet(item: $showingInfoItem) { item in
             FileInfoView(item: item)
-        }
-        .alert("Enable Everything Search", isPresented: $showingEverythingSearchAlert) {
-            Button("Enable") {
-                settings.everythingSearchEnabled = true
-                // Open Settings to Search tab so user can monitor progress
-                NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
-            }
-            Button("Cancel", role: .cancel) { }
-        } message: {
-            Text("Everything Search indexes your entire filesystem for instant searches.\n\nThis requires a one-time indexing process that runs in the background. You can monitor progress in Settings > Search.")
         }
         .onReceive(NotificationCenter.default.publisher(for: .showGetInfo)) { notification in
             if let item = notification.object as? FileItem {
@@ -742,10 +709,17 @@ struct TabContentWrapper: View {
     }
 
     // Generate a unique ID for view refresh that includes archive state and search results
+    // Note: Don't include navigationGeneration for scroll-preserving views (CoverFlow, Masonry)
+    // to prevent scroll position reset during refresh
     private var contentViewId: String {
         let archiveId = viewModel.isInsideArchive ? "-archive-\(viewModel.currentArchivePath)" : ""
         let searchId = "-\(viewModel.searchMode.rawValue)-\(viewModel.searchResults.count)"
-        return "\(viewModel.currentPath.path)-\(selectedTabId)\(archiveId)\(searchId)-\(viewModel.navigationGeneration)"
+        return "\(viewModel.currentPath.path)-\(selectedTabId)\(archiveId)\(searchId)"
+    }
+
+    // Full content view ID including navigation generation - use for views that should reset on navigation
+    private var fullContentViewId: String {
+        return "\(contentViewId)-\(viewModel.navigationGeneration)"
     }
 
     @ViewBuilder
@@ -791,46 +765,6 @@ extension FocusedValues {
 
 // Tab notification names are defined in UIConstants.swift
 
-// Indexing progress overlay
-struct IndexingOverlayView: View {
-    let progress: Double
-    let fileCount: Int
-    let isLoadingCache: Bool
-
-    var body: some View {
-        VStack(spacing: 16) {
-            ProgressView()
-                .scaleEffect(1.5)
-
-            Text(isLoadingCache ? "Loading Search Index..." : "Building Search Index...")
-                .font(.headline)
-
-            if isLoadingCache {
-                Text("Please wait while the index loads")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-            } else {
-                Text("\(fileCount.formatted()) files indexed")
-                    .font(.subheadline)
-                    .foregroundColor(.secondary)
-
-                if progress > 0 && progress < 1 {
-                    ProgressView(value: progress)
-                        .frame(width: 200)
-                }
-
-                Text("Search will be available once indexing completes.\nYou can monitor progress in Settings > Search.")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .multilineTextAlignment(.center)
-            }
-        }
-        .padding(32)
-        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
-        .shadow(radius: 10)
-    }
-}
-
 // Native macOS search field
 struct SearchField: NSViewRepresentable {
     @Binding var text: String
@@ -844,6 +778,18 @@ struct SearchField: NSViewRepresentable {
         searchField.action = #selector(Coordinator.searchFieldAction(_:))
         searchField.sendsSearchStringImmediately = true
         searchField.sendsWholeSearchString = false
+
+        // Store reference for focus handling
+        context.coordinator.searchField = searchField
+
+        // Listen for focus notification
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(Coordinator.focusSearchField),
+            name: .focusSearch,
+            object: nil
+        )
+
         return searchField
     }
 
@@ -866,9 +812,30 @@ struct SearchField: NSViewRepresentable {
 
     class Coordinator: NSObject, NSSearchFieldDelegate {
         var parent: SearchField
+        weak var searchField: NSSearchField?
 
         init(_ parent: SearchField) {
             self.parent = parent
+        }
+
+        deinit {
+            NotificationCenter.default.removeObserver(self)
+        }
+
+        @objc func focusSearchField() {
+            guard let searchField = searchField,
+                  let window = searchField.window else { return }
+            window.makeFirstResponder(searchField)
+        }
+
+        // Handle Escape key to unfocus the search field
+        func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
+                // Escape pressed - resign first responder
+                control.window?.makeFirstResponder(nil)
+                return true
+            }
+            return false
         }
 
         func controlTextDidChange(_ obj: Notification) {
