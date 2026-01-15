@@ -94,7 +94,7 @@ struct ContentView: View {
 
     private var viewModePickerWidth: CGFloat {
         let count = CGFloat(ViewMode.allCases.count)
-        return min(420, max(260, count * 48))
+        return min(380, max(220, count * 40))
     }
 
     init() {
@@ -299,6 +299,7 @@ struct ContentView: View {
             navHistoryCount = newHistory.count
         }
         .background(QuickLookWindowController())
+        .background(LiquidGlassWindowConfigurator())
     }
 
     // MARK: - Tab Management
@@ -368,10 +369,23 @@ struct FileItemContextMenu: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     var onRename: (FileItem) -> Void
 
+    private var isPackage: Bool {
+        let packageExtensions = ["app", "bundle", "framework", "plugin", "kext", "prefPane", "qlgenerator", "saver", "wdgt", "xpc"]
+        let ext = item.url.pathExtension.lowercased()
+        return packageExtensions.contains(ext) || NSWorkspace.shared.isFilePackage(atPath: item.url.path)
+    }
+
     var body: some View {
         Group {
             Button("Open") {
                 viewModel.openItem(item)
+            }
+
+            // Show Package Contents option for bundles like .app
+            if isPackage {
+                Button("Show Package Contents") {
+                    viewModel.navigateTo(item.url)
+                }
             }
 
             Button("Open With...") {
@@ -868,6 +882,86 @@ struct SearchField: NSViewRepresentable {
                 parent.text = newValue
             }
         }
+    }
+}
+
+// MARK: - Liquid Glass Window Configurator
+
+/// Placeholder - Liquid Glass effect is now applied via FeatheredBlurOverlay in scroll views
+struct LiquidGlassWindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        NSView()
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
+}
+
+// MARK: - Feathered Blur Overlay
+
+/// A SwiftUI view that creates the feathered blur effect at the top of scroll content.
+/// Uses NSVisualEffectView with withinWindow blending and a gradient mask.
+struct FeatheredBlurOverlay: NSViewRepresentable {
+    let height: CGFloat
+
+    init(height: CGFloat = 60) {
+        self.height = height
+    }
+
+    func makeNSView(context: Context) -> NSVisualEffectView {
+        let blurView = NSVisualEffectView()
+        blurView.material = .headerView
+        blurView.blendingMode = .withinWindow
+        blurView.state = .active
+        blurView.wantsLayer = true
+
+        // Create and apply the gradient mask
+        blurView.maskImage = createFeatheredMask(height: height)
+
+        return blurView
+    }
+
+    func updateNSView(_ nsView: NSVisualEffectView, context: Context) {
+        // Update mask if height changes
+        nsView.maskImage = createFeatheredMask(height: height)
+    }
+
+    private func createFeatheredMask(height: CGFloat) -> NSImage {
+        let maskImage = NSImage(size: NSSize(width: 1, height: height))
+
+        maskImage.lockFocus()
+
+        // Gradient from opaque at top to transparent at bottom
+        let gradient = NSGradient(colors: [
+            NSColor(white: 0.0, alpha: 1.0),  // Full blur at top
+            NSColor(white: 0.0, alpha: 0.5),  // Fading
+            NSColor(white: 0.0, alpha: 0.0)   // No blur at bottom
+        ], atLocations: [0.0, 0.4, 1.0], colorSpace: .deviceGray)
+
+        gradient?.draw(in: NSRect(x: 0, y: 0, width: 1, height: height), angle: 270)
+
+        maskImage.unlockFocus()
+
+        maskImage.resizingMode = .stretch
+        return maskImage
+    }
+}
+
+/// View modifier that adds the feathered blur overlay at the top of a view
+struct FeatheredBlurModifier: ViewModifier {
+    let height: CGFloat
+
+    func body(content: Content) -> some View {
+        content.overlay(alignment: .top) {
+            FeatheredBlurOverlay(height: height)
+                .frame(height: height)
+                .allowsHitTesting(false)  // Pass through mouse events
+        }
+    }
+}
+
+extension View {
+    /// Adds a feathered blur effect at the top of the view (Liquid Glass style)
+    func featheredTopBlur(height: CGFloat = 60) -> some View {
+        modifier(FeatheredBlurModifier(height: height))
     }
 }
 

@@ -127,6 +127,7 @@ struct IconGridView: View {
                     }
                     .padding(20)
                 }
+                .scrollEdgeEffectStyle(.soft, for: .top)
                 .onAppear {
                     currentWidth = geometry.size.width
                     // Scroll to selected item when view appears (e.g., when switching view modes)
@@ -153,6 +154,7 @@ struct IconGridView: View {
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
+        .featheredTopBlur(height: 50)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
             return true

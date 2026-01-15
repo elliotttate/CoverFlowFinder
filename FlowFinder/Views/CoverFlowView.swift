@@ -157,6 +157,11 @@ struct CoverFlowView: View {
                     onDelete: {
                         viewModel.deleteSelectedItems()
                     },
+                    onShowPackageContents: { index in
+                        if index < sortedItemsCache.count {
+                            viewModel.navigateTo(sortedItemsCache[index].url)
+                        }
+                    },
                     onQuickLook: { item in
                         viewModel.previewURL(for: item) { previewURL in
                             guard let previewURL = previewURL else {
@@ -774,6 +779,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onCut: () -> Void
     let onPaste: () -> Void
     let onDelete: () -> Void
+    let onShowPackageContents: (Int) -> Void
     let onQuickLook: (FileItem) -> Void
 
     private static var viewInstanceCount = 0
@@ -794,6 +800,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.onCut = onCut
         view.onPaste = onPaste
         view.onDelete = onDelete
+        view.onShowPackageContents = onShowPackageContents
         view.onQuickLook = onQuickLook
         view.selectedItems = selectedItems
         view.coverScale = coverScale
@@ -818,6 +825,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         nsView.onCut = onCut
         nsView.onPaste = onPaste
         nsView.onDelete = onDelete
+        nsView.onShowPackageContents = onShowPackageContents
         nsView.onQuickLook = onQuickLook
         nsView.selectedItems = selectedItems
         nsView.coverScale = coverScale
@@ -842,6 +850,7 @@ class CoverFlowNSView: NSView {
     var onCut: (() -> Void)?
     var onPaste: (() -> Void)?
     var onDelete: (() -> Void)?
+    var onShowPackageContents: ((Int) -> Void)?
     var onQuickLook: ((FileItem) -> Void)?
     var selectedItems: Set<FileItem> = []  // Track multi-selection for drag
 
@@ -1567,7 +1576,23 @@ class CoverFlowNSView: NSView {
     override func menu(for event: NSEvent) -> NSMenu? {
         let location = convert(event.locationInWindow, from: nil)
         let index = hitTestCover(at: location) ?? selectedIndex
+        debugWriteToFile("[CoverFlow] menu(for:) called, index: \(index), items count: \(items.count)")
         return createContextMenu(for: index)
+    }
+
+    private func debugWriteToFile(_ message: String) {
+        let logPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/flowfinder_context_debug.log")
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "[\(timestamp)] \(message)\n"
+        if FileManager.default.fileExists(atPath: logPath.path) {
+            if let handle = try? FileHandle(forWritingTo: logPath) {
+                handle.seekToEndOfFile()
+                handle.write(line.data(using: .utf8)!)
+                handle.closeFile()
+            }
+        } else {
+            try? line.write(to: logPath, atomically: true, encoding: .utf8)
+        }
     }
 
     private func showContextMenu(for index: Int, with event: NSEvent) {
@@ -1586,6 +1611,18 @@ class CoverFlowNSView: NSView {
         openItem.target = self
         openItem.representedObject = index
         menu.addItem(openItem)
+
+        // Show Package Contents for bundles like .app
+        if let item = item {
+            let isPkg = isPackage(item)
+            debugWriteToFile("[CoverFlow] Context menu for: \(item.name), ext: \(item.url.pathExtension), isPackage: \(isPkg)")
+            if isPkg {
+                let packageItem = NSMenuItem(title: "Show Package Contents", action: #selector(menuShowPackageContents(_:)), keyEquivalent: "")
+                packageItem.target = self
+                packageItem.representedObject = index
+                menu.addItem(packageItem)
+            }
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -1647,6 +1684,21 @@ class CoverFlowNSView: NSView {
                 NSWorkspace.shared.activateFileViewerSelecting([item.url])
             }
         }
+    }
+
+    @objc private func menuShowPackageContents(_ sender: NSMenuItem) {
+        if selectedIndex >= 0 && selectedIndex < items.count {
+            onShowPackageContents?(selectedIndex)
+        }
+    }
+
+    private func isPackage(_ item: FileItem) -> Bool {
+        let packageExtensions = ["app", "bundle", "framework", "plugin", "kext", "prefPane", "qlgenerator", "saver", "wdgt", "xpc"]
+        let ext = item.url.pathExtension.lowercased()
+        let byExt = packageExtensions.contains(ext)
+        let byWorkspace = NSWorkspace.shared.isFilePackage(atPath: item.url.path)
+        debugWriteToFile("[CoverFlow] isPackage: \(item.name), ext: '\(ext)', byExt: \(byExt), byWorkspace: \(byWorkspace)")
+        return byExt || byWorkspace
     }
 
     // Make sure we become first responder when view appears and on any click

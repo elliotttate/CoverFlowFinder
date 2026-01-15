@@ -301,6 +301,7 @@ struct MasonryView: View {
                     .padding(.horizontal, sidePadding)
                     .padding(.vertical, sidePadding)
                 }
+                .scrollEdgeEffectStyle(.soft, for: .top)
                 .onAppear {
                     currentWidth = geometry.size.width
                     refreshThumbnailTargetSize()
@@ -347,6 +348,7 @@ struct MasonryView: View {
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
+        .featheredTopBlur(height: 50)
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)
             return true
