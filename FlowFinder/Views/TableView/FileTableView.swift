@@ -1114,6 +1114,13 @@ extension FileTableCoordinator: NSMenuDelegate {
         openItem.target = self
         menu.addItem(openItem)
 
+        // Show Package Contents (for .app, .bundle, etc.)
+        if isPackage(item) {
+            let packageItem = NSMenuItem(title: "Show Package Contents", action: #selector(menuShowPackageContents(_:)), keyEquivalent: "")
+            packageItem.target = self
+            menu.addItem(packageItem)
+        }
+
         // Open With...
         let openWithItem = NSMenuItem(title: "Open With...", action: #selector(menuOpenWith(_:)), keyEquivalent: "")
         openWithItem.target = self
@@ -1345,6 +1352,22 @@ extension FileTableCoordinator: NSMenuDelegate {
 
     @objc private func menuShowCurrentFolderInFinder(_ sender: NSMenuItem) {
         NSWorkspace.shared.activateFileViewerSelecting([viewModel.currentPath])
+    }
+
+    @objc private func menuShowPackageContents(_ sender: NSMenuItem) {
+        guard let tableView = tableView else { return }
+        let row = tableView.clickedRow
+        guard row >= 0, row < items.count else { return }
+        let item = items[row]
+        viewModel.showPackageContents(item)
+    }
+
+    // MARK: - Package Detection
+
+    private func isPackage(_ item: FileItem) -> Bool {
+        let packageExtensions = ["app", "bundle", "framework", "plugin", "kext", "prefPane", "qlgenerator", "saver", "wdgt", "xpc"]
+        let ext = item.url.pathExtension.lowercased()
+        return packageExtensions.contains(ext) || NSWorkspace.shared.isFilePackage(atPath: item.url.path)
     }
 }
 

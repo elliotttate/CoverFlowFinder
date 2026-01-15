@@ -1761,7 +1761,11 @@ class FileBrowserViewModel: ObservableObject {
             return
         }
 
-        if item.isDirectory {
+        // Check if this is a package/bundle (like .app) - should be opened, not navigated into
+        if NSWorkspace.shared.isFilePackage(atPath: item.url.path) {
+            NSWorkspace.shared.open(item.url)
+        } else if item.isDirectory {
+            // Regular directory - navigate into it
             // Clear search when navigating to a folder from search results
             if searchMode != .filter && !searchText.isEmpty {
                 searchText = ""
@@ -1772,6 +1776,18 @@ class FileBrowserViewModel: ObservableObject {
         } else {
             NSWorkspace.shared.open(item.url)
         }
+    }
+
+    /// Show the contents of a package/bundle (navigate into it like a folder)
+    func showPackageContents(_ item: FileItem) {
+        cancelPendingRename()
+        // Clear search when navigating into package
+        if searchMode != .filter && !searchText.isEmpty {
+            searchText = ""
+            searchResults = []
+        }
+        enteredFolderURL = item.url
+        navigateTo(item.url)
     }
 
     // MARK: - Archive Navigation
