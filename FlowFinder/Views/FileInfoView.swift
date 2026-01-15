@@ -35,6 +35,7 @@ struct FileInfoView: View {
                 }
                 .buttonStyle(.plain)
                 .keyboardShortcut(.escape, modifiers: [])
+                .focusable(false)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)

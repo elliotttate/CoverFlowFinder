@@ -974,7 +974,7 @@ struct MasonryItemView: View {
 
         VStack(alignment: .center, spacing: 6) {
             // Image/icon area - clicks here don't trigger rename
-            ZStack {
+            ZStack(alignment: .topTrailing) {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Color(nsColor: .textBackgroundColor).opacity(0.6))
 
@@ -990,6 +990,14 @@ struct MasonryItemView: View {
                         .scaledToFit()
                         .frame(width: iconSize, height: iconSize)
                         .foregroundColor(.primary)
+                }
+
+                // Cloud status badge
+                if let cloudStatus = item.cloudStatus, cloudStatus.shouldShowBadge {
+                    CloudStatusBadgeView(status: cloudStatus, size: 14)
+                        .padding(6)
+                        .background(Color(nsColor: .windowBackgroundColor).opacity(0.9))
+                        .clipShape(Circle())
                 }
             }
             .frame(width: columnWidth, height: imageHeight)

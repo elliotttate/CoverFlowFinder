@@ -236,6 +236,8 @@ class FileBrowserViewModel: ObservableObject {
     private var directoryLoadToken = UUID()
     /// Track which items have had their metadata loaded
     private var hydratedURLs: Set<URL> = []
+    /// Track which items have had their cloud status loaded
+    private var cloudStatusLoadedURLs: Set<URL> = []
     /// Flag to prevent redundant reloads during navigation
     private var isNavigating = false
     /// Queue for metadata hydration requests
@@ -517,6 +519,7 @@ class FileBrowserViewModel: ObservableObject {
         isLoading = true
         items = []
         hydratedURLs.removeAll()
+        cloudStatusLoadedURLs.removeAll()
         pendingHydrationURLs.removeAll()
         let pathToLoad = currentPath
         let listingURL = resolvedListingURL(for: pathToLoad)
@@ -678,6 +681,7 @@ class FileBrowserViewModel: ObservableObject {
         isLoading = true
         items = []
         hydratedURLs.removeAll()
+        cloudStatusLoadedURLs.removeAll()
         pendingHydrationURLs.removeAll()
         navigationGeneration += 1
         discoveredSMBHosts = []
@@ -914,6 +918,98 @@ class FileBrowserViewModel: ObservableObject {
     /// Check if an item needs metadata hydration
     func needsHydration(_ item: FileItem) -> Bool {
         !item.hasMetadata && !hydratedURLs.contains(item.url)
+    }
+
+    // MARK: - Cloud Status Hydration
+
+    /// Request cloud status loading for specific items (call from visible row detection)
+    func hydrateCloudStatus(for urls: [URL]) {
+        let urlsToHydrate = urls.filter {
+            !cloudStatusLoadedURLs.contains($0) &&
+            CloudStatusManager.shared.isInICloud($0)
+        }
+        guard !urlsToHydrate.isEmpty else { return }
+
+        let loadToken = directoryLoadToken
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+
+            var updates: [(URL, CloudSyncStatus)] = []
+            for url in urlsToHydrate {
+                // Check if still valid
+                guard DispatchQueue.main.sync(execute: { self.directoryLoadToken == loadToken }) else { return }
+                let status = CloudStatusManager.shared.getStatus(for: url)
+                updates.append((url, status))
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self,
+                      self.directoryLoadToken == loadToken else { return }
+
+                var updatedItems = self.items
+                let indicesByURL = Dictionary(uniqueKeysWithValues: updatedItems.enumerated().map { ($0.element.url, $0.offset) })
+                var didUpdate = false
+
+                for (url, status) in updates {
+                    self.cloudStatusLoadedURLs.insert(url)
+                    if let index = indicesByURL[url] {
+                        updatedItems[index] = updatedItems[index].withCloudStatus(status)
+                        didUpdate = true
+                    }
+                }
+
+                if didUpdate {
+                    self.items = updatedItems
+                    NotificationCenter.default.post(name: .cloudStatusHydrationCompleted, object: nil)
+                }
+            }
+        }
+    }
+
+    /// Check if an item needs cloud status hydration
+    func needsCloudStatusHydration(_ item: FileItem) -> Bool {
+        item.isInICloud && item.cloudStatus == nil && !cloudStatusLoadedURLs.contains(item.url)
+    }
+
+    /// Download an iCloud item to make it available locally
+    func downloadCloudItem(_ item: FileItem) {
+        guard item.cloudStatus?.canDownload == true else { return }
+
+        do {
+            try CloudStatusManager.shared.downloadItem(at: item.url)
+            // Refresh the item's status
+            cloudStatusLoadedURLs.remove(item.url)
+            hydrateCloudStatus(for: [item.url])
+        } catch {
+            // Show error alert
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Download Failed"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.runModal()
+            }
+        }
+    }
+
+    /// Evict (remove local copy of) an iCloud item to free up space
+    func evictCloudItem(_ item: FileItem) {
+        guard item.cloudStatus?.canEvict == true else { return }
+
+        do {
+            try CloudStatusManager.shared.evictItem(at: item.url)
+            // Refresh the item's status
+            cloudStatusLoadedURLs.remove(item.url)
+            hydrateCloudStatus(for: [item.url])
+        } catch {
+            DispatchQueue.main.async {
+                let alert = NSAlert()
+                alert.messageText = "Remove Download Failed"
+                alert.informativeText = error.localizedDescription
+                alert.alertStyle = .warning
+                alert.runModal()
+            }
+        }
     }
 
     // MARK: - Directory Watching

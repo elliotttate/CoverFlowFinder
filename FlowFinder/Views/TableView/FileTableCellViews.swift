@@ -498,3 +498,87 @@ final class TagBadgeView: NSView {
         layer?.backgroundColor = tagColor.withAlphaComponent(0.3).cgColor
     }
 }
+
+// MARK: - Cloud Status Badge View (AppKit)
+
+/// AppKit cloud status badge for table view cells
+final class CloudStatusBadgeNSView: NSView {
+    private let imageView = NSImageView()
+
+    var status: CloudSyncStatus? {
+        didSet { updateDisplay() }
+    }
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupViews()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupViews()
+    }
+
+    private func setupViews() {
+        translatesAutoresizingMaskIntoConstraints = false
+
+        imageView.translatesAutoresizingMaskIntoConstraints = false
+        imageView.imageScaling = .scaleProportionallyUpOrDown
+        addSubview(imageView)
+
+        NSLayoutConstraint.activate([
+            imageView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            imageView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            imageView.widthAnchor.constraint(equalToConstant: 14),
+            imageView.heightAnchor.constraint(equalToConstant: 14)
+        ])
+    }
+
+    private func updateDisplay() {
+        guard let status = status, status.shouldShowBadge else {
+            imageView.image = nil
+            isHidden = true
+            return
+        }
+
+        isHidden = false
+        let config = NSImage.SymbolConfiguration(pointSize: 12, weight: .medium)
+        imageView.image = NSImage(systemSymbolName: status.systemImage, accessibilityDescription: status.description)?
+            .withSymbolConfiguration(config)
+        imageView.contentTintColor = status.color
+        toolTip = status.description
+    }
+}
+
+// MARK: - Cloud Status Cell View (for dedicated column)
+
+/// Table cell view that displays only the cloud status badge
+final class CloudStatusCellView: NSTableCellView {
+    private let badgeView = CloudStatusBadgeNSView()
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        setupViews()
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        setupViews()
+    }
+
+    private func setupViews() {
+        badgeView.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(badgeView)
+
+        NSLayoutConstraint.activate([
+            badgeView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            badgeView.centerYAnchor.constraint(equalTo: centerYAnchor),
+            badgeView.widthAnchor.constraint(equalToConstant: 20),
+            badgeView.heightAnchor.constraint(equalToConstant: 20)
+        ])
+    }
+
+    func configure(item: FileItem) {
+        badgeView.status = item.cloudStatus
+    }
+}

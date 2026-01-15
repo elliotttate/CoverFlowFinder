@@ -206,6 +206,20 @@ struct FileItem: Identifiable, Hashable, Transferable {
     let archiveURL: URL?
     let archivePath: String?
 
+    // iCloud status (loaded on demand)
+    var cloudStatus: CloudSyncStatus?
+
+    /// Whether this file is in an iCloud container
+    var isInICloud: Bool {
+        guard !isFromArchive else { return false }
+        return CloudStatusManager.shared.isInICloud(url)
+    }
+
+    /// Formatted cloud status description for display
+    var formattedCloudStatus: String {
+        cloudStatus?.description ?? ""
+    }
+
     /// Get tags for this file (reads from filesystem each time)
     var tags: [String] {
         guard !isFromArchive else { return [] }
@@ -333,6 +347,9 @@ struct FileItem: Identifiable, Hashable, Transferable {
         } else {
             self.fileType = .other
         }
+
+        // Cloud status is loaded on demand, not during init
+        self.cloudStatus = nil
     }
 
     /// Initialize from archive entry data (for ZIP file contents)
@@ -373,11 +390,25 @@ struct FileItem: Identifiable, Hashable, Transferable {
                 self.fileType = .other
             }
         }
+
+        // Archive items don't have cloud status
+        self.cloudStatus = nil
     }
 
     /// Return a copy of this item with full metadata loaded (reuses the same identity).
-    func hydrated() -> FileItem {
-        FileItem(url: url, id: id, loadMetadata: true)
+    func hydrated(includeCloudStatus: Bool = false) -> FileItem {
+        var item = FileItem(url: url, id: id, loadMetadata: true)
+        if includeCloudStatus && item.isInICloud {
+            item.cloudStatus = CloudStatusManager.shared.getStatus(for: url)
+        }
+        return item
+    }
+
+    /// Return a copy of this item with the specified cloud status
+    func withCloudStatus(_ status: CloudSyncStatus?) -> FileItem {
+        var copy = self
+        copy.cloudStatus = status
+        return copy
     }
 
     private static func determineFileType(from type: UTType) -> FileType {

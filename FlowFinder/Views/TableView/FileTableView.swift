@@ -573,7 +573,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             // NSTableView will toggle direction automatically on subsequent clicks
             let ascending: Bool
             switch settings.column {
-            case .name, .kind, .tags:
+            case .name, .kind, .tags, .cloudStatus:
                 ascending = true
             case .dateModified, .dateCreated, .size:
                 ascending = false
@@ -582,7 +582,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             let sortDescriptor = NSSortDescriptor(
                 key: settings.column.rawValue,
                 ascending: ascending,
-                selector: settings.column == .name || settings.column == .kind || settings.column == .tags
+                selector: settings.column == .name || settings.column == .kind || settings.column == .tags || settings.column == .cloudStatus
                     ? #selector(NSString.localizedStandardCompare(_:))
                     : nil
             )
@@ -740,6 +740,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             cellView = makeKindCell(for: item, tableView: tableView)
         case .tags:
             cellView = makeTagsCell(for: item, tableView: tableView)
+        case .cloudStatus:
+            cellView = makeCloudStatusCell(for: item, tableView: tableView)
         }
 
         return cellView
@@ -1144,6 +1146,15 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             ?? TagsCellView()
         cell.identifier = identifier
         cell.configure(item: item, appSettings: appSettings)
+        return cell
+    }
+
+    private func makeCloudStatusCell(for item: FileItem, tableView: NSTableView) -> NSTableCellView {
+        let identifier = NSUserInterfaceItemIdentifier("CloudStatusCell")
+        let cell = tableView.makeView(withIdentifier: identifier, owner: nil) as? CloudStatusCellView
+            ?? CloudStatusCellView()
+        cell.identifier = identifier
+        cell.configure(item: item)
         return cell
     }
 

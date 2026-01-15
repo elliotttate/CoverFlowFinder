@@ -557,7 +557,7 @@ struct IconGridItem: View {
 
         VStack(spacing: 8) {
             // Icon area - clicks here don't trigger rename
-            ZStack {
+            ZStack(alignment: .bottomTrailing) {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
                     .frame(width: backgroundSize, height: backgroundSize)
@@ -567,6 +567,15 @@ struct IconGridItem: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: iconSize, height: iconSize)
                     .cornerRadius(4)
+
+                // Cloud status badge
+                if let cloudStatus = item.cloudStatus, cloudStatus.shouldShowBadge {
+                    CloudStatusBadgeView(status: cloudStatus, size: 12)
+                        .padding(2)
+                        .background(Color(nsColor: .windowBackgroundColor).opacity(0.9))
+                        .clipShape(Circle())
+                        .offset(x: 4, y: 4)
+                }
             }
             .contentShape(Rectangle())
             .onTapGesture {

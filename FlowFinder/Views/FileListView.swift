@@ -166,3 +166,59 @@ struct TagBadge: View {
     }
 }
 
+// MARK: - Cloud Status Badge
+
+/// Displays iCloud sync status as an SF Symbol badge
+struct CloudStatusBadgeView: View {
+    let status: CloudSyncStatus?
+    var size: CGFloat = 14
+
+    var body: some View {
+        if let status = status, status.shouldShowBadge {
+            Image(systemName: status.systemImage)
+                .font(.system(size: size, weight: .medium))
+                .foregroundColor(status.swiftUIColor)
+                .help(status.description)
+        }
+    }
+}
+
+/// Progress indicator for downloading/uploading cloud items
+struct CloudProgressBadgeView: View {
+    let status: CloudSyncStatus
+    var size: CGFloat = 14
+
+    var body: some View {
+        switch status {
+        case .downloading(let progress), .uploading(let progress):
+            if let progress = progress {
+                CircularProgressView(progress: progress, size: size)
+            } else {
+                ProgressView()
+                    .scaleEffect(size / 20)
+                    .frame(width: size, height: size)
+            }
+        default:
+            EmptyView()
+        }
+    }
+}
+
+/// Circular progress indicator
+struct CircularProgressView: View {
+    let progress: Double
+    let size: CGFloat
+
+    var body: some View {
+        ZStack {
+            Circle()
+                .stroke(Color.gray.opacity(0.3), lineWidth: 2)
+            Circle()
+                .trim(from: 0, to: progress)
+                .stroke(Color.accentColor, lineWidth: 2)
+                .rotationEffect(.degrees(-90))
+        }
+        .frame(width: size, height: size)
+    }
+}
+

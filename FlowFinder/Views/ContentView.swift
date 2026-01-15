@@ -434,6 +434,29 @@ struct FileItemContextMenu: View {
                 Divider()
             }
 
+            // iCloud actions (only show for iCloud items)
+            if item.isInICloud && !item.isFromArchive {
+                if item.cloudStatus?.canDownload == true {
+                    Button("Download Now") {
+                        viewModel.downloadCloudItem(item)
+                    }
+                }
+
+                if item.cloudStatus?.canEvict == true {
+                    Button("Remove Download") {
+                        viewModel.evictCloudItem(item)
+                    }
+                }
+
+                if item.cloudStatus == .hasConflict {
+                    Button("Show in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([item.url])
+                    }
+                }
+
+                Divider()
+            }
+
             Button("Copy") {
                 viewModel.selectItem(item)
                 viewModel.copySelectedItems()

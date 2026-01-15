@@ -9,6 +9,7 @@ enum ListColumn: String, CaseIterable, Codable, Identifiable {
     case size = "Size"
     case kind = "Kind"
     case tags = "Tags"
+    case cloudStatus = "iCloud Status"
 
     var id: String { rawValue }
 
@@ -20,6 +21,7 @@ enum ListColumn: String, CaseIterable, Codable, Identifiable {
         case .size: return 90
         case .kind: return 110
         case .tags: return 120
+        case .cloudStatus: return 80
         }
     }
 
@@ -31,6 +33,7 @@ enum ListColumn: String, CaseIterable, Codable, Identifiable {
         case .size: return 60
         case .kind: return 70
         case .tags: return 80
+        case .cloudStatus: return 50
         }
     }
 
@@ -44,7 +47,7 @@ enum ListColumn: String, CaseIterable, Codable, Identifiable {
 
     var defaultSortDirection: SortDirection {
         switch self {
-        case .name, .kind, .tags:
+        case .name, .kind, .tags, .cloudStatus:
             return .ascending
         case .dateModified, .dateCreated, .size:
             return .descending
@@ -115,7 +118,8 @@ class ListColumnConfigManager: ObservableObject {
                 ColumnSettings(column: .size, isVisible: true),
                 ColumnSettings(column: .kind, isVisible: true),
                 ColumnSettings(column: .dateCreated, isVisible: false),
-                ColumnSettings(column: .tags, isVisible: false)
+                ColumnSettings(column: .tags, isVisible: false),
+                ColumnSettings(column: .cloudStatus, isVisible: false)
             ]
             self.sortColumn = .name
             self.sortDirection = .ascending
@@ -160,7 +164,8 @@ class ListColumnConfigManager: ObservableObject {
             ColumnSettings(column: .size, isVisible: true),
             ColumnSettings(column: .kind, isVisible: true),
             ColumnSettings(column: .dateCreated, isVisible: false),
-            ColumnSettings(column: .tags, isVisible: false)
+            ColumnSettings(column: .tags, isVisible: false),
+            ColumnSettings(column: .cloudStatus, isVisible: false)
         ]
         sortColumn = .name
         sortDirection = .ascending
@@ -219,6 +224,10 @@ class ListColumnConfigManager: ObservableObject {
                 let tags1 = FileTagManager.getTags(for: item1.url).joined(separator: ",")
                 let tags2 = FileTagManager.getTags(for: item2.url).joined(separator: ",")
                 comparison = tags1.localizedCaseInsensitiveCompare(tags2)
+            case .cloudStatus:
+                let status1 = item1.cloudStatus?.description ?? ""
+                let status2 = item2.cloudStatus?.description ?? ""
+                comparison = status1.localizedCaseInsensitiveCompare(status2)
             }
 
             if comparison == .orderedSame {

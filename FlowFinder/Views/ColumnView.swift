@@ -372,6 +372,11 @@ struct ColumnRowView: View {
         HStack(spacing: 8) {
             AsyncListIconView(item: item, size: appSettings.columnIconSizeValue)
 
+            // Cloud status badge (shown inline after icon)
+            if let cloudStatus = item.cloudStatus, cloudStatus.shouldShowBadge {
+                CloudStatusBadgeView(status: cloudStatus, size: 12)
+            }
+
             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.columnFont, alignment: .leading, lineLimit: 1)
 
             if appSettings.showItemTags, !item.tags.isEmpty {
