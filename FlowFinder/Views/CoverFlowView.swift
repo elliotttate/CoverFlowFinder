@@ -23,6 +23,7 @@ struct CoverFlowView: View {
     private let thumbnailLoadThrottle: TimeInterval = 0.016
     @State private var lastHydrationRange: Range<Int>? = nil
     @State private var itemsToken: Int = 0
+    @State private var userClearedSelection: Bool = false
 
     // Pending thumbnail updates - batched to reduce re-renders
     @State private var pendingThumbnailUpdates: [URL: NSImage] = [:]
@@ -127,6 +128,12 @@ struct CoverFlowView: View {
                         if index < sortedItemsCache.count {
                             viewModel.openItem(sortedItemsCache[index])
                         }
+                    },
+                    onDeselect: {
+                        userClearedSelection = true
+                        viewModel.selectedItems.removeAll()
+                        viewModel.cancelPendingRename()
+                        updateQuickLook(for: nil)
                     },
                     onRightClick: { index in
                         rightClickedIndex = index
@@ -234,7 +241,14 @@ struct CoverFlowView: View {
                     onOpen: { item in
                         viewModel.openItem(item)
                     },
-                    viewModel: viewModel
+                    viewModel: viewModel,
+                    onEmptySpaceClick: {
+                        // Click on empty space - deselect all
+                        userClearedSelection = true
+                        viewModel.selectedItems.removeAll()
+                        viewModel.cancelPendingRename()
+                        updateQuickLook(for: nil)
+                    }
                 )
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -415,15 +429,30 @@ struct CoverFlowView: View {
             viewModel.coverFlowSelectedIndex = safeIndex
         }
 
+        if !viewModel.selectedItems.isEmpty {
+            userClearedSelection = false
+        }
+
+        if viewModel.selectedItems.isEmpty {
+            if userClearedSelection {
+                Self.debugLog("[SELECTION] syncSelection: selection empty (user-cleared), preserving empty selection")
+                updateQuickLook(for: nil)
+                return
+            }
+            let item = sortedItemsCache[safeIndex]
+            Self.debugLog("[SELECTION] syncSelection: selection empty, auto-selecting item '\(item.name)' at index \(safeIndex)")
+            viewModel.selectedItems = [item]
+            updateQuickLook(for: item)
+            return
+        }
+
         if let selected = viewModel.selectedItems.first,
            let index = sortedItemsCache.firstIndex(of: selected) {
             Self.debugLog("[SELECTION] syncSelection: found selected item '\(selected.name)' at index \(index), setting coverFlowSelectedIndex")
             viewModel.coverFlowSelectedIndex = index
         } else {
-            // selectedItems is empty OR has an item that's not in sortedItemsCache (e.g., deleted)
-            // Auto-select the item at coverFlowSelectedIndex
             let item = sortedItemsCache[safeIndex]
-            Self.debugLog("[SELECTION] syncSelection: auto-selecting item '\(item.name)' at index \(safeIndex) (selectedItems.isEmpty=\(viewModel.selectedItems.isEmpty))")
+            Self.debugLog("[SELECTION] syncSelection: selected item missing, auto-selecting item '\(item.name)' at index \(safeIndex)")
             viewModel.selectedItems = [item]
             updateQuickLook(for: item)
         }
@@ -771,6 +800,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let scrollSensitivity: CGFloat
     let onSelect: (Int) -> Void
     let onOpen: (Int) -> Void
+    let onDeselect: () -> Void
     let onRightClick: (Int) -> Void
     let onDrop: ([URL]) -> Void
     let onDropToFolder: ([URL], URL) -> Void  // Drop to specific folder
@@ -790,6 +820,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         let view = CoverFlowNSView()
         view.onSelect = onSelect
         view.onOpen = onOpen
+        view.onDeselect = onDeselect
         view.onRightClick = { index, _ in
             onRightClick(index)
         }
@@ -815,6 +846,7 @@ struct CoverFlowContainer: NSViewRepresentable {
 
         nsView.onSelect = onSelect
         nsView.onOpen = onOpen
+        nsView.onDeselect = onDeselect
         nsView.onRightClick = { index, _ in
             onRightClick(index)
         }
@@ -844,6 +876,7 @@ struct CoverFlowContainer: NSViewRepresentable {
 class CoverFlowNSView: NSView {
     var onSelect: ((Int) -> Void)?
     var onOpen: ((Int) -> Void)?
+    var onDeselect: (() -> Void)?
     var onRightClick: ((Int, NSPoint) -> Void)?
     var onScrollStateChange: ((Bool) -> Void)?
     var onCopy: (() -> Void)?
@@ -1493,11 +1526,25 @@ class CoverFlowNSView: NSView {
         dragStartLocation = location
         dragStartIndex = hitTestCover(at: location)
 
-        if let index = dragStartIndex {
-            selectIndexLocally(index)
+        if let index = dragStartIndex, index < items.count {
+            let clickedItem = items[index]
+
+            // If clicking on an already-selected item (part of multi-selection),
+            // preserve the selection for potential multi-file drag
+            let isAlreadySelected = selectedItems.contains(clickedItem)
+
+            if !isAlreadySelected {
+                // Not part of existing selection - select just this item
+                selectIndexLocally(index)
+            }
+            // If already selected, don't change selection - allows dragging multiple items
+
             lastClickTime = now
             lastClickIndex = index
             lastClickLocation = location
+        } else {
+            // Clicked on empty space - deselect all
+            onDeselect?()
         }
     }
 
@@ -1548,6 +1595,9 @@ class CoverFlowNSView: NSView {
                 draggingItem.setDraggingFrame(NSRect(origin: itemLocation, size: iconSize), contents: dragImage)
                 draggingItems.append(draggingItem)
             }
+
+            // Mark internal drag as active to suppress drop overlays
+            InternalDragState.shared.isDragging = true
 
             _ = beginDraggingSession(with: draggingItems, event: event, source: self)
 
@@ -1727,6 +1777,22 @@ class CoverFlowNSView: NSView {
                 object: window
             )
         }
+
+        // Observe focus file list notification (e.g., after Escape from search)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleFocusFileList(_:)),
+            name: .focusFileList,
+            object: nil
+        )
+    }
+
+    @objc private func handleFocusFileList(_ notification: Notification) {
+        // Focus this view when requested (e.g., after pressing Escape in search field)
+        // Only take focus if we're actually visible in the window
+        guard let window = window,
+              visibleRect.size.height > 0 else { return }
+        window.makeFirstResponder(self)
     }
 
     @objc private func windowDidUpdate(_ notification: Notification) {
@@ -2122,6 +2188,11 @@ class CoverFlowNSView: NSView {
 
     // MARK: - NSDraggingDestination
 
+    // Enable periodic updates for auto-scroll during drag (Finder-style)
+    override func wantsPeriodicDraggingUpdates() -> Bool {
+        return true
+    }
+
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         isDropTargeted = true
         updateDropTarget(from: sender)
@@ -2130,7 +2201,41 @@ class CoverFlowNSView: NSView {
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
         updateDropTarget(from: sender)
+
+        // Auto-scroll when dragging near edges (Finder-style)
+        performAutoScroll(for: sender)
+
         return currentDragOperation()
+    }
+
+    // MARK: - Auto-Scroll During Drag
+
+    private let autoScrollEdgeThreshold: CGFloat = 80  // Distance from edge to trigger scroll
+    private var lastAutoScrollTime: Date = .distantPast
+    private let autoScrollInterval: TimeInterval = 0.15  // Interval between auto-scroll steps
+
+    private func performAutoScroll(for sender: NSDraggingInfo) {
+        let location = convert(sender.draggingLocation, from: nil)
+        let viewWidth = bounds.width
+
+        // Throttle auto-scroll to prevent too-fast scrolling
+        let now = Date()
+        guard now.timeIntervalSince(lastAutoScrollTime) >= autoScrollInterval else { return }
+
+        // Check if near left or right edges
+        if location.x < autoScrollEdgeThreshold && selectedIndex > 0 {
+            // Near left edge - scroll left (previous item)
+            lastAutoScrollTime = now
+            selectedIndex -= 1
+            animateToSelection()
+            onSelect?(selectedIndex)
+        } else if location.x > viewWidth - autoScrollEdgeThreshold && selectedIndex < items.count - 1 {
+            // Near right edge - scroll right (next item)
+            lastAutoScrollTime = now
+            selectedIndex += 1
+            animateToSelection()
+            onSelect?(selectedIndex)
+        }
     }
 
     private func currentDragOperation() -> NSDragOperation {
@@ -2374,6 +2479,7 @@ extension CoverFlowNSView: NSDraggingSource {
         guard let window = window else {
             clearDropTargetHighlight()
             dropTargetIndex = nil
+            InternalDragState.shared.isDragging = false
             return
         }
 
@@ -2409,6 +2515,9 @@ extension CoverFlowNSView: NSDraggingSource {
 
         clearDropTargetHighlight()
         dropTargetIndex = nil
+
+        // Clear internal drag state
+        InternalDragState.shared.isDragging = false
     }
 }
 
@@ -2456,6 +2565,7 @@ struct FileListSection: View {
     let onSelect: (FileItem, Int) -> Void
     let onOpen: (FileItem) -> Void
     @ObservedObject var viewModel: FileBrowserViewModel
+    var onEmptySpaceClick: (() -> Void)? = nil
     @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
     @State private var isDropTargeted = false
@@ -2466,7 +2576,8 @@ struct FileListSection: View {
             columnConfig: columnConfig,
             appSettings: appSettings,
             items: items,
-            tagRefreshToken: viewModel.tagRefreshToken
+            tagRefreshToken: viewModel.tagRefreshToken,
+            onEmptySpaceClick: onEmptySpaceClick
         )
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
             handleDrop(providers: providers)

@@ -5,6 +5,7 @@ import Quartz
 struct FileListView: View {
     @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
+    @ObservedObject private var internalDragState = InternalDragState.shared
     let items: [FileItem]
     @ObservedObject private var columnConfig = ListColumnConfigManager.shared
     @State private var isDropTargeted = false
@@ -22,7 +23,7 @@ struct FileListView: View {
             handleDrop(providers: providers)
             return true
         }
-        .dropTargetOverlay(isTargeted: isDropTargeted)
+        .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging)
         .allowsHitTesting(true)
         .onChange(of: viewModel.selectedItems) { newSelection in
             if let firstSelected = newSelection.first {

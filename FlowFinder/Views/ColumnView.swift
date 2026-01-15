@@ -297,25 +297,7 @@ struct SingleColumnView: View {
                             .stroke(Color.accentColor, lineWidth: 2)
                             .opacity(dropTargetedItemID == item.id ? 1 : 0)
                     )
-                    .onDrag {
-                        guard !item.isFromArchive else { return NSItemProvider() }
-
-                        // Check if this item is part of a multi-selection
-                        let itemsToDrag: [FileItem]
-                        if viewModel.selectedItems.contains(item) && viewModel.selectedItems.count > 1 {
-                            itemsToDrag = Array(viewModel.selectedItems).filter { !$0.isFromArchive }
-                        } else {
-                            itemsToDrag = [item]
-                        }
-
-                        // Write all URLs to the pasteboard for multi-selection drag
-                        let urls = itemsToDrag.map { $0.url as NSURL }
-                        let pasteboard = NSPasteboard(name: .drag)
-                        pasteboard.clearContents()
-                        pasteboard.writeObjects(urls)
-
-                        return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
-                    }
+                    .internalDrag(url: item.url)
                     .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
                         item: item,
                         viewModel: viewModel,
@@ -511,10 +493,14 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
     @Binding var isColumnDropTargeted: Bool
 
     func validateDrop(info: DropInfo) -> Bool {
+        // Don't accept drops during internal drag operations
+        if InternalDragState.shared.isDragging { return false }
         return !viewModel.isInsideArchive && info.hasItemsConforming(to: [.fileURL])
     }
 
     func dropEntered(info: DropInfo) {
+        // Don't show drop target during internal drags
+        if InternalDragState.shared.isDragging { return }
         if dropTargetedItemID == nil {
             isColumnDropTargeted = true
         }
@@ -525,6 +511,11 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
+        // Don't show drop indicator during internal drags
+        if InternalDragState.shared.isDragging {
+            isColumnDropTargeted = false
+            return DropProposal(operation: .forbidden)
+        }
         guard !viewModel.isInsideArchive else {
             isColumnDropTargeted = false
             return DropProposal(operation: .forbidden)
@@ -540,6 +531,8 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        // Don't accept drops during internal drag operations
+        if InternalDragState.shared.isDragging { return false }
         // If hovering over a folder, that delegate handles it
         guard dropTargetedItemID == nil, !viewModel.isInsideArchive else { return false }
 

@@ -8,6 +8,7 @@ struct QuadPaneView: View {
     @ObservedObject var topRightViewModel: FileBrowserViewModel
     @ObservedObject var bottomLeftViewModel: FileBrowserViewModel
     @ObservedObject var bottomRightViewModel: FileBrowserViewModel
+    @ObservedObject private var internalDragState = InternalDragState.shared
     @Binding var activePane: Pane
 
     @State private var topLeftViewMode: PaneViewMode = .list
@@ -239,6 +240,7 @@ struct QuadPaneView: View {
 struct QuadPaneCell: View {
     @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
+    @ObservedObject private var internalDragState = InternalDragState.shared
     let otherViewModels: [FileBrowserViewModel]
     let isActive: Bool
     @Binding var paneViewMode: QuadPaneView.PaneViewMode
@@ -378,7 +380,7 @@ struct QuadPaneCell: View {
                 handleDrop(providers: providers)
                 return true
             }
-            .dropTargetOverlay(isTargeted: isDropTargeted, cornerRadius: UI.CornerRadius.medium, lineWidth: UI.LineWidth.standard, padding: UI.Spacing.tiny)
+            .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging, cornerRadius: UI.CornerRadius.medium, lineWidth: UI.LineWidth.standard, padding: UI.Spacing.tiny)
 
             Divider()
 
@@ -527,10 +529,7 @@ struct QuadPaneListRow: View {
         .contentShape(Rectangle())
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
-        .onDrag {
-            guard !item.isFromArchive else { return NSItemProvider() }
-            return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
-        }
+        .internalDrag(url: item.url)
         .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
@@ -732,10 +731,7 @@ struct QuadPaneIconCell: View {
         .contentShape(Rectangle())
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
-        .onDrag {
-            guard !item.isFromArchive else { return NSItemProvider() }
-            return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
-        }
+        .internalDrag(url: item.url)
         .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,

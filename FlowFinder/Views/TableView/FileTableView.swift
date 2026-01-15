@@ -2,6 +2,74 @@ import AppKit
 import SwiftUI
 import Combine
 
+// MARK: - Custom Scroll View for Empty Space Click Detection
+
+// Custom clip view that handles clicks in empty space below table rows
+final class TableClipView: NSClipView {
+    weak var coordinator: FileTableCoordinator?
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+
+        // Check if click is in empty space (below the document view's content)
+        if let documentView = documentView {
+            let docFrame = documentView.frame
+
+            // In a flipped clip view, check if click Y is beyond document content
+            // documentView frame origin.y is the scroll position (negative when scrolled down)
+            let contentBottom = docFrame.origin.y + docFrame.height
+            NSLog("[TableClipView] mouseDown - point.y: %.1f, contentBottom: %.1f, docFrame: %@", point.y, contentBottom, "\(docFrame)")
+
+            if point.y > contentBottom {
+                NSLog("[TableClipView] Empty space click - deselecting all")
+                coordinator?.handleEmptySpaceClick()
+                if let tableView = documentView as? NSTableView {
+                    tableView.deselectAll(nil)
+                    window?.makeFirstResponder(tableView)
+                }
+                return
+            }
+        }
+
+        super.mouseDown(with: event)
+    }
+}
+
+final class TableScrollView: NSScrollView {
+    weak var coordinator: FileTableCoordinator?
+
+    override func mouseDown(with event: NSEvent) {
+        let point = convert(event.locationInWindow, from: nil)
+        NSLog("[TableScrollView] mouseDown at: %@", "\(point)")
+
+        // Check if click is in empty space below table rows
+        if let tableView = documentView as? NSTableView {
+            let tablePoint = tableView.convert(event.locationInWindow, from: nil)
+            let clickedRow = tableView.row(at: tablePoint)
+
+            // Check if below all rows
+            if clickedRow < 0 && tableView.numberOfRows > 0 {
+                let lastRowRect = tableView.rect(ofRow: tableView.numberOfRows - 1)
+                if tablePoint.y > lastRowRect.maxY {
+                    NSLog("[TableScrollView] Empty space click detected below rows")
+                    coordinator?.handleEmptySpaceClick()
+                    tableView.deselectAll(nil)
+                    window?.makeFirstResponder(tableView)
+                    return
+                }
+            } else if tableView.numberOfRows == 0 {
+                // Empty table - any click is empty space
+                NSLog("[TableScrollView] Empty table click detected")
+                coordinator?.handleEmptySpaceClick()
+                window?.makeFirstResponder(tableView)
+                return
+            }
+        }
+
+        super.mouseDown(with: event)
+    }
+}
+
 // MARK: - NSViewRepresentable Wrapper
 
 struct FileTableView: NSViewRepresentable {
@@ -10,22 +78,31 @@ struct FileTableView: NSViewRepresentable {
     @ObservedObject var appSettings: AppSettings
     let items: [FileItem]
     let tagRefreshToken: Int
+    var onEmptySpaceClick: (() -> Void)? = nil
 
     func makeCoordinator() -> FileTableCoordinator {
         FileTableCoordinator(
             viewModel: viewModel,
             columnConfig: columnConfig,
-            appSettings: appSettings
+            appSettings: appSettings,
+            onEmptySpaceClick: onEmptySpaceClick
         )
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = NSScrollView()
+        let scrollView = TableScrollView()
+        scrollView.coordinator = context.coordinator
         scrollView.hasVerticalScroller = true
         scrollView.hasHorizontalScroller = true
         scrollView.autohidesScrollers = true
         scrollView.borderType = .noBorder
         scrollView.drawsBackground = true
+
+        // Use custom clip view to handle clicks in empty space
+        let clipView = TableClipView()
+        clipView.coordinator = context.coordinator
+        scrollView.contentView = clipView
+        NSLog("[FileTableView] Created with custom TableClipView")
 
         let tableView = KeyboardTableView()
         tableView.coordinator = context.coordinator
@@ -98,6 +175,14 @@ struct FileTableView: NSViewRepresentable {
             object: nil
         )
 
+        // Observe focus file list notification (e.g., after Escape from search)
+        NotificationCenter.default.addObserver(
+            context.coordinator,
+            selector: #selector(context.coordinator.handleFocusFileList(_:)),
+            name: .focusFileList,
+            object: nil
+        )
+
         // Setup menus after a short delay to ensure view hierarchy is ready
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
             context.coordinator.setupHeaderMenu()
@@ -111,6 +196,7 @@ struct FileTableView: NSViewRepresentable {
         context.coordinator.viewModel = viewModel
         context.coordinator.columnConfig = columnConfig
         context.coordinator.appSettings = appSettings
+        context.coordinator.onEmptySpaceClick = onEmptySpaceClick
 
         // Ensure header menu is set up (in case it wasn't ready before)
         context.coordinator.ensureHeaderMenu()
@@ -205,6 +291,23 @@ final class KeyboardTableView: NSTableView {
         return super.acceptsFirstResponder
     }
 
+    // Enable periodic updates for auto-scroll during drag (Finder-style)
+    override func wantsPeriodicDraggingUpdates() -> Bool {
+        return true
+    }
+
+    // Auto-scroll when dragging near edges
+    override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
+        // Call autoscroll on enclosing scroll view for Finder-style edge scrolling
+        if let scrollView = enclosingScrollView {
+            let event = NSApp.currentEvent
+            if let event = event {
+                scrollView.contentView.autoscroll(with: event)
+            }
+        }
+        return super.draggingUpdated(sender)
+    }
+
     override func keyDown(with event: NSEvent) {
         switch event.keyCode {
         case 49: // Space - Quick Look
@@ -222,13 +325,34 @@ final class KeyboardTableView: NSTableView {
         let point = convert(event.locationInWindow, from: nil)
         let clickedRow = row(at: point)
 
-        // Call coordinator's handleClick before super to capture pre-selection state
-        if clickedRow >= 0 {
-            coordinator?.handleRowClick(row: clickedRow, event: event)
+        // Check if click is actually in empty space below all rows
+        // row(at:) can return the last row index when clicking near it
+        var isEmptySpaceClick = clickedRow < 0 || numberOfRows == 0
+
+        if !isEmptySpaceClick && numberOfRows > 0 {
+            // Check if click point is below the last row's frame
+            let lastRowRect = rect(ofRow: numberOfRows - 1)
+            NSLog("[TableView] mouseDown - point.y: %.1f, lastRowRect.maxY: %.1f, clickedRow: %d", point.y, lastRowRect.maxY, clickedRow)
+            if point.y > lastRowRect.maxY {
+                isEmptySpaceClick = true
+            }
         }
+
+        // Handle empty space click (below all rows or empty table)
+        if isEmptySpaceClick {
+            NSLog("[TableView] Empty space click - deselecting all")
+            coordinator?.handleEmptySpaceClick()
+            deselectAll(nil)
+            window?.makeFirstResponder(self)
+            return  // Don't call super - prevents NSTableView from selecting
+        }
+
+        // Call coordinator's handleClick before super to capture pre-selection state
+        coordinator?.handleRowClick(row: clickedRow, event: event)
 
         super.mouseDown(with: event)
     }
+
 }
 
 // MARK: - Custom Row View with Always-Emphasized Selection
@@ -276,14 +400,18 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var lastProcessedRenamingURL: URL?
     private weak var currentEditingCell: FileNameCellView?
 
+    // Callback for empty space click (used by CoverFlow view)
+    var onEmptySpaceClick: (() -> Void)?
+
     var isCurrentlyEditing: Bool {
         return currentEditingCell?.isEditing ?? false
     }
 
-    init(viewModel: FileBrowserViewModel, columnConfig: ListColumnConfigManager, appSettings: AppSettings) {
+    init(viewModel: FileBrowserViewModel, columnConfig: ListColumnConfigManager, appSettings: AppSettings, onEmptySpaceClick: (() -> Void)? = nil) {
         self.viewModel = viewModel
         self.columnConfig = columnConfig
         self.appSettings = appSettings
+        self.onEmptySpaceClick = onEmptySpaceClick
         super.init()
     }
 
@@ -345,21 +473,80 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         viewModel.renamingURL = nil
     }
 
+    func fileNameCellView(_ cell: FileNameCellView, commitRenameAndMoveNext item: FileItem, newName: String) {
+        currentEditingCell = nil
+        lastProcessedRenamingURL = nil
+        viewModel.commitRenameAndNext(currentItem: item, newName: newName)
+    }
+
+    func fileNameCellView(_ cell: FileNameCellView, commitRenameAndMovePrevious item: FileItem, newName: String) {
+        currentEditingCell = nil
+        lastProcessedRenamingURL = nil
+        viewModel.commitRenameAndPrevious(currentItem: item, newName: newName)
+    }
+
     // MARK: - Click Handling for Rename
 
     func handleRowClick(row: Int, event: NSEvent) {
         guard row >= 0, row < items.count else { return }
+        guard let tableView = tableView else { return }
+
         let item = items[row]
+        let modifiers = event.modifierFlags
+
+        // If clicking on an already-selected item without modifiers,
+        // preserve the multi-selection (for potential drag)
+        // handleSelection would reset to single selection otherwise
+        let isAlreadySelected = viewModel.selectedItems.contains(item)
+        let hasModifiers = modifiers.contains(.shift) || modifiers.contains(.command)
+
+        if isAlreadySelected && !hasModifiers && viewModel.selectedItems.count > 1 {
+            // Don't change selection - allows multi-file drag
+            return
+        }
+
+        // Determine if click was on the text area (for Finder-style rename behavior)
+        let clickedOnTextArea = isClickOnTextArea(event: event, row: row, tableView: tableView)
 
         // Use handleSelection to get Finder-style click-to-rename behavior
-        let modifiers = event.modifierFlags
         viewModel.handleSelection(
             item: item,
             index: row,
             in: items,
             withShift: modifiers.contains(.shift),
-            withCommand: modifiers.contains(.command)
+            withCommand: modifiers.contains(.command),
+            clickedOnTextArea: clickedOnTextArea
         )
+    }
+
+    /// Handle click on empty space (below all rows) - deselect all items
+    func handleEmptySpaceClick() {
+        viewModel.selectedItems.removeAll()
+        viewModel.cancelPendingRename()
+        // Call callback if provided (used by CoverFlow view)
+        onEmptySpaceClick?()
+    }
+
+    /// Determine if a click event was on the text area of the name column
+    private func isClickOnTextArea(event: NSEvent, row: Int, tableView: NSTableView) -> Bool {
+        let point = tableView.convert(event.locationInWindow, from: nil)
+        let clickedColumn = tableView.column(at: point)
+
+        // If not clicking on a column or not on the name column, it's not on text area
+        guard clickedColumn >= 0 else { return false }
+        let columnId = tableView.tableColumns[clickedColumn].identifier.rawValue
+        guard columnId == ListColumn.name.rawValue else { return false }
+
+        // Get the cell rect for this row/column
+        let cellRect = tableView.frameOfCell(atColumn: clickedColumn, row: row)
+
+        // Icon area: 4pt leading padding + icon size + 6pt trailing padding
+        let iconSize = appSettings.listIconSizeValue
+        let iconAreaWidth: CGFloat = 4 + iconSize + 6
+
+        // Check if click was past the icon area (on the text portion)
+        let clickXInCell = point.x - cellRect.minX
+        return clickXInCell > iconAreaWidth
     }
 
     // MARK: - Column Setup
@@ -751,6 +938,15 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         // (user may have scrolled since hydration was requested)
         guard let tableView = tableView else { return }
         tableView.reloadData()
+    }
+
+    @objc func handleFocusFileList(_ notification: Notification) {
+        // Focus the table view (e.g., after pressing Escape in search field)
+        // Only take focus if we're actually visible in the window
+        guard let tableView = tableView,
+              let window = tableView.window,
+              tableView.visibleRect.size.height > 0 else { return }
+        window.makeFirstResponder(tableView)
     }
 
     /// Hydrate metadata for currently visible rows
@@ -1374,27 +1570,28 @@ extension FileTableCoordinator: NSMenuDelegate {
 // MARK: - Drag and Drop
 
 extension FileTableCoordinator {
-    // Use writeRowsWith for explicit multi-selection drag support
-    func tableView(_ tableView: NSTableView, writeRowsWith rowIndexes: IndexSet, to pboard: NSPasteboard) -> Bool {
-        let urls = rowIndexes.compactMap { row -> URL? in
-            guard row < items.count else { return nil }
-            let item = items[row]
-            guard !item.isFromArchive else { return nil }
-            return item.url
-        }
-
-        guard !urls.isEmpty else { return false }
-
-        pboard.clearContents()
-        pboard.writeObjects(urls as [NSURL])
-        return true
-    }
-
+    // Modern drag support - called for each selected row
     func tableView(_ tableView: NSTableView, pasteboardWriterForRow row: Int) -> NSPasteboardWriting? {
         guard row < items.count else { return nil }
         let item = items[row]
         guard !item.isFromArchive else { return nil }
         return item.url as NSURL
+    }
+
+    // Customize drag image for multi-selection (shows stacked icons)
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
+        // Mark internal drag as active to suppress drop overlays
+        InternalDragState.shared.isDragging = true
+
+        // Use stack formation for multiple items (like Finder)
+        if rowIndexes.count > 1 {
+            session.draggingFormation = .stack
+        }
+    }
+
+    // Clear internal drag state when drag ends
+    func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
+        InternalDragState.shared.isDragging = false
     }
 
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {

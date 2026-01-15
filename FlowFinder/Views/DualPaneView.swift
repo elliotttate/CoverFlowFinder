@@ -6,6 +6,7 @@ import Quartz
 struct DualPaneView: View {
     @ObservedObject var leftViewModel: FileBrowserViewModel
     @ObservedObject var rightViewModel: FileBrowserViewModel
+    @ObservedObject private var internalDragState = InternalDragState.shared
     @Binding var activePane: Pane
     @State private var leftPaneViewMode: PaneViewMode = .list
     @State private var rightPaneViewMode: PaneViewMode = .list
@@ -192,6 +193,7 @@ struct PaneView: View {
     @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject var otherViewModel: FileBrowserViewModel
+    @ObservedObject private var internalDragState = InternalDragState.shared
     let isActive: Bool
     @Binding var paneViewMode: DualPaneView.PaneViewMode
     let onActivate: () -> Void
@@ -335,7 +337,7 @@ struct PaneView: View {
                 handleDrop(providers: providers)
                 return true
             }
-            .dropTargetOverlay(isTargeted: isDropTargeted, cornerRadius: UI.CornerRadius.medium)
+            .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging, cornerRadius: UI.CornerRadius.medium)
 
             Divider()
 
@@ -457,10 +459,7 @@ struct PaneListView: View {
                     )
                     .contentShape(Rectangle())
                     .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
-                    .onDrag {
-                        guard !item.isFromArchive else { return NSItemProvider() }
-                        return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
-                    }
+                    .internalDrag(url: item.url)
                     .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
                         item: item,
                         viewModel: viewModel,
@@ -630,8 +629,7 @@ struct PaneIconView: View {
                             .contentShape(Rectangle())
                             .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
                             .onDrag {
-                                guard !item.isFromArchive else { return NSItemProvider() }
-                                return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
+                                NSItemProvider(object: item.url as NSURL)
                             }
                             .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
                                 item: item,

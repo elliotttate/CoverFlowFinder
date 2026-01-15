@@ -73,4 +73,5 @@ extension Notification.Name {
     static let showGetInfo = Notification.Name("showGetInfo")
     static let metadataHydrationCompleted = Notification.Name("metadataHydrationCompleted")
     static let focusSearch = Notification.Name("focusSearch")
+    static let focusFileList = Notification.Name("focusFileList")
 }

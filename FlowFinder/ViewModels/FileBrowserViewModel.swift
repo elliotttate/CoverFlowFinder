@@ -447,6 +447,14 @@ class FileBrowserViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        // Cancel pending rename when drag starts (Finder behavior: dragging cancels rename)
+        InternalDragState.shared.$isDragging
+            .filter { $0 == true }
+            .sink { [weak self] _ in
+                self?.cancelPendingRename()
+            }
+            .store(in: &cancellables)
+
         let columnConfig = ListColumnConfigManager.shared
         columnConfig.$sortColumn
             .dropFirst() // Skip initial value
@@ -1979,7 +1987,9 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     /// Handle selection with all modifier combinations
-    func handleSelection(item: FileItem, index: Int, in items: [FileItem], withShift: Bool, withCommand: Bool, allowRename: Bool = true) {
+    /// - Parameters:
+    ///   - clickedOnTextArea: If true, this click can trigger rename (Finder-style: only text label clicks trigger rename)
+    func handleSelection(item: FileItem, index: Int, in items: [FileItem], withShift: Bool, withCommand: Bool, allowRename: Bool = true, clickedOnTextArea: Bool = true) {
         let now = Date()
         cancelPendingRename()
 
@@ -2010,8 +2020,10 @@ class FileBrowserViewModel: ObservableObject {
 
             // If clicking the only selected item after the system double-click interval,
             // schedule rename with a short delay to avoid double-click collisions.
-            // Skip rename trigger if allowRename is false (e.g., for CoverFlow view)
-            if allowRename && wasOnlySelected && isSameItem && timeSinceLastClick > doubleClickInterval && timeSinceLastClick < 3.0 && renamingURL == nil {
+            // Skip rename trigger if:
+            // - allowRename is false (e.g., for CoverFlow view)
+            // - clickedOnTextArea is false (Finder-style: only clicks on text label trigger rename)
+            if allowRename && clickedOnTextArea && wasOnlySelected && isSameItem && timeSinceLastClick > doubleClickInterval && timeSinceLastClick < 3.0 && renamingURL == nil {
                 if item.isFromArchive {
                     NSSound.beep()
                 } else {
@@ -2041,7 +2053,8 @@ class FileBrowserViewModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + renameDelay, execute: workItem)
     }
 
-    private func cancelPendingRename() {
+    /// Cancel any pending rename operation (e.g., when drag starts)
+    func cancelPendingRename() {
         pendingRenameWorkItem?.cancel()
         pendingRenameWorkItem = nil
     }
@@ -2648,6 +2661,66 @@ class FileBrowserViewModel: ObservableObject {
 
         let move = MoveRecord(from: item.url, to: newURL)
         performMoves([move], actionName: "Rename", registerUndo: true, resolveCollisions: false)
+    }
+
+    /// Commit current rename and start renaming the next item (Tab behavior)
+    func commitRenameAndNext(currentItem: FileItem, newName: String) {
+        // Commit the current rename
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && trimmed != currentItem.nameWithoutExtension {
+            let ext = currentItem.url.pathExtension
+            let finalName = ext.isEmpty ? trimmed : "\(trimmed).\(ext)"
+            renameItem(currentItem, to: finalName)
+        }
+
+        // Find next item to rename
+        if let currentIndex = items.firstIndex(where: { $0.url == currentItem.url }) {
+            let nextIndex = currentIndex + 1
+            if nextIndex < items.count {
+                let nextItem = items[nextIndex]
+                if !nextItem.isFromArchive {
+                    selectedItems = [nextItem]
+                    lastSelectedIndex = nextIndex
+                    // Small delay to allow the rename to complete before starting new one
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                        self?.renamingURL = nextItem.url
+                    }
+                    return
+                }
+            }
+        }
+        // No next item or it's not renamable - just clear rename state
+        renamingURL = nil
+    }
+
+    /// Commit current rename and start renaming the previous item (Shift+Tab behavior)
+    func commitRenameAndPrevious(currentItem: FileItem, newName: String) {
+        // Commit the current rename
+        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmed.isEmpty && trimmed != currentItem.nameWithoutExtension {
+            let ext = currentItem.url.pathExtension
+            let finalName = ext.isEmpty ? trimmed : "\(trimmed).\(ext)"
+            renameItem(currentItem, to: finalName)
+        }
+
+        // Find previous item to rename
+        if let currentIndex = items.firstIndex(where: { $0.url == currentItem.url }) {
+            let prevIndex = currentIndex - 1
+            if prevIndex >= 0 {
+                let prevItem = items[prevIndex]
+                if !prevItem.isFromArchive {
+                    selectedItems = [prevItem]
+                    lastSelectedIndex = prevIndex
+                    // Small delay to allow the rename to complete before starting new one
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+                        self?.renamingURL = prevItem.url
+                    }
+                    return
+                }
+            }
+        }
+        // No previous item or it's not renamable - just clear rename state
+        renamingURL = nil
     }
 
     func moveSelectedItemsToTrash() {

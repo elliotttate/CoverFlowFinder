@@ -842,11 +842,25 @@ struct SearchField: NSViewRepresentable {
             window.makeFirstResponder(searchField)
         }
 
-        // Handle Escape key to unfocus the search field
+        // Handle Escape key to unfocus the search field and return focus to file list
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-                // Escape pressed - resign first responder
-                control.window?.makeFirstResponder(nil)
+                // Escape pressed - return focus to file list
+                // Post notification for FileTableView to handle (it will make itself first responder)
+                NotificationCenter.default.post(name: .focusFileList, object: nil)
+
+                // Fallback: if no view took focus (still on search field), focus content view
+                // This allows KeyboardManager to handle keyboard for SwiftUI views
+                DispatchQueue.main.async {
+                    guard let window = control.window else { return }
+                    // Only change focus if still on a text field (no one else took focus)
+                    if let firstResponder = window.firstResponder,
+                       firstResponder is NSTextView || firstResponder is NSText {
+                        if let contentView = window.contentView {
+                            window.makeFirstResponder(contentView)
+                        }
+                    }
+                }
                 return true
             }
             return false

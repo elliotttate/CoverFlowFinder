@@ -6,6 +6,8 @@ import SwiftUI
 protocol FileNameCellViewDelegate: AnyObject {
     func fileNameCellView(_ cell: FileNameCellView, didRenameItem item: FileItem, to newName: String)
     func fileNameCellViewDidCancelRename(_ cell: FileNameCellView)
+    func fileNameCellView(_ cell: FileNameCellView, commitRenameAndMoveNext item: FileItem, newName: String)
+    func fileNameCellView(_ cell: FileNameCellView, commitRenameAndMovePrevious item: FileItem, newName: String)
 }
 
 final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
@@ -240,8 +242,32 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
             // Escape key pressed
             cancelEditing()
             return true
+        } else if commandSelector == #selector(NSResponder.insertTab(_:)) {
+            // Tab key pressed - commit and move to next item
+            commitRenameAndMoveNext()
+            return true
+        } else if commandSelector == #selector(NSResponder.insertBacktab(_:)) {
+            // Shift+Tab pressed - commit and move to previous item
+            commitRenameAndMovePrevious()
+            return true
         }
         return false
+    }
+
+    private func commitRenameAndMoveNext() {
+        guard isEditing, let item = currentItem else { return }
+
+        let trimmedName = nameTextField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        endEditingMode()
+        delegate?.fileNameCellView(self, commitRenameAndMoveNext: item, newName: trimmedName)
+    }
+
+    private func commitRenameAndMovePrevious() {
+        guard isEditing, let item = currentItem else { return }
+
+        let trimmedName = nameTextField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        endEditingMode()
+        delegate?.fileNameCellView(self, commitRenameAndMovePrevious: item, newName: trimmedName)
     }
 }
 

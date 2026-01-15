@@ -5,10 +5,14 @@ import Quartz
 struct IconGridView: View {
     @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
+    @ObservedObject private var internalDragState = InternalDragState.shared
+    @ObservedObject private var autoScrollState = DragAutoScrollState.shared
     let items: [FileItem]
     @State private var isDropTargeted = false
     @State private var dropTargetedItemID: UUID?
     @State private var currentWidth: CGFloat = 800
+    @State private var currentHeight: CGFloat = 600
+    @State private var autoScrollTimer: Timer?
     @State private var pinchStartIconSize: Double?
     @State private var pinchStartSpacing: Double?
     @State private var pinchStartFontSize: Double?
@@ -60,7 +64,24 @@ struct IconGridView: View {
                                 item: item,
                                 viewModel: viewModel,
                                 isSelected: viewModel.selectedItems.contains(item),
-                                thumbnail: thumbnails[item.url]
+                                thumbnail: thumbnails[item.url],
+                                onSingleClick: { clickedOnTextArea in
+                                    if let index = items.firstIndex(of: item) {
+                                        let modifiers = NSEvent.modifierFlags
+                                        viewModel.handleSelection(
+                                            item: item,
+                                            index: index,
+                                            in: items,
+                                            withShift: modifiers.contains(.shift),
+                                            withCommand: modifiers.contains(.command),
+                                            clickedOnTextArea: clickedOnTextArea
+                                        )
+                                        updateQuickLook(for: item)
+                                    }
+                                },
+                                onDoubleClick: {
+                                    viewModel.openItem(item)
+                                }
                             )
                             .id(item.id)
                             .overlay(
@@ -75,49 +96,12 @@ struct IconGridView: View {
                             .onDisappear {
                                 updateVisibility(for: item, isVisible: false)
                             }
-                            .onDrag {
-                                guard !item.isFromArchive else { return NSItemProvider() }
-
-                                // Check if this item is part of a multi-selection
-                                let itemsToDrag: [FileItem]
-                                if viewModel.selectedItems.contains(item) && viewModel.selectedItems.count > 1 {
-                                    itemsToDrag = Array(viewModel.selectedItems).filter { !$0.isFromArchive }
-                                } else {
-                                    itemsToDrag = [item]
-                                }
-
-                                // Write all URLs to the pasteboard for multi-selection drag
-                                let urls = itemsToDrag.map { $0.url as NSURL }
-                                let pasteboard = NSPasteboard(name: .drag)
-                                pasteboard.clearContents()
-                                pasteboard.writeObjects(urls)
-
-                                return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
-                            }
+                            .internalDrag(url: item.url)
                             .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
                                 item: item,
                                 viewModel: viewModel,
                                 dropTargetedItemID: $dropTargetedItemID
                             ))
-                            .instantTap(
-                                id: item.id,
-                                onSingleClick: {
-                                    if let index = items.firstIndex(of: item) {
-                                        let modifiers = NSEvent.modifierFlags
-                                        viewModel.handleSelection(
-                                            item: item,
-                                            index: index,
-                                            in: items,
-                                            withShift: modifiers.contains(.shift),
-                                            withCommand: modifiers.contains(.command)
-                                        )
-                                        updateQuickLook(for: item)
-                                    }
-                                },
-                                onDoubleClick: {
-                                    viewModel.openItem(item)
-                                }
-                            )
                             .contextMenu {
                                 FileItemContextMenu(item: item, viewModel: viewModel) { item in
                                     viewModel.renamingURL = item.url
@@ -126,6 +110,17 @@ struct IconGridView: View {
                         }
                     }
                     .padding(20)
+                    // Fill remaining space to allow clicking on empty area
+                    .frame(minHeight: geometry.size.height)
+                    .background(
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                // Click on empty space - deselect all
+                                viewModel.selectedItems.removeAll()
+                                viewModel.cancelPendingRename()
+                            }
+                    )
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
                 .onAppear {
@@ -151,15 +146,85 @@ struct IconGridView: View {
                         updateQuickLook(for: nil)
                     }
                 }
+                .onChange(of: internalDragState.isDragging) { isDragging in
+                    // Start/stop auto-scroll timer based on drag state
+                    if isDragging {
+                        autoScrollTimer?.invalidate()
+                        autoScrollTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [self] _ in
+                            guard internalDragState.isDragging else {
+                                autoScrollTimer?.invalidate()
+                                return
+                            }
+
+                            // Use window-relative coordinates for edge detection
+                            guard let window = NSApp.keyWindow ?? NSApp.mainWindow else { return }
+
+                            // Use current mouse location
+                            let screenPoint = NSEvent.mouseLocation
+                            let windowPoint = window.convertPoint(fromScreen: screenPoint)
+                            let windowHeight = window.frame.height
+
+                            // Edge detection - use percentage-based approach (15% of window height)
+                            let edgePercent: CGFloat = 0.15
+                            let topThreshold = windowHeight * (1.0 - edgePercent)
+                            let bottomThreshold = windowHeight * edgePercent
+
+                            var direction: DragAutoScrollState.ScrollDirection = .none
+
+                            // Near top edge (high y value)
+                            if windowPoint.y > topThreshold {
+                                direction = .up
+                            }
+                            // Near bottom edge (low y value)
+                            else if windowPoint.y < bottomThreshold {
+                                direction = .down
+                            }
+
+                            guard direction != .none else { return }
+
+                            // Find visible items by their indices
+                            let visibleIndices = items.enumerated().compactMap { index, item in
+                                visibleItemIDs.contains(item.id) ? index : nil
+                            }
+                            guard !visibleIndices.isEmpty else { return }
+
+                            let targetIndex: Int
+                            if direction == .up {
+                                let minIndex = visibleIndices.min() ?? 0
+                                targetIndex = max(0, minIndex - 1)
+                            } else {
+                                let maxIndex = visibleIndices.max() ?? (items.count - 1)
+                                targetIndex = min(items.count - 1, maxIndex + 1)
+                            }
+
+                            if targetIndex >= 0 && targetIndex < items.count {
+                                withAnimation(.linear(duration: 0.1)) {
+                                    scrollProxy.scrollTo(items[targetIndex].id, anchor: direction == .up ? .top : .bottom)
+                                }
+                            }
+                        }
+                    } else {
+                        autoScrollTimer?.invalidate()
+                        autoScrollTimer = nil
+                    }
+                }
+                .onAppear {
+                    currentHeight = geometry.size.height
+                }
+                .onChange(of: geometry.size.height) { newHeight in
+                    currentHeight = newHeight
+                }
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .featheredTopBlur(height: 50)
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-            handleDrop(providers: providers)
-            return true
-        }
-        .dropTargetOverlay(isTargeted: isDropTargeted, padding: UI.Spacing.standard)
+        .onDrop(of: [.fileURL], delegate: ContainerDropDelegate(
+            viewModel: viewModel,
+            isDropTargeted: $isDropTargeted,
+            containerHeight: currentHeight,
+            items: items
+        ))
+        .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging, padding: UI.Spacing.standard)
         .contextMenu {
             Button("New Folder") {
                 viewModel.createNewFolder()
@@ -475,8 +540,11 @@ struct IconGridItem: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
     let thumbnail: NSImage?
+    let onSingleClick: (Bool) -> Void  // Bool indicates if clicked on text area
+    let onDoubleClick: () -> Void
 
     @State private var isHovering = false
+    @StateObject private var clickState = ClickState()
 
     private var displayImage: NSImage {
         thumbnail ?? item.icon
@@ -488,6 +556,7 @@ struct IconGridItem: View {
         let labelWidth = iconSize + 20
 
         VStack(spacing: 8) {
+            // Icon area - clicks here don't trigger rename
             ZStack {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
@@ -499,7 +568,12 @@ struct IconGridItem: View {
                     .frame(width: iconSize, height: iconSize)
                     .cornerRadius(4)
             }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                handleTap(onTextArea: false)
+            }
 
+            // Text/label area - clicks here can trigger rename
             VStack(spacing: 2) {
                 InlineRenameField(item: item, viewModel: viewModel, font: appSettings.iconGridFont, alignment: .center, lineLimit: 2)
                     .frame(width: labelWidth)
@@ -515,6 +589,10 @@ struct IconGridItem: View {
                     TagDotsView(tags: item.tags)
                 }
             }
+            .contentShape(Rectangle())
+            .onTapGesture {
+                handleTap(onTextArea: true)
+            }
         }
         .padding(8)
         .background(
@@ -525,6 +603,27 @@ struct IconGridItem: View {
             isHovering = hovering
         }
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+    }
+
+    private func handleTap(onTextArea: Bool) {
+        let now = Date()
+        let doubleClickThreshold = NSEvent.doubleClickInterval
+
+        // Check if this is a double-click
+        if let lastTime = clickState.lastClickTime,
+           let lastId = clickState.lastClickId,
+           lastId == AnyHashable(item.id),
+           now.timeIntervalSince(lastTime) < doubleClickThreshold {
+            // Double-click detected
+            clickState.lastClickTime = nil
+            clickState.lastClickId = nil
+            onDoubleClick()
+        } else {
+            // Single click
+            clickState.lastClickTime = now
+            clickState.lastClickId = AnyHashable(item.id)
+            onSingleClick(onTextArea)
+        }
     }
 }
 

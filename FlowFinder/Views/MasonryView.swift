@@ -9,11 +9,15 @@ private let masonryLog = OSLog(subsystem: "com.flowfinder", category: "MasonryLa
 struct MasonryView: View {
     @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
+    @ObservedObject private var internalDragState = InternalDragState.shared
+    @ObservedObject private var autoScrollState = DragAutoScrollState.shared
     let items: [FileItem]
 
     @State private var isDropTargeted = false
     @State private var dropTargetedItemID: UUID?
     @State private var currentWidth: CGFloat = 800
+    @State private var currentHeight: CGFloat = 600
+    @State private var autoScrollTimer: Timer?
 
     @State private var thumbnails: [URL: NSImage] = [:]
     @State private var aspectRatios: [URL: CGFloat] = [:]
@@ -285,7 +289,12 @@ struct MasonryView: View {
                                         labelHeight: labelHeight(for: item),
                                         showLabels: shouldShowLabel(for: item),
                                         dropTargetedItemID: $dropTargetedItemID,
-                                        onSelect: { selectItem($0) }
+                                        onSelect: { item, clickedOnTextArea in
+                                            selectItem(item, clickedOnTextArea: clickedOnTextArea)
+                                        },
+                                        onDoubleClick: { item in
+                                            viewModel.openItem(item)
+                                        }
                                     )
                                     .id(item.id)
                                     .onAppear {
@@ -300,6 +309,17 @@ struct MasonryView: View {
                     }
                     .padding(.horizontal, sidePadding)
                     .padding(.vertical, sidePadding)
+                    // Fill remaining space to allow clicking on empty area
+                    .frame(minHeight: geometry.size.height)
+                    .background(
+                        Color.clear
+                            .contentShape(Rectangle())
+                            .onTapGesture {
+                                // Click on empty space - deselect all
+                                viewModel.selectedItems.removeAll()
+                                viewModel.cancelPendingRename()
+                            }
+                    )
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
                 .onAppear {
@@ -345,15 +365,85 @@ struct MasonryView: View {
                         }
                     }
                 }
+                .onChange(of: internalDragState.isDragging) { isDragging in
+                    // Start/stop auto-scroll timer based on drag state
+                    if isDragging {
+                        autoScrollTimer?.invalidate()
+                        autoScrollTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [self] _ in
+                            guard internalDragState.isDragging else {
+                                autoScrollTimer?.invalidate()
+                                return
+                            }
+
+                            // Use window-relative coordinates for edge detection
+                            guard let window = NSApp.keyWindow ?? NSApp.mainWindow else { return }
+
+                            // Use current mouse location
+                            let screenPoint = NSEvent.mouseLocation
+                            let windowPoint = window.convertPoint(fromScreen: screenPoint)
+                            let windowHeight = window.frame.height
+
+                            // Edge detection - use percentage-based approach (15% of window height)
+                            let edgePercent: CGFloat = 0.15
+                            let topThreshold = windowHeight * (1.0 - edgePercent)
+                            let bottomThreshold = windowHeight * edgePercent
+
+                            var direction: DragAutoScrollState.ScrollDirection = .none
+
+                            // Near top edge (high y value)
+                            if windowPoint.y > topThreshold {
+                                direction = .up
+                            }
+                            // Near bottom edge (low y value)
+                            else if windowPoint.y < bottomThreshold {
+                                direction = .down
+                            }
+
+                            guard direction != .none else { return }
+
+                            // Find visible items by their indices
+                            let visibleIndices = items.enumerated().compactMap { index, item in
+                                visibleItemIDs.contains(item.id) ? index : nil
+                            }
+                            guard !visibleIndices.isEmpty else { return }
+
+                            let targetIndex: Int
+                            if direction == .up {
+                                let minIndex = visibleIndices.min() ?? 0
+                                targetIndex = max(0, minIndex - 1)
+                            } else {
+                                let maxIndex = visibleIndices.max() ?? (items.count - 1)
+                                targetIndex = min(items.count - 1, maxIndex + 1)
+                            }
+
+                            if targetIndex >= 0 && targetIndex < items.count {
+                                withAnimation(.linear(duration: 0.1)) {
+                                    scrollProxy.scrollTo(items[targetIndex].id, anchor: direction == .up ? .top : .bottom)
+                                }
+                            }
+                        }
+                    } else {
+                        autoScrollTimer?.invalidate()
+                        autoScrollTimer = nil
+                    }
+                }
+                .onAppear {
+                    currentHeight = geometry.size.height
+                }
+                .onChange(of: geometry.size.height) { newHeight in
+                    currentHeight = newHeight
+                }
             }
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .featheredTopBlur(height: 50)
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-            handleDrop(providers: providers)
-            return true
-        }
-        .dropTargetOverlay(isTargeted: isDropTargeted, padding: UI.Spacing.medium)
+        .onDrop(of: [.fileURL], delegate: ContainerDropDelegate(
+            viewModel: viewModel,
+            isDropTargeted: $isDropTargeted,
+            containerHeight: currentHeight,
+            items: items
+        ))
+        .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging, padding: UI.Spacing.medium)
         .onChange(of: items) { newItems in
             let oldToken = itemsToken
             let newToken = itemsTokenFor(newItems)
@@ -430,7 +520,7 @@ struct MasonryView: View {
         .simultaneousGesture(magnificationGesture)
     }
 
-    private func selectItem(_ item: FileItem) {
+    private func selectItem(_ item: FileItem, clickedOnTextArea: Bool = true) {
         if let index = items.firstIndex(of: item) {
             let modifiers = NSEvent.modifierFlags
             viewModel.handleSelection(
@@ -438,7 +528,8 @@ struct MasonryView: View {
                 index: index,
                 in: items,
                 withShift: modifiers.contains(.shift),
-                withCommand: modifiers.contains(.command)
+                withCommand: modifiers.contains(.command),
+                clickedOnTextArea: clickedOnTextArea
             )
             updateQuickLook(for: item)
         }
@@ -866,7 +957,10 @@ struct MasonryItemView: View {
     let labelHeight: CGFloat
     let showLabels: Bool
     @Binding var dropTargetedItemID: UUID?
-    let onSelect: (FileItem) -> Void
+    let onSelect: (FileItem, Bool) -> Void  // Bool indicates if clicked on text area
+    let onDoubleClick: (FileItem) -> Void
+
+    @StateObject private var clickState = ClickState()
 
     private var isSelected: Bool {
         viewModel.selectedItems.contains(item)
@@ -879,6 +973,7 @@ struct MasonryItemView: View {
         let iconSize = min(columnWidth * 0.5, imageHeight * 0.8)
 
         VStack(alignment: .center, spacing: 6) {
+            // Image/icon area - clicks here don't trigger rename
             ZStack {
                 RoundedRectangle(cornerRadius: 10)
                     .fill(Color(nsColor: .textBackgroundColor).opacity(0.6))
@@ -904,7 +999,12 @@ struct MasonryItemView: View {
                     .stroke(Color.accentColor, lineWidth: 3)
                     .opacity(dropTargetedItemID == item.id ? 1 : 0)
             )
+            .contentShape(Rectangle())
+            .onTapGesture {
+                handleTap(onTextArea: false)
+            }
 
+            // Text/label area - clicks here can trigger rename
             if showLabels {
                 InlineRenameField(
                     item: item,
@@ -920,6 +1020,10 @@ struct MasonryItemView: View {
                         .fill(isSelected && viewModel.renamingURL != item.url ? Color.accentColor.opacity(0.9) : Color.clear)
                 )
                 .foregroundColor(isSelected && viewModel.renamingURL != item.url ? .white : .primary)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    handleTap(onTextArea: true)
+                }
             }
 
             if settings.showItemTags, !item.tags.isEmpty {
@@ -938,45 +1042,38 @@ struct MasonryItemView: View {
                 .stroke(Color.accentColor, lineWidth: 2)
                 .opacity(isSelected ? 1 : 0)
         )
-        .contentShape(Rectangle())
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
-        .onDrag {
-            guard !item.isFromArchive else { return NSItemProvider() }
-
-            // Check if this item is part of a multi-selection
-            let itemsToDrag: [FileItem]
-            if viewModel.selectedItems.contains(item) && viewModel.selectedItems.count > 1 {
-                itemsToDrag = Array(viewModel.selectedItems).filter { !$0.isFromArchive }
-            } else {
-                itemsToDrag = [item]
-            }
-
-            // Write all URLs to the pasteboard for multi-selection drag
-            let urls = itemsToDrag.map { $0.url as NSURL }
-            let pasteboard = NSPasteboard(name: .drag)
-            pasteboard.clearContents()
-            pasteboard.writeObjects(urls)
-
-            return NSItemProvider(contentsOf: item.url) ?? NSItemProvider()
-        }
+        .internalDrag(url: item.url)
         .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
             dropTargetedItemID: $dropTargetedItemID
         ))
-        .instantTap(
-            id: item.id,
-            onSingleClick: {
-                onSelect(item)
-            },
-            onDoubleClick: {
-                viewModel.openItem(item)
-            }
-        )
         .contextMenu {
             FileItemContextMenu(item: item, viewModel: viewModel) { item in
                 viewModel.renamingURL = item.url
             }
+        }
+    }
+
+    private func handleTap(onTextArea: Bool) {
+        let now = Date()
+        let doubleClickThreshold = NSEvent.doubleClickInterval
+
+        // Check if this is a double-click
+        if let lastTime = clickState.lastClickTime,
+           let lastId = clickState.lastClickId,
+           lastId == AnyHashable(item.id),
+           now.timeIntervalSince(lastTime) < doubleClickThreshold {
+            // Double-click detected
+            clickState.lastClickTime = nil
+            clickState.lastClickId = nil
+            onDoubleClick(item)
+        } else {
+            // Single click
+            clickState.lastClickTime = now
+            clickState.lastClickId = AnyHashable(item.id)
+            onSelect(item, onTextArea)
         }
     }
 }

@@ -218,10 +218,14 @@ struct UnifiedFolderDropDelegate: DropDelegate {
     @Binding var dropTargetedItemID: UUID?
 
     func validateDrop(info: DropInfo) -> Bool {
+        // Don't accept drops during internal drag operations
+        if InternalDragState.shared.isDragging { return false }
         return item.isDirectory && !item.isFromArchive && info.hasItemsConforming(to: [.fileURL])
     }
 
     func dropEntered(info: DropInfo) {
+        // Don't show drop target during internal drags
+        if InternalDragState.shared.isDragging { return }
         if item.isDirectory {
             dropTargetedItemID = item.id
         }
@@ -234,12 +238,16 @@ struct UnifiedFolderDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
+        // Don't show drop indicator during internal drags
+        if InternalDragState.shared.isDragging { return DropProposal(operation: .forbidden) }
         guard item.isDirectory && !item.isFromArchive else { return DropProposal(operation: .forbidden) }
         let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
         return DropProposal(operation: operation)
     }
 
     func performDrop(info: DropInfo) -> Bool {
+        // Don't accept drops during internal drag operations
+        if InternalDragState.shared.isDragging { return false }
         guard item.isDirectory && !item.isFromArchive else { return false }
 
         let providers = info.itemProviders(for: [.fileURL])
@@ -249,6 +257,98 @@ struct UnifiedFolderDropDelegate: DropDelegate {
                       let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
                 DispatchQueue.main.async {
                     viewModel.handleDrop(urls: [url], to: item.url)
+                }
+            }
+        }
+        return true
+    }
+}
+
+// MARK: - Drag Auto-Scroll State
+/// Shared state for triggering auto-scroll during drag operations
+
+class DragAutoScrollState: ObservableObject {
+    static let shared = DragAutoScrollState()
+
+    enum ScrollDirection {
+        case none, up, down
+    }
+
+    @Published var scrollDirection: ScrollDirection = .none
+    @Published var scrollTargetID: UUID? = nil
+
+    private init() {}
+
+    func reset() {
+        scrollDirection = .none
+        scrollTargetID = nil
+    }
+}
+
+// MARK: - Container Drop Delegate
+/// Drop delegate for container-level drops (dropping into the current folder background)
+/// This checks InternalDragState to prevent showing drop indicators during internal drags
+
+struct ContainerDropDelegate: DropDelegate {
+    let viewModel: FileBrowserViewModel
+    @Binding var isDropTargeted: Bool
+    let containerHeight: CGFloat
+    let items: [FileItem]
+
+    private let edgeThreshold: CGFloat = 60
+
+    func validateDrop(info: DropInfo) -> Bool {
+        // Always return true for internal drags so dropUpdated continues to be called
+        // (needed for auto-scroll edge detection). The actual drop is blocked in dropUpdated.
+        if InternalDragState.shared.isDragging { return true }
+        return !viewModel.isInsideArchive && info.hasItemsConforming(to: [.fileURL])
+    }
+
+    func dropEntered(info: DropInfo) {
+        if InternalDragState.shared.isDragging { return }
+        isDropTargeted = true
+    }
+
+    func dropExited(info: DropInfo) {
+        isDropTargeted = false
+        DragAutoScrollState.shared.reset()
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        // Handle auto-scroll near edges (for external drags)
+        let location = info.location
+        if location.y < edgeThreshold {
+            DragAutoScrollState.shared.scrollDirection = .up
+        } else if location.y > containerHeight - edgeThreshold {
+            DragAutoScrollState.shared.scrollDirection = .down
+        } else {
+            DragAutoScrollState.shared.scrollDirection = .none
+        }
+
+        if InternalDragState.shared.isDragging {
+            isDropTargeted = false
+            return DropProposal(operation: .forbidden)
+        }
+        guard !viewModel.isInsideArchive else {
+            isDropTargeted = false
+            return DropProposal(operation: .forbidden)
+        }
+        let operation: DropOperation = NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        return DropProposal(operation: operation)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        DragAutoScrollState.shared.reset()
+        if InternalDragState.shared.isDragging { return false }
+        guard !viewModel.isInsideArchive else { return false }
+
+        let providers = info.itemProviders(for: [.fileURL])
+        for provider in providers {
+            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
+                guard let data = data as? Data,
+                      let url = URL(dataRepresentation: data, relativeTo: nil) else { return }
+                DispatchQueue.main.async {
+                    viewModel.handleDrop(urls: [url], to: viewModel.currentPath)
                 }
             }
         }
@@ -361,6 +461,7 @@ struct InlineRenameField: View {
     @FocusState private var isFocused: Bool
     @State private var hasCommitted: Bool = false
     @State private var clickMonitor: Any?
+    @State private var keyMonitor: Any?
 
     init(item: FileItem, viewModel: FileBrowserViewModel, font: Font = .body, alignment: TextAlignment = .leading, lineLimit: Int = 1) {
         self.item = item
@@ -386,10 +487,11 @@ struct InlineRenameField: View {
                         isFocused = true
                         selectAllText()
                         setupClickMonitor()
+                        setupKeyMonitor()
                     }
                 }
                 .onDisappear {
-                    removeClickMonitor()
+                    removeMonitors()
                     if !hasCommitted {
                         commitRename()
                     }
@@ -425,17 +527,41 @@ struct InlineRenameField: View {
         }
     }
 
-    private func removeClickMonitor() {
+    private func setupKeyMonitor() {
+        // Monitor for Tab and Shift+Tab to navigate to next/previous item
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            guard !hasCommitted else { return event }
+
+            // Check for Tab key (keyCode 48)
+            if event.keyCode == 48 {
+                if event.modifierFlags.contains(.shift) {
+                    // Shift+Tab: commit and move to previous item
+                    commitRenameAndPrevious()
+                } else {
+                    // Tab: commit and move to next item
+                    commitRenameAndNext()
+                }
+                return nil // Consume the event
+            }
+            return event
+        }
+    }
+
+    private func removeMonitors() {
         if let monitor = clickMonitor {
             NSEvent.removeMonitor(monitor)
             clickMonitor = nil
+        }
+        if let monitor = keyMonitor {
+            NSEvent.removeMonitor(monitor)
+            keyMonitor = nil
         }
     }
 
     private func commitRename() {
         guard !hasCommitted else { return }
         hasCommitted = true
-        removeClickMonitor()
+        removeMonitors()
 
         let trimmed = editText.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmed.isEmpty && trimmed != item.nameWithoutExtension {
@@ -446,9 +572,23 @@ struct InlineRenameField: View {
         viewModel.renamingURL = nil
     }
 
+    private func commitRenameAndNext() {
+        guard !hasCommitted else { return }
+        hasCommitted = true
+        removeMonitors()
+        viewModel.commitRenameAndNext(currentItem: item, newName: editText)
+    }
+
+    private func commitRenameAndPrevious() {
+        guard !hasCommitted else { return }
+        hasCommitted = true
+        removeMonitors()
+        viewModel.commitRenameAndPrevious(currentItem: item, newName: editText)
+    }
+
     private func cancelRename() {
         hasCommitted = true
-        removeClickMonitor()
+        removeMonitors()
         viewModel.renamingURL = nil
     }
 
