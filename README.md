@@ -2,8 +2,6 @@
 
 A beautiful macOS file browser that brings back the classic Cover Flow view from older versions of Finder.
 
-https://github.com/elliotttate/FlowFinder/releases/download/v1.0.0/FlowFinder-demo.mp4
-
 ![Flow Finder Screenshot](screenshots/coverflow-apps.png)
 
 ## Features
@@ -23,18 +21,18 @@ https://github.com/elliotttate/FlowFinder/releases/download/v1.0.0/FlowFinder-de
 
 ## Requirements
 
-- macOS 13.0 (Ventura) or later
+- macOS 26.0 (Tahoe) or later
 - Apple Silicon or Intel Mac
 
 ## Installation
 
 ### Download
-Download the latest DMG from the [Releases](https://github.com/elliotttate/FlowFinder/releases) page.
+Download the latest DMG from the [Releases](https://github.com/elliotttate/CoverFlowFinder/releases) page.
 
 ### Build from Source
 1. Clone the repository:
    ```bash
-   git clone https://github.com/elliotttate/FlowFinder.git
+   git clone https://github.com/elliotttate/CoverFlowFinder.git
    ```
 2. Open `FlowFinder.xcodeproj` in Xcode
 3. Build and run (⌘R)
@@ -95,3 +93,6 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 Inspired by the classic Cover Flow view from iTunes and older versions of macOS Finder.
+
+
+
