@@ -27,7 +27,7 @@ A beautiful macOS file browser that brings back the classic Cover Flow view from
 ## Installation
 
 ### Download
-Download the latest DMG from the [Releases](https://github.com/elliotttate/FlowFinder/releases) page.
+Download the latest DMG from the [Releases](https://github.com/elliotttate/CoverFlowFinder/releases) page.
 
 ### Build from Source
 1. Clone the repository:
@@ -93,4 +93,5 @@ MIT License - see [LICENSE](LICENSE) for details.
 ## Acknowledgments
 
 Inspired by the classic Cover Flow view from iTunes and older versions of macOS Finder.
+
 
