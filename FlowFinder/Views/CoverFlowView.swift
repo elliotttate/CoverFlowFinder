@@ -884,7 +884,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     }
 }
 
-class CoverFlowNSView: NSView {
+class CoverFlowNSView: NSView, OpenWithActionTarget {
     var onSelect: ((Int) -> Void)?
     var onOpen: ((Int) -> Void)?
     var onDeselect: (() -> Void)?
@@ -1685,6 +1685,13 @@ class CoverFlowNSView: NSView {
                 packageItem.representedObject = index
                 menu.addItem(packageItem)
             }
+
+            // Open With submenu (only for non-archive, non-directory files)
+            if !item.isFromArchive && !item.isDirectory {
+                let openWithItem = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
+                openWithItem.submenu = OpenWithMenuBuilder.buildNSMenu(for: [item.url], target: self)
+                menu.addItem(openWithItem)
+            }
         }
 
         menu.addItem(NSMenuItem.separator())
@@ -1753,6 +1760,16 @@ class CoverFlowNSView: NSView {
         if selectedIndex >= 0 && selectedIndex < items.count {
             onShowPackageContents?(selectedIndex)
         }
+    }
+
+    @objc func openWithApp(_ sender: NSMenuItem) {
+        guard let action = sender.representedObject as? OpenWithAction else { return }
+        OpenWithMenuBuilder.openFiles(action.fileURLs, withAppAt: action.appURL)
+    }
+
+    @objc func openWithOther(_ sender: NSMenuItem) {
+        guard let fileURLs = sender.representedObject as? [URL] else { return }
+        OpenWithMenuBuilder.showOpenWithPanel(for: fileURLs, relativeTo: window)
     }
 
     private func isPackage(_ item: FileItem) -> Bool {

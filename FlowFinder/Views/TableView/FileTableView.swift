@@ -367,7 +367,7 @@ final class EmphasizedTableRowView: NSTableRowView {
 // MARK: - Coordinator (NSTableViewDataSource & NSTableViewDelegate)
 
 @MainActor
-final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, FileNameCellViewDelegate {
+final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, FileNameCellViewDelegate, OpenWithActionTarget {
     var viewModel: FileBrowserViewModel
     var columnConfig: ListColumnConfigManager
     var appSettings: AppSettings
@@ -1328,11 +1328,12 @@ extension FileTableCoordinator: NSMenuDelegate {
             menu.addItem(packageItem)
         }
 
-        // Open With...
-        let openWithItem = NSMenuItem(title: "Open With...", action: #selector(menuOpenWith(_:)), keyEquivalent: "")
-        openWithItem.target = self
-        openWithItem.isEnabled = !isFromArchive
-        menu.addItem(openWithItem)
+        // Open With submenu
+        if !isFromArchive && !item.isDirectory {
+            let openWithItem = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
+            openWithItem.submenu = OpenWithMenuBuilder.buildNSMenu(for: [item.url], target: self)
+            menu.addItem(openWithItem)
+        }
 
         menu.addItem(NSMenuItem.separator())
 
@@ -1460,11 +1461,14 @@ extension FileTableCoordinator: NSMenuDelegate {
         viewModel.openItem(items[row])
     }
 
-    @objc private func menuOpenWith(_ sender: NSMenuItem) {
-        guard let tableView = tableView else { return }
-        let row = tableView.clickedRow
-        guard row >= 0, row < items.count else { return }
-        NSWorkspace.shared.activateFileViewerSelecting([items[row].url])
+    @objc func openWithApp(_ sender: NSMenuItem) {
+        guard let action = sender.representedObject as? OpenWithAction else { return }
+        OpenWithMenuBuilder.openFiles(action.fileURLs, withAppAt: action.appURL)
+    }
+
+    @objc func openWithOther(_ sender: NSMenuItem) {
+        guard let fileURLs = sender.representedObject as? [URL] else { return }
+        OpenWithMenuBuilder.showOpenWithPanel(for: fileURLs, relativeTo: tableView?.window)
     }
 
     @objc private func menuGetInfo(_ sender: NSMenuItem) {

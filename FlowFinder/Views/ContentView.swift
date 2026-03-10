@@ -370,10 +370,9 @@ struct FileItemContextMenu: View {
                 }
             }
 
-            Button("Open With...") {
-                NSWorkspace.shared.activateFileViewerSelecting([item.url])
+            if !item.isFromArchive && !item.isDirectory {
+                OpenWithSubmenu(fileURLs: [item.url])
             }
-            .disabled(item.isFromArchive)
 
             Divider()
 
