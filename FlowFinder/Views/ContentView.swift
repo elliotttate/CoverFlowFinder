@@ -3,20 +3,6 @@ import AppKit
 
 struct ContentView: View {
 
-    static func debugLog(_ message: String) {
-        let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/flowfinder_searchmode.log")
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let logMessage = "[\(timestamp)] \(message)\n"
-        if FileManager.default.fileExists(atPath: logURL.path) {
-            if let handle = try? FileHandle(forWritingTo: logURL) {
-                handle.seekToEndOfFile()
-                handle.write(logMessage.data(using: .utf8)!)
-                handle.closeFile()
-            }
-        } else {
-            try? logMessage.data(using: .utf8)?.write(to: logURL)
-        }
-    }
     @EnvironmentObject private var settings: AppSettings
     @Environment(\.undoManager) private var undoManager
     @State private var tabs: [BrowserTab] = [BrowserTab()]
@@ -220,19 +206,15 @@ struct ContentView: View {
                 // Search mode picker and search field
                 HStack(spacing: 2) {
                     // Search mode picker
-                    let _ = Self.debugLog("🔄 Rendering HStack with searchMode: \(viewModel.searchMode.rawValue)")
                     Menu {
                         ForEach(SearchMode.allCases, id: \.self) { mode in
                             Button {
-                                Self.debugLog("🔘 Button tapped for mode: \(mode.rawValue)")
                                 viewModel.searchMode = mode
-                                Self.debugLog("🔘 After setting, viewModel.searchMode is: \(viewModel.searchMode.rawValue)")
                             } label: {
                                 Label(mode.rawValue, systemImage: mode.systemImage)
                             }
                         }
                     } label: {
-                        let _ = Self.debugLog("🏷️ Menu label body rendering: \(viewModel.searchMode.rawValue)")
                         Label(viewModel.searchMode.rawValue, systemImage: viewModel.searchMode.systemImage)
                             .labelStyle(.titleAndIcon)
                     }

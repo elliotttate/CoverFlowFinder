@@ -505,10 +505,10 @@ struct MasonryView: View {
             refreshThumbnailTargetSize()
         }
         .keyboardNavigable(
-            onUpArrow: { navigateVertical(-1) },
-            onDownArrow: { navigateVertical(1) },
-            onLeftArrow: { navigateHorizontal(-1) },
-            onRightArrow: { navigateHorizontal(1) },
+            onUpArrow: { shift in navigateVertical(-1, extend: shift) },
+            onDownArrow: { shift in navigateVertical(1, extend: shift) },
+            onLeftArrow: { shift in navigateHorizontal(-1, extend: shift) },
+            onRightArrow: { shift in navigateHorizontal(1, extend: shift) },
             onReturn: { openSelectedItem() },
             onSpace: { toggleQuickLook() },
             onDelete: { viewModel.deleteSelectedItems() },
@@ -552,7 +552,7 @@ struct MasonryView: View {
         updateQuickLook(for: newItem)
     }
 
-    private func navigateVertical(_ direction: Int) {
+    private func navigateVertical(_ direction: Int, extend: Bool = false) {
         guard let currentItem = ensureSelection() else { return }
         let layout = masonryLayout
         guard let position = layout.positions[currentItem.id] else { return }
@@ -561,10 +561,16 @@ struct MasonryView: View {
         let nextIndex = position.indexInColumn + direction
         guard columnItems.indices.contains(nextIndex) else { return }
 
-        selectItem(columnItems[nextIndex])
+        let targetItem = columnItems[nextIndex]
+        if extend, let targetIndex = items.firstIndex(of: targetItem) {
+            viewModel.selectRange(to: targetIndex, in: items)
+            updateQuickLook(for: targetItem)
+        } else {
+            selectItem(targetItem)
+        }
     }
 
-    private func navigateHorizontal(_ direction: Int) {
+    private func navigateHorizontal(_ direction: Int, extend: Bool = false) {
         guard let currentItem = ensureSelection() else { return }
         let layout = masonryLayout
         guard let position = layout.positions[currentItem.id] else { return }
@@ -589,7 +595,12 @@ struct MasonryView: View {
             }
         }
 
-        selectItem(closestItem)
+        if extend, let targetIndex = items.firstIndex(of: closestItem) {
+            viewModel.selectRange(to: targetIndex, in: items)
+            updateQuickLook(for: closestItem)
+        } else {
+            selectItem(closestItem)
+        }
     }
 
     private func openSelectedItem() {

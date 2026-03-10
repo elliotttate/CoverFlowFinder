@@ -112,19 +112,20 @@ struct DualPaneView: View {
                 let mode = pane == .left ? leftMode : rightMode
                 let columnsCount = mode == .icons ? (pane == .left ? leftCols : rightCols) : 1
                 let modifiers = event.modifierFlags
+                let hasShift = modifiers.contains(.shift)
 
                 switch event.keyCode {
                 case 126: // Up arrow
-                    navigateInViewModel(vm, by: -columnsCount)
+                    navigateInViewModel(vm, by: -columnsCount, extend: hasShift)
                     return true
                 case 125: // Down arrow
-                    navigateInViewModel(vm, by: columnsCount)
+                    navigateInViewModel(vm, by: columnsCount, extend: hasShift)
                     return true
                 case 123: // Left arrow
-                    if mode == .icons { navigateInViewModel(vm, by: -1) }
+                    if mode == .icons { navigateInViewModel(vm, by: -1, extend: hasShift) }
                     return true
                 case 124: // Right arrow
-                    if mode == .icons { navigateInViewModel(vm, by: 1) }
+                    if mode == .icons { navigateInViewModel(vm, by: 1, extend: hasShift) }
                     return true
                 case 36: // Return
                     if let item = vm.selectedItems.first {
@@ -167,24 +168,25 @@ struct DualPaneView: View {
         }
     }
 
-    private func navigateInViewModel(_ vm: FileBrowserViewModel, by offset: Int) {
+    private func navigateInViewModel(_ vm: FileBrowserViewModel, by offset: Int, extend: Bool = false) {
         let items = vm.filteredItems
         guard !items.isEmpty else { return }
 
-        let currentIndex: Int
-        if let selectedItem = vm.selectedItems.first,
-           let index = items.firstIndex(of: selectedItem) {
-            currentIndex = index
+        let currentIndex = vm.lastSelectedIndex
+        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
+        guard newIndex != currentIndex || vm.selectedItems.isEmpty else { return }
+
+        if extend {
+            vm.selectRange(to: newIndex, in: items)
         } else {
-            currentIndex = -1
+            let newItem = items[newIndex]
+            vm.selectItem(newItem)
+            vm.lastSelectedIndex = newIndex
+            vm.selectionAnchorIndex = newIndex
         }
 
-        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
-        let newItem = items[newIndex]
-        vm.selectItem(newItem)
-
         // Refresh Quick Look if visible
-        vm.updateQuickLookPreview(for: newItem)
+        vm.updateQuickLookPreview(for: items[newIndex])
     }
 
 }

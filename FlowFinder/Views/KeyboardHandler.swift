@@ -60,10 +60,10 @@ class KeyboardManager {
 // View modifier for keyboard handling - doesn't wrap the view
 struct KeyboardNavigable: ViewModifier {
     let isActive: Bool
-    let onUpArrow: () -> Void
-    let onDownArrow: () -> Void
-    let onLeftArrow: () -> Void
-    let onRightArrow: () -> Void
+    let onUpArrow: (_ shift: Bool) -> Void
+    let onDownArrow: (_ shift: Bool) -> Void
+    let onLeftArrow: (_ shift: Bool) -> Void
+    let onRightArrow: (_ shift: Bool) -> Void
     let onReturn: () -> Void
     let onSpace: () -> Void
     let onDelete: () -> Void
@@ -102,22 +102,23 @@ struct KeyboardNavigable: ViewModifier {
             }
 
             let modifiers = event.modifierFlags
+            let hasShift = modifiers.contains(.shift)
 
             // Don't intercept if command key is held (except for specific shortcuts)
             let hasCommand = modifiers.contains(.command)
 
             switch event.keyCode {
             case 126: // Up arrow
-                onUpArrow()
+                onUpArrow(hasShift)
                 return true
             case 125: // Down arrow
-                onDownArrow()
+                onDownArrow(hasShift)
                 return true
             case 123: // Left arrow
-                onLeftArrow()
+                onLeftArrow(hasShift)
                 return true
             case 124: // Right arrow
-                onRightArrow()
+                onRightArrow(hasShift)
                 return true
             case 36: // Return
                 onReturn()
@@ -178,10 +179,10 @@ struct KeyboardNavigable: ViewModifier {
 extension View {
     func keyboardNavigable(
         isActive: Bool = true,
-        onUpArrow: @escaping () -> Void = {},
-        onDownArrow: @escaping () -> Void = {},
-        onLeftArrow: @escaping () -> Void = {},
-        onRightArrow: @escaping () -> Void = {},
+        onUpArrow: @escaping (_ shift: Bool) -> Void = { _ in },
+        onDownArrow: @escaping (_ shift: Bool) -> Void = { _ in },
+        onLeftArrow: @escaping (_ shift: Bool) -> Void = { _ in },
+        onRightArrow: @escaping (_ shift: Bool) -> Void = { _ in },
         onReturn: @escaping () -> Void = {},
         onSpace: @escaping () -> Void = {},
         onDelete: @escaping () -> Void = {},

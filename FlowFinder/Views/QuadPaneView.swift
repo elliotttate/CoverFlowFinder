@@ -161,21 +161,22 @@ struct QuadPaneView: View {
             KeyboardManager.shared.setHandler {
                 guard let event = NSApp.currentEvent else { return false }
                 let modifiers = event.modifierFlags
+                let hasShift = modifiers.contains(.shift)
 
                 switch event.keyCode {
                 case 126: // Up arrow
                     let offset = mode == .icons ? -safeColumns : -1
-                    navigateInViewModel(vm, by: offset)
+                    navigateInViewModel(vm, by: offset, extend: hasShift)
                     return true
                 case 125: // Down arrow
                     let offset = mode == .icons ? safeColumns : 1
-                    navigateInViewModel(vm, by: offset)
+                    navigateInViewModel(vm, by: offset, extend: hasShift)
                     return true
                 case 123: // Left arrow
-                    navigateInViewModel(vm, by: -1)
+                    navigateInViewModel(vm, by: -1, extend: hasShift)
                     return true
                 case 124: // Right arrow
-                    navigateInViewModel(vm, by: 1)
+                    navigateInViewModel(vm, by: 1, extend: hasShift)
                     return true
                 case 36: // Return
                     if let item = vm.selectedItems.first {
@@ -218,22 +219,24 @@ struct QuadPaneView: View {
         }
     }
 
-    private func navigateInViewModel(_ vm: FileBrowserViewModel, by offset: Int) {
+    private func navigateInViewModel(_ vm: FileBrowserViewModel, by offset: Int, extend: Bool = false) {
         let items = vm.filteredItems
         guard !items.isEmpty else { return }
 
-        var currentIndex: Int
-        if let selectedItem = vm.selectedItems.first,
-           let index = items.firstIndex(of: selectedItem) {
-            currentIndex = index
+        let currentIndex = vm.lastSelectedIndex
+        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
+        guard newIndex != currentIndex || vm.selectedItems.isEmpty else { return }
+
+        if extend {
+            vm.selectRange(to: newIndex, in: items)
         } else {
-            currentIndex = -1
+            let newItem = items[newIndex]
+            vm.selectItem(newItem)
+            vm.lastSelectedIndex = newIndex
+            vm.selectionAnchorIndex = newIndex
         }
 
-        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
-        let newItem = items[newIndex]
-        vm.selectItem(newItem)
-        vm.updateQuickLookPreview(for: newItem)
+        vm.updateQuickLookPreview(for: items[newIndex])
     }
 }
 

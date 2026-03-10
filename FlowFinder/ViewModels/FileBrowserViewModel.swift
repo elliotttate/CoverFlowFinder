@@ -92,25 +92,7 @@ class FileBrowserViewModel: ObservableObject {
     @Published var searchText: String = ""
     @Published var searchMode: SearchMode = .filter {
         didSet {
-            Self.searchModeLog("✅ didSet: oldValue=\(oldValue.rawValue), newValue=\(searchMode.rawValue)")
-            // Force objectWillChange to ensure SwiftUI updates
-            Self.searchModeLog("✅ Sending objectWillChange")
             objectWillChange.send()
-        }
-    }
-
-    private static func searchModeLog(_ message: String) {
-        let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/flowfinder_searchmode.log")
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let logMessage = "[\(timestamp)] [VM] \(message)\n"
-        if FileManager.default.fileExists(atPath: logURL.path) {
-            if let handle = try? FileHandle(forWritingTo: logURL) {
-                handle.seekToEndOfFile()
-                handle.write(logMessage.data(using: .utf8)!)
-                handle.closeFile()
-            }
-        } else {
-            try? logMessage.data(using: .utf8)?.write(to: logURL)
         }
     }
     /// Debug logging for sort functionality
@@ -2057,6 +2039,8 @@ class FileBrowserViewModel: ObservableObject {
 
     // Track anchor index for Shift+click range selection
     var lastSelectedIndex: Int = 0
+    // Anchor index stays fixed during shift+arrow extend operations
+    var selectionAnchorIndex: Int = 0
 
     func selectItem(_ item: FileItem, extend: Bool = false) {
         if extend {
@@ -2070,11 +2054,11 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
-    /// Select a range of items from lastSelectedIndex to the given index (Shift+click behavior)
+    /// Select a range of items from selectionAnchorIndex to the given index (Shift+click/arrow behavior)
     func selectRange(to index: Int, in items: [FileItem]) {
         guard !items.isEmpty else { return }
-        let start = min(lastSelectedIndex, index)
-        let end = max(lastSelectedIndex, index)
+        let start = min(selectionAnchorIndex, index)
+        let end = max(selectionAnchorIndex, index)
         let clampedStart = max(0, start)
         let clampedEnd = min(items.count - 1, end)
 
@@ -2106,6 +2090,7 @@ class FileBrowserViewModel: ObservableObject {
                 selectedItems.insert(item)
             }
             lastSelectedIndex = index
+            selectionAnchorIndex = index
             lastClickedURL = nil
         } else {
             // Normal click: check for Finder-style rename trigger
@@ -2130,6 +2115,7 @@ class FileBrowserViewModel: ObservableObject {
                 // Normal selection
                 selectedItems = [item]
                 lastSelectedIndex = index
+                selectionAnchorIndex = index
                 lastClickedURL = item.url
             }
         }
@@ -2777,6 +2763,7 @@ class FileBrowserViewModel: ObservableObject {
                 if !nextItem.isFromArchive {
                     selectedItems = [nextItem]
                     lastSelectedIndex = nextIndex
+                    selectionAnchorIndex = nextIndex
                     // Small delay to allow the rename to complete before starting new one
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                         self?.renamingURL = nextItem.url
@@ -2807,6 +2794,7 @@ class FileBrowserViewModel: ObservableObject {
                 if !prevItem.isFromArchive {
                     selectedItems = [prevItem]
                     lastSelectedIndex = prevIndex
+                    selectionAnchorIndex = prevIndex
                     // Small delay to allow the rename to complete before starting new one
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
                         self?.renamingURL = prevItem.url

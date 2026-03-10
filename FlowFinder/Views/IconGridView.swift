@@ -271,10 +271,10 @@ struct IconGridView: View {
             refreshThumbnails()
         }
         .keyboardNavigable(
-            onUpArrow: { navigateSelection(by: -columnCount) },
-            onDownArrow: { navigateSelection(by: columnCount) },
-            onLeftArrow: { navigateSelection(by: -1) },
-            onRightArrow: { navigateSelection(by: 1) },
+            onUpArrow: { shift in navigateSelection(by: -columnCount, extend: shift) },
+            onDownArrow: { shift in navigateSelection(by: columnCount, extend: shift) },
+            onLeftArrow: { shift in navigateSelection(by: -1, extend: shift) },
+            onRightArrow: { shift in navigateSelection(by: 1, extend: shift) },
             onReturn: { openSelectedItem() },
             onSpace: { toggleQuickLook() },
             onDelete: { viewModel.deleteSelectedItems() },
@@ -286,23 +286,24 @@ struct IconGridView: View {
         .simultaneousGesture(magnificationGesture)
     }
 
-    private func navigateSelection(by offset: Int) {
+    private func navigateSelection(by offset: Int, extend: Bool = false) {
         guard !items.isEmpty else { return }
 
-        let currentIndex: Int
-        if let selectedItem = viewModel.selectedItems.first,
-           let index = items.firstIndex(of: selectedItem) {
-            currentIndex = index
+        let currentIndex = viewModel.lastSelectedIndex
+        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
+        guard newIndex != currentIndex || viewModel.selectedItems.isEmpty else { return }
+
+        if extend {
+            viewModel.selectRange(to: newIndex, in: items)
         } else {
-            currentIndex = -1
+            let newItem = items[newIndex]
+            viewModel.selectItem(newItem)
+            viewModel.lastSelectedIndex = newIndex
+            viewModel.selectionAnchorIndex = newIndex
         }
 
-        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
-        let newItem = items[newIndex]
-        viewModel.selectItem(newItem)
-
         // Refresh Quick Look if visible
-        updateQuickLook(for: newItem)
+        updateQuickLook(for: items[newIndex])
     }
 
     private func openSelectedItem() {

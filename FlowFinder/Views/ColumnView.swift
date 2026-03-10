@@ -71,10 +71,10 @@ struct ColumnView: View {
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .keyboardNavigable(
-            onUpArrow: { navigateInActiveColumn(by: -1) },
-            onDownArrow: { navigateInActiveColumn(by: 1) },
-            onLeftArrow: { navigateToParentColumn() },
-            onRightArrow: { navigateToChildColumn() },
+            onUpArrow: { shift in navigateInActiveColumn(by: -1, extend: shift) },
+            onDownArrow: { shift in navigateInActiveColumn(by: 1, extend: shift) },
+            onLeftArrow: { _ in navigateToParentColumn() },
+            onRightArrow: { _ in navigateToChildColumn() },
             onReturn: { openSelectedItem() },
             onSpace: { toggleQuickLook() },
             onDelete: { viewModel.deleteSelectedItems() },
@@ -143,7 +143,7 @@ struct ColumnView: View {
 
     // MARK: - Keyboard Navigation
 
-    private func navigateInActiveColumn(by offset: Int) {
+    private func navigateInActiveColumn(by offset: Int, extend: Bool = false) {
         let (columnItems, columnURL) = getActiveColumnData()
         guard !columnItems.isEmpty else { return }
 
@@ -158,21 +158,34 @@ struct ColumnView: View {
         let newIndex = max(0, min(columnItems.count - 1, currentIndex + offset))
         let newItem = columnItems[newIndex]
         columnSelections[columnURL] = newItem
-        viewModel.selectItem(newItem)
 
-        // Update subsequent columns if directory
-        if activeColumnIndex == 0 {
-            if newItem.isDirectory {
-                updateColumns(from: newItem)
-            } else {
-                columns = []
+        if extend {
+            // For column view, use the column's items for range selection
+            // Map indices to main items array for selectRange
+            if let mainIndex = items.firstIndex(of: newItem) {
+                viewModel.selectRange(to: mainIndex, in: items)
             }
-        } else if activeColumnIndex <= columns.count {
-            let column = columns[activeColumnIndex - 1]
-            if newItem.isDirectory {
-                updateColumnsFrom(column: column, selectedItem: newItem)
-            } else {
-                removeColumnsAfter(column)
+        } else {
+            viewModel.selectItem(newItem)
+            if let mainIndex = items.firstIndex(of: newItem) {
+                viewModel.lastSelectedIndex = mainIndex
+                viewModel.selectionAnchorIndex = mainIndex
+            }
+
+            // Update subsequent columns if directory (only for non-extend)
+            if activeColumnIndex == 0 {
+                if newItem.isDirectory {
+                    updateColumns(from: newItem)
+                } else {
+                    columns = []
+                }
+            } else if activeColumnIndex <= columns.count {
+                let column = columns[activeColumnIndex - 1]
+                if newItem.isDirectory {
+                    updateColumnsFrom(column: column, selectedItem: newItem)
+                } else {
+                    removeColumnsAfter(column)
+                }
             }
         }
 

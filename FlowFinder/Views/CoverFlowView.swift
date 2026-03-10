@@ -40,6 +40,7 @@ struct CoverFlowView: View {
         return try? FileHandle(forWritingTo: debugLogURL)
     }()
 
+
     static func debugLog(_ message: String) {
         guard debugEnabled else { return }
         let line = "\(Date()): \(message)\n"
@@ -178,6 +179,13 @@ struct CoverFlowView: View {
                             QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
                                 navigateSelection(by: offset)
                             }
+                        }
+                    },
+                    onExtendSelect: { index in
+                        viewModel.coverFlowSelectedIndex = index
+                        if index < sortedItemsCache.count {
+                            viewModel.selectRange(to: index, in: sortedItemsCache)
+                            updateQuickLook(for: sortedItemsCache[index])
                         }
                     }
                 )
@@ -811,6 +819,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onDelete: () -> Void
     let onShowPackageContents: (Int) -> Void
     let onQuickLook: (FileItem) -> Void
+    let onExtendSelect: (Int) -> Void  // Shift+arrow range selection
 
     private static var viewInstanceCount = 0
 
@@ -833,6 +842,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.onDelete = onDelete
         view.onShowPackageContents = onShowPackageContents
         view.onQuickLook = onQuickLook
+        view.onExtendSelect = onExtendSelect
         view.selectedItems = selectedItems
         view.coverScale = coverScale
         view.scrollSensitivity = scrollSensitivity
@@ -859,6 +869,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         nsView.onDelete = onDelete
         nsView.onShowPackageContents = onShowPackageContents
         nsView.onQuickLook = onQuickLook
+        nsView.onExtendSelect = onExtendSelect
         nsView.selectedItems = selectedItems
         nsView.coverScale = coverScale
         nsView.scrollSensitivity = scrollSensitivity
@@ -885,6 +896,7 @@ class CoverFlowNSView: NSView {
     var onDelete: (() -> Void)?
     var onShowPackageContents: ((Int) -> Void)?
     var onQuickLook: ((FileItem) -> Void)?
+    var onExtendSelect: ((Int) -> Void)?  // Shift+arrow range selection
     var selectedItems: Set<FileItem> = []  // Track multi-selection for drag
 
     private var items: [FileItem] = []
@@ -897,6 +909,7 @@ class CoverFlowNSView: NSView {
 
     // Fast scroll detection
     private var isScrolling = false
+    private var isExtendingSelection = false  // True during shift+arrow range selection
     private var scrollSettleTimer: Timer?
     private var lastClickIndex: Int = -1
     private var lastClickLocation: CGPoint = .zero
@@ -1009,9 +1022,9 @@ class CoverFlowNSView: NSView {
         self.itemsToken = itemsToken
         self.thumbnails = thumbnails
 
-        let shouldSyncSelection = itemsChanged || !isScrolling
+        let shouldSyncSelection = (itemsChanged || !isScrolling) && !isExtendingSelection
         let indexChanged = self.selectedIndex != selectedIndex
-        CoverFlowView.debugLog("[NSView-SELECTION] updateItems: incoming selectedIndex=\(selectedIndex), current self.selectedIndex=\(self.selectedIndex), shouldSync=\(shouldSyncSelection), itemsChanged=\(itemsChanged), items.count=\(items.count)")
+        CoverFlowView.debugLog("[NSView-SELECTION] updateItems: incoming selectedIndex=\(selectedIndex), current self.selectedIndex=\(self.selectedIndex), shouldSync=\(shouldSyncSelection), itemsChanged=\(itemsChanged), isExtending=\(isExtendingSelection), items.count=\(items.count)")
         if shouldSyncSelection {
             CoverFlowView.debugLog("[NSView-SELECTION] updateItems: SYNCING self.selectedIndex from \(self.selectedIndex) to \(selectedIndex)")
             self.selectedIndex = selectedIndex
@@ -1975,9 +1988,17 @@ class CoverFlowNSView: NSView {
         }
     }
 
+    // Move visual position without triggering onSelect (used for shift+arrow extend)
+    private func moveVisualIndex(to newIndex: Int) {
+        guard newIndex >= 0 && newIndex < items.count else { return }
+        selectedIndex = newIndex
+        animateToSelection()
+    }
+
     // Local-first selection: animate immediately, defer SwiftUI notification until scroll stops
     private func selectIndexLocally(_ newIndex: Int) {
         guard newIndex != selectedIndex && newIndex >= 0 && newIndex < items.count else { return }
+        isExtendingSelection = false
         selectedIndex = newIndex
         animateToSelection()
 
@@ -2010,7 +2031,12 @@ class CoverFlowNSView: NSView {
 
     private func onScrollSettled() {
         // Notify SwiftUI before flipping scroll state to avoid selection snap-back
-        onSelect?(selectedIndex)
+        // Skip if we're in a shift+arrow extend operation (selection already handled by onExtendSelect)
+        if isExtendingSelection {
+            isExtendingSelection = false
+        } else {
+            onSelect?(selectedIndex)
+        }
         setScrolling(false)
 
         // Ensure we maintain focus after scroll completes
@@ -2103,22 +2129,32 @@ class CoverFlowNSView: NSView {
             }
         }
 
+        let hasShift = event.modifierFlags.contains(.shift)
+
         switch event.keyCode {
-        case 123: // Left arrow
+        case 123, 126: // Left arrow, Up arrow - previous
             if selectedIndex > 0 {
-                selectIndexLocally(selectedIndex - 1)
+                let newIndex = selectedIndex - 1
+                if hasShift {
+                    isExtendingSelection = true
+                    moveVisualIndex(to: newIndex)
+                    onExtendSelect?(newIndex)
+                } else {
+                    isExtendingSelection = false
+                    selectIndexLocally(newIndex)
+                }
             }
-        case 124: // Right arrow
+        case 124, 125: // Right arrow, Down arrow - next
             if selectedIndex < items.count - 1 {
-                selectIndexLocally(selectedIndex + 1)
-            }
-        case 126: // Up arrow - previous (up in list = lower index)
-            if selectedIndex > 0 {
-                selectIndexLocally(selectedIndex - 1)
-            }
-        case 125: // Down arrow - next (down in list = higher index)
-            if selectedIndex < items.count - 1 {
-                selectIndexLocally(selectedIndex + 1)
+                let newIndex = selectedIndex + 1
+                if hasShift {
+                    isExtendingSelection = true
+                    moveVisualIndex(to: newIndex)
+                    onExtendSelect?(newIndex)
+                } else {
+                    isExtendingSelection = false
+                    selectIndexLocally(newIndex)
+                }
             }
         case 36: // Return
             if selectedIndex >= 0 && selectedIndex < items.count {
