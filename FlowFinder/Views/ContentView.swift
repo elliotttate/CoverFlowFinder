@@ -825,14 +825,88 @@ struct StatusBarView: View {
 struct EmptyFolderView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
 
+    private var hasSearchText: Bool {
+        !viewModel.searchText.isEmpty
+    }
+
+    private var isFinderSearchEmptyState: Bool {
+        viewModel.searchMode == .finder && hasSearchText
+    }
+
+    private var titleText: String {
+        if isFinderSearchEmptyState {
+            return "No search results"
+        }
+        if hasSearchText || viewModel.filterTag != nil {
+            return "No matching items"
+        }
+        return "This folder is empty"
+    }
+
+    private var subtitleText: String? {
+        if isFinderSearchEmptyState {
+            return "No results for \"\(viewModel.searchText)\" in this location."
+        }
+        if hasSearchText, let tag = viewModel.filterTag {
+            return "No items match \"\(viewModel.searchText)\" with the tag \"\(tag)\"."
+        }
+        if hasSearchText {
+            return "No items match \"\(viewModel.searchText)\" in this folder."
+        }
+        if let tag = viewModel.filterTag {
+            return "No items in this folder have the tag \"\(tag)\"."
+        }
+        return nil
+    }
+
+    private var iconName: String {
+        if isFinderSearchEmptyState {
+            return "magnifyingglass"
+        }
+        if viewModel.filterTag != nil {
+            return "tag"
+        }
+        if hasSearchText {
+            return "line.3.horizontal.decrease.circle"
+        }
+        return "folder"
+    }
+
+    private var clearSearchButtonTitle: String {
+        viewModel.searchMode == .finder ? "Clear Search" : "Clear Filter"
+    }
+
     var body: some View {
         VStack(spacing: 16) {
-            Image(systemName: "folder")
+            Image(systemName: iconName)
                 .font(.system(size: 64))
                 .foregroundColor(.secondary)
-            Text("This folder is empty")
+            Text(titleText)
                 .font(.title2)
                 .foregroundColor(.secondary)
+
+            if let subtitleText {
+                Text(subtitleText)
+                    .font(.body)
+                    .foregroundColor(.secondary)
+                    .multilineTextAlignment(.center)
+            }
+
+            if hasSearchText || viewModel.filterTag != nil {
+                HStack(spacing: 12) {
+                    if hasSearchText {
+                        Button(clearSearchButtonTitle) {
+                            viewModel.clearSearchQuery()
+                        }
+                    }
+
+                    if viewModel.filterTag != nil {
+                        Button("Clear Tag Filter") {
+                            viewModel.filterTag = nil
+                        }
+                    }
+                }
+            }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
@@ -872,7 +946,7 @@ struct TabContentWrapper: View {
 
             // Main content area
             Group {
-                if viewModel.isLoading {
+                if shouldShowProgressView {
                     ProgressView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if viewModel.filteredItems.isEmpty {
@@ -888,6 +962,11 @@ struct TabContentWrapper: View {
                 StatusBarView(viewModel: viewModel)
             }
         }
+    }
+
+    private var shouldShowProgressView: Bool {
+        viewModel.isLoading ||
+        (viewModel.isSearching && viewModel.searchMode == .finder && !viewModel.searchText.isEmpty)
     }
 
     // Generate a unique ID for view refresh that includes archive state and search results

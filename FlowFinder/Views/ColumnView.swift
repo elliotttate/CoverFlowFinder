@@ -66,6 +66,7 @@ struct ColumnView: View {
                    !lastSelection.isDirectory {
                     Divider()
                     PreviewColumn(item: lastSelection)
+                        .id(lastSelection.id)
                 }
             }
         }
@@ -80,7 +81,7 @@ struct ColumnView: View {
             onDelete: { viewModel.deleteSelectedItems() },
             onCopy: { viewModel.copySelectedItems() },
             onCut: { viewModel.cutSelectedItems() },
-            onPaste: { viewModel.paste() },
+            onPaste: { viewModel.paste(to: activeColumnURL) },
             onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
         .onAppear {
@@ -93,12 +94,18 @@ struct ColumnView: View {
         .onDisappear {
             // When leaving column view (e.g. switching view modes), navigate to the
             // deepest selected folder so other views show where the user drilled into.
-            if let deepestFolder = deepestSelectedFolder {
+            // Skip this during normal folder loads while we remain in Columns mode.
+            if viewModel.viewMode != .columns, let deepestFolder = deepestSelectedFolder {
                 if deepestFolder != viewModel.currentPath {
                     viewModel.navigateTo(deepestFolder)
                 }
             }
         }
+    }
+
+    /// The URL of the folder represented by the currently active column.
+    private var activeColumnURL: URL {
+        getActiveColumnData().1
     }
 
     private var lastSelectedItem: FileItem? {
@@ -394,6 +401,28 @@ struct SingleColumnView: View {
                 RoundedRectangle(cornerRadius: 4)
                     .stroke(isColumnDropTargeted && dropTargetedItemID == nil ? Color.accentColor : Color.clear, lineWidth: 2)
             )
+            .contextMenu {
+                Button("New Folder") {
+                    viewModel.createNewFolder()
+                }
+
+                if viewModel.canPaste {
+                    Divider()
+                    Button("Paste") {
+                        viewModel.paste(to: columnURL)
+                    }
+                }
+
+                Divider()
+
+                Button("Refresh") {
+                    viewModel.refresh()
+                }
+
+                Button("Show in Finder") {
+                    viewModel.showInFinder()
+                }
+            }
             .onAppear {
                 // Scroll to selected item when view appears (e.g., when switching view modes)
                 if let selected = selectedItem {
@@ -451,6 +480,11 @@ struct PreviewColumn: View {
     let item: FileItem
 
     @State private var thumbnail: NSImage?
+    @State private var isHovering = false
+
+    private var previewSize: CGSize {
+        CGSize(width: 200, height: 200)
+    }
 
     var body: some View {
         VStack(spacing: 16) {
@@ -460,7 +494,7 @@ struct PreviewColumn: View {
                     Image(nsImage: thumbnail)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: 200, maxHeight: 200)
+                        .frame(maxWidth: previewSize.width, maxHeight: previewSize.height)
                         .cornerRadius(8)
                         .shadow(radius: 4)
                 } else {
@@ -469,6 +503,10 @@ struct PreviewColumn: View {
                         .aspectRatio(contentMode: .fit)
                         .frame(width: 128, height: 128)
                 }
+            }
+            .videoPreviewOnHover(item: item, isHovering: $isHovering, size: previewSize)
+            .onHover { hovering in
+                isHovering = hovering
             }
             .padding(.top, 20)
 
@@ -496,6 +534,11 @@ struct PreviewColumn: View {
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             loadThumbnail()
+        }
+        .onChange(of: item.id) { _ in
+            // Cancel video preview when selection changes
+            InlineVideoPreviewManager.shared.cancelPreview()
+            isHovering = false
         }
     }
 

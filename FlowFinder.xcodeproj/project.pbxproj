@@ -43,6 +43,7 @@
 		A1000036001 /* OpenWithMenuBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000036000 /* OpenWithMenuBuilder.swift */; };
 		A1000037001 /* InlineVideoPreviewManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000037000 /* InlineVideoPreviewManager.swift */; };
 		A1000038001 /* VideoPreviewOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000038000 /* VideoPreviewOverlay.swift */; };
+		A1000039001 /* InlineAudioPreviewManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000039000 /* InlineAudioPreviewManager.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -85,6 +86,7 @@
 		A1000035000 /* CloudStatusManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudStatusManager.swift; sourceTree = "<group>"; };
 		A1000037000 /* InlineVideoPreviewManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineVideoPreviewManager.swift; sourceTree = "<group>"; };
 		A1000038000 /* VideoPreviewOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPreviewOverlay.swift; sourceTree = "<group>"; };
+		A1000039000 /* InlineAudioPreviewManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineAudioPreviewManager.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -143,6 +145,7 @@
 				A100002E000 /* UIConstants.swift */,
 				A1000036000 /* OpenWithMenuBuilder.swift */,
 				A1000037000 /* InlineVideoPreviewManager.swift */,
+				A1000039000 /* InlineAudioPreviewManager.swift */,
 				A1000026000 /* ZipArchiveManager.swift */,
 			);
 			path = Models;
@@ -268,6 +271,7 @@
 				A1000036001 /* OpenWithMenuBuilder.swift in Sources */,
 				A1000037001 /* InlineVideoPreviewManager.swift in Sources */,
 				A1000038001 /* VideoPreviewOverlay.swift in Sources */,
+				A1000039001 /* InlineAudioPreviewManager.swift in Sources */,
 				A1000002003 /* ListColumnConfig.swift in Sources */,
 				A1000003001 /* FileBrowserViewModel.swift in Sources */,
 				A1000004001 /* ContentView.swift in Sources */,
