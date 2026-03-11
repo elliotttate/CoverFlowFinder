@@ -421,85 +421,86 @@ struct PaneListView: View {
 
     var body: some View {
         ScrollViewReader { scrollProxy in
-            List {
-                ForEach(viewModel.filteredItems) { item in
-                    let isSelected = viewModel.selectedItems.contains(item)
-                    HStack(spacing: 8) {
-                        AsyncListIconView(item: item, size: appSettings.compactListIconSize)
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(viewModel.filteredItems) { item in
+                        let isSelected = viewModel.selectedItems.contains(item)
+                        HStack(spacing: 8) {
+                            AsyncListIconView(item: item, size: appSettings.compactListIconSize)
 
-                        InlineRenameField(item: item, viewModel: viewModel, font: appSettings.compactListFont, alignment: .leading, lineLimit: 1)
+                            InlineRenameField(item: item, viewModel: viewModel, font: appSettings.compactListFont, alignment: .leading, lineLimit: 1)
 
-                        if appSettings.showItemTags, !item.tags.isEmpty {
-                            TagDotsView(tags: item.tags)
-                        }
-
-                        Spacer()
-
-                        Text(item.formattedSize)
-                            .font(appSettings.compactListDetailFont)
-                            .foregroundColor(.secondary)
-                            .frame(width: 60, alignment: .trailing)
-
-                        Text(item.formattedDate)
-                            .font(appSettings.compactListDetailFont)
-                            .foregroundColor(.secondary)
-                            .frame(width: 100, alignment: .trailing)
-                    }
-                    .id(item.id)
-                    .padding(.vertical, 4)
-                    .padding(.horizontal, 4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(
-                        dropTargetedItemID == item.id
-                            ? Color.accentColor.opacity(0.4)
-                            : (isSelected ? Color.accentColor.opacity(0.3) : Color.clear)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 4)
-                            .stroke(Color.accentColor, lineWidth: 2)
-                            .opacity(dropTargetedItemID == item.id ? 1 : 0)
-                    )
-                    .contentShape(Rectangle())
-                    .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
-                    .internalDrag(url: item.url)
-                    .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
-                        item: item,
-                        viewModel: viewModel,
-                        dropTargetedItemID: $dropTargetedItemID
-                    ))
-                    .instantTap(
-                        id: item.id,
-                        onSingleClick: {
-                            onActivate()
-                            if let index = viewModel.filteredItems.firstIndex(of: item) {
-                                let modifiers = NSEvent.modifierFlags
-                                viewModel.handleSelection(
-                                    item: item,
-                                    index: index,
-                                    in: viewModel.filteredItems,
-                                    withShift: modifiers.contains(.shift),
-                                    withCommand: modifiers.contains(.command)
-                                )
-                                viewModel.updateQuickLookPreview(for: item)
+                            if appSettings.showItemTags, !item.tags.isEmpty {
+                                TagDotsView(tags: item.tags)
                             }
-                        },
-                        onDoubleClick: {
-                            onActivate()
-                            viewModel.openItem(item)
+
+                            Spacer()
+
+                            Text(item.formattedSize)
+                                .font(appSettings.compactListDetailFont)
+                                .foregroundColor(.secondary)
+                                .frame(width: 60, alignment: .trailing)
+
+                            Text(item.formattedDate)
+                                .font(appSettings.compactListDetailFont)
+                                .foregroundColor(.secondary)
+                                .frame(width: 100, alignment: .trailing)
                         }
-                    )
-                    .contextMenu {
-                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                            viewModel.renamingURL = item.url
+                        .id(item.id)
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(dropTargetedItemID == item.id
+                                    ? Color.accentColor.opacity(0.4)
+                                    : (isSelected ? Color.accentColor.opacity(0.3) : Color.clear))
+                                .padding(.horizontal, 4)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color.accentColor, lineWidth: 2)
+                                .opacity(dropTargetedItemID == item.id ? 1 : 0)
+                                .padding(.horizontal, 4)
+                        )
+                        .contentShape(Rectangle())
+                        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+                        .internalDrag(url: item.url)
+                        .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
+                            item: item,
+                            viewModel: viewModel,
+                            dropTargetedItemID: $dropTargetedItemID
+                        ))
+                        .instantTap(
+                            id: item.id,
+                            onSingleClick: {
+                                onActivate()
+                                if let index = viewModel.filteredItems.firstIndex(of: item) {
+                                    let modifiers = NSEvent.modifierFlags
+                                    viewModel.handleSelection(
+                                        item: item,
+                                        index: index,
+                                        in: viewModel.filteredItems,
+                                        withShift: modifiers.contains(.shift),
+                                        withCommand: modifiers.contains(.command)
+                                    )
+                                    viewModel.updateQuickLookPreview(for: item)
+                                }
+                            },
+                            onDoubleClick: {
+                                onActivate()
+                                viewModel.openItem(item)
+                            }
+                        )
+                        .contextMenu {
+                            FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                                viewModel.renamingURL = item.url
+                            }
                         }
                     }
-                    .listRowInsets(EdgeInsets())
-                    .listRowSeparator(.hidden)
                 }
             }
-            .listStyle(.plain)
             .onAppear {
-                // Scroll to selected item when view appears (e.g., when switching view modes)
                 if let firstSelected = viewModel.selectedItems.first {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         scrollProxy.scrollTo(firstSelected.id, anchor: .center)

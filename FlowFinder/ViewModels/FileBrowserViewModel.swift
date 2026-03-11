@@ -120,7 +120,10 @@ class FileBrowserViewModel: ObservableObject {
     /// This means clicking column headers in List View sorts search results too
     var sortedSearchResults: [FileItem] {
         let items = searchResults
-        guard !items.isEmpty else { return items }
+        guard !items.isEmpty else {
+            sortedSearchResultsStructuralToken = 0
+            return items
+        }
 
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
         let foldersFirst = AppSettings.shared.foldersFirst
@@ -128,6 +131,7 @@ class FileBrowserViewModel: ObservableObject {
         Self.sortDebugLog("sortedSearchResults called: \(items.count) items, sortBy: \(sortState.column.rawValue), direction: \(sortState.direction), foldersFirst: \(foldersFirst)")
 
         let result = ListColumnConfigManager.sortedItems(items, sortState: sortState, foldersFirst: foldersFirst)
+        sortedSearchResultsStructuralToken = structuralToken(for: result)
 
         if let first = result.first, let last = result.last {
             Self.sortDebugLog("Result: first=\(first.name), last=\(last.name)")
@@ -136,6 +140,8 @@ class FileBrowserViewModel: ObservableObject {
     }
     private var searchTask: Task<Void, Never>?
     private var metadataQuery: NSMetadataQuery?
+    private var metadataQueryDidFinishObserver: NSObjectProtocol?
+    private var metadataQueryDidUpdateObserver: NSObjectProtocol?
     @Published var navigationHistory: [NavigationLocation] = []
     @Published var historyIndex: Int = -1
     @Published var coverFlowSelectedIndex: Int = 0
@@ -190,6 +196,8 @@ class FileBrowserViewModel: ObservableObject {
     }
     private var filteredItemsCacheKey: FilteredItemsCacheKey?
     private var filteredItemsCache: [FileItem] = []
+    private var filteredItemsStructuralToken: Int = 0
+    private var sortedSearchResultsStructuralToken: Int = 0
 
     private var photosLibraryInfo: PhotosLibraryInfo?
     private let photosImageManager = PHCachingImageManager()
@@ -210,6 +218,8 @@ class FileBrowserViewModel: ObservableObject {
     private var smbSubnetScanner: SMBSubnetScanner?
     private var discoveredSMBHosts: [SMBHostInfo] = []
     private var smbScanComplete = false
+    private var isBackgroundWorkActive = true
+    private var needsReloadOnResume = false
 
     // MARK: - Lazy Metadata Loading
     /// Batch size for progressive loading of large directories
@@ -301,6 +311,23 @@ class FileBrowserViewModel: ObservableObject {
         historyIndex < navigationHistory.count - 1
     }
 
+    /// Order-insensitive token for the currently displayed item set.
+    /// Cover Flow uses this to distinguish structural changes from pure reordering.
+    var coverFlowItemsToken: Int {
+        switch searchMode {
+        case .finder:
+            if searchText.isEmpty {
+                _ = filterCurrentDirectoryItems()
+                return filteredItemsStructuralToken
+            }
+            _ = sortedSearchResults
+            return sortedSearchResultsStructuralToken
+        case .filter:
+            _ = filterCurrentDirectoryItems()
+            return filteredItemsStructuralToken
+        }
+    }
+
     var filteredItems: [FileItem] {
         // For Finder search mode, return search results
         switch searchMode {
@@ -325,6 +352,23 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
+    private func structuralToken(for items: [FileItem]) -> Int {
+        var xorValue = 0
+        var sumValue = 0
+
+        for item in items {
+            let hash = item.url.absoluteString.hashValue
+            xorValue ^= hash
+            sumValue &+= hash
+        }
+
+        var hasher = Hasher()
+        hasher.combine(items.count)
+        hasher.combine(xorValue)
+        hasher.combine(sumValue)
+        return hasher.finalize()
+    }
+
     /// Filter items in the current directory (original filter behavior)
     private func filterCurrentDirectoryItems() -> [FileItem] {
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
@@ -346,9 +390,11 @@ class FileBrowserViewModel: ObservableObject {
            filterTag == nil {
             if sortState.column == .dateCreated || sortState.column == .dateModified {
                 if photosSortState == sortState {
+                    filteredItemsStructuralToken = structuralToken(for: items)
                     return items
                 }
             } else {
+                filteredItemsStructuralToken = structuralToken(for: items)
                 return items
             }
         }
@@ -372,6 +418,7 @@ class FileBrowserViewModel: ObservableObject {
         let sorted = sortItemsForBackground(filtered, sortState: sortState, foldersFirst: foldersFirst)
         filteredItemsCacheKey = cacheKey
         filteredItemsCache = sorted
+        filteredItemsStructuralToken = structuralToken(for: sorted)
         return sorted
     }
 
@@ -479,7 +526,23 @@ class FileBrowserViewModel: ObservableObject {
             .store(in: &cancellables)
     }
 
+    func setBackgroundWorkActive(_ isActive: Bool) {
+        guard isBackgroundWorkActive != isActive else { return }
+        isBackgroundWorkActive = isActive
+
+        if isActive {
+            resumeBackgroundWork()
+        } else {
+            suspendBackgroundWork()
+        }
+    }
+
     func loadContents() {
+        guard isBackgroundWorkActive else {
+            needsReloadOnResume = true
+            return
+        }
+
         // If we're inside an archive, load archive contents instead
         if isInsideArchive {
             stopDirectoryWatcher()
@@ -513,6 +576,7 @@ class FileBrowserViewModel: ObservableObject {
         let batchSize = directoryBatchSize
         let loadToken = UUID()
         directoryLoadToken = loadToken
+        needsReloadOnResume = false
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
@@ -658,6 +722,11 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     private func loadNetworkContents() {
+        guard isBackgroundWorkActive else {
+            needsReloadOnResume = true
+            return
+        }
+
         stopNetworkBrowsing()
         isNetworkBrowsing = true
         isLoading = true
@@ -702,6 +771,29 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     private var lastBonjourServices: [NetworkServiceInfo] = []
+
+    private func suspendBackgroundWork() {
+        needsReloadOnResume = needsReloadOnResume || isLoading || isSearching
+        isLoading = false
+        isSearching = false
+        directoryLoadToken = UUID()
+        photosLoadToken = UUID()
+        pendingRenameWorkItem?.cancel()
+        pendingRenameWorkItem = nil
+        stopDirectoryWatcher()
+        stopNetworkBrowsing()
+        cancelSearch()
+    }
+
+    private func resumeBackgroundWork() {
+        if needsReloadOnResume || items.isEmpty || isInsideArchive || photosLibraryInfo != nil || currentPath.path == "/Network" {
+            needsReloadOnResume = false
+            loadContents()
+            return
+        }
+
+        startDirectoryWatcher(for: resolvedListingURL(for: currentPath))
+    }
 
     private func updateNetworkItems(from services: [NetworkServiceInfo], isFinal: Bool) {
         guard isNetworkBrowsing, currentPath.path == "/Network" else { return }
@@ -1673,6 +1765,9 @@ class FileBrowserViewModel: ObservableObject {
     func navigateTo(_ url: URL) {
         guard url != currentPath else { return }
 
+        // Stop inline video previews when navigating
+        InlineVideoPreviewManager.shared.stopAllPreviews()
+
         // Save column state for current folder before navigating
         ListColumnConfigManager.shared.saveCurrentStateForFolder(currentPath, appSettings: AppSettings.shared)
 
@@ -2150,6 +2245,7 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     func refresh() {
+        InlineVideoPreviewManager.shared.stopAllPreviews()
         loadContents()
     }
 
@@ -2966,6 +3062,7 @@ class FileBrowserViewModel: ObservableObject {
         searchTask = nil
         metadataQuery?.stop()
         metadataQuery = nil
+        removeMetadataQueryObservers()
     }
 
     /// Perform Finder search using NSMetadataQuery (Spotlight)
@@ -2985,7 +3082,7 @@ class FileBrowserViewModel: ObservableObject {
         mdQuery.searchScopes = [currentPath]
 
         // Observe results
-        NotificationCenter.default.addObserver(
+        metadataQueryDidFinishObserver = NotificationCenter.default.addObserver(
             forName: .NSMetadataQueryDidFinishGathering,
             object: mdQuery,
             queue: .main
@@ -2997,7 +3094,7 @@ class FileBrowserViewModel: ObservableObject {
         }
 
         // Also handle updates during gathering
-        NotificationCenter.default.addObserver(
+        metadataQueryDidUpdateObserver = NotificationCenter.default.addObserver(
             forName: .NSMetadataQueryDidUpdate,
             object: mdQuery,
             queue: .main
@@ -3010,6 +3107,18 @@ class FileBrowserViewModel: ObservableObject {
 
         searchDebugLogger.info("🔎 Starting NSMetadataQuery...")
         mdQuery.start()
+    }
+
+    private func removeMetadataQueryObservers() {
+        if let observer = metadataQueryDidFinishObserver {
+            NotificationCenter.default.removeObserver(observer)
+            metadataQueryDidFinishObserver = nil
+        }
+
+        if let observer = metadataQueryDidUpdateObserver {
+            NotificationCenter.default.removeObserver(observer)
+            metadataQueryDidUpdateObserver = nil
+        }
     }
 
     /// Handle results from NSMetadataQuery

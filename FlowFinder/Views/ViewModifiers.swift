@@ -190,7 +190,7 @@ extension View {
 class InternalDragState: ObservableObject {
     static let shared = InternalDragState()
     @Published var isDragging = false
-    @Published var mouseScreenLocation: NSPoint = .zero
+    var mouseScreenLocation: NSPoint = .zero
     private var dragMonitor: Any?
     private var mouseDraggedMonitor: Any?
 

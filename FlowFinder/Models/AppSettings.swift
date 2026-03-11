@@ -40,6 +40,7 @@ final class AppSettings: ObservableObject {
         static let coverFlowShowInfo = "settings.coverFlowShowInfo"
         static let coverFlowPaneHeight = "settings.coverFlowPaneHeight"
         static let usePerFolderColumnState = "settings.usePerFolderColumnState"
+        static let inlineVideoPreview = "settings.inlineVideoPreview"
     }
 
     private enum Defaults {
@@ -88,6 +89,7 @@ final class AppSettings: ObservableObject {
         static let coverFlowShowInfo = true
         static let coverFlowPaneHeight: Double = 0
         static let usePerFolderColumnState = true  // Finder-like behavior (default)
+        static let inlineVideoPreview = true
     }
 
     private let defaults: UserDefaults
@@ -190,6 +192,9 @@ final class AppSettings: ObservableObject {
     @Published var usePerFolderColumnState: Bool {
         didSet { defaults.set(usePerFolderColumnState, forKey: Keys.usePerFolderColumnState) }
     }
+    @Published var inlineVideoPreview: Bool {
+        didSet { defaults.set(inlineVideoPreview, forKey: Keys.inlineVideoPreview) }
+    }
 
     private init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -224,7 +229,8 @@ final class AppSettings: ObservableObject {
             Keys.coverFlowSwipeSpeed: Defaults.coverFlowSwipeSpeed,
             Keys.coverFlowShowInfo: Defaults.coverFlowShowInfo,
             Keys.coverFlowPaneHeight: Defaults.coverFlowPaneHeight,
-            Keys.usePerFolderColumnState: Defaults.usePerFolderColumnState
+            Keys.usePerFolderColumnState: Defaults.usePerFolderColumnState,
+            Keys.inlineVideoPreview: Defaults.inlineVideoPreview
         ])
 
         showHiddenFiles = defaults.bool(forKey: Keys.showHiddenFiles)
@@ -268,6 +274,7 @@ final class AppSettings: ObservableObject {
         coverFlowShowInfo = defaults.bool(forKey: Keys.coverFlowShowInfo)
         coverFlowPaneHeight = defaults.double(forKey: Keys.coverFlowPaneHeight)
         usePerFolderColumnState = defaults.bool(forKey: Keys.usePerFolderColumnState)
+        inlineVideoPreview = defaults.bool(forKey: Keys.inlineVideoPreview)
     }
 
     func resetToDefaults() {
@@ -305,6 +312,7 @@ final class AppSettings: ObservableObject {
         coverFlowShowInfo = Defaults.coverFlowShowInfo
         coverFlowPaneHeight = Defaults.coverFlowPaneHeight
         usePerFolderColumnState = Defaults.usePerFolderColumnState
+        inlineVideoPreview = Defaults.inlineVideoPreview
     }
 
     var listFont: Font {

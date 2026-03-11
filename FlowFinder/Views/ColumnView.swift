@@ -90,6 +90,15 @@ struct ColumnView: View {
                 columnSelections[viewModel.currentPath] = firstSelected
             }
         }
+        .onDisappear {
+            // When leaving column view (e.g. switching view modes), navigate to the
+            // deepest selected folder so other views show where the user drilled into.
+            if let deepestFolder = deepestSelectedFolder {
+                if deepestFolder != viewModel.currentPath {
+                    viewModel.navigateTo(deepestFolder)
+                }
+            }
+        }
     }
 
     private var lastSelectedItem: FileItem? {
@@ -97,6 +106,23 @@ struct ColumnView: View {
             return selection
         }
         return columnSelections[viewModel.currentPath]
+    }
+
+    /// The deepest folder the user has drilled into via sub-columns.
+    private var deepestSelectedFolder: URL? {
+        // Walk columns in reverse to find the deepest selected directory
+        for column in columns.reversed() {
+            if let selection = columnSelections[column.url], selection.isDirectory {
+                return selection.url
+            }
+            // The column itself represents a folder the user drilled into
+            return column.url
+        }
+        // No sub-columns — check if root selection is a directory
+        if let rootSelection = columnSelections[viewModel.currentPath], rootSelection.isDirectory {
+            return rootSelection.url
+        }
+        return nil
     }
 
     private func updateColumns(from item: FileItem) {
@@ -160,17 +186,12 @@ struct ColumnView: View {
         columnSelections[columnURL] = newItem
 
         if extend {
-            // For column view, use the column's items for range selection
-            // Map indices to main items array for selectRange
-            if let mainIndex = items.firstIndex(of: newItem) {
-                viewModel.selectRange(to: mainIndex, in: items)
-            }
+            // Use the active column's items for range selection
+            viewModel.selectRange(to: newIndex, in: columnItems)
         } else {
             viewModel.selectItem(newItem)
-            if let mainIndex = items.firstIndex(of: newItem) {
-                viewModel.lastSelectedIndex = mainIndex
-                viewModel.selectionAnchorIndex = mainIndex
-            }
+            viewModel.lastSelectedIndex = newIndex
+            viewModel.selectionAnchorIndex = newIndex
 
             // Update subsequent columns if directory (only for non-extend)
             if activeColumnIndex == 0 {
@@ -196,6 +217,14 @@ struct ColumnView: View {
     private func navigateToParentColumn() {
         if activeColumnIndex > 0 {
             activeColumnIndex -= 1
+            // Reset anchor to the selected item in the parent column
+            let (columnItems, columnURL) = getActiveColumnData()
+            if let sel = columnSelections[columnURL],
+               let idx = columnItems.firstIndex(of: sel) {
+                viewModel.selectItem(sel)
+                viewModel.lastSelectedIndex = idx
+                viewModel.selectionAnchorIndex = idx
+            }
         }
     }
 
@@ -209,6 +238,14 @@ struct ColumnView: View {
                 if columnSelections[newColumnURL] == nil, let firstItem = columns[activeColumnIndex - 1].items.first {
                     columnSelections[newColumnURL] = firstItem
                     viewModel.selectItem(firstItem)
+                    viewModel.lastSelectedIndex = 0
+                    viewModel.selectionAnchorIndex = 0
+                }
+                // Reset anchor when entering a column with an existing selection
+                if let sel = columnSelections[newColumnURL],
+                   let idx = columns[activeColumnIndex - 1].items.firstIndex(of: sel) {
+                    viewModel.lastSelectedIndex = idx
+                    viewModel.selectionAnchorIndex = idx
                 }
             }
         }
@@ -288,63 +325,64 @@ struct SingleColumnView: View {
 
     var body: some View {
         ScrollViewReader { scrollProxy in
-            List {
-                ForEach(items) { item in
-                    ColumnRowView(
-                        item: item,
-                        viewModel: viewModel,
-                        isSelected: viewModel.selectedItems.contains(item)
-                    )
-                    .id(item.id)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .contentShape(Rectangle())
-                    .listRowBackground(
-                        dropTargetedItemID == item.id
-                            ? Color.accentColor.opacity(0.3)
-                            : (viewModel.selectedItems.contains(item)
-                                ? Color.accentColor.opacity(0.2)
-                                : Color.clear)
-                    )
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 4)
-                            .stroke(Color.accentColor, lineWidth: 2)
-                            .opacity(dropTargetedItemID == item.id ? 1 : 0)
-                    )
-                    .internalDrag(url: item.url)
-                    .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
-                        item: item,
-                        viewModel: viewModel,
-                        dropTargetedItemID: $dropTargetedItemID
-                    ))
-                    .instantTap(
-                        id: item.id,
-                        onSingleClick: {
-                            if let index = items.firstIndex(of: item) {
-                                let modifiers = NSEvent.modifierFlags
-                                viewModel.handleSelection(
-                                    item: item,
-                                    index: index,
-                                    in: items,
-                                    withShift: modifiers.contains(.shift),
-                                    withCommand: modifiers.contains(.command)
-                                )
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(items) { item in
+                        ColumnRowView(
+                            item: item,
+                            viewModel: viewModel,
+                            isSelected: viewModel.selectedItems.contains(item)
+                        )
+                        .id(item.id)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 4)
+                        .background(
+                            dropTargetedItemID == item.id
+                                ? Color.accentColor.opacity(0.3)
+                                : (viewModel.selectedItems.contains(item)
+                                    ? Color.accentColor.opacity(0.2)
+                                    : Color.clear)
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 4)
+                                .stroke(Color.accentColor, lineWidth: 2)
+                                .opacity(dropTargetedItemID == item.id ? 1 : 0)
+                        )
+                        .contentShape(Rectangle())
+                        .internalDrag(url: item.url)
+                        .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
+                            item: item,
+                            viewModel: viewModel,
+                            dropTargetedItemID: $dropTargetedItemID
+                        ))
+                        .instantTap(
+                            id: item.id,
+                            onSingleClick: {
+                                if let index = items.firstIndex(of: item) {
+                                    let modifiers = NSEvent.modifierFlags
+                                    viewModel.handleSelection(
+                                        item: item,
+                                        index: index,
+                                        in: items,
+                                        withShift: modifiers.contains(.shift),
+                                        withCommand: modifiers.contains(.command)
+                                    )
+                                }
+                                onSelect(item)
+                            },
+                            onDoubleClick: {
+                                onDoubleClick(item)
                             }
-                            onSelect(item)
-                        },
-                        onDoubleClick: {
-                            onDoubleClick(item)
-                        }
-                    )
-                    .contextMenu {
-                        FileItemContextMenu(item: item, viewModel: viewModel) { item in
-                            viewModel.renamingURL = item.url
+                        )
+                        .contextMenu {
+                            FileItemContextMenu(item: item, viewModel: viewModel) { item in
+                                viewModel.renamingURL = item.url
+                            }
                         }
                     }
-                    .listRowInsets(EdgeInsets(top: 0, leading: 4, bottom: 0, trailing: 4))
-                    .listRowSeparator(.hidden)
                 }
             }
-            .listStyle(.plain)
             .frame(width: appSettings.columnWidthValue)
             .onDrop(of: [.fileURL], delegate: ColumnBackgroundDropDelegate(
                 columnURL: columnURL,
@@ -404,7 +442,6 @@ struct ColumnRowView: View {
                     .foregroundColor(.secondary)
             }
         }
-        .padding(.vertical, 2)
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
     }
 }

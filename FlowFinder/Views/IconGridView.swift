@@ -6,7 +6,7 @@ struct IconGridView: View {
     @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject private var internalDragState = InternalDragState.shared
-    @ObservedObject private var autoScrollState = DragAutoScrollState.shared
+    private var autoScrollState: DragAutoScrollState { DragAutoScrollState.shared }
     let items: [FileItem]
     @State private var isDropTargeted = false
     @State private var dropTargetedItemID: UUID?
@@ -90,7 +90,6 @@ struct IconGridView: View {
                                     .opacity(dropTargetedItemID == item.id ? 1 : 0)
                             )
                             .onAppear {
-                                loadThumbnail(for: item)
                                 updateVisibility(for: item, isVisible: true)
                             }
                             .onDisappear {
@@ -111,7 +110,7 @@ struct IconGridView: View {
                     }
                     .padding(20)
                     // Fill remaining space to allow clicking on empty area
-                    .frame(minHeight: geometry.size.height)
+                    .frame(minHeight: geometry.size.height, alignment: .top)
                     .background(
                         Color.clear
                             .contentShape(Rectangle())
@@ -182,10 +181,9 @@ struct IconGridView: View {
 
                             guard direction != .none else { return }
 
-                            // Find visible items by their indices
-                            let visibleIndices = items.enumerated().compactMap { index, item in
-                                visibleItemIDs.contains(item.id) ? index : nil
-                            }
+                            // Find visible items by their indices using dictionary lookup
+                            let indexByID: [UUID: Int] = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($1.id, $0) })
+                            let visibleIndices = visibleItemIDs.compactMap { indexByID[$0] }
                             guard !visibleIndices.isEmpty else { return }
 
                             let targetIndex: Int
@@ -367,9 +365,9 @@ struct IconGridView: View {
 
         let workItem = DispatchWorkItem { [itemsSnapshot, visibleSnapshot, currentColumnCount, scrolling] in
             guard !visibleSnapshot.isEmpty else { return }
-            let visibleIndices = itemsSnapshot.enumerated().compactMap { index, item in
-                visibleSnapshot.contains(item.id) ? index : nil
-            }
+            // Build index lookup once
+            let indexByID: [UUID: Int] = Dictionary(uniqueKeysWithValues: itemsSnapshot.enumerated().map { ($1.id, $0) })
+            let visibleIndices = visibleSnapshot.compactMap { indexByID[$0] }
             guard let minIndex = visibleIndices.min(),
                   let maxIndex = visibleIndices.max() else { return }
 
@@ -427,6 +425,20 @@ struct IconGridView: View {
                         self.scheduleHydration()
                     }
                 }
+
+                // Evict thumbnails far from visible range to limit memory
+                if !scrolling {
+                    let evictionBuffer = range.count * 2
+                    let evictionStart = max(0, range.lowerBound - evictionBuffer)
+                    let evictionEnd = min(itemsSnapshot.count, range.upperBound + evictionBuffer)
+                    let keepRange = evictionStart..<evictionEnd
+                    let keepURLs = Set(itemsSnapshot[keepRange].map { $0.url })
+                    for url in self.thumbnails.keys {
+                        if !keepURLs.contains(url) {
+                            self.thumbnails.removeValue(forKey: url)
+                        }
+                    }
+                }
             }
         }
         hydrationWorkItem = workItem
@@ -476,16 +488,9 @@ struct IconGridView: View {
     }
 
     private func refreshThumbnails() {
-        let targetPixelSize = iconGridThumbnailPixelSize
-        DispatchQueue.main.async {
-            for item in items {
-                if let existing = thumbnails[item.url],
-                   imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
-                    continue
-                }
-                loadThumbnail(for: item)
-            }
-        }
+        // Clear hydration range to force reload of visible items at new size
+        lastHydratedRange = nil
+        scheduleHydration()
     }
 
     private func imageSatisfiesMinimum(_ image: NSImage, minPixelSize: CGFloat) -> Bool {
@@ -494,14 +499,10 @@ struct IconGridView: View {
     }
 
     private func itemsTokenFor(_ items: [FileItem]) -> Int {
-        // Use a simple count + set of URL paths for stable comparison
-        // This ignores order changes which happen frequently during sorting
         var hasher = Hasher()
         hasher.combine(items.count)
-        // Sort URLs to make hash order-independent
-        let sortedPaths = items.map { $0.url.path }.sorted()
-        for path in sortedPaths {
-            hasher.combine(path)
+        for item in items {
+            hasher.combine(item.id)
         }
         return hasher.finalize()
     }
@@ -545,7 +546,7 @@ struct IconGridItem: View {
     let onDoubleClick: () -> Void
 
     @State private var isHovering = false
-    @StateObject private var clickState = ClickState()
+    @State private var clickState = ClickStateData()
 
     private var displayImage: NSImage {
         thumbnail ?? item.icon
@@ -558,7 +559,7 @@ struct IconGridItem: View {
 
         VStack(spacing: 8) {
             // Icon area - clicks here don't trigger rename
-            ZStack(alignment: .bottomTrailing) {
+            ZStack {
                 RoundedRectangle(cornerRadius: 8)
                     .fill(isSelected ? Color.accentColor.opacity(0.2) : Color.clear)
                     .frame(width: backgroundSize, height: backgroundSize)
@@ -568,7 +569,9 @@ struct IconGridItem: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: iconSize, height: iconSize)
                     .cornerRadius(4)
-
+                    .videoPreviewOnHover(item: item, isHovering: $isHovering, size: CGSize(width: iconSize, height: iconSize))
+            }
+            .overlay(alignment: .bottomTrailing) {
                 // Cloud status badge
                 if let cloudStatus = item.cloudStatus, cloudStatus.shouldShowBadge {
                     CloudStatusBadgeView(status: cloudStatus, size: 12)

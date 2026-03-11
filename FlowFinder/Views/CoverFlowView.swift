@@ -2,6 +2,7 @@ import SwiftUI
 import QuickLookThumbnailing
 import AppKit
 import Quartz
+import AVFoundation
 
 struct CoverFlowView: View {
     @EnvironmentObject private var settings: AppSettings
@@ -24,6 +25,8 @@ struct CoverFlowView: View {
     @State private var lastHydrationRange: Range<Int>? = nil
     @State private var itemsToken: Int = 0
     @State private var userClearedSelection: Bool = false
+    @State private var isCoverFlowActive: Bool = true
+    @State private var deferredThumbnailReloadWorkItem: DispatchWorkItem?
 
     // Pending thumbnail updates - batched to reduce re-renders
     @State private var pendingThumbnailUpdates: [URL: NSImage] = [:]
@@ -31,14 +34,20 @@ struct CoverFlowView: View {
     private let thumbnailBatchInterval: TimeInterval = 0.1
 
     // Debug logging (set to false for release)
-    private static var debugEnabled = true
+    private static let debugEnabled = ProcessInfo.processInfo.environment["FLOWFINDER_COVERFLOW_DEBUG"] == "1" ||
+        UserDefaults.standard.bool(forKey: "flowfinder.debug.coverflow")
     private static var lastBodyTime: Date = .distantPast
     private static var bodyCallCount = 0
     private static let debugLogURL = FileManager.default.temporaryDirectory.appendingPathComponent("flowfinder_debug.log")
     private static var debugLogHandle: FileHandle? = {
+        guard debugEnabled else { return nil }
         FileManager.default.createFile(atPath: debugLogURL.path, contents: nil)
         return try? FileHandle(forWritingTo: debugLogURL)
     }()
+
+    static var isDebugLoggingEnabled: Bool {
+        debugEnabled
+    }
 
 
     static func debugLog(_ message: String) {
@@ -73,8 +82,8 @@ struct CoverFlowView: View {
     }
 
     private let visibleRange = 12
-    private let maxConcurrentThumbnails = 24
-    private let maxConcurrentPreloadThumbnails = 16
+    private let maxConcurrentThumbnails = 12
+    private let maxConcurrentPreloadThumbnails = 8
     private let preloadRangeMultiplier = 8
     private let thumbnailCache = ThumbnailCacheManager.shared
 
@@ -187,6 +196,9 @@ struct CoverFlowView: View {
                             viewModel.selectRange(to: index, in: sortedItemsCache)
                             updateQuickLook(for: sortedItemsCache[index])
                         }
+                    },
+                    onActivityStateChange: { isActive in
+                        handleCoverFlowActivityChange(isActive)
                     }
                 )
                 .id("coverFlowContainer")  // Stable identity to prevent view recreation
@@ -262,22 +274,21 @@ struct CoverFlowView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .onAppear {
+            isCoverFlowActive = true
             KeyboardManager.shared.clearHandler()
-            updateSortedItems(using: items, updateToken: true)
+            updateSortedItems(using: items, updateToken: true, newToken: viewModel.coverFlowItemsToken)
             loadVisibleThumbnails()
             syncSelection()
         }
         .onDisappear {
-            thumbnailLoadTimer?.invalidate()
-            thumbnailLoadTimer = nil
-            thumbnailBatchTimer?.invalidate()
-            thumbnailBatchTimer = nil
+            isCoverFlowActive = false
+            suspendCoverFlowWork()
         }
         .onChange(of: items) { newItems in
             let oldCount = sortedItemsCache.count
             let newCount = newItems.count
             let oldToken = itemsToken
-            let newToken = itemsTokenFor(newItems)
+            let newToken = viewModel.coverFlowItemsToken
             let oldOrder = sortedItemsCache.map { $0.url }
             let newOrder = newItems.map { $0.url }
             let orderChanged = oldOrder != newOrder
@@ -292,7 +303,7 @@ struct CoverFlowView: View {
                     iconPlaceholders.removeAll()
                     thumbnailLoadGeneration += 1
                     thumbnailCache.clearForNewFolder()
-                    updateSortedItems(using: newItems, updateToken: true)
+                    updateSortedItems(using: newItems, updateToken: true, newToken: newToken)
                     loadVisibleThumbnails()
                     syncSelection()
                 }
@@ -305,25 +316,6 @@ struct CoverFlowView: View {
                     }
                     syncSelection()
                 }
-            }
-        }
-        .onReceive(viewModel.$items) { _ in
-            let newItems = viewModel.filteredItems
-            guard newItems.count == sortedItemsCache.count else { return }
-
-            let oldURLs = Set(sortedItemsCache.map { $0.url })
-            let newURLs = Set(newItems.map { $0.url })
-            guard oldURLs == newURLs else { return }
-
-            let oldOrder = sortedItemsCache.map { $0.url }
-            let newOrder = newItems.map { $0.url }
-            let orderChanged = oldOrder != newOrder
-            DispatchQueue.main.async {
-                updateSortedItems(using: newItems, updateToken: false)
-                if orderChanged {
-                    loadVisibleThumbnails()
-                }
-                syncSelection()
             }
         }
         .onChange(of: viewModel.coverFlowSelectedIndex) { _ in
@@ -349,7 +341,37 @@ struct CoverFlowView: View {
         }
     }
 
+    private func handleCoverFlowActivityChange(_ isActive: Bool) {
+        guard isCoverFlowActive != isActive else { return }
+        isCoverFlowActive = isActive
+
+        if isActive {
+            resumeCoverFlowWork()
+        } else {
+            suspendCoverFlowWork()
+        }
+    }
+
+    private func suspendCoverFlowWork() {
+        isCoverFlowScrolling = false
+        thumbnailLoadTimer?.invalidate()
+        thumbnailLoadTimer = nil
+        thumbnailBatchTimer?.invalidate()
+        thumbnailBatchTimer = nil
+        deferredThumbnailReloadWorkItem?.cancel()
+        deferredThumbnailReloadWorkItem = nil
+        pendingThumbnailUpdates.removeAll()
+        thumbnailLoadGeneration &+= 1
+    }
+
+    private func resumeCoverFlowWork() {
+        lastThumbnailLoadTime = .distantPast
+        guard !sortedItemsCache.isEmpty else { return }
+        loadVisibleThumbnails()
+    }
+
     private func throttledLoadThumbnails() {
+        guard isCoverFlowActive else { return }
         let now = Date()
         let timeSinceLastLoad = now.timeIntervalSince(lastThumbnailLoadTime)
 
@@ -368,13 +390,13 @@ struct CoverFlowView: View {
         }
     }
 
-    private func updateSortedItems(using newItems: [FileItem], updateToken: Bool) {
+    private func updateSortedItems(using newItems: [FileItem], updateToken: Bool, newToken: Int? = nil) {
         let oldIndex = viewModel.coverFlowSelectedIndex
         Self.debugLog("[SELECTION] updateSortedItems called: newItems.count=\(newItems.count), currentIndex=\(oldIndex), updateToken=\(updateToken)")
 
         sortedItemsCache = newItems
         if updateToken {
-            itemsToken = itemsTokenFor(newItems)
+            itemsToken = newToken ?? viewModel.coverFlowItemsToken
         }
 
         // Don't adjust selection when items become empty - this is a transient state during refresh
@@ -399,20 +421,6 @@ struct CoverFlowView: View {
             }
         }
         Self.debugLog("[SELECTION] updateSortedItems done: finalIndex=\(viewModel.coverFlowSelectedIndex)")
-    }
-
-    private func itemsTokenFor(_ items: [FileItem]) -> Int {
-        // Use a simple count + set of URL paths for stable comparison
-        // This ignores order changes which happen frequently during sorting
-        var hasher = Hasher()
-        hasher.combine(items.count)
-        // Sort URLs to make hash order-independent
-        let sortedPaths = items.map { $0.url.path }.sorted()
-        for path in sortedPaths {
-            hasher.combine(path)
-        }
-        let result = hasher.finalize()
-        return result
     }
 
     private func logTokenState(_ context: String) {
@@ -509,7 +517,7 @@ struct CoverFlowView: View {
     private static var loadVisibleCount = 0
 
     private func loadVisibleThumbnails() {
-        guard !sortedItemsCache.isEmpty else { return }
+        guard isCoverFlowActive, !sortedItemsCache.isEmpty else { return }
         Self.loadVisibleCount += 1
         if Self.debugEnabled {
             Self.debugLog("[CoverFlow] loadVisibleThumbnails #\(Self.loadVisibleCount) - items:\(sortedItemsCache.count) scrolling:\(isCoverFlowScrolling)")
@@ -680,10 +688,17 @@ struct CoverFlowView: View {
 
             // If there are more items to load and we're not scrolling, schedule another pass
             // Use longer delay to prevent rapid cascading updates that cause UI flashing
+            deferredThumbnailReloadWorkItem?.cancel()
+            deferredThumbnailReloadWorkItem = nil
             if hasMoreToLoad && !isCoverFlowScrolling {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [self] in
-                    loadVisibleThumbnails()
+                let workItem = DispatchWorkItem { [self] in
+                    deferredThumbnailReloadWorkItem = nil
+                    if isCoverFlowActive {
+                        loadVisibleThumbnails()
+                    }
                 }
+                deferredThumbnailReloadWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
             }
         }
     }
@@ -717,7 +732,7 @@ struct CoverFlowView: View {
 
         thumbnailCache.generateThumbnail(for: item, maxPixelSize: maxPixelSize) { url, image in
             DispatchQueue.main.async { [self] in
-                guard currentGen == thumbnailLoadGeneration else { return }
+                guard currentGen == thumbnailLoadGeneration, isCoverFlowActive else { return }
 
                 let finalImage = image ?? item.placeholderIcon
 
@@ -740,6 +755,7 @@ struct CoverFlowView: View {
     }
 
     private func scheduleThumbnailBatch() {
+        guard isCoverFlowActive else { return }
         // If timer already scheduled, let it handle the batch
         guard thumbnailBatchTimer == nil else { return }
 
@@ -752,7 +768,10 @@ struct CoverFlowView: View {
         thumbnailBatchTimer?.invalidate()
         thumbnailBatchTimer = nil
 
-        guard !pendingThumbnailUpdates.isEmpty else { return }
+        guard isCoverFlowActive, !pendingThumbnailUpdates.isEmpty else {
+            pendingThumbnailUpdates.removeAll()
+            return
+        }
 
         let count = pendingThumbnailUpdates.count
         if Self.debugEnabled {
@@ -820,6 +839,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onShowPackageContents: (Int) -> Void
     let onQuickLook: (FileItem) -> Void
     let onExtendSelect: (Int) -> Void  // Shift+arrow range selection
+    let onActivityStateChange: (Bool) -> Void
 
     private static var viewInstanceCount = 0
 
@@ -843,6 +863,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.onShowPackageContents = onShowPackageContents
         view.onQuickLook = onQuickLook
         view.onExtendSelect = onExtendSelect
+        view.onActivityStateChange = onActivityStateChange
         view.selectedItems = selectedItems
         view.coverScale = coverScale
         view.scrollSensitivity = scrollSensitivity
@@ -870,10 +891,12 @@ struct CoverFlowContainer: NSViewRepresentable {
         nsView.onShowPackageContents = onShowPackageContents
         nsView.onQuickLook = onQuickLook
         nsView.onExtendSelect = onExtendSelect
+        nsView.onActivityStateChange = onActivityStateChange
         nsView.selectedItems = selectedItems
         nsView.coverScale = coverScale
         nsView.scrollSensitivity = scrollSensitivity
         nsView.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
+        nsView.updateActivityState()
 
         // Restore first responder only if CoverFlowNSView was the first responder before update
         // Don't steal focus from other views like the search field
@@ -897,6 +920,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     var onShowPackageContents: ((Int) -> Void)?
     var onQuickLook: ((FileItem) -> Void)?
     var onExtendSelect: ((Int) -> Void)?  // Shift+arrow range selection
+    var onActivityStateChange: ((Bool) -> Void)?
     var selectedItems: Set<FileItem> = []  // Track multi-selection for drag
 
     private var items: [FileItem] = []
@@ -909,6 +933,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
     // Fast scroll detection
     private var isScrolling = false
+    private var isViewActive = false
     private var isExtendingSelection = false  // True during shift+arrow range selection
     private var scrollSettleTimer: Timer?
     private var lastClickIndex: Int = -1
@@ -964,6 +989,12 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     private var dropTargetIndex: Int?  // Which folder cover is being hovered
     private var dropTargetHighlightLayer: CAShapeLayer?  // Visible hover ring
 
+    // Inline video preview (mirrors Finder's TDesktopInlinePreviewController)
+    private var hoverTrackingArea: NSTrackingArea?
+    private var hoveredCoverIndex: Int?
+    private var videoPreviewLayer: AVPlayerLayer?
+    private var videoPreviewCoverIndex: Int?
+
     private func setupView() {
         wantsLayer = true
 
@@ -986,6 +1017,170 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         // Register for drag and drop
         registerForDraggedTypes([.fileURL])
+
+        // Setup hover tracking for inline video preview
+        setupHoverTracking()
+        setupVideoPreviewCallbacks()
+    }
+
+    private func currentActivityState() -> Bool {
+        guard let window else { return false }
+        guard NSApp.isActive else { return false }
+        guard window.isVisible, !window.isMiniaturized else { return false }
+        guard !isHiddenOrHasHiddenAncestor else { return false }
+        guard bounds.width > 0, bounds.height > 0 else { return false }
+        return window.occlusionState.contains(.visible)
+    }
+
+    func updateActivityState() {
+        let newState = currentActivityState()
+        guard newState != isViewActive else { return }
+
+        isViewActive = newState
+        if !newState {
+            pauseTransientWork()
+        }
+        onActivityStateChange?(newState)
+    }
+
+    private func pauseTransientWork() {
+        momentumTimer?.invalidate()
+        momentumTimer = nil
+        scrollSettleTimer?.invalidate()
+        scrollSettleTimer = nil
+        typeAheadTimer?.invalidate()
+        typeAheadTimer = nil
+        scrollVelocity = 0
+        accumulatedScroll = 0
+        if isScrolling {
+            isScrolling = false
+            onScrollStateChange?(false)
+        }
+        clearDropTargetHighlight()
+        dropTargetIndex = nil
+
+        // Stop inline video preview
+        hoveredCoverIndex = nil
+        InlineVideoPreviewManager.shared.stopAllPreviews()
+    }
+
+    // MARK: - Inline Video Preview (Finder-style hover-to-play)
+
+    private func setupHoverTracking() {
+        let trackingArea = NSTrackingArea(
+            rect: .zero,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        hoverTrackingArea = trackingArea
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let old = hoverTrackingArea {
+            removeTrackingArea(old)
+        }
+        let trackingArea = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseEnteredAndExited, .mouseMoved, .activeInKeyWindow, .inVisibleRect],
+            owner: self,
+            userInfo: nil
+        )
+        addTrackingArea(trackingArea)
+        hoverTrackingArea = trackingArea
+    }
+
+    override func mouseMoved(with event: NSEvent) {
+        guard AppSettings.shared.inlineVideoPreview else { return }
+        guard !isScrolling else { return }
+
+        let location = convert(event.locationInWindow, from: nil)
+        guard let index = hitTestCover(at: location), index < items.count else {
+            // Mouse is over empty space
+            if hoveredCoverIndex != nil {
+                hoveredCoverIndex = nil
+                InlineVideoPreviewManager.shared.cancelPreview()
+            }
+            return
+        }
+
+        // Same cover — nothing to do
+        if hoveredCoverIndex == index { return }
+        hoveredCoverIndex = index
+
+        let item = items[index]
+        if item.fileType == .video {
+            InlineVideoPreviewManager.shared.requestPreview(for: item)
+        } else {
+            InlineVideoPreviewManager.shared.cancelPreview()
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        hoveredCoverIndex = nil
+        InlineVideoPreviewManager.shared.cancelPreview()
+    }
+
+    private func setupVideoPreviewCallbacks() {
+        InlineVideoPreviewManager.shared.onPlayerLayerReady = { [weak self] playerLayer, url in
+            self?.attachVideoPreviewLayer(playerLayer, for: url)
+        }
+        InlineVideoPreviewManager.shared.onPlayerLayerDetach = { [weak self] url in
+            self?.detachVideoPreviewLayer(for: url)
+        }
+    }
+
+    private func attachVideoPreviewLayer(_ playerLayer: AVPlayerLayer, for url: URL) {
+        // Find the cover layer for this URL
+        guard let coverIndex = items.firstIndex(where: { $0.url == url }) else { return }
+        guard let coverLayer = coverLayers.first(where: {
+            ($0.value(forKey: "itemIndex") as? Int) == coverIndex
+        }) else { return }
+
+        // Find the imageLayer sublayer
+        guard let imageLayer = coverLayer.sublayers?.first(where: { $0.name == "imageLayer" }) else { return }
+
+        // Remove any existing video preview
+        detachVideoPreviewLayer(for: url)
+
+        // Configure and attach
+        playerLayer.frame = imageLayer.bounds
+        playerLayer.name = "videoPreviewLayer"
+        playerLayer.videoGravity = .resizeAspect
+        playerLayer.cornerRadius = imageLayer.cornerRadius
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        coverLayer.insertSublayer(playerLayer, above: imageLayer)
+        CATransaction.commit()
+
+        // Fade in
+        let fadeIn = CABasicAnimation(keyPath: "opacity")
+        fadeIn.fromValue = 0.0
+        fadeIn.toValue = 1.0
+        fadeIn.duration = 0.2
+        playerLayer.add(fadeIn, forKey: "fadeIn")
+
+        videoPreviewLayer = playerLayer
+        videoPreviewCoverIndex = coverIndex
+    }
+
+    private func detachVideoPreviewLayer(for url: URL) {
+        guard let layer = videoPreviewLayer else { return }
+
+        // Fade out and remove
+        CATransaction.begin()
+        CATransaction.setCompletionBlock {
+            layer.removeFromSuperlayer()
+        }
+        CATransaction.setAnimationDuration(0.15)
+        layer.opacity = 0
+        CATransaction.commit()
+
+        videoPreviewLayer = nil
+        videoPreviewCoverIndex = nil
     }
 
     @objc private func handleRightClick(_ gesture: NSClickGestureRecognizer) {
@@ -1643,9 +1838,15 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         return createContextMenu(for: index)
     }
 
+    private static let debugFileFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        return f
+    }()
+
     private func debugWriteToFile(_ message: String) {
+        guard CoverFlowView.isDebugLoggingEnabled else { return }
         let logPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/flowfinder_context_debug.log")
-        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let timestamp = Self.debugFileFormatter.string(from: Date())
         let line = "[\(timestamp)] \(message)\n"
         if FileManager.default.fileExists(atPath: logPath.path) {
             if let handle = try? FileHandle(forWritingTo: logPath) {
@@ -1784,16 +1985,19 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     // Make sure we become first responder when view appears and on any click
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self)
         requestFocus()
 
         // Observe first responder changes to debug focus loss
         if let window = window {
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(windowDidUpdate(_:)),
-                name: NSWindow.didUpdateNotification,
-                object: window
-            )
+            if CoverFlowView.isDebugLoggingEnabled {
+                NotificationCenter.default.addObserver(
+                    self,
+                    selector: #selector(windowDidUpdate(_:)),
+                    name: NSWindow.didUpdateNotification,
+                    object: window
+                )
+            }
             NotificationCenter.default.addObserver(
                 self,
                 selector: #selector(windowDidBecomeKey(_:)),
@@ -1806,7 +2010,38 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
                 name: NSWindow.didResignKeyNotification,
                 object: window
             )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowDidMiniaturize(_:)),
+                name: NSWindow.didMiniaturizeNotification,
+                object: window
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowDidDeminiaturize(_:)),
+                name: NSWindow.didDeminiaturizeNotification,
+                object: window
+            )
+            NotificationCenter.default.addObserver(
+                self,
+                selector: #selector(windowDidChangeOcclusionState(_:)),
+                name: NSWindow.didChangeOcclusionStateNotification,
+                object: window
+            )
         }
+
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidBecomeActive(_:)),
+            name: NSApplication.didBecomeActiveNotification,
+            object: nil
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(applicationDidResignActive(_:)),
+            name: NSApplication.didResignActiveNotification,
+            object: nil
+        )
 
         // Observe focus file list notification (e.g., after Escape from search)
         NotificationCenter.default.addObserver(
@@ -1815,27 +2050,25 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             name: .focusFileList,
             object: nil
         )
+        updateActivityState()
     }
 
     @objc private func handleFocusFileList(_ notification: Notification) {
         // Focus this view when requested (e.g., after pressing Escape in search field)
         // Only take focus if we're actually visible in the window
         guard let window = window,
-              visibleRect.size.height > 0 else { return }
+              visibleRect.size.height > 0,
+              currentActivityState() else { return }
         window.makeFirstResponder(self)
     }
 
     @objc private func windowDidUpdate(_ notification: Notification) {
-        // Check if we lost focus
+        // Check if we lost focus (debug-only observer)
         if let window = window, window.firstResponder !== self {
-            let responderType = String(describing: type(of: window.firstResponder))
-            // Only log if we had focus before (track with instance variable)
             if hadFocus {
                 hadFocus = false
+                let responderType = String(describing: type(of: window.firstResponder))
                 CoverFlowView.debugLog("[NSView] FOCUS LOST via windowDidUpdate! New responder: \(responderType)")
-                // Log the call stack to find the culprit
-                let symbols = Thread.callStackSymbols.prefix(15).joined(separator: "\n")
-                CoverFlowView.debugLog("[NSView] Stack trace:\n\(symbols)")
             }
         } else if window?.firstResponder === self && !hadFocus {
             hadFocus = true
@@ -1846,6 +2079,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     private var hadFocus = false
 
     @objc private func windowDidBecomeKey(_ notification: Notification) {
+        updateActivityState()
         let isFirst = window?.firstResponder === self
         CoverFlowView.debugLog("[NSView] WINDOW became key - isFirstResponder: \(isFirst)")
         // Proactively restore focus when window becomes key
@@ -1856,7 +2090,28 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     }
 
     @objc private func windowDidResignKey(_ notification: Notification) {
+        updateActivityState()
         CoverFlowView.debugLog("[NSView] WINDOW resigned key")
+    }
+
+    @objc private func windowDidMiniaturize(_ notification: Notification) {
+        updateActivityState()
+    }
+
+    @objc private func windowDidDeminiaturize(_ notification: Notification) {
+        updateActivityState()
+    }
+
+    @objc private func windowDidChangeOcclusionState(_ notification: Notification) {
+        updateActivityState()
+    }
+
+    @objc private func applicationDidBecomeActive(_ notification: Notification) {
+        updateActivityState()
+    }
+
+    @objc private func applicationDidResignActive(_ notification: Notification) {
+        updateActivityState()
     }
 
     /// Ensure we maintain first responder status - called periodically during scroll and after updates
@@ -1869,15 +2124,16 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         if let currentResponder = window.firstResponder {
             if currentResponder is NSTextView ||
                currentResponder is NSTextField ||
-               currentResponder is NSSearchField ||
-               String(describing: type(of: currentResponder)).contains("FieldEditor") {
+               currentResponder is NSSearchField {
                 return
             }
         }
 
         if window.firstResponder !== self {
-            let currentResponder = String(describing: type(of: window.firstResponder))
-            CoverFlowView.debugLog("[NSView] ensureFirstResponder - lost to \(currentResponder), reclaiming")
+            if CoverFlowView.isDebugLoggingEnabled {
+                let currentResponder = String(describing: type(of: window.firstResponder))
+                CoverFlowView.debugLog("[NSView] ensureFirstResponder - lost to \(currentResponder), reclaiming")
+            }
             window.makeFirstResponder(self)
         }
     }
@@ -2081,15 +2337,25 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             return
         }
 
+        // Cancel settle timer — momentum handles its own termination via onScrollSettled()
+        scrollSettleTimer?.invalidate()
+        scrollSettleTimer = nil
+
+        // Ensure scroll state is active without recreating the settle timer
+        if !isScrolling {
+            isScrolling = true
+            onScrollStateChange?(true)
+            // Stop video preview during scroll
+            hoveredCoverIndex = nil
+            InlineVideoPreviewManager.shared.stopAllPreviews()
+        }
+
         momentumTimer?.invalidate()
         momentumTimer = Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { [weak self] timer in
             guard let self = self else {
                 timer.invalidate()
                 return
             }
-
-            // Keep scroll state active
-            self.setScrolling(true)
 
             // Apply friction (lower = longer momentum)
             self.scrollVelocity *= 0.94

@@ -41,6 +41,8 @@
 		A1000030001 /* ViewModifiers.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000030000 /* ViewModifiers.swift */; };
 		A1000031001 /* AsyncListIconView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000031000 /* AsyncListIconView.swift */; };
 		A1000036001 /* OpenWithMenuBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000036000 /* OpenWithMenuBuilder.swift */; };
+		A1000037001 /* InlineVideoPreviewManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000037000 /* InlineVideoPreviewManager.swift */; };
+		A1000038001 /* VideoPreviewOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000038000 /* VideoPreviewOverlay.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -81,6 +83,8 @@
 		A1000033000 /* FlowFinder.icon */ = {isa = PBXFileReference; lastKnownFileType = folder.iconcomposer; path = FlowFinder.icon; sourceTree = "<group>"; };
 		A1000034000 /* CloudSyncStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncStatus.swift; sourceTree = "<group>"; };
 		A1000035000 /* CloudStatusManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudStatusManager.swift; sourceTree = "<group>"; };
+		A1000037000 /* InlineVideoPreviewManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineVideoPreviewManager.swift; sourceTree = "<group>"; };
+		A1000038000 /* VideoPreviewOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPreviewOverlay.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -138,6 +142,7 @@
 				A1000024000 /* ThumbnailCacheManager.swift */,
 				A100002E000 /* UIConstants.swift */,
 				A1000036000 /* OpenWithMenuBuilder.swift */,
+				A1000037000 /* InlineVideoPreviewManager.swift */,
 				A1000026000 /* ZipArchiveManager.swift */,
 			);
 			path = Models;
@@ -172,6 +177,7 @@
 				A1000028000 /* SettingsView.swift */,
 				A1000029000 /* MasonryView.swift */,
 				A1000030000 /* ViewModifiers.swift */,
+				A1000038000 /* VideoPreviewOverlay.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -260,6 +266,8 @@
 				A1000035001 /* CloudStatusManager.swift in Sources */,
 				A1000002001 /* FileItem.swift in Sources */,
 				A1000036001 /* OpenWithMenuBuilder.swift in Sources */,
+				A1000037001 /* InlineVideoPreviewManager.swift in Sources */,
+				A1000038001 /* VideoPreviewOverlay.swift in Sources */,
 				A1000002003 /* ListColumnConfig.swift in Sources */,
 				A1000003001 /* FileBrowserViewModel.swift in Sources */,
 				A1000004001 /* ContentView.swift in Sources */,

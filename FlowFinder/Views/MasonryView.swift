@@ -10,7 +10,6 @@ struct MasonryView: View {
     @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject private var internalDragState = InternalDragState.shared
-    @ObservedObject private var autoScrollState = DragAutoScrollState.shared
     let items: [FileItem]
 
     @State private var isDropTargeted = false
@@ -78,11 +77,8 @@ struct MasonryView: View {
     }
 
     private func aspectRatio(for item: FileItem) -> CGFloat {
-        let name = item.name
-
         // First check our cached aspect ratios (from thumbnails)
         if let ratio = aspectRatios[item.url] {
-            os_log(.debug, log: masonryLog, "aspectRatio [%{public}@]: using THUMBNAIL ratio %.3f", name, ratio)
             return ratio
         }
 
@@ -91,17 +87,14 @@ struct MasonryView: View {
            dimensions.width > 0, dimensions.height > 0 {
             let ratio = dimensions.width / dimensions.height
             let clamped = min(max(ratio, 0.4), 2.5)
-            os_log(.debug, log: masonryLog, "aspectRatio [%{public}@]: using DIMENSIONS cache %.0fx%.0f -> ratio %.3f", name, dimensions.width, dimensions.height, clamped)
             return clamped
         }
 
         // Fallback to defaults
         switch item.fileType {
         case .image, .video:
-            os_log(.debug, log: masonryLog, "aspectRatio [%{public}@]: using DEFAULT 4:3 (no cache)", name)
             return 4.0 / 3.0
         default:
-            os_log(.debug, log: masonryLog, "aspectRatio [%{public}@]: using DEFAULT 1:1 (non-image)", name)
             return 1.0
         }
     }
@@ -401,10 +394,9 @@ struct MasonryView: View {
 
                             guard direction != .none else { return }
 
-                            // Find visible items by their indices
-                            let visibleIndices = items.enumerated().compactMap { index, item in
-                                visibleItemIDs.contains(item.id) ? index : nil
-                            }
+                            // Find visible items by their indices using dictionary lookup
+                            let indexByID: [UUID: Int] = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($1.id, $0) })
+                            let visibleIndices = visibleItemIDs.compactMap { indexByID[$0] }
                             guard !visibleIndices.isEmpty else { return }
 
                             let targetIndex: Int
@@ -653,15 +645,10 @@ struct MasonryView: View {
     // MARK: - Scroll-Optimized Loading
 
     private func updateVisibility(for item: FileItem, isVisible: Bool) {
-        let wasEmpty = visibleItemIDs.isEmpty
         if isVisible {
             visibleItemIDs.insert(item.id)
         } else {
             visibleItemIDs.remove(item.id)
-        }
-
-        if wasEmpty && !visibleItemIDs.isEmpty {
-            os_log(.info, log: masonryLog, "VISIBILITY: first item appeared [%{public}@]", item.name)
         }
 
         markScrolling()
@@ -669,17 +656,11 @@ struct MasonryView: View {
     }
 
     private func markScrolling() {
-        let wasScrolling = isScrolling
         isScrolling = true
         scrollEndTimer?.invalidate()
 
-        if !wasScrolling {
-            os_log(.info, log: masonryLog, "SCROLL: started")
-        }
-
         scrollEndTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [self] _ in
             DispatchQueue.main.async {
-                os_log(.info, log: masonryLog, "SCROLL: ended, visible=%d items", visibleItemIDs.count)
                 isScrolling = false
                 // Trigger a final hydration pass when scroll stops
                 scheduleHydration()
@@ -702,10 +683,9 @@ struct MasonryView: View {
         let workItem = DispatchWorkItem { [itemsSnapshot, visibleSnapshot, currentColumnCount, scrolling, fetchedDimensions] in
             guard !visibleSnapshot.isEmpty else { return }
 
-            // Find visible indices
-            let visibleIndices = itemsSnapshot.enumerated().compactMap { index, item in
-                visibleSnapshot.contains(item.id) ? index : nil
-            }
+            // Find visible indices using dictionary lookup instead of linear scan
+            let indexByID: [UUID: Int] = Dictionary(uniqueKeysWithValues: itemsSnapshot.enumerated().map { ($1.id, $0) })
+            let visibleIndices = visibleSnapshot.compactMap { indexByID[$0] }
             guard let minIndex = visibleIndices.min(),
                   let maxIndex = visibleIndices.max() else { return }
 
@@ -754,8 +734,6 @@ struct MasonryView: View {
                 }
 
                 if !urlsNeedingDimensions.isEmpty {
-                    os_log(.info, log: masonryLog, "PREFETCH dimensions for %d images (range %d-%d)", urlsNeedingDimensions.count, start, end)
-
                     // Mark as fetched immediately to avoid duplicate requests
                     for url in urlsNeedingDimensions {
                         self.dimensionsFetched.insert(url)
@@ -763,7 +741,6 @@ struct MasonryView: View {
 
                     // Prefetch dimensions (very fast, runs on background thread)
                     self.thumbnailCache.prefetchImageDimensions(for: urlsNeedingDimensions) { results in
-                        os_log(.info, log: masonryLog, "PREFETCH complete: got %d dimensions", results.count)
                         // Dimensions are now cached - no need to store them here
                         // Just trigger a layout refresh if we're not scrolling
                         if !self.isScrolling {
@@ -800,6 +777,19 @@ struct MasonryView: View {
                         self.scheduleHydration()
                     }
                 }
+
+                // Evict thumbnails far from visible range to limit memory
+                if !self.isScrolling {
+                    let evictionBuffer = range.count * 2
+                    let evStart = max(0, range.lowerBound - evictionBuffer)
+                    let evEnd = min(itemsSnapshot.count, range.upperBound + evictionBuffer)
+                    let extendedKeepURLs = Set(itemsSnapshot[evStart..<evEnd].map { $0.url })
+                    for url in self.thumbnails.keys {
+                        if !extendedKeepURLs.contains(url) {
+                            self.thumbnails.removeValue(forKey: url)
+                        }
+                    }
+                }
             }
         }
 
@@ -826,16 +816,13 @@ struct MasonryView: View {
         }
 
         if let existing = thumbnails[url], imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
-            os_log(.debug, log: masonryLog, "loadThumbnail [%{public}@]: already have adequate thumbnail", item.name)
             return
         }
         if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) {
-            os_log(.debug, log: masonryLog, "loadThumbnail [%{public}@]: already pending", item.name)
             return
         }
 
         if thumbnailCache.hasFailed(url: url) {
-            os_log(.debug, log: masonryLog, "loadThumbnail [%{public}@]: previously failed, using icon", item.name)
             DispatchQueue.main.async {
                 thumbnails[url] = item.icon
             }
@@ -843,25 +830,17 @@ struct MasonryView: View {
         }
 
         if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
-            os_log(.debug, log: masonryLog, "loadThumbnail [%{public}@]: found in cache", item.name)
             DispatchQueue.main.async {
                 thumbnails[url] = cached
-                // NOTE: Do NOT update aspect ratio here - it causes layout shift!
-                // We rely on the dimension cache (getImageDimensions) for stable layout
             }
             return
         }
 
-        os_log(.info, log: masonryLog, "loadThumbnail [%{public}@]: GENERATING new thumbnail", item.name)
         thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { url, image in
             DispatchQueue.main.async {
                 if let image = image {
-                    os_log(.debug, log: masonryLog, "loadThumbnail [%{public}@]: generated %.0fx%.0f", item.name, image.size.width, image.size.height)
                     thumbnails[url] = image
-                    // NOTE: Do NOT update aspect ratio here - it causes layout shift!
-                    // We rely on the dimension cache (getImageDimensions) for stable layout
                 } else {
-                    os_log(.debug, log: masonryLog, "loadThumbnail [%{public}@]: generation failed, using icon", item.name)
                     thumbnails[url] = item.icon
                 }
             }
@@ -917,14 +896,10 @@ struct MasonryView: View {
     }
 
     private func itemsTokenFor(_ items: [FileItem]) -> Int {
-        // Use a simple count + set of URL paths for stable comparison
-        // This ignores order changes which happen frequently during sorting
         var hasher = Hasher()
         hasher.combine(items.count)
-        // Sort URLs to make hash order-independent
-        let sortedPaths = items.map { $0.url.path }.sorted()
-        for path in sortedPaths {
-            hasher.combine(path)
+        for item in items {
+            hasher.combine(item.id)
         }
         return hasher.finalize()
     }
@@ -971,7 +946,8 @@ struct MasonryItemView: View {
     let onSelect: (FileItem, Bool) -> Void  // Bool indicates if clicked on text area
     let onDoubleClick: (FileItem) -> Void
 
-    @StateObject private var clickState = ClickState()
+    @State private var clickState = ClickStateData()
+    @State private var isHovering = false
 
     private var isSelected: Bool {
         viewModel.selectedItems.contains(item)
@@ -995,12 +971,14 @@ struct MasonryItemView: View {
                         .scaledToFill()
                         .frame(width: columnWidth, height: imageHeight)
                         .clipped()
+                        .videoPreviewOnHover(item: item, isHovering: $isHovering, size: CGSize(width: columnWidth, height: imageHeight))
                 } else {
                     Image(nsImage: displayImage)
                         .resizable()
                         .scaledToFit()
                         .frame(width: iconSize, height: iconSize)
                         .foregroundColor(.primary)
+                        .frame(width: columnWidth, height: imageHeight)
                 }
 
                 // Cloud status badge
@@ -1062,6 +1040,9 @@ struct MasonryItemView: View {
                 .opacity(isSelected ? 1 : 0)
         )
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+        .onHover { hovering in
+            isHovering = hovering
+        }
         .internalDrag(url: item.url)
         .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
             item: item,

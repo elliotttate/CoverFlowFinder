@@ -396,6 +396,12 @@ extension FileBrowserViewModel {
 // Provides instant single-click with time-based double-click detection
 // This avoids SwiftUI's ~300ms delay when both single and double tap gestures are present
 
+struct ClickStateData {
+    var lastClickTime: Date?
+    var lastClickId: AnyHashable?
+}
+
+// Keep class wrapper for backward compatibility with @StateObject usage sites
 class ClickState: ObservableObject {
     var lastClickTime: Date?
     var lastClickId: AnyHashable?
@@ -406,7 +412,7 @@ struct InstantTapModifier<ID: Hashable>: ViewModifier {
     let onSingleClick: () -> Void
     let onDoubleClick: () -> Void
 
-    @StateObject private var clickState = ClickState()
+    @State private var clickState = ClickStateData()
     private let doubleClickThreshold: TimeInterval = NSEvent.doubleClickInterval
 
     func body(content: Content) -> some View {
