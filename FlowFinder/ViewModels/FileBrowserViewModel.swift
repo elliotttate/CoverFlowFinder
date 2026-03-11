@@ -713,7 +713,10 @@ class FileBrowserViewModel: ObservableObject {
                 }
             } catch {
                 DispatchQueue.main.async { [weak self] in
-                    guard let self = self else { return }
+                    guard let self = self,
+                          self.directoryLoadToken == loadToken,
+                          !self.isInsideArchive,
+                          self.currentPath == pathToLoad else { return }
                     self.items = []
                     self.isLoading = false
                 }
@@ -1761,6 +1764,17 @@ class FileBrowserViewModel: ObservableObject {
         photosLoadToken = UUID()
     }
 
+    private func refreshFinderSearchScopeIfNeeded() {
+        guard searchMode == .finder, !searchText.isEmpty else { return }
+        searchResults = []
+        performSearch(query: searchText)
+    }
+
+    private func clearFinderSearchIfNeeded() {
+        guard searchMode == .finder, !searchText.isEmpty else { return }
+        clearSearchQuery()
+    }
+
 
     func navigateTo(_ url: URL) {
         guard url != currentPath else { return }
@@ -1783,6 +1797,7 @@ class FileBrowserViewModel: ObservableObject {
         isNavigating = false
 
         loadContents()
+        refreshFinderSearchScopeIfNeeded()
         addToHistory(.filesystem(url))
     }
 
@@ -1807,10 +1822,12 @@ class FileBrowserViewModel: ObservableObject {
         isNavigating = false
 
         loadContents()
+        refreshFinderSearchScopeIfNeeded()
         addToHistory(.filesystem(url))
     }
 
     func navigateToPhotosLibrary(_ info: PhotosLibraryInfo) {
+        clearFinderSearchIfNeeded()
         clearPhotosCaches()
         photosLibraryInfo = info
         photosLogger.info("Navigate to Photos library: \(info.libraryURL.path, privacy: .public)")
@@ -1866,7 +1883,11 @@ class FileBrowserViewModel: ObservableObject {
             clearPhotosCaches()
             currentPath = url
             selectedItems.removeAll()
+            isNavigating = true
+            ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
+            isNavigating = false
             loadContents()
+            refreshFinderSearchScopeIfNeeded()
         case .archive(let archiveURL, let internalPath):
             do {
                 if currentArchiveURL != archiveURL || archiveEntries.isEmpty {
@@ -1888,8 +1909,10 @@ class FileBrowserViewModel: ObservableObject {
                 clearPhotosCaches()
                 currentPath = archiveURL.deletingLastPathComponent()
                 loadContents()
+                refreshFinderSearchScopeIfNeeded()
             }
         case .photosLibrary(let info):
+            clearFinderSearchIfNeeded()
             isInsideArchive = false
             currentArchiveURL = nil
             currentArchivePath = ""
@@ -2637,6 +2660,10 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     func paste() {
+        paste(to: currentPath)
+    }
+
+    func paste(to destination: URL) {
         guard !isInsideArchive else {
             NSSound.beep()
             return
@@ -2658,11 +2685,9 @@ class FileBrowserViewModel: ObservableObject {
 
         guard !urlsToPaste.isEmpty else { return }
 
-        let destinationPath = currentPath
-
         if operationIsCut {
             let moves = urlsToPaste.map {
-                MoveRecord(from: $0, to: destinationPath.appendingPathComponent($0.lastPathComponent))
+                MoveRecord(from: $0, to: destination.appendingPathComponent($0.lastPathComponent))
             }
             performMoves(moves, actionName: "Move", registerUndo: true, resolveCollisions: true) { [weak self] completed in
                 guard let self else { return }
@@ -2674,7 +2699,7 @@ class FileBrowserViewModel: ObservableObject {
             }
         } else {
             let copies = urlsToPaste.map {
-                CopyRecord(from: $0, to: destinationPath.appendingPathComponent($0.lastPathComponent))
+                CopyRecord(from: $0, to: destination.appendingPathComponent($0.lastPathComponent))
             }
             performCopies(copies, actionName: "Copy", registerUndo: true, resolveCollisions: true)
         }
@@ -3063,6 +3088,13 @@ class FileBrowserViewModel: ObservableObject {
         metadataQuery?.stop()
         metadataQuery = nil
         removeMetadataQueryObservers()
+    }
+
+    func clearSearchQuery() {
+        cancelSearch()
+        searchResults = []
+        searchText = ""
+        isSearching = false
     }
 
     /// Perform Finder search using NSMetadataQuery (Spotlight)

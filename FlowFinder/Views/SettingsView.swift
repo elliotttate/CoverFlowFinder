@@ -73,6 +73,8 @@ struct SettingsView: View {
             Section("Preview") {
                 Toggle("Inline video preview on hover", isOn: $settings.inlineVideoPreview)
                     .help("When hovering over a video file, play a preview within the thumbnail")
+                Toggle("Inline audio preview on hover", isOn: $settings.inlineAudioPreview)
+                    .help("When hovering over an audio file, play a preview with progress bar and pause control")
             }
 
             Section("Sound") {

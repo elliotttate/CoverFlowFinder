@@ -115,9 +115,10 @@ struct IconGridView: View {
                         Color.clear
                             .contentShape(Rectangle())
                             .onTapGesture {
-                                // Click on empty space - deselect all
+                                // Click on empty space - deselect all and commit/dismiss active rename
                                 viewModel.selectedItems.removeAll()
                                 viewModel.cancelPendingRename()
+                                viewModel.renamingURL = nil
                             }
                     )
                 }
