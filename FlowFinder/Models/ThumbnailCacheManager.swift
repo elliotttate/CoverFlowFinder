@@ -24,6 +24,10 @@ class ThumbnailCacheManager {
     private var currentGeneration: Int = 0
     private let queue = DispatchQueue(label: "com.coverflowfinder.thumbnailcache", qos: .userInitiated)
 
+    // MARK: - Filesystem mtime Cache (avoids repeated stat calls)
+    private var mtimeCache: [URL: TimeInterval] = [:]
+    private let mtimeCacheLock = NSLock()
+
     // MARK: - Settings
     private let maxMemoryCacheCount = 1000  // Max thumbnails in memory
     private let maxMemoryCacheCost = 400 * 1024 * 1024  // 400MB
@@ -127,7 +131,18 @@ class ThumbnailCacheManager {
             pendingRequests.removeAll()
             failedURLs.removeAll()
         }
+        mtimeCacheLock.lock()
+        mtimeCache.removeAll()
+        mtimeCacheLock.unlock()
         // Don't clear memory cache - thumbnails might be reused if user navigates back
+    }
+
+    private func finishPendingRequest(_ cacheKey: String, generation: Int) -> Bool {
+        queue.sync {
+            guard pendingRequests[cacheKey] == generation else { return false }
+            pendingRequests.removeValue(forKey: cacheKey)
+            return true
+        }
     }
 
     // MARK: - Fast Image Dimensions
@@ -320,11 +335,7 @@ class ThumbnailCacheManager {
 
                 // Cache and call completion on main queue
                 DispatchQueue.main.async {
-                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKeyStr) }
-
-                    let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
-                    guard stillValid else { return }
-
+                    guard self.finishPendingRequest(cacheKeyStr, generation: generation) else { return }
                     self.memoryCache.setObject(highResIcon, forKey: cacheKey)
                     completion(url, highResIcon)
                 }
@@ -410,10 +421,7 @@ class ThumbnailCacheManager {
             if let thumbnail = thumbnail {
                 // Got cached thumbnail instantly
                 DispatchQueue.main.async {
-                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
-                    let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
-                    guard stillValid else { return }
-
+                    guard self.finishPendingRequest(cacheKey, generation: generation) else { return }
                     let image = thumbnail.nsImage
                     self.cacheImage(image, for: url, maxPixelSize: maxPixelSize)
                     completion(url, image)
@@ -465,10 +473,7 @@ class ThumbnailCacheManager {
             }
 
             DispatchQueue.main.async {
-                _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
-                let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
-                guard stillValid else { return }
-
+                guard self.finishPendingRequest(cacheKey, generation: generation) else { return }
                 if let image = resultImage {
                     self.cacheImage(image, for: url, maxPixelSize: maxPixelSize)
                     completion(url, image)
@@ -500,10 +505,7 @@ class ThumbnailCacheManager {
             guard let self = self else { return }
 
             DispatchQueue.main.async {
-                _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
-                let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
-                guard stillValid else { return }
-
+                guard self.finishPendingRequest(cacheKey, generation: generation) else { return }
                 if let thumbnail = thumbnail {
                     let image = thumbnail.nsImage
                     self.cacheImage(image, for: url, maxPixelSize: maxPixelSize)
@@ -661,10 +663,7 @@ class ThumbnailCacheManager {
 
                 DispatchQueue.main.async { [weak self] in
                     guard let self = self else { return }
-                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
-                    let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
-                    guard stillValid else { return }
-
+                    guard self.finishPendingRequest(cacheKey, generation: generation) else { return }
                     self.cacheArchiveImage(image, cacheKey: cacheKey)
                     completion(originalURL, image)
                 }
@@ -686,17 +685,14 @@ class ThumbnailCacheManager {
                 representationTypes: [.thumbnail, .icon]
             )
 
-            QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] thumbnail, error in
-                guard let self = self else { return }
+                QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { [weak self] thumbnail, error in
+                    guard let self = self else { return }
 
-                DispatchQueue.main.async {
-                    _ = self.queue.sync { self.pendingRequests.removeValue(forKey: cacheKey) }
-                    let stillValid = self.queue.sync { generation >= self.currentGeneration - 1 }
-                    guard stillValid else { return }
-
-                    if let thumbnail = thumbnail {
-                        let image = thumbnail.nsImage
-                        self.cacheArchiveImage(image, cacheKey: cacheKey)
+                    DispatchQueue.main.async {
+                        guard self.finishPendingRequest(cacheKey, generation: generation) else { return }
+                        if let thumbnail = thumbnail {
+                            let image = thumbnail.nsImage
+                            self.cacheArchiveImage(image, cacheKey: cacheKey)
                         completion(originalURL, image)
                     } else {
                         _ = self.queue.sync { self.failedURLs.insert(originalURL) }
@@ -710,8 +706,20 @@ class ThumbnailCacheManager {
     private func archiveCacheKey(archiveURL: URL, archivePath: String, maxPixelSize: CGFloat) -> String {
         let sizeBucket = Int(clampPixelSize(maxPixelSize).rounded(.toNearestOrAwayFromZero))
         var keyString = "archive_\(archiveURL.path)_\(archivePath)_\(sizeBucket)"
-        if let mtime = try? archiveURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
-            keyString += "_\(mtime.timeIntervalSince1970)"
+
+        // Use cached mtime to avoid filesystem stat on every call
+        mtimeCacheLock.lock()
+        let cachedMtime = mtimeCache[archiveURL]
+        mtimeCacheLock.unlock()
+
+        if let mtime = cachedMtime {
+            keyString += "_\(mtime)"
+        } else if let mtime = try? archiveURL.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
+            let interval = mtime.timeIntervalSince1970
+            keyString += "_\(interval)"
+            mtimeCacheLock.lock()
+            mtimeCache[archiveURL] = interval
+            mtimeCacheLock.unlock()
         }
 
         let hash = SHA256.hash(data: Data(keyString.utf8))
@@ -746,8 +754,20 @@ class ThumbnailCacheManager {
     private func cacheKey(for url: URL, maxPixelSize: CGFloat) -> String {
         let sizeBucket = Int(clampPixelSize(maxPixelSize).rounded(.toNearestOrAwayFromZero))
         var keyString = "\(url.path)_\(sizeBucket)"
-        if let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
-            keyString += "_\(mtime.timeIntervalSince1970)"
+
+        // Use cached mtime to avoid filesystem stat on every call
+        mtimeCacheLock.lock()
+        let cachedMtime = mtimeCache[url]
+        mtimeCacheLock.unlock()
+
+        if let mtime = cachedMtime {
+            keyString += "_\(mtime)"
+        } else if let mtime = try? url.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate {
+            let interval = mtime.timeIntervalSince1970
+            keyString += "_\(interval)"
+            mtimeCacheLock.lock()
+            mtimeCache[url] = interval
+            mtimeCacheLock.unlock()
         }
 
         // Hash the key for safe filename
@@ -886,5 +906,8 @@ class ThumbnailCacheManager {
             pendingRequests.removeAll()
             currentGeneration = 0
         }
+        mtimeCacheLock.lock()
+        mtimeCache.removeAll()
+        mtimeCacheLock.unlock()
     }
 }

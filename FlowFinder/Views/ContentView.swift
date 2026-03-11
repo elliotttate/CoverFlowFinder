@@ -1,30 +1,132 @@
 import SwiftUI
 import AppKit
 
+@MainActor
+final class AuxiliaryPaneStore: ObservableObject {
+    private var rightPaneStorage: FileBrowserViewModel?
+    private var bottomLeftPaneStorage: FileBrowserViewModel?
+    private var bottomRightPaneStorage: FileBrowserViewModel?
+
+    var loadedViewModels: [FileBrowserViewModel] {
+        [rightPaneStorage, bottomLeftPaneStorage, bottomRightPaneStorage].compactMap { $0 }
+    }
+
+    var rightPaneViewModel: FileBrowserViewModel {
+        if let viewModel = rightPaneStorage {
+            return viewModel
+        }
+
+        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        let viewModel = FileBrowserViewModel(initialPath: desktop)
+        rightPaneStorage = viewModel
+        return viewModel
+    }
+
+    var bottomLeftPaneViewModel: FileBrowserViewModel {
+        if let viewModel = bottomLeftPaneStorage {
+            return viewModel
+        }
+
+        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        let viewModel = FileBrowserViewModel(initialPath: downloads)
+        bottomLeftPaneStorage = viewModel
+        return viewModel
+    }
+
+    var bottomRightPaneViewModel: FileBrowserViewModel {
+        if let viewModel = bottomRightPaneStorage {
+            return viewModel
+        }
+
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.homeDirectoryForCurrentUser
+        let viewModel = FileBrowserViewModel(initialPath: documents)
+        bottomRightPaneStorage = viewModel
+        return viewModel
+    }
+}
+
+private struct ViewModelActivitySyncView: View {
+    let selectedTabId: UUID
+    let currentViewMode: ViewMode
+    let activePane: DualPaneView.Pane
+    let activeQuadPane: QuadPaneView.Pane
+    let scenePhase: ScenePhase
+    let tabIDs: [UUID]
+    let showHiddenFiles: Bool
+    let onAppearAction: () -> Void
+    let onSelectedTabChange: () -> Void
+    let onRefreshAll: () -> Void
+    let onUpdateActivity: () -> Void
+    let onTabsChange: () -> Void
+
+    var body: some View {
+        Color.clear
+            .frame(width: 0, height: 0)
+            .onAppear(perform: onAppearAction)
+            .onChange(of: selectedTabId) { _ in
+                onSelectedTabChange()
+            }
+            .onChange(of: currentViewMode) { _ in
+                onUpdateActivity()
+            }
+            .onChange(of: activePane) { _ in
+                onUpdateActivity()
+            }
+            .onChange(of: activeQuadPane) { _ in
+                onUpdateActivity()
+            }
+            .onChange(of: scenePhase) { _ in
+                onUpdateActivity()
+            }
+            .onChange(of: tabIDs) { _ in
+                onTabsChange()
+            }
+            .onChange(of: showHiddenFiles) { _ in
+                onRefreshAll()
+            }
+    }
+}
+
+private struct NotificationReceivers: ViewModifier {
+    @Binding var showingInfoItem: FileItem?
+    let onNewTab: () -> Void
+    let onCloseTab: () -> Void
+    let onNextTab: () -> Void
+    let onPreviousTab: () -> Void
+
+    func body(content: Content) -> some View {
+        content
+            .onReceive(NotificationCenter.default.publisher(for: .showGetInfo)) { notification in
+                if let item = notification.object as? FileItem {
+                    showingInfoItem = item
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .newTab)) { _ in
+                onNewTab()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .closeTab)) { _ in
+                onCloseTab()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .nextTab)) { _ in
+                onNextTab()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .previousTab)) { _ in
+                onPreviousTab()
+            }
+    }
+}
+
 struct ContentView: View {
 
     @EnvironmentObject private var settings: AppSettings
     @Environment(\.undoManager) private var undoManager
+    @Environment(\.scenePhase) private var scenePhase
     @State private var tabs: [BrowserTab] = [BrowserTab()]
     @State private var selectedTabId: UUID = UUID()
-
-    @StateObject private var rightPaneViewModel: FileBrowserViewModel = {
-        let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        return FileBrowserViewModel(initialPath: desktop)
-    }()
-
-    @StateObject private var bottomLeftPaneViewModel: FileBrowserViewModel = {
-        let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        return FileBrowserViewModel(initialPath: downloads)
-    }()
-
-    @StateObject private var bottomRightPaneViewModel: FileBrowserViewModel = {
-        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
-            ?? FileManager.default.homeDirectoryForCurrentUser
-        return FileBrowserViewModel(initialPath: documents)
-    }()
+    @StateObject private var auxiliaryPaneStore = AuxiliaryPaneStore()
 
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var activePane: DualPaneView.Pane = .left
@@ -40,12 +142,26 @@ struct ContentView: View {
         tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
     }
 
+    private var rightPaneViewModel: FileBrowserViewModel {
+        auxiliaryPaneStore.rightPaneViewModel
+    }
+
+    private var bottomLeftPaneViewModel: FileBrowserViewModel {
+        auxiliaryPaneStore.bottomLeftPaneViewModel
+    }
+
+    private var bottomRightPaneViewModel: FileBrowserViewModel {
+        auxiliaryPaneStore.bottomRightPaneViewModel
+    }
+
     private var viewModeBinding: Binding<ViewMode> {
         Binding(
             get: { viewModel.viewMode },
             set: { newValue in
-                viewModel.viewMode = newValue
-                currentViewMode = newValue
+                DispatchQueue.main.async {
+                    viewModel.viewMode = newValue
+                    currentViewMode = newValue
+                }
             }
         )
     }
@@ -78,6 +194,21 @@ struct ContentView: View {
         return viewModel
     }
 
+    private var visibleViewModels: [FileBrowserViewModel] {
+        switch currentViewMode {
+        case .dualPane:
+            return [viewModel, rightPaneViewModel]
+        case .quadPane:
+            return [viewModel, rightPaneViewModel, bottomLeftPaneViewModel, bottomRightPaneViewModel]
+        default:
+            return [viewModel]
+        }
+    }
+
+    private var managedViewModels: [FileBrowserViewModel] {
+        deduplicatedViewModels(tabs.map(\.viewModel) + auxiliaryPaneStore.loadedViewModels)
+    }
+
     private var viewModePickerWidth: CGFloat {
         let count = CGFloat(ViewMode.allCases.count)
         return min(380, max(220, count * 40))
@@ -90,198 +221,214 @@ struct ContentView: View {
     }
 
     var body: some View {
+        splitView
+            .toolbar { toolbarItems }
+            .navigationTitle(viewModel.currentPath.lastPathComponent)
+            .focusedSceneValue(\.viewModel, viewModel)
+            .sheet(item: $showingInfoItem) { item in
+                FileInfoView(item: item)
+            }
+            .modifier(NotificationReceivers(
+                showingInfoItem: $showingInfoItem,
+                onNewTab: addNewTab,
+                onCloseTab: { closeTab(selectedTabId) },
+                onNextTab: selectNextTab,
+                onPreviousTab: selectPreviousTab
+            ))
+            .onReceive(viewModel.$historyIndex) { newIndex in
+                navHistoryIndex = newIndex
+            }
+            .onReceive(viewModel.$navigationHistory) { newHistory in
+                navHistoryCount = newHistory.count
+            }
+            .background(activitySyncView)
+            .background(QuickLookWindowController())
+            .background(LiquidGlassWindowConfigurator())
+    }
+
+    @ToolbarContentBuilder
+    private var toolbarItems: some ToolbarContent {
+        ToolbarItem(placement: .navigation) {
+            Button(action: { viewModel.goBack() }) {
+                Image(systemName: "chevron.left")
+            }
+            .disabled(navHistoryIndex <= 0)
+            .help("Back")
+        }
+
+        ToolbarItem(placement: .navigation) {
+            Button(action: { viewModel.goForward() }) {
+                Image(systemName: "chevron.right")
+            }
+            .disabled(navHistoryIndex >= navHistoryCount - 1)
+            .help("Forward")
+        }
+
+        ToolbarItem(placement: .principal) {
+            Picker("View", selection: viewModeBinding) {
+                ForEach(ViewMode.allCases, id: \.self) { mode in
+                    Image(systemName: mode.systemImage)
+                        .tag(mode)
+                        .help(mode.rawValue)
+                        .accessibilityLabel(mode.rawValue)
+                }
+            }
+            .pickerStyle(.segmented)
+            .frame(width: viewModePickerWidth)
+            .help("Change view mode")
+        }
+
+        ToolbarItemGroup(placement: .primaryAction) {
+            toolbarActions
+        }
+    }
+
+    private var activitySyncView: some View {
+        ViewModelActivitySyncView(
+            selectedTabId: selectedTabId,
+            currentViewMode: currentViewMode,
+            activePane: activePane,
+            activeQuadPane: activeQuadPane,
+            scenePhase: scenePhase,
+            tabIDs: tabs.map(\.id),
+            showHiddenFiles: settings.showHiddenFiles,
+            onAppearAction: {
+                currentViewMode = viewModel.viewMode
+                syncNavigationState()
+                assignUndoManager()
+                updateViewModelActivity()
+            },
+            onSelectedTabChange: {
+                currentViewMode = viewModel.viewMode
+                syncNavigationState()
+                assignUndoManager()
+                updateViewModelActivity()
+            },
+            onRefreshAll: refreshAllViewModels,
+            onUpdateActivity: updateViewModelActivity,
+            onTabsChange: {
+                assignUndoManager()
+                updateViewModelActivity()
+            }
+        )
+    }
+
+    private var splitView: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             SidebarView(viewModel: activeViewModel, isDualPane: currentViewMode == .dualPane || currentViewMode == .quadPane)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 300)
         } detail: {
-            VStack(spacing: 0) {
-                if tabs.count > 1 {
-                    TabBarView(
-                        tabs: $tabs,
-                        selectedTabId: $selectedTabId,
-                        onNewTab: addNewTab,
-                        onCloseTab: closeTab
-                    )
-                    Divider()
-                }
+            detailContent
+        }
+    }
 
-                if currentViewMode == .dualPane {
-                    DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel, activePane: $activePane)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .frame(minWidth: 700, minHeight: 400)
-                        .id("dualpane-\(viewModel.currentPath.path)-\(selectedTabId)")
-                } else if currentViewMode == .quadPane {
-                    QuadPaneView(
-                        topLeftViewModel: viewModel,
-                        topRightViewModel: rightPaneViewModel,
-                        bottomLeftViewModel: bottomLeftPaneViewModel,
-                        bottomRightViewModel: bottomRightPaneViewModel,
-                        activePane: $activeQuadPane
-                    )
+    @ViewBuilder
+    private var detailContent: some View {
+        VStack(spacing: 0) {
+            if tabs.count > 1 {
+                TabBarView(
+                    tabs: $tabs,
+                    selectedTabId: $selectedTabId,
+                    onNewTab: addNewTab,
+                    onCloseTab: closeTab
+                )
+                Divider()
+            }
+
+            if currentViewMode == .dualPane {
+                DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel, activePane: $activePane)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .frame(minWidth: 800, minHeight: 600)
-                    .id("quadpane-\(viewModel.currentPath.path)-\(selectedTabId)")
-                } else {
-                    TabContentWrapper(viewModel: viewModel, selectedTabId: selectedTabId)
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                }
+                    .frame(minWidth: 700, minHeight: 400)
+                    .id("dualpane-\(viewModel.currentPath.path)-\(selectedTabId)")
+            } else if currentViewMode == .quadPane {
+                QuadPaneView(
+                    topLeftViewModel: viewModel,
+                    topRightViewModel: rightPaneViewModel,
+                    bottomLeftViewModel: bottomLeftPaneViewModel,
+                    bottomRightViewModel: bottomRightPaneViewModel,
+                    activePane: $activeQuadPane
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 800, minHeight: 600)
+                .id("quadpane-\(viewModel.currentPath.path)-\(selectedTabId)")
+            } else {
+                TabContentWrapper(viewModel: viewModel, selectedTabId: selectedTabId)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
             }
         }
-        .toolbar {
-            ToolbarItem(placement: .navigation) {
-                Button(action: { viewModel.goBack() }) {
-                    Image(systemName: "chevron.left")
-                }
-                .disabled(navHistoryIndex <= 0)
-                .help("Back")
-            }
+    }
 
-            ToolbarItem(placement: .navigation) {
-                Button(action: { viewModel.goForward() }) {
-                    Image(systemName: "chevron.right")
-                }
-                .disabled(navHistoryIndex >= navHistoryCount - 1)
-                .help("Forward")
-            }
-
-            ToolbarItem(placement: .principal) {
-                Picker("View", selection: viewModeBinding) {
-                    ForEach(ViewMode.allCases, id: \.self) { mode in
-                        Image(systemName: mode.systemImage)
-                            .tag(mode)
-                            .help(mode.rawValue)
-                            .accessibilityLabel(mode.rawValue)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(width: viewModePickerWidth)
-                .help("Change view mode")
-            }
-
-            ToolbarItemGroup(placement: .primaryAction) {
-                // Sort menu
-                Menu {
-                    ForEach(ListColumn.allCases) { column in
-                        Button(action: {
-                            columnConfig.setSortColumn(column)
-                        }) {
-                            HStack {
-                                Text(column.rawValue)
-                                if columnConfig.sortColumn == column {
-                                    Image(systemName: columnConfig.sortDirection == .ascending ? "chevron.up" : "chevron.down")
-                                }
-                            }
+    @ViewBuilder
+    private var toolbarActions: some View {
+        Menu {
+            ForEach(ListColumn.allCases) { column in
+                Button(action: {
+                    columnConfig.setSortColumn(column)
+                }) {
+                    HStack {
+                        Text(column.rawValue)
+                        if columnConfig.sortColumn == column {
+                            Image(systemName: columnConfig.sortDirection == .ascending ? "chevron.up" : "chevron.down")
                         }
                     }
-                } label: {
-                    Image(systemName: "arrow.up.arrow.down")
                 }
-                .help("Sort by")
+            }
+        } label: {
+            Image(systemName: "arrow.up.arrow.down")
+        }
+        .help("Sort by")
 
-                // Action menu
-                Menu {
-                    Button("New Folder") {
-                        viewModel.createNewFolder()
-                    }
-                    .keyboardShortcut("n", modifiers: [.command, .shift])
+        Menu {
+            Button("New Folder") {
+                viewModel.createNewFolder()
+            }
+            .keyboardShortcut("n", modifiers: [.command, .shift])
 
-                    Divider()
+            Divider()
 
-                    Button("Get Info") {
-                        viewModel.getInfo()
-                    }
-                    .keyboardShortcut("i", modifiers: .command)
-                    .disabled(viewModel.selectedItems.isEmpty)
+            Button("Get Info") {
+                viewModel.getInfo()
+            }
+            .keyboardShortcut("i", modifiers: .command)
+            .disabled(viewModel.selectedItems.isEmpty)
 
-                    Divider()
+            Divider()
 
-                    Button("Show in Finder") {
-                        viewModel.showInFinder()
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-                .help("Actions")
+            Button("Show in Finder") {
+                viewModel.showInFinder()
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .help("Actions")
 
-                // Search mode picker and search field
-                HStack(spacing: 2) {
-                    // Search mode picker
-                    Menu {
-                        ForEach(SearchMode.allCases, id: \.self) { mode in
-                            Button {
-                                viewModel.searchMode = mode
-                            } label: {
-                                Label(mode.rawValue, systemImage: mode.systemImage)
-                            }
-                        }
+        HStack(spacing: 2) {
+            Menu {
+                ForEach(SearchMode.allCases, id: \.self) { mode in
+                    Button {
+                        viewModel.searchMode = mode
                     } label: {
-                        Label(viewModel.searchMode.rawValue, systemImage: viewModel.searchMode.systemImage)
-                            .labelStyle(.titleAndIcon)
-                    }
-                    .id("search-mode-\(viewModel.searchMode.rawValue)")
-                    .fixedSize()
-                    .help("Search mode: \(viewModel.searchMode.rawValue)")
-
-                    // Search field - stable ID prevents recreation during view updates
-                    SearchField(text: searchTextBinding, placeholder: viewModel.searchMode.placeholder)
-                        .frame(width: 180)
-                        .id("main-search-field")
-
-                    // Loading indicator
-                    if viewModel.isSearching {
-                        ProgressView()
-                            .scaleEffect(0.6)
-                            .frame(width: 16, height: 16)
+                        Label(mode.rawValue, systemImage: mode.systemImage)
                     }
                 }
+            } label: {
+                Label(viewModel.searchMode.rawValue, systemImage: viewModel.searchMode.systemImage)
+                    .labelStyle(.titleAndIcon)
+            }
+            .id("search-mode-\(viewModel.searchMode.rawValue)")
+            .fixedSize()
+            .help("Search mode: \(viewModel.searchMode.rawValue)")
+
+            SearchField(text: searchTextBinding, placeholder: viewModel.searchMode.placeholder)
+                .frame(width: 180)
+                .id("main-search-field")
+
+            if viewModel.isSearching {
+                ProgressView()
+                    .scaleEffect(0.6)
+                    .frame(width: 16, height: 16)
             }
         }
-        .navigationTitle(viewModel.currentPath.lastPathComponent)
-        .focusedSceneValue(\.viewModel, viewModel)
-        .sheet(item: $showingInfoItem) { item in
-            FileInfoView(item: item)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .showGetInfo)) { notification in
-            if let item = notification.object as? FileItem {
-                showingInfoItem = item
-            }
-        }
-        // Tab notifications from menu commands
-        .onReceive(NotificationCenter.default.publisher(for: .newTab)) { _ in
-            addNewTab()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .closeTab)) { _ in
-            closeTab(selectedTabId)
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .nextTab)) { _ in
-            selectNextTab()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: .previousTab)) { _ in
-            selectPreviousTab()
-        }
-        // Sync currentViewMode when tab changes
-        .onChange(of: selectedTabId) { _ in
-            currentViewMode = viewModel.viewMode
-            syncNavigationState()
-            assignUndoManager()
-        }
-        .onAppear {
-            currentViewMode = viewModel.viewMode
-            syncNavigationState()
-            assignUndoManager()
-        }
-        .onChange(of: settings.showHiddenFiles) { _ in
-            refreshAllViewModels()
-        }
-        // Observe navigation changes from the viewModel
-        .onReceive(viewModel.$historyIndex) { newIndex in
-            navHistoryIndex = newIndex
-        }
-        .onReceive(viewModel.$navigationHistory) { newHistory in
-            navHistoryCount = newHistory.count
-        }
-        .background(QuickLookWindowController())
-        .background(LiquidGlassWindowConfigurator())
     }
 
     // MARK: - Tab Management
@@ -325,12 +472,9 @@ struct ContentView: View {
     }
 
     private func refreshAllViewModels() {
-        for tab in tabs {
-            tab.viewModel.refresh()
+        for viewModel in visibleViewModels {
+            viewModel.refresh()
         }
-        rightPaneViewModel.refresh()
-        bottomLeftPaneViewModel.refresh()
-        bottomRightPaneViewModel.refresh()
     }
 
     private func assignUndoManager() {
@@ -338,9 +482,29 @@ struct ContentView: View {
         for tab in tabs {
             tab.viewModel.setUndoManager(manager)
         }
-        rightPaneViewModel.setUndoManager(manager)
-        bottomLeftPaneViewModel.setUndoManager(manager)
-        bottomRightPaneViewModel.setUndoManager(manager)
+        for viewModel in auxiliaryPaneStore.loadedViewModels {
+            viewModel.setUndoManager(manager)
+        }
+    }
+
+    private func updateViewModelActivity() {
+        assignUndoManager()
+
+        // Visible VMs are always active — scenePhase only affects non-visible auxiliary panes.
+        // On macOS, scenePhase can be unreliable (may not report .active promptly at startup),
+        // so we never suspend the primary/visible view models based on it.
+        let visibleIdentifiers = Set(visibleViewModels.map { ObjectIdentifier($0) })
+
+        for viewModel in managedViewModels {
+            let isVisible = visibleIdentifiers.contains(ObjectIdentifier(viewModel))
+            let isActive = isVisible || scenePhase == .active
+            viewModel.setBackgroundWorkActive(isActive)
+        }
+    }
+
+    private func deduplicatedViewModels(_ viewModels: [FileBrowserViewModel]) -> [FileBrowserViewModel] {
+        var seen = Set<ObjectIdentifier>()
+        return viewModels.filter { seen.insert(ObjectIdentifier($0)).inserted }
     }
 }
 

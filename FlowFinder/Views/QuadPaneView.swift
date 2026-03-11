@@ -465,14 +465,14 @@ struct QuadPaneListView: View {
 
     var body: some View {
         ScrollViewReader { scrollProxy in
-            List {
-                ForEach(viewModel.filteredItems) { item in
-                    QuadPaneListRow(item: item, viewModel: viewModel, onActivate: onActivate, dropTargetedItemID: $dropTargetedItemID)
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(viewModel.filteredItems) { item in
+                        QuadPaneListRow(item: item, viewModel: viewModel, onActivate: onActivate, dropTargetedItemID: $dropTargetedItemID)
+                    }
                 }
             }
-            .listStyle(.plain)
             .onAppear {
-                // Scroll to selected item when view appears (e.g., when switching view modes)
                 if let firstSelected = viewModel.selectedItems.first {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         scrollProxy.scrollTo(firstSelected.id, anchor: .center)
@@ -515,7 +515,7 @@ struct QuadPaneListRow: View {
                 .foregroundColor(.secondary)
                 .frame(width: 50, alignment: .trailing)
         }
-        .padding(.vertical, 1)
+        .padding(.vertical, 3)
         .padding(.horizontal, 4)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
