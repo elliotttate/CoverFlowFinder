@@ -161,6 +161,10 @@ class FileBrowserViewModel: ObservableObject {
     private var enteredFolderURL: URL?
     // URL to select after loading (used when going back)
     private var pendingSelectionURL: URL?
+    // URLs to select after loading (used for paste operations with multiple files)
+    private var pendingSelectionURLs: Set<URL>?
+    // URL to select and immediately start renaming (used for new folder creation)
+    private var pendingNewFolderRenameURL: URL?
 
     private let fileOperationQueue = DispatchQueue(label: "com.coverflowfinder.fileops", qos: .userInitiated)
     private struct MoveRecord {
@@ -570,6 +574,10 @@ class FileBrowserViewModel: ObservableObject {
         let listingURL = resolvedListingURL(for: pathToLoad)
         startDirectoryWatcher(for: listingURL)
         let pendingURL = pendingSelectionURL  // Capture before async
+        let pendingURLs = pendingSelectionURLs  // Capture multi-selection (paste)
+        if let pendingURL = pendingURL {
+            NSLog("[NewFolder] loadContents captured pendingURL: %@", pendingURL.lastPathComponent)
+        }
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
         let showHiddenFiles = AppSettings.shared.showHiddenFiles
         let foldersFirst = AppSettings.shared.foldersFirst
@@ -626,13 +634,29 @@ class FileBrowserViewModel: ObservableObject {
                 // Calculate selection for first batch
                 var selectedIndex = 0
                 var selectedItem: FileItem?
-                if let pendingURL = pendingURL,
-                   let item = allItems.first(where: { $0.url == pendingURL }) {
+                var selectedItemsForPaste: Set<FileItem>?
+                if let pendingURLs = pendingURLs, !pendingURLs.isEmpty {
+                    // Multi-file paste selection
+                    let pendingPaths = Set(pendingURLs.map { $0.standardizedFileURL.path })
+                    let matched = allItems.filter { pendingPaths.contains($0.url.standardizedFileURL.path) }
+                    if !matched.isEmpty {
+                        selectedItemsForPaste = Set(matched)
+                        selectedItem = matched.first
+                        let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
+                        if let first = matched.first, let index = sorted.firstIndex(of: first) {
+                            selectedIndex = index
+                        }
+                    }
+                } else if let pendingURL = pendingURL,
+                   let item = allItems.first(where: { $0.url.standardizedFileURL.path == pendingURL.standardizedFileURL.path }) {
                     selectedItem = item
                     let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
                     if let index = sorted.firstIndex(of: item) {
                         selectedIndex = index
                     }
+                    NSLog("[NewFolder] Found pending item '%@' in first batch at sorted index %d (total items: %d)", item.name, selectedIndex, allItems.count)
+                } else if pendingURL != nil {
+                    NSLog("[NewFolder] WARNING: pendingURL '%@' NOT found in first batch of %d items", pendingURL!.lastPathComponent, allItems.count)
                 }
 
                 // Show first batch immediately (unless large directory - we'll show all at once to prevent jumping)
@@ -643,7 +667,13 @@ class FileBrowserViewModel: ObservableObject {
                               !self.isInsideArchive,
                               self.currentPath == pathToLoad else { return }
 
-                        if let item = selectedItem {
+                        if let pasteItems = selectedItemsForPaste {
+                            self.coverFlowSelectedIndex = selectedIndex
+                            self.selectedItems = pasteItems
+                            self.pendingSelectionURL = nil
+                            self.pendingSelectionURLs = nil
+                        } else if let item = selectedItem {
+                            NSLog("[NewFolder] Setting selection: coverFlowSelectedIndex=%d, item='%@'", selectedIndex, item.name)
                             self.coverFlowSelectedIndex = selectedIndex
                             self.selectedItems = [item]
                             self.pendingSelectionURL = nil
@@ -651,6 +681,7 @@ class FileBrowserViewModel: ObservableObject {
                             self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
                         }
 
+                        NSLog("[NewFolder] Setting self.items (count=%d), pendingNewFolderRenameURL=%@", allItems.count, self.pendingNewFolderRenameURL?.lastPathComponent ?? "nil")
                         self.items = allItems
                         if !isLargeDirectory {
                             self.isLoading = false
@@ -662,6 +693,8 @@ class FileBrowserViewModel: ObservableObject {
                                 self.hydratedURLs.insert(item.url)
                             }
                         }
+
+                        self.triggerPendingNewFolderRename()
                     }
                 }
 
@@ -687,18 +720,35 @@ class FileBrowserViewModel: ObservableObject {
                               self.currentPath == pathToLoad else { return }
 
                         // Handle selection
-                        if let pendingURL = pendingURL,
-                           let item = allItems.first(where: { $0.url == pendingURL }) {
+                        if let pendingURLs = pendingURLs, !pendingURLs.isEmpty {
+                            let pendingPaths = Set(pendingURLs.map { $0.standardizedFileURL.path })
+                            let matched = allItems.filter { pendingPaths.contains($0.url.standardizedFileURL.path) }
+                            if !matched.isEmpty {
+                                let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
+                                if let first = matched.first, let index = sorted.firstIndex(of: first) {
+                                    self.coverFlowSelectedIndex = index
+                                }
+                                self.selectedItems = Set(matched)
+                                self.pendingSelectionURL = nil
+                                self.pendingSelectionURLs = nil
+                            }
+                        } else if let pendingURL = pendingURL,
+                           let item = allItems.first(where: { $0.url.standardizedFileURL.path == pendingURL.standardizedFileURL.path }) {
                             let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
                             if let index = sorted.firstIndex(of: item) {
                                 self.coverFlowSelectedIndex = index
                             }
+                            NSLog("[NewFolder] LARGE DIR: Found pending item '%@' at index %d", item.name, self.coverFlowSelectedIndex)
                             self.selectedItems = [item]
                             self.pendingSelectionURL = nil
                         } else {
+                            if pendingURL != nil {
+                                NSLog("[NewFolder] LARGE DIR WARNING: pendingURL '%@' NOT found in %d items", pendingURL!.lastPathComponent, allItems.count)
+                            }
                             self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
                         }
 
+                        NSLog("[NewFolder] LARGE DIR: Setting items (count=%d), pendingNewFolderRenameURL=%@", allItems.count, self.pendingNewFolderRenameURL?.lastPathComponent ?? "nil")
                         self.items = allItems
                         self.isLoading = false
                         self.navigationGeneration += 1
@@ -709,6 +759,8 @@ class FileBrowserViewModel: ObservableObject {
                                 self.hydratedURLs.insert(item.url)
                             }
                         }
+
+                        self.triggerPendingNewFolderRename()
                     }
                 }
             } catch {
@@ -783,6 +835,7 @@ class FileBrowserViewModel: ObservableObject {
         photosLoadToken = UUID()
         pendingRenameWorkItem?.cancel()
         pendingRenameWorkItem = nil
+        pendingNewFolderRenameURL = nil
         stopDirectoryWatcher()
         stopNetworkBrowsing()
         cancelSearch()
@@ -1152,6 +1205,12 @@ class FileBrowserViewModel: ObservableObject {
     private func applyDirectoryEventUpdates(for urls: Set<URL>) {
         guard let watchURL = watchingDirectoryURL, watchURL == currentPath else { return }
         guard !urls.isEmpty else { return }
+        if pendingNewFolderRenameURL != nil || renamingURL != nil {
+            NSLog("[NewFolder] applyDirectoryEventUpdates firing while pendingNewFolderRename=%@, renamingURL=%@, urls=%@",
+                  pendingNewFolderRenameURL?.lastPathComponent ?? "nil",
+                  renamingURL?.lastPathComponent ?? "nil",
+                  urls.map { $0.lastPathComponent }.joined(separator: ", "))
+        }
 
         let showHidden = AppSettings.shared.showHiddenFiles
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
@@ -1860,6 +1919,7 @@ class FileBrowserViewModel: ObservableObject {
         } else {
             pendingSelectionURL = nil
         }
+        pendingSelectionURLs = nil
         enteredFolderURL = nil
         applyNavigationLocation(location)
     }
@@ -1869,6 +1929,7 @@ class FileBrowserViewModel: ObservableObject {
         historyIndex += 1
         let location = navigationHistory[historyIndex]
         pendingSelectionURL = nil
+        pendingSelectionURLs = nil
         applyNavigationLocation(location)
     }
 
@@ -2259,6 +2320,24 @@ class FileBrowserViewModel: ObservableObject {
         pendingRenameWorkItem = nil
     }
 
+    /// Trigger rename for a newly created folder after it appears in the loaded items.
+    /// Called from loadContents() after items are set and selection is resolved.
+    private func triggerPendingNewFolderRename() {
+        guard let newFolderURL = pendingNewFolderRenameURL else { return }
+        pendingNewFolderRenameURL = nil
+
+        let newFolderPath = newFolderURL.standardizedFileURL.path
+        // Dispatch to the next run loop iteration so SwiftUI has a chance to
+        // propagate the new items to the FileTableView before we start editing.
+        DispatchQueue.main.async { [weak self] in
+            guard let self = self else { return }
+            guard self.selectedItems.count == 1,
+                  let selectedItem = self.selectedItems.first,
+                  selectedItem.url.standardizedFileURL.path == newFolderPath else { return }
+            self.renamingURL = selectedItem.url
+        }
+    }
+
     private func addToHistory(_ location: NavigationLocation) {
         if historyIndex < navigationHistory.count - 1 {
             navigationHistory.removeSubrange((historyIndex + 1)...)
@@ -2637,7 +2716,9 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     func cutSelectedItems() {
-        guard !selectedItems.isEmpty else { return }
+        guard !selectedItems.isEmpty else {
+            return
+        }
 
         // Check if any items are from archive - cut from archive acts as copy
         let hasArchiveItems = selectedItems.contains { $0.isFromArchive }
@@ -2692,6 +2773,10 @@ class FileBrowserViewModel: ObservableObject {
             performMoves(moves, actionName: "Move", registerUndo: true, resolveCollisions: true) { [weak self] completed in
                 guard let self else { return }
                 guard !completed.isEmpty else { return }
+                // Select pasted files after refresh
+                let pastedURLs = Set(completed.map { $0.to })
+                self.pendingSelectionURLs = pastedURLs
+                self.pendingSelectionURL = completed.first?.to
                 self.clipboardItems.removeAll()
                 // Clear the cut marker from pasteboard to prevent re-pasting moved files
                 let pasteboard = NSPasteboard.general
@@ -2701,7 +2786,14 @@ class FileBrowserViewModel: ObservableObject {
             let copies = urlsToPaste.map {
                 CopyRecord(from: $0, to: destination.appendingPathComponent($0.lastPathComponent))
             }
-            performCopies(copies, actionName: "Copy", registerUndo: true, resolveCollisions: true)
+            performCopies(copies, actionName: "Copy", registerUndo: true, resolveCollisions: true) { [weak self] completed in
+                guard let self else { return }
+                guard !completed.isEmpty else { return }
+                // Select pasted files after refresh
+                let pastedURLs = Set(completed.map { $0.to })
+                self.pendingSelectionURLs = pastedURLs
+                self.pendingSelectionURL = completed.first?.to
+            }
         }
     }
 
@@ -2991,6 +3083,7 @@ class FileBrowserViewModel: ObservableObject {
                 try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
                 DispatchQueue.main.async { [weak self] in
                     guard let self else { return }
+                    NSLog("[NewFolder] Created folder: %@", folderURL.lastPathComponent)
                     self.undoManager?.registerUndo(withTarget: self) { target in
                         target.performTrash(
                             [folderURL],
@@ -3000,6 +3093,9 @@ class FileBrowserViewModel: ObservableObject {
                         )
                     }
                     self.undoManager?.setActionName("New Folder")
+                    NSLog("[NewFolder] Setting pendingSelectionURL and pendingNewFolderRenameURL to: %@", folderURL.absoluteString)
+                    self.pendingSelectionURL = folderURL
+                    self.pendingNewFolderRenameURL = folderURL
                     self.refresh()
                 }
             } catch {

@@ -226,6 +226,12 @@ struct FileTableView: NSViewRepresentable {
         let tagsRefreshed = tagRefreshToken != context.coordinator.lastTagRefreshToken
         context.coordinator.lastTagRefreshToken = tagRefreshToken
 
+        // Check if clipboard state changed (for cut item dimming)
+        let clipboardChanged = viewModel.clipboardItems.count != context.coordinator.lastClipboardCount ||
+            viewModel.clipboardOperation != context.coordinator.lastClipboardOperation
+        context.coordinator.lastClipboardCount = viewModel.clipboardItems.count
+        context.coordinator.lastClipboardOperation = viewModel.clipboardOperation
+
         // Update items
         let oldItems = context.coordinator.items
         context.coordinator.items = items
@@ -259,8 +265,8 @@ struct FileTableView: NSViewRepresentable {
             DispatchQueue.main.async { [weak coordinator = context.coordinator] in
                 coordinator?.hydrateVisibleRows()
             }
-        } else if tagsRefreshed {
-            // Tags changed but items didn't - reload visible rows to update tag display
+        } else if tagsRefreshed || clipboardChanged {
+            // Tags or clipboard changed but items didn't - reload visible rows to update display
             context.coordinator.tableView?.reloadData()
         } else {
             context.coordinator.reloadVisibleRowsIfNeeded(previousItems: oldItems)
@@ -309,13 +315,24 @@ final class KeyboardTableView: NSTableView {
     }
 
     override func keyDown(with event: NSEvent) {
+        let hasCommand = event.modifierFlags.contains(.command)
+        let hasShift = event.modifierFlags.contains(.shift)
+
         switch event.keyCode {
         case 49: // Space - Quick Look
             coordinator?.triggerQuickLook()
         case 36: // Return - Open item
             coordinator?.openSelectedItem()
-        case 51 where event.modifierFlags.contains(.command): // Cmd+Backspace - Delete
+        case 51 where hasCommand: // Cmd+Backspace - Delete
             coordinator?.deleteSelectedItems()
+        case 8 where hasCommand && !hasShift: // Cmd+C - Copy
+            coordinator?.copySelectedItems()
+        case 7 where hasCommand && !hasShift: // Cmd+X - Cut
+            coordinator?.cutSelectedItems()
+        case 9 where hasCommand && !hasShift: // Cmd+V - Paste
+            coordinator?.pasteItems()
+        case 0 where hasCommand && !hasShift: // Cmd+A - Select All
+            coordinator?.selectAllItems()
         default:
             super.keyDown(with: event)
         }
@@ -390,6 +407,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var isLiveScrolling = false
     var lastHydrationItemCount: Int = 0  // Track items with metadata after hydration (public for updateNSView access)
     var lastTagRefreshToken: Int = 0  // Track tag changes for UI refresh
+    var lastClipboardCount: Int = 0  // Track clipboard changes for cut dimming
+    var lastClipboardOperation: ClipboardOperation = .copy
 
     // Thumbnail preheat state (like PHCachingImageManager)
     private var lastPreheatRange: Range<Int>?
@@ -493,14 +512,26 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
         let item = items[row]
         let modifiers = event.modifierFlags
+        let hasShift = modifiers.contains(.shift)
+        let hasCommand = modifiers.contains(.command)
+
+        // For Cmd+click and Shift+click, let NSTableView handle selection natively
+        // via tableViewSelectionDidChange. Calling handleSelection here would double-toggle
+        // because both handleSelection AND NSTableView's mouseDown modify selection.
+        if hasCommand || hasShift {
+            viewModel.cancelPendingRename()
+            if viewModel.renamingURL != nil {
+                viewModel.renamingURL = nil
+            }
+            return
+        }
 
         // If clicking on an already-selected item without modifiers,
         // preserve the multi-selection (for potential drag)
         // handleSelection would reset to single selection otherwise
         let isAlreadySelected = viewModel.selectedItems.contains(item)
-        let hasModifiers = modifiers.contains(.shift) || modifiers.contains(.command)
 
-        if isAlreadySelected && !hasModifiers && viewModel.selectedItems.count > 1 {
+        if isAlreadySelected && viewModel.selectedItems.count > 1 {
             // Don't change selection - allows multi-file drag
             return
         }
@@ -508,23 +539,23 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         // Determine if click was on the text area (for Finder-style rename behavior)
         let clickedOnTextArea = isClickOnTextArea(event: event, row: row, tableView: tableView)
 
-        // Use handleSelection to get Finder-style click-to-rename behavior
+        // Use handleSelection to get Finder-style click-to-rename behavior (plain clicks only)
         viewModel.handleSelection(
             item: item,
             index: row,
             in: items,
-            withShift: modifiers.contains(.shift),
-            withCommand: modifiers.contains(.command),
+            withShift: false,
+            withCommand: false,
             clickedOnTextArea: clickedOnTextArea
         )
     }
 
     /// Handle click on empty space (below all rows) - deselect all items
     func handleEmptySpaceClick() {
+        // Call callback first (used by CoverFlow to set userClearedSelection before clearing items)
+        onEmptySpaceClick?()
         viewModel.selectedItems.removeAll()
         viewModel.cancelPendingRename()
-        // Call callback if provided (used by CoverFlow view)
-        onEmptySpaceClick?()
     }
 
     /// Determine if a click event was on the text area of the name column
@@ -744,6 +775,9 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             cellView = makeCloudStatusCell(for: item, tableView: tableView)
         }
 
+        // Dim cut items (Finder-style visual feedback)
+        cellView.alphaValue = viewModel.isItemCut(item) ? 0.5 : 1.0
+
         return cellView
     }
 
@@ -854,6 +888,27 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     func deleteSelectedItems() {
         viewModel.deleteSelectedItems()
+    }
+
+    func copySelectedItems() {
+        viewModel.copySelectedItems()
+    }
+
+    func cutSelectedItems() {
+        viewModel.cutSelectedItems()
+    }
+
+    func pasteItems() {
+        viewModel.paste()
+    }
+
+    func selectAllItems() {
+        guard let tableView = tableView else { return }
+        let allItems = Set(items)
+        isUpdatingSelection = true
+        viewModel.selectedItems = allItems
+        tableView.selectRowIndexes(IndexSet(integersIn: 0..<items.count), byExtendingSelection: false)
+        isUpdatingSelection = false
     }
 
     private func navigateSelection(by offset: Int) {
