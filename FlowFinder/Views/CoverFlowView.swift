@@ -4,6 +4,12 @@ import AppKit
 import Quartz
 import AVFoundation
 
+/// Simple reference-type flag so mutations are immediately visible
+/// regardless of SwiftUI's @State batching.
+private class SelectionFlag {
+    var userClearedSelection = false
+}
+
 struct CoverFlowView: View {
     @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
@@ -24,7 +30,7 @@ struct CoverFlowView: View {
     private let thumbnailLoadThrottle: TimeInterval = 0.016
     @State private var lastHydrationRange: Range<Int>? = nil
     @State private var itemsToken: Int = 0
-    @State private var userClearedSelection: Bool = false
+    @State private var selectionFlag = SelectionFlag()
     @State private var isCoverFlowActive: Bool = true
     @State private var deferredThumbnailReloadWorkItem: DispatchWorkItem?
 
@@ -116,9 +122,11 @@ struct CoverFlowView: View {
                     thumbnailCount: thumbnails.count,
                     navigationGeneration: viewModel.navigationGeneration,
                     selectedItems: viewModel.selectedItems,
+                    cutItemURLs: Set(viewModel.clipboardOperation == .cut ? viewModel.clipboardItems : []),
                     coverScale: settings.coverFlowScaleValue,
                     scrollSensitivity: settings.coverFlowSwipeSpeedValue,
                     onSelect: { index in
+                        selectionFlag.userClearedSelection = false
                         viewModel.coverFlowSelectedIndex = index
                         if index < sortedItemsCache.count {
                             let item = sortedItemsCache[index]
@@ -140,7 +148,7 @@ struct CoverFlowView: View {
                         }
                     },
                     onDeselect: {
-                        userClearedSelection = true
+                        selectionFlag.userClearedSelection = true
                         viewModel.selectedItems.removeAll()
                         viewModel.cancelPendingRename()
                         updateQuickLook(for: nil)
@@ -191,11 +199,16 @@ struct CoverFlowView: View {
                         }
                     },
                     onExtendSelect: { index in
+                        selectionFlag.userClearedSelection = false
                         viewModel.coverFlowSelectedIndex = index
                         if index < sortedItemsCache.count {
                             viewModel.selectRange(to: index, in: sortedItemsCache)
                             updateQuickLook(for: sortedItemsCache[index])
                         }
+                    },
+                    onSelectAll: {
+                        selectionFlag.userClearedSelection = false
+                        viewModel.selectedItems = Set(sortedItemsCache)
                     },
                     onActivityStateChange: { isActive in
                         handleCoverFlowActivityChange(isActive)
@@ -255,6 +268,7 @@ struct CoverFlowView: View {
                     items: sortedItemsCache,
                     selectedItems: viewModel.selectedItems,
                     onSelect: { item, index in
+                        selectionFlag.userClearedSelection = false
                         viewModel.coverFlowSelectedIndex = index
                         updateQuickLook(for: item)
                     },
@@ -264,7 +278,7 @@ struct CoverFlowView: View {
                     viewModel: viewModel,
                     onEmptySpaceClick: {
                         // Click on empty space - deselect all
-                        userClearedSelection = true
+                        selectionFlag.userClearedSelection = true
                         viewModel.selectedItems.removeAll()
                         viewModel.cancelPendingRename()
                         updateQuickLook(for: nil)
@@ -299,12 +313,17 @@ struct CoverFlowView: View {
             if tokenChanged {
                 Self.debugLog("[CoverFlow] Items actually changed - clearing thumbnails")
                 DispatchQueue.main.async {
+                    NSLog("[NewFolder] onChange(items) DEFERRED ASYNC: updating sortedItemsCache from %d to %d items, selectedItems='%@'",
+                          sortedItemsCache.count, newItems.count,
+                          viewModel.selectedItems.first?.name ?? "nil")
                     thumbnails.removeAll()
                     iconPlaceholders.removeAll()
                     thumbnailLoadGeneration += 1
                     thumbnailCache.clearForNewFolder()
+                    selectionFlag.userClearedSelection = false  // Reset for new folder
                     updateSortedItems(using: newItems, updateToken: true, newToken: newToken)
                     loadVisibleThumbnails()
+                    NSLog("[NewFolder] onChange(items) DEFERRED: about to call syncSelection, coverFlowSelectedIndex=%d", viewModel.coverFlowSelectedIndex)
                     syncSelection()
                 }
             } else {
@@ -324,9 +343,18 @@ struct CoverFlowView: View {
                 updateQuickLookForSelection()
             }
         }
-        .onChange(of: viewModel.selectedItems) { _ in
+        .onChange(of: viewModel.selectedItems) { newSelection in
             // Sync Cover Flow selection when file list selection changes
-            syncSelection()
+            NSLog("[NewFolder] onChange(selectedItems): count=%d, first='%@', sortedItemsCache.count=%d, items.count=%d",
+                  newSelection.count,
+                  newSelection.first?.name ?? "nil",
+                  sortedItemsCache.count,
+                  items.count)
+            if newSelection.isEmpty {
+                updateQuickLook(for: nil)
+            } else {
+                syncSelection()
+            }
         }
         .onPreferenceChange(CoverFlowInfoHeightKey.self) { newValue in
             if newValue > 0 {
@@ -438,6 +466,16 @@ struct CoverFlowView: View {
             return
         }
 
+        // Check for transient state: selected item exists in incoming items but
+        // sortedItemsCache hasn't caught up yet (e.g., new folder just created).
+        // Don't clamp the index or overwrite selection — wait for the cache to sync.
+        if let selected = viewModel.selectedItems.first,
+           !sortedItemsCache.contains(selected),
+           items.contains(selected) {
+            NSLog("[NewFolder] syncSelection: TRANSIENT STATE - item '%@' in items(%d) but not sortedItemsCache(%d), skipping", selected.name, items.count, sortedItemsCache.count)
+            return
+        }
+
         // Clamp index to valid range
         let safeIndex = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
         if safeIndex != viewModel.coverFlowSelectedIndex {
@@ -445,12 +483,8 @@ struct CoverFlowView: View {
             viewModel.coverFlowSelectedIndex = safeIndex
         }
 
-        if !viewModel.selectedItems.isEmpty {
-            userClearedSelection = false
-        }
-
         if viewModel.selectedItems.isEmpty {
-            if userClearedSelection {
+            if selectionFlag.userClearedSelection {
                 Self.debugLog("[SELECTION] syncSelection: selection empty (user-cleared), preserving empty selection")
                 updateQuickLook(for: nil)
                 return
@@ -823,6 +857,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let thumbnailCount: Int  // Explicit count to force SwiftUI updates
     let navigationGeneration: Int  // Forces update on every navigation
     let selectedItems: Set<FileItem>  // Multi-selection for drag
+    let cutItemURLs: Set<URL>  // URLs of items marked for cut (dimmed)
     let coverScale: CGFloat
     let scrollSensitivity: CGFloat
     let onSelect: (Int) -> Void
@@ -839,6 +874,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onShowPackageContents: (Int) -> Void
     let onQuickLook: (FileItem) -> Void
     let onExtendSelect: (Int) -> Void  // Shift+arrow range selection
+    let onSelectAll: () -> Void
     let onActivityStateChange: (Bool) -> Void
 
     private static var viewInstanceCount = 0
@@ -863,8 +899,10 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.onShowPackageContents = onShowPackageContents
         view.onQuickLook = onQuickLook
         view.onExtendSelect = onExtendSelect
+        view.onSelectAll = onSelectAll
         view.onActivityStateChange = onActivityStateChange
         view.selectedItems = selectedItems
+        view.cutItemURLs = cutItemURLs
         view.coverScale = coverScale
         view.scrollSensitivity = scrollSensitivity
         view.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
@@ -891,11 +929,17 @@ struct CoverFlowContainer: NSViewRepresentable {
         nsView.onShowPackageContents = onShowPackageContents
         nsView.onQuickLook = onQuickLook
         nsView.onExtendSelect = onExtendSelect
+        nsView.onSelectAll = onSelectAll
         nsView.onActivityStateChange = onActivityStateChange
         nsView.selectedItems = selectedItems
+        let cutURLsChanged = nsView.cutItemURLs != cutItemURLs
+        nsView.cutItemURLs = cutItemURLs
         nsView.coverScale = coverScale
         nsView.scrollSensitivity = scrollSensitivity
         nsView.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
+        if cutURLsChanged {
+            nsView.updateCutItemOpacity()
+        }
         nsView.updateActivityState()
 
         // Restore first responder only if CoverFlowNSView was the first responder before update
@@ -920,8 +964,10 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     var onShowPackageContents: ((Int) -> Void)?
     var onQuickLook: ((FileItem) -> Void)?
     var onExtendSelect: ((Int) -> Void)?  // Shift+arrow range selection
+    var onSelectAll: (() -> Void)?
     var onActivityStateChange: ((Bool) -> Void)?
     var selectedItems: Set<FileItem> = []  // Track multi-selection for drag
+    var cutItemURLs: Set<URL> = []  // URLs of items marked for cut (dimmed)
 
     private var items: [FileItem] = []
     private var itemsToken: Int = 0
@@ -1030,6 +1076,17 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         guard !isHiddenOrHasHiddenAncestor else { return false }
         guard bounds.width > 0, bounds.height > 0 else { return false }
         return window.occlusionState.contains(.visible)
+    }
+
+    /// Update cover layer opacity based on cut state
+    func updateCutItemOpacity() {
+        for coverLayer in coverLayers {
+            if let index = coverLayer.value(forKey: "itemIndex") as? Int,
+               index < items.count {
+                let isCut = cutItemURLs.contains(items[index].url)
+                coverLayer.opacity = isCut ? 0.5 : 1.0
+            }
+        }
     }
 
     func updateActivityState() {
@@ -1394,7 +1451,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             } else {
                 // Create new layer
                 coverLayer = createCoverLayer(for: item, at: index)
-                coverLayer.opacity = 1
+                coverLayer.opacity = cutItemURLs.contains(item.url) ? 0.5 : 1.0
                 layer?.addSublayer(coverLayer)
                 coverLayers.append(coverLayer)
             }
@@ -1425,7 +1482,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         for coverLayer in coverLayers {
             if let index = coverLayer.value(forKey: "itemIndex") as? Int {
                 positionCover(coverLayer, at: index, centerX: centerX, centerY: centerY, animated: true)
-                coverLayer.opacity = 1
+                let isCut = index < items.count && cutItemURLs.contains(items[index].url)
+                coverLayer.opacity = isCut ? 0.5 : 1.0
             }
         }
 
@@ -1447,6 +1505,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         coverLayer.setValue(coverSize.width, forKey: "coverWidth")
         coverLayer.setValue(coverSize.height, forKey: "coverHeight")
         coverLayer.setValue(thumbnailToken(for: item, thumbnail: thumbnail), forKey: "thumbnailToken")
+        coverLayer.opacity = cutItemURLs.contains(item.url) ? 0.5 : 1.0
         // Match createCoverLayer - bounds should NOT include reflection height
         coverLayer.bounds = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
 
@@ -2407,6 +2466,9 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             case 51: // Cmd+Backspace - Delete/Move to Trash
                 onDelete?()
                 return
+            case 0: // Cmd+A - Select All
+                onSelectAll?()
+                return
             default:
                 break
             }
@@ -2459,8 +2521,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             typeAheadBuffer = ""
             typeAheadTimer?.invalidate()
         default:
-            // Handle type-ahead search for printable characters
-            if let characters = event.characters, !characters.isEmpty {
+            // Handle type-ahead search for printable characters (only without Command modifier)
+            if !hasCommand, let characters = event.characters, !characters.isEmpty {
                 let char = characters.first!
                 if char.isLetter || char.isNumber || char == " " || char == "." || char == "-" || char == "_" {
                     typeAheadBuffer.append(char)
