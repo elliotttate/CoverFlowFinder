@@ -210,18 +210,6 @@ struct FileTableView: NSViewRepresentable {
         let incomingMetadataCount = items.filter { $0.hasMetadata }.count
         let currentMetadataCount = context.coordinator.items.filter { $0.hasMetadata }.count
 
-        // If SwiftUI is passing stale items (less metadata than what hydration gave us), reject the update
-        // This happens because SwiftUI's update cycle captures data before our hydration notification runs
-        if items.count == context.coordinator.items.count &&
-           incomingMetadataCount < context.coordinator.lastHydrationItemCount &&
-           currentMetadataCount >= context.coordinator.lastHydrationItemCount {
-            // Still sync columns and selection
-            context.coordinator.syncColumnsIfNeeded()
-            context.coordinator.syncSelectionFromViewModel()
-            context.coordinator.checkForPendingRename()
-            return
-        }
-
         // Check if tags were refreshed (force reload visible rows to show new tags)
         let tagsRefreshed = tagRefreshToken != context.coordinator.lastTagRefreshToken
         context.coordinator.lastTagRefreshToken = tagRefreshToken
@@ -231,6 +219,21 @@ struct FileTableView: NSViewRepresentable {
             viewModel.clipboardOperation != context.coordinator.lastClipboardOperation
         context.coordinator.lastClipboardCount = viewModel.clipboardItems.count
         context.coordinator.lastClipboardOperation = viewModel.clipboardOperation
+
+        // If SwiftUI is passing stale items (less metadata than what hydration gave us), reject the update
+        // This happens because SwiftUI's update cycle captures data before our hydration notification runs
+        if items.count == context.coordinator.items.count &&
+           incomingMetadataCount < context.coordinator.lastHydrationItemCount &&
+           currentMetadataCount >= context.coordinator.lastHydrationItemCount {
+            // Still sync columns, selection, and clipboard-driven dimming
+            if clipboardChanged {
+                context.coordinator.tableView?.reloadData()
+            }
+            context.coordinator.syncColumnsIfNeeded()
+            context.coordinator.syncSelectionFromViewModel()
+            context.coordinator.checkForPendingRename()
+            return
+        }
 
         // Update items
         let oldItems = context.coordinator.items
