@@ -1,7 +1,15 @@
-<?xml version="1.0" encoding="utf-8"?>
-<rss version="2.0" xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/">
+<?xml version="1.0" encoding="utf-8" standalone="yes"?>
+<rss xmlns:sparkle="http://www.andymatuschak.org/xml-namespaces/sparkle" xmlns:dc="http://purl.org/dc/elements/1.1/" version="2.0">
     <channel>
         <title>FlowFinder Updates</title>
         <language>en</language>
+        <item>
+            <title>1.37.0</title>
+            <pubDate>Thu, 12 Mar 2026 11:15:24 -0400</pubDate>
+            <sparkle:version>137</sparkle:version>
+            <sparkle:shortVersionString>1.37.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/elliotttate/CoverFlowFinder/releases/download/v1.37.0/FlowFinder-1.37.0.dmg" length="6995063" type="application/octet-stream" sparkle:edSignature="1zg0wzlHMDXBf9s/Xih2Te1lGDvHzU3NrqVWV1Iijy4ZPF5718l07kv/wBMHJpFHFoRRoj+q+1AQCA98ZadkBg=="/>
+        </item>
     </channel>
 </rss>
