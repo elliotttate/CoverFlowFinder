@@ -18,6 +18,10 @@
 #   3. Ensure you have the GitHub CLI installed: brew install gh
 #      Then authenticate: gh auth login
 #
+#   4. Generate Sparkle EdDSA signing keys (one-time):
+#      ./build/sparkle-tools/bin/generate_keys
+#      The private key is stored in your Keychain automatically.
+#
 # USAGE:
 #   ./scripts/notarize.sh              # Build, sign, notarize, create DMG
 #   ./scripts/notarize.sh --release    # Same as above + create GitHub release
@@ -43,6 +47,13 @@ ARCHIVE_PATH="$BUILD_DIR/$APP_NAME.xcarchive"
 EXPORT_PATH="$BUILD_DIR/export"
 APP_PATH="$EXPORT_PATH/$APP_NAME.app"
 EXPORT_OPTIONS="$BUILD_DIR/ExportOptions.plist"
+
+# Sparkle tools
+SPARKLE_VERSION="2.9.0"
+SPARKLE_TOOLS_DIR="$BUILD_DIR/sparkle-tools"
+SPARKLE_SIGN="$SPARKLE_TOOLS_DIR/bin/sign_update"
+SPARKLE_APPCAST="$SPARKLE_TOOLS_DIR/bin/generate_appcast"
+DOCS_DIR="$PROJECT_DIR/docs"
 
 # Colors for output
 RED='\033[0;31m'
@@ -100,10 +111,31 @@ check_certificate() {
     print_success "Developer ID certificate found"
 }
 
+ensure_sparkle_tools() {
+    if [ ! -f "$SPARKLE_SIGN" ]; then
+        print_step "Downloading Sparkle tools v${SPARKLE_VERSION}..."
+        mkdir -p "$SPARKLE_TOOLS_DIR"
+        curl -L -o "/tmp/Sparkle-${SPARKLE_VERSION}.tar.xz" \
+            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
+        tar -xf "/tmp/Sparkle-${SPARKLE_VERSION}.tar.xz" -C "$SPARKLE_TOOLS_DIR"
+        rm -f "/tmp/Sparkle-${SPARKLE_VERSION}.tar.xz"
+        print_success "Sparkle tools downloaded"
+    else
+        print_success "Sparkle tools found"
+    fi
+}
+
 clean_build() {
     print_step "Cleaning previous build..."
+    # Preserve sparkle-tools across builds
+    if [ -d "$SPARKLE_TOOLS_DIR" ]; then
+        mv "$SPARKLE_TOOLS_DIR" /tmp/sparkle-tools-backup
+    fi
     rm -rf "$BUILD_DIR"
     mkdir -p "$BUILD_DIR"
+    if [ -d /tmp/sparkle-tools-backup ]; then
+        mv /tmp/sparkle-tools-backup "$SPARKLE_TOOLS_DIR"
+    fi
     print_success "Build directory cleaned"
 }
 
@@ -283,6 +315,67 @@ verify_dmg() {
     fi
 }
 
+sparkle_sign_dmg() {
+    VERSION=$(get_version)
+    DMG_PATH="$PROJECT_DIR/$APP_NAME-$VERSION.dmg"
+
+    print_step "Signing DMG with Sparkle EdDSA key..."
+
+    # sign_update reads the private key from the Keychain automatically
+    SPARKLE_SIG=$("$SPARKLE_SIGN" "$DMG_PATH")
+
+    if [ -z "$SPARKLE_SIG" ]; then
+        print_error "Sparkle signing failed! Make sure EdDSA key is in Keychain."
+        print_warning "Run: $SPARKLE_TOOLS_DIR/bin/generate_keys  (if not done)"
+        exit 1
+    fi
+
+    print_success "DMG signed with Sparkle EdDSA"
+    echo "  $SPARKLE_SIG"
+}
+
+update_appcast() {
+    VERSION=$(get_version)
+    DMG_PATH="$PROJECT_DIR/$APP_NAME-$VERSION.dmg"
+
+    print_step "Generating appcast.xml..."
+
+    mkdir -p "$DOCS_DIR"
+
+    # Create a releases directory with the current DMG
+    local RELEASES_DIR="$BUILD_DIR/releases"
+    mkdir -p "$RELEASES_DIR"
+    cp "$DMG_PATH" "$RELEASES_DIR/"
+
+    # If an existing appcast exists, copy it so generate_appcast can append
+    if [ -f "$DOCS_DIR/appcast.xml" ]; then
+        cp "$DOCS_DIR/appcast.xml" "$RELEASES_DIR/"
+    fi
+
+    # generate_appcast reads the EdDSA key from Keychain
+    "$SPARKLE_APPCAST" \
+        --download-url-prefix "https://github.com/elliotttate/CoverFlowFinder/releases/download/v$VERSION/" \
+        "$RELEASES_DIR"
+
+    # Copy generated appcast to docs/
+    cp "$RELEASES_DIR/appcast.xml" "$DOCS_DIR/appcast.xml"
+
+    print_success "Appcast updated at docs/appcast.xml"
+}
+
+commit_appcast() {
+    VERSION=$(get_version)
+
+    print_step "Committing appcast.xml..."
+
+    cd "$PROJECT_DIR"
+    git add docs/appcast.xml
+    git commit -m "Update appcast.xml for v$VERSION"
+    git push origin main
+
+    print_success "Appcast committed and pushed"
+}
+
 create_github_release() {
     VERSION=$(get_version)
     DMG_PATH="$PROJECT_DIR/$APP_NAME-$VERSION.dmg"
@@ -333,7 +426,7 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  (none)        Build, sign, notarize app, create DMG"
-    echo "  --release     Same as above + create GitHub release"
+    echo "  --release     Same as above + create GitHub release + update appcast"
     echo "  --skip-build  Skip build, notarize existing app"
     echo "  --dmg-only    Create DMG from existing notarized app"
     echo "  --check       Show notarization history"
@@ -344,7 +437,10 @@ show_help() {
     echo "     xcrun notarytool store-credentials \"$KEYCHAIN_PROFILE\" \\"
     echo "         --apple-id \"your@email.com\" --team-id \"$TEAM_ID\""
     echo ""
-    echo "  2. For GitHub releases, install and authenticate gh:"
+    echo "  2. Generate Sparkle EdDSA signing keys (one-time):"
+    echo "     ./build/sparkle-tools/bin/generate_keys"
+    echo ""
+    echo "  3. For GitHub releases, install and authenticate gh:"
     echo "     brew install gh && gh auth login"
     echo ""
 }
@@ -397,6 +493,7 @@ main() {
         --release)
             check_credentials
             check_certificate
+            ensure_sparkle_tools
             clean_build
             build_archive
             export_app
@@ -407,7 +504,10 @@ main() {
             create_dmg
             notarize_dmg
             verify_dmg
+            sparkle_sign_dmg
+            update_appcast
             create_github_release
+            commit_appcast
             ;;
         "")
             check_credentials
