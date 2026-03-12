@@ -243,6 +243,9 @@ struct ContentView: View {
             }
             .background(activitySyncView)
             .background(QuickLookWindowController())
+            .background(WindowRepresentedURL(url: viewModel.isInsideArchive ? nil : viewModel.currentPath) { url in
+                viewModel.navigateToAndSelectCurrent(url)
+            })
             .background(LiquidGlassWindowConfigurator())
     }
 
@@ -1143,6 +1146,151 @@ struct SearchField: NSViewRepresentable {
                 parent.text = newValue
             }
         }
+    }
+}
+
+// MARK: - Window Represented URL
+
+/// Sets the window's representedURL so that Command-clicking (or right-clicking)
+/// the title bar folder name shows the native macOS path hierarchy popup.
+/// Intercepts the popup menu so selections navigate within the app instead of opening Finder.
+struct WindowRepresentedURL: NSViewRepresentable {
+    let url: URL?
+    let onNavigate: (URL) -> Void
+
+    func makeNSView(context: Context) -> WindowRepresentedURLView {
+        let view = WindowRepresentedURLView()
+        view.representedURL = url
+        view.onNavigate = onNavigate
+        return view
+    }
+
+    func updateNSView(_ nsView: WindowRepresentedURLView, context: Context) {
+        nsView.representedURL = url
+        nsView.onNavigate = onNavigate
+        nsView.applyRepresentedURL()
+    }
+}
+
+/// Custom NSView that applies representedURL when it is attached to a window.
+/// Intercepts the title bar path popup menu by swizzling into the window delegate
+/// chain, redirecting navigation to the app instead of Finder.
+final class WindowRepresentedURLView: NSView {
+    var representedURL: URL?
+    var onNavigate: ((URL) -> Void)?
+    private var delegateProxy: PathMenuWindowDelegateProxy?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyRepresentedURL()
+        installProxy()
+    }
+
+    func applyRepresentedURL() {
+        guard let window else { return }
+        if window.representedURL != representedURL {
+            window.representedURL = representedURL
+        }
+        delegateProxy?.parentView = self
+        // Re-install proxy if SwiftUI replaced the window delegate
+        if let proxy = delegateProxy, window.delegate !== proxy {
+            proxy.originalDelegate = window.delegate
+            window.delegate = proxy
+        }
+    }
+
+    private func installProxy() {
+        guard let window else { return }
+        // If we already have a proxy installed on this window, just update it
+        if let existing = delegateProxy, window.delegate === existing {
+            existing.parentView = self
+            return
+        }
+        let proxy = PathMenuWindowDelegateProxy()
+        proxy.parentView = self
+        proxy.originalDelegate = window.delegate
+        delegateProxy = proxy
+        window.delegate = proxy
+    }
+}
+
+/// A delegate proxy that sits between the window and its original SwiftUI delegate.
+/// It intercepts `window(_:shouldPopUpDocumentPathMenu:)` to customize the path
+/// menu items, and forwards everything else to the original delegate.
+final class PathMenuWindowDelegateProxy: NSObject, NSWindowDelegate {
+    weak var parentView: WindowRepresentedURLView?
+    weak var originalDelegate: (any NSWindowDelegate)?
+
+    func window(_ window: NSWindow, shouldPopUpDocumentPathMenu menu: NSMenu) -> Bool {
+        // Replace each menu item's action so clicking navigates within the app
+        for item in menu.items {
+            item.target = self
+            item.action = #selector(pathMenuItemClicked(_:))
+        }
+        return true
+    }
+
+    func window(_ window: NSWindow, shouldDragDocumentWith event: NSEvent, from dragImageLocation: NSPoint, with pasteboard: NSPasteboard) -> Bool {
+        return originalDelegate?.window?(window, shouldDragDocumentWith: event, from: dragImageLocation, with: pasteboard) ?? true
+    }
+
+    @objc private func pathMenuItemClicked(_ sender: NSMenuItem) {
+        // The native path menu items store the URL in their representedObject
+        // But the path components can also be inferred from the menu item's title
+        // and the window's representedURL
+        guard let parentView else { return }
+        guard let windowURL = parentView.representedURL else { return }
+
+        // Build the URL from the menu item's position - items are ordered from
+        // deepest (current folder) to root. The item's title is the path component name.
+        let menu = sender.menu
+
+        // Find the target URL by walking up from the window's representedURL
+        // The menu lists path components from current to root (top to bottom)
+        if let menu {
+            var pathURL = windowURL
+            var urls: [URL] = []
+
+            // Build the full list of path components from root to current
+            while pathURL.path != "/" {
+                urls.insert(pathURL, at: 0)
+                pathURL = pathURL.deletingLastPathComponent()
+            }
+            urls.insert(URL(fileURLWithPath: "/"), at: 0)
+
+            // Menu items go from current (index 0) to root (last index)
+            // Find which index our sender is in the menu
+            if let itemIndex = menu.items.firstIndex(of: sender) {
+                // Menu items are ordered current-to-root, so reverse index into urls
+                let urlIndex = urls.count - 1 - itemIndex
+                if urlIndex >= 0 && urlIndex < urls.count {
+                    let targetURL = urls[urlIndex]
+                    if targetURL != parentView.representedURL {
+                        parentView.onNavigate?(targetURL)
+                    }
+                    return
+                }
+            }
+        }
+
+        // Fallback: try representedObject as URL
+        if let url = sender.representedObject as? URL, url != parentView.representedURL {
+            parentView.onNavigate?(url)
+        }
+    }
+
+    // MARK: - Forward all other delegate methods to original
+
+    override func responds(to aSelector: Selector!) -> Bool {
+        if super.responds(to: aSelector) { return true }
+        return originalDelegate?.responds(to: aSelector) ?? false
+    }
+
+    override func forwardingTarget(for aSelector: Selector!) -> Any? {
+        if let original = originalDelegate, original.responds(to: aSelector) {
+            return original
+        }
+        return super.forwardingTarget(for: aSelector)
     }
 }
 

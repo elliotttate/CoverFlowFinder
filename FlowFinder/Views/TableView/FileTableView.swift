@@ -239,6 +239,12 @@ struct FileTableView: NSViewRepresentable {
         let oldItems = context.coordinator.items
         context.coordinator.items = items
 
+        if oldItems.count != items.count {
+            NSLog("[TABLE-UPDATE] updateNSView: items count changed %d -> %d, tableView.selectedRowIndexes=%@",
+                  oldItems.count, items.count,
+                  context.coordinator.tableView?.selectedRowIndexes.map { String($0) }.joined(separator: ",") ?? "nil")
+        }
+
         // Check if items actually changed (including order change from sorting)
         let changed: Bool
         if oldItems.count != items.count {
@@ -256,12 +262,16 @@ struct FileTableView: NSViewRepresentable {
         }
 
         if changed {
+            NSLog("[TABLE-UPDATE] Items changed - calling reloadData. tableView.selectedRowIndexes before=%@",
+                  context.coordinator.tableView?.selectedRowIndexes.map { String($0) }.joined(separator: ",") ?? "nil")
             context.coordinator.resetThumbnailState()
             // Reset lastVisibleRange so hydration can trigger
             context.coordinator.resetHydrationRange()
             // Reset hydration tracking since we have new items
             context.coordinator.lastHydrationItemCount = 0
             context.coordinator.tableView?.reloadData()
+            NSLog("[TABLE-UPDATE] After reloadData. tableView.selectedRowIndexes=%@",
+                  context.coordinator.tableView?.selectedRowIndexes.map { String($0) }.joined(separator: ",") ?? "nil")
             // Trigger hydration for newly visible rows
             context.coordinator.hydrateVisibleRows()
             // Retry after layout settles to ensure visible rows are detected
@@ -799,8 +809,21 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             return items[row]
         })
 
+        NSLog("[TABLE-SEL] tableViewSelectionDidChange: selectedRows=%@, coordItems.count=%d, vmItems.count=%d, names=%@",
+              selectedRows.map { String($0) }.joined(separator: ","),
+              items.count,
+              viewModel.items.count,
+              selectedItems.map { $0.name }.joined(separator: ", "))
+
         isUpdatingSelection = true
         viewModel.selectedItems = selectedItems
+        // Update lastSelectedIndex and selectionAnchorIndex so keyboard navigation
+        // (in all view modes) starts from the correct position after native NSTableView
+        // arrow key navigation or programmatic selection changes.
+        if let lastRow = selectedRows.last, lastRow < items.count {
+            viewModel.lastSelectedIndex = lastRow
+            viewModel.selectionAnchorIndex = lastRow
+        }
         isUpdatingSelection = false
     }
 
@@ -843,6 +866,11 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         // Only update selection and scroll if selection actually changed
         // This prevents scroll jumping when user is manually scrolling the list
         if newIndexSet != currentSelection {
+            NSLog("[TABLE-SYNC] syncSelectionFromViewModel: coordItems.count=%d, vmSelectedItems=%@, rowsToSelect=%@, currentTableSelection=%@",
+                  items.count,
+                  viewModel.selectedItems.map { $0.name }.joined(separator: ", "),
+                  rowsToSelect.map { String($0) }.joined(separator: ","),
+                  currentSelection.map { String($0) }.joined(separator: ","))
             isUpdatingSelection = true
             tableView.selectRowIndexes(newIndexSet, byExtendingSelection: false)
             isUpdatingSelection = false
