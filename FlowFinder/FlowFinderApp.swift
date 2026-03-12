@@ -1,4 +1,5 @@
 import SwiftUI
+import Sparkle
 
 @main
 struct FlowFinderApp: App {
@@ -6,6 +7,15 @@ struct FlowFinderApp: App {
     @StateObject private var settings = AppSettings.shared
     @StateObject private var soundEffectsMonitor = FinderSoundEffectsMonitor()
 
+    private let updaterController: SPUStandardUpdaterController
+
+    init() {
+        updaterController = SPUStandardUpdaterController(
+            startingUpdater: true,
+            updaterDelegate: nil,
+            userDriverDelegate: nil
+        )
+    }
 
     var body: some Scene {
         WindowGroup {
@@ -15,6 +25,10 @@ struct FlowFinderApp: App {
         .windowStyle(.automatic)
         .windowToolbarStyle(.unified(showsTitle: true))
         .commands {
+            CommandGroup(after: .appInfo) {
+                CheckForUpdatesView(updater: updaterController.updater)
+            }
+
             SidebarCommands()
             ToolbarCommands()
 

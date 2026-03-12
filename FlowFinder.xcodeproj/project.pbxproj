@@ -7,6 +7,9 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A100003C002 /* Sparkle in Frameworks */ = {isa = PBXBuildFile; productRef = A100003C001 /* Sparkle */; };
+		A100003A001 /* CheckForUpdatesViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100003A000 /* CheckForUpdatesViewModel.swift */; };
+		A100003B001 /* CheckForUpdatesView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A100003B000 /* CheckForUpdatesView.swift */; };
 		A1000033001 /* FlowFinder.icon in Resources */ = {isa = PBXBuildFile; fileRef = A1000033000 /* FlowFinder.icon */; };
 		A1000034001 /* CloudSyncStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000034000 /* CloudSyncStatus.swift */; };
 		A1000035001 /* CloudStatusManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000035000 /* CloudStatusManager.swift */; };
@@ -87,6 +90,8 @@
 		A1000037000 /* InlineVideoPreviewManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineVideoPreviewManager.swift; sourceTree = "<group>"; };
 		A1000038000 /* VideoPreviewOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VideoPreviewOverlay.swift; sourceTree = "<group>"; };
 		A1000039000 /* InlineAudioPreviewManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineAudioPreviewManager.swift; sourceTree = "<group>"; };
+		A100003A000 /* CheckForUpdatesViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckForUpdatesViewModel.swift; sourceTree = "<group>"; };
+		A100003B000 /* CheckForUpdatesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckForUpdatesView.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -94,6 +99,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				A100003C002 /* Sparkle in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -154,6 +160,7 @@
 		A1000012000 /* ViewModels */ = {
 			isa = PBXGroup;
 			children = (
+				A100003A000 /* CheckForUpdatesViewModel.swift */,
 				A1000003000 /* FileBrowserViewModel.swift */,
 			);
 			path = ViewModels;
@@ -164,6 +171,7 @@
 			children = (
 				A100002C000 /* TableView */,
 				A1000031000 /* AsyncListIconView.swift */,
+				A100003B000 /* CheckForUpdatesView.swift */,
 				A1000004000 /* ContentView.swift */,
 				A1000005000 /* CoverFlowView.swift */,
 				A100002F000 /* DropHelper.swift */,
@@ -210,6 +218,9 @@
 			dependencies = (
 			);
 			name = FlowFinder;
+			packageProductDependencies = (
+				A100003C001 /* Sparkle */,
+			);
 			productName = FlowFinder;
 			productReference = A1000000000 /* FlowFinder.app */;
 			productType = "com.apple.product-type.application";
@@ -238,6 +249,9 @@
 				Base,
 			);
 			mainGroup = A100000E000;
+			packageReferences = (
+				A100003C000 /* XCRemoteSwiftPackageReference "Sparkle" */,
+			);
 			productRefGroup = A1000010000 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -299,6 +313,8 @@
 				A100002F001 /* DropHelper.swift in Sources */,
 				A1000030001 /* ViewModifiers.swift in Sources */,
 				A1000031001 /* AsyncListIconView.swift in Sources */,
+				A100003A001 /* CheckForUpdatesViewModel.swift in Sources */,
+				A100003B001 /* CheckForUpdatesView.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -438,7 +454,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 136;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "";
 				"DEVELOPMENT_TEAM[sdk=macosx*]" = RH4U5VJHM6;
@@ -479,7 +495,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 3;
+				CURRENT_PROJECT_VERSION = 136;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "";
 				"DEVELOPMENT_TEAM[sdk=macosx*]" = RH4U5VJHM6;
@@ -532,6 +548,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		A100003C000 /* XCRemoteSwiftPackageReference "Sparkle" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/sparkle-project/Sparkle";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 2.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		A100003C001 /* Sparkle */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A100003C000 /* XCRemoteSwiftPackageReference "Sparkle" */;
+			productName = Sparkle;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = A1000018000 /* Project object */;
 }

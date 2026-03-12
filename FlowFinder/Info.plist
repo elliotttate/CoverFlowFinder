@@ -19,9 +19,13 @@
     <key>CFBundlePackageType</key>
     <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
     <key>CFBundleShortVersionString</key>
-    <string>1.20.0</string>
+    <string>$(MARKETING_VERSION)</string>
     <key>CFBundleVersion</key>
-    <string>1</string>
+    <string>$(CURRENT_PROJECT_VERSION)</string>
+    <key>SUFeedURL</key>
+    <string>https://elliotttate.github.io/CoverFlowFinder/appcast.xml</string>
+    <key>SUPublicEDKey</key>
+    <string>6Mnotk0Hz2FeDtGWEkUOtlSl+O9EctXXjH0xtRMaoas=</string>
     <key>LSMinimumSystemVersion</key>
     <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
     <key>NSHumanReadableCopyright</key>
