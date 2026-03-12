@@ -545,7 +545,16 @@ struct MasonryView: View {
     }
 
     private func navigateVertical(_ direction: Int, extend: Bool = false) {
-        guard let currentItem = ensureSelection() else { return }
+        // When extending selection, use lastSelectedIndex to find the cursor position
+        // instead of selectedItems.first which returns an arbitrary item from the Set.
+        let currentItem: FileItem
+        if extend {
+            let idx = max(0, min(items.count - 1, viewModel.lastSelectedIndex))
+            currentItem = items[idx]
+        } else {
+            guard let item = ensureSelection() else { return }
+            currentItem = item
+        }
         let layout = masonryLayout
         guard let position = layout.positions[currentItem.id] else { return }
 
@@ -563,7 +572,16 @@ struct MasonryView: View {
     }
 
     private func navigateHorizontal(_ direction: Int, extend: Bool = false) {
-        guard let currentItem = ensureSelection() else { return }
+        // When extending selection, use lastSelectedIndex to find the cursor position
+        // instead of selectedItems.first which returns an arbitrary item from the Set.
+        let currentItem: FileItem
+        if extend {
+            let idx = max(0, min(items.count - 1, viewModel.lastSelectedIndex))
+            currentItem = items[idx]
+        } else {
+            guard let item = ensureSelection() else { return }
+            currentItem = item
+        }
         let layout = masonryLayout
         guard let position = layout.positions[currentItem.id] else { return }
 

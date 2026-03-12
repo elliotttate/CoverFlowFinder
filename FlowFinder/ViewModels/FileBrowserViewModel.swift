@@ -437,20 +437,17 @@ class FileBrowserViewModel: ObservableObject {
 
         // Observe search text changes
         $searchText
+            .removeDuplicates()
             .debounce(for: .milliseconds(200), scheduler: RunLoop.main)
             .sink { [weak self] newText in
                 guard let self else { return }
-                print("📝 [FileBrowserVM] searchText changed to: '\(newText)', mode: \(self.searchMode.rawValue)")
-                searchDebugLogger.notice("📝 searchText changed to: '\(newText)', mode: \(self.searchMode.rawValue)")
-                self.objectWillChange.send()
                 // Trigger search for Finder/Everything modes
                 if self.searchMode != .filter {
-                    print("📝 [FileBrowserVM] Triggering performSearch for non-filter mode")
-                    searchDebugLogger.notice("📝 Triggering performSearch for non-filter mode")
+                    self.objectWillChange.send()
                     self.performSearch(query: newText)
-                } else {
-                    print("📝 [FileBrowserVM] Filter mode - not calling performSearch")
-                    searchDebugLogger.notice("📝 Filter mode - not calling performSearch")
+                } else if !newText.isEmpty {
+                    // Filter mode with non-empty text — trigger view update for filtering
+                    self.objectWillChange.send()
                 }
             }
             .store(in: &cancellables)
@@ -681,7 +678,9 @@ class FileBrowserViewModel: ObservableObject {
                             self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
                         }
 
-                        NSLog("[NewFolder] Setting self.items (count=%d), pendingNewFolderRenameURL=%@", allItems.count, self.pendingNewFolderRenameURL?.lastPathComponent ?? "nil")
+                        if self.pendingNewFolderRenameURL != nil {
+                            NSLog("[NewFolder] Setting self.items (count=%d), pendingNewFolderRenameURL=%@", allItems.count, self.pendingNewFolderRenameURL?.lastPathComponent ?? "nil")
+                        }
                         self.items = allItems
                         if !isLargeDirectory {
                             self.isLoading = false
@@ -748,7 +747,9 @@ class FileBrowserViewModel: ObservableObject {
                             self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
                         }
 
-                        NSLog("[NewFolder] LARGE DIR: Setting items (count=%d), pendingNewFolderRenameURL=%@", allItems.count, self.pendingNewFolderRenameURL?.lastPathComponent ?? "nil")
+                        if self.pendingNewFolderRenameURL != nil {
+                            NSLog("[NewFolder] LARGE DIR: Setting items (count=%d), pendingNewFolderRenameURL=%@", allItems.count, self.pendingNewFolderRenameURL?.lastPathComponent ?? "nil")
+                        }
                         self.items = allItems
                         self.isLoading = false
                         self.navigationGeneration += 1
@@ -2804,6 +2805,11 @@ class FileBrowserViewModel: ObservableObject {
             return
         }
 
+        NSLog("[DELETE] Starting delete of %d items. lastSelectedIndex=%d, items.count=%d, filteredItems.count=%d", itemsToDelete.count, lastSelectedIndex, items.count, filteredItems.count)
+        for item in itemsToDelete {
+            NSLog("[DELETE]   Deleting: %@", item.name)
+        }
+
         // Find the URL to select after deletion (next item, or previous if at end)
         let currentItems = filteredItems
         let deletedURLs = Set(itemsToDelete.map { $0.url })
@@ -2852,23 +2858,30 @@ class FileBrowserViewModel: ObservableObject {
 
             // Remove deleted items from the items array directly (incremental update)
             let trashedURLs = Set(records.map { $0.original })
+            NSLog("[DELETE] Trash completed. Trashed %d items. items.count before removal=%d", trashedURLs.count, self.items.count)
             self.items.removeAll { trashedURLs.contains($0.url) }
+            NSLog("[DELETE] items.count after removal=%d, targetIndex=%d, targetItem=%@", self.items.count, targetIndex, targetItem?.name ?? "nil")
 
             // Update selection to the next/previous item
-            self.coverFlowSelectedIndex = min(targetIndex, max(0, self.items.count - 1))
+            let safeTargetIndex = self.items.isEmpty ? 0 : min(targetIndex, self.items.count - 1)
+            self.coverFlowSelectedIndex = safeTargetIndex
+            self.lastSelectedIndex = safeTargetIndex
+            self.selectionAnchorIndex = safeTargetIndex
+            let debugSelectedName = targetItem?.name ?? (safeTargetIndex < self.items.count ? self.items[safeTargetIndex].name : "nil")
+            NSLog("[DELETE] Set lastSelectedIndex=%d, selectedItem=%@", safeTargetIndex, debugSelectedName)
             if let targetItem = targetItem {
                 self.selectedItems = [targetItem]
             } else if !self.items.isEmpty {
                 // Select item at the target index if original target was deleted
-                let safeIndex = min(targetIndex, self.items.count - 1)
-                if safeIndex >= 0 {
-                    self.selectedItems = [self.items[safeIndex]]
+                if safeTargetIndex >= 0 {
+                    self.selectedItems = [self.items[safeTargetIndex]]
                 } else {
                     self.selectedItems.removeAll()
                 }
             } else {
                 self.selectedItems.removeAll()
             }
+            NSLog("[DELETE] Final state: selectedItems.count=%d, selectedItems=%@, lastSelectedIndex=%d", self.selectedItems.count, self.selectedItems.map { $0.name }.joined(separator: ", "), self.lastSelectedIndex)
 
             // Clean up hydration tracking
             for url in trashedURLs {

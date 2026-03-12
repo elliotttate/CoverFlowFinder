@@ -309,31 +309,55 @@ struct CoverFlowView: View {
             let tokenChanged = oldToken != newToken
             Self.debugLog("[CoverFlow] onChange(items) FIRED! old:\(oldCount) new:\(newCount) oldToken:\(oldToken) newToken:\(newToken) tokenMatch:\(oldToken == newToken)")
 
+            // Detect item removal (deletion) vs folder navigation
+            // For removals, update sortedItemsCache synchronously so the FileTableView
+            // coordinator immediately has the correct items for selection/navigation.
+            let isItemRemoval = newCount < oldCount && newCount > 0
+
             // Only clear thumbnails if items actually changed
             if tokenChanged {
                 Self.debugLog("[CoverFlow] Items actually changed - clearing thumbnails")
-                DispatchQueue.main.async {
-                    NSLog("[NewFolder] onChange(items) DEFERRED ASYNC: updating sortedItemsCache from %d to %d items, selectedItems='%@'",
-                          sortedItemsCache.count, newItems.count,
-                          viewModel.selectedItems.first?.name ?? "nil")
-                    thumbnails.removeAll()
-                    iconPlaceholders.removeAll()
-                    thumbnailLoadGeneration += 1
-                    thumbnailCache.clearForNewFolder()
-                    selectionFlag.userClearedSelection = false  // Reset for new folder
-                    updateSortedItems(using: newItems, updateToken: true, newToken: newToken)
-                    loadVisibleThumbnails()
-                    NSLog("[NewFolder] onChange(items) DEFERRED: about to call syncSelection, coverFlowSelectedIndex=%d", viewModel.coverFlowSelectedIndex)
-                    syncSelection()
+
+                // Update sortedItemsCache and selection synchronously to prevent
+                // stale items in the FileTableView coordinator after deletion.
+                // This ensures arrow key navigation works correctly immediately.
+                updateSortedItems(using: newItems, updateToken: true, newToken: newToken)
+                syncSelection()
+
+                if isItemRemoval {
+                    // For deletions: only remove thumbnails for deleted items, don't clear everything
+                    let newURLs = Set(newItems.map { $0.url })
+                    let removedURLs = thumbnails.keys.filter { !newURLs.contains($0) }
+                    for url in removedURLs {
+                        thumbnails.removeValue(forKey: url)
+                        iconPlaceholders.remove(url)
+                    }
+                    DispatchQueue.main.async {
+                        loadVisibleThumbnails()
+                    }
+                } else {
+                    // For folder navigation: clear all thumbnails (deferred for performance)
+                    DispatchQueue.main.async {
+                        NSLog("[NewFolder] onChange(items) DEFERRED ASYNC: clearing thumbnails, items=%d, selectedItems='%@'",
+                              newItems.count,
+                              viewModel.selectedItems.first?.name ?? "nil")
+                        thumbnails.removeAll()
+                        iconPlaceholders.removeAll()
+                        thumbnailLoadGeneration += 1
+                        thumbnailCache.clearForNewFolder()
+                        selectionFlag.userClearedSelection = false  // Reset for new folder
+                        loadVisibleThumbnails()
+                    }
                 }
             } else {
                 Self.debugLog("[CoverFlow] Items unchanged (same token) - skipping clear")
-                DispatchQueue.main.async {
-                    updateSortedItems(using: newItems, updateToken: false)
-                    if orderChanged {
+                // Update synchronously for consistent selection state
+                updateSortedItems(using: newItems, updateToken: false)
+                syncSelection()
+                if orderChanged {
+                    DispatchQueue.main.async {
                         loadVisibleThumbnails()
                     }
-                    syncSelection()
                 }
             }
         }

@@ -172,9 +172,17 @@ struct DualPaneView: View {
         let items = vm.filteredItems
         guard !items.isEmpty else { return }
 
-        let currentIndex = vm.lastSelectedIndex
-        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
-        guard newIndex != currentIndex || vm.selectedItems.isEmpty else { return }
+        // Derive current index from actual selection to avoid stale lastSelectedIndex
+        let currentIndex: Int
+        if let selected = vm.selectedItems.first,
+           let idx = items.firstIndex(of: selected) {
+            currentIndex = idx
+        } else {
+            currentIndex = vm.lastSelectedIndex
+        }
+        let clampedCurrentIndex = max(0, min(items.count - 1, currentIndex))
+        let newIndex = max(0, min(items.count - 1, clampedCurrentIndex + offset))
+        guard newIndex != clampedCurrentIndex || vm.selectedItems.isEmpty else { return }
 
         if extend {
             vm.selectRange(to: newIndex, in: items)

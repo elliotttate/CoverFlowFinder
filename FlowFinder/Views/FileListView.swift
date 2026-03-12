@@ -58,9 +58,21 @@ struct FileListView: View {
     private func navigateSelection(by offset: Int, extend: Bool = false) {
         guard !items.isEmpty else { return }
 
-        let currentIndex = viewModel.lastSelectedIndex
-        let newIndex = max(0, min(items.count - 1, currentIndex + offset))
-        guard newIndex != currentIndex || viewModel.selectedItems.isEmpty else { return }
+        // When extending selection, use lastSelectedIndex to track the moving end
+        // of the range. Using selectedItems.first would pick an arbitrary item from
+        // the Set, causing the cursor to jump around during shift+arrow.
+        let currentIndex: Int
+        if extend {
+            currentIndex = viewModel.lastSelectedIndex
+        } else if let selected = viewModel.selectedItems.first,
+                  let idx = items.firstIndex(of: selected) {
+            currentIndex = idx
+        } else {
+            currentIndex = viewModel.lastSelectedIndex
+        }
+        let clampedCurrentIndex = max(0, min(items.count - 1, currentIndex))
+        let newIndex = max(0, min(items.count - 1, clampedCurrentIndex + offset))
+        guard newIndex != clampedCurrentIndex || viewModel.selectedItems.isEmpty else { return }
 
         if extend {
             viewModel.selectRange(to: newIndex, in: items)
