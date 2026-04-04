@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 
 struct AsyncListIconView: View {
+    @EnvironmentObject private var settings: AppSettings
     let item: FileItem
     let size: CGFloat
 
@@ -28,11 +29,14 @@ struct AsyncListIconView: View {
             .onChange(of: size) { _ in
                 loadIconIfNeeded(force: true)
             }
+            .onChange(of: settings.thumbnailQuality) { _ in
+                loadIconIfNeeded(force: true)
+            }
     }
 
     private func loadIconIfNeeded(force: Bool = false) {
         let scale = NSScreen.main?.backingScaleFactor ?? 2.0
-        let targetPixelSize = max(64, size * scale)
+        let targetPixelSize = max(64, size * scale * settings.thumbnailQualityValue)
         let loadKey = "\(item.url.path)|\(Int(targetPixelSize))"
 
         if !force, loadKey == lastLoadKey {

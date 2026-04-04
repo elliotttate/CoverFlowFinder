@@ -776,7 +776,7 @@ class ThumbnailCacheManager {
     }
 
     private func clampPixelSize(_ size: CGFloat) -> CGFloat {
-        min(max(size, Self.minimumPixelSize), 1024)
+        min(max(size, Self.minimumPixelSize), 1536)
     }
 
     private func estimateCost(for image: NSImage) -> Int {

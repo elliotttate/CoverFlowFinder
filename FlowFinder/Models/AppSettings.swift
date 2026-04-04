@@ -42,6 +42,7 @@ final class AppSettings: ObservableObject {
         static let usePerFolderColumnState = "settings.usePerFolderColumnState"
         static let inlineVideoPreview = "settings.inlineVideoPreview"
         static let inlineAudioPreview = "settings.inlineAudioPreview"
+        static let videoSkimming = "settings.videoSkimming"
     }
 
     private enum Defaults {
@@ -68,7 +69,7 @@ final class AppSettings: ObservableObject {
         static let sidebarFavoritesData: Data = {
             (try? JSONEncoder().encode(sidebarFavorites)) ?? Data()
         }()
-        static let thumbnailQuality: Double = 1.15
+        static let thumbnailQuality: Double = 1.0
         static let masonryShowFilenames = false
 
         static let listFontSize: Double = 13
@@ -92,6 +93,7 @@ final class AppSettings: ObservableObject {
         static let usePerFolderColumnState = true  // Finder-like behavior (default)
         static let inlineVideoPreview = true
         static let inlineAudioPreview = true
+        static let videoSkimming = true
     }
 
     private let defaults: UserDefaults
@@ -200,6 +202,9 @@ final class AppSettings: ObservableObject {
     @Published var inlineAudioPreview: Bool {
         didSet { defaults.set(inlineAudioPreview, forKey: Keys.inlineAudioPreview) }
     }
+    @Published var videoSkimming: Bool {
+        didSet { defaults.set(videoSkimming, forKey: Keys.videoSkimming) }
+    }
 
     private init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -236,7 +241,8 @@ final class AppSettings: ObservableObject {
             Keys.coverFlowPaneHeight: Defaults.coverFlowPaneHeight,
             Keys.usePerFolderColumnState: Defaults.usePerFolderColumnState,
             Keys.inlineVideoPreview: Defaults.inlineVideoPreview,
-            Keys.inlineAudioPreview: Defaults.inlineAudioPreview
+            Keys.inlineAudioPreview: Defaults.inlineAudioPreview,
+            Keys.videoSkimming: Defaults.videoSkimming
         ])
 
         showHiddenFiles = defaults.bool(forKey: Keys.showHiddenFiles)
@@ -282,6 +288,7 @@ final class AppSettings: ObservableObject {
         usePerFolderColumnState = defaults.bool(forKey: Keys.usePerFolderColumnState)
         inlineVideoPreview = defaults.bool(forKey: Keys.inlineVideoPreview)
         inlineAudioPreview = defaults.bool(forKey: Keys.inlineAudioPreview)
+        videoSkimming = defaults.bool(forKey: Keys.videoSkimming)
     }
 
     func resetToDefaults() {
@@ -321,6 +328,7 @@ final class AppSettings: ObservableObject {
         usePerFolderColumnState = Defaults.usePerFolderColumnState
         inlineVideoPreview = Defaults.inlineVideoPreview
         inlineAudioPreview = Defaults.inlineAudioPreview
+        videoSkimming = Defaults.videoSkimming
     }
 
     var listFont: Font {
@@ -424,7 +432,7 @@ final class AppSettings: ObservableObject {
     }
 
     var thumbnailQualityValue: CGFloat {
-        CGFloat(thumbnailQuality)
+        CGFloat(thumbnailQuality * 1.6)
     }
 }
 

@@ -78,7 +78,7 @@ struct CoverFlowView: View {
     private var coverFlowThumbnailPixelSize: CGFloat {
         let base = 192 * settings.coverFlowScaleValue * settings.thumbnailQualityValue
         let bucket = (base / 64).rounded() * 64
-        return min(768, max(128, bucket))
+        return min(1024, max(128, bucket))
     }
 
     private var coverFlowPlaceholderPixelSize: CGFloat {
@@ -1064,6 +1064,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     private var hoveredCoverIndex: Int?
     private var videoPreviewLayer: AVPlayerLayer?
     private var videoPreviewCoverIndex: Int?
+    private var skimProgressLayer: CALayer?
 
     private func setupView() {
         wantsLayer = true
@@ -1182,26 +1183,67 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             // Mouse is over empty space
             if hoveredCoverIndex != nil {
                 hoveredCoverIndex = nil
+                InlineVideoPreviewManager.shared.endSkimming()
                 InlineVideoPreviewManager.shared.cancelPreview()
             }
             return
         }
 
-        // Same cover — nothing to do
-        if hoveredCoverIndex == index { return }
-        hoveredCoverIndex = index
+        if hoveredCoverIndex != index {
+            // New cover — request preview
+            InlineVideoPreviewManager.shared.endSkimming()
+            hoveredCoverIndex = index
 
-        let item = items[index]
-        if item.fileType == .video {
-            InlineVideoPreviewManager.shared.requestPreview(for: item)
-        } else {
-            InlineVideoPreviewManager.shared.cancelPreview()
+            let item = items[index]
+            if item.fileType == .video {
+                InlineVideoPreviewManager.shared.requestPreview(for: item)
+            } else {
+                InlineVideoPreviewManager.shared.cancelPreview()
+            }
+        } else if AppSettings.shared.videoSkimming, items[index].fileType == .video {
+            // Same video cover — drive skimming from mouse X position
+            if let coverFrame = coverFrameForIndex(index), coverFrame.width > 0 {
+                let fraction = (location.x - coverFrame.minX) / coverFrame.width
+                let clampedFraction = min(max(fraction, 0), 1)
+                InlineVideoPreviewManager.shared.seekToFraction(clampedFraction, for: items[index].url)
+                updateSkimProgressLayer(fraction: clampedFraction)
+            }
         }
     }
 
     override func mouseExited(with event: NSEvent) {
         hoveredCoverIndex = nil
+        InlineVideoPreviewManager.shared.endSkimming()
         InlineVideoPreviewManager.shared.cancelPreview()
+    }
+
+    /// Returns the frame rect of the cover at the given item index, or nil if not found.
+    private func coverFrameForIndex(_ index: Int) -> CGRect? {
+        guard let coverLayer = coverLayers.first(where: {
+            ($0.value(forKey: "itemIndex") as? Int) == index
+        }) else { return nil }
+
+        let coverWidth = coverLayer.value(forKey: "coverWidth") as? CGFloat ?? baseCoverSize
+        let coverHeight = coverLayer.value(forKey: "coverHeight") as? CGFloat ?? baseCoverSize
+
+        return CGRect(
+            x: coverLayer.position.x - coverWidth / 2,
+            y: coverLayer.position.y - coverHeight / 2,
+            width: coverWidth,
+            height: coverHeight
+        )
+    }
+
+    /// Updates the skim progress bar layer width based on the current fraction.
+    private func updateSkimProgressLayer(fraction: Double) {
+        guard let progressLayer = skimProgressLayer,
+              let videoLayer = videoPreviewLayer else { return }
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        let width = videoLayer.bounds.width * CGFloat(fraction)
+        progressLayer.frame = CGRect(x: videoLayer.frame.minX, y: videoLayer.frame.minY, width: width, height: 3)
+        CATransaction.commit()
     }
 
     private func setupVideoPreviewCallbacks() {
@@ -1246,10 +1288,25 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         videoPreviewLayer = playerLayer
         videoPreviewCoverIndex = coverIndex
+
+        // Add skim progress bar layer if skimming is enabled
+        if AppSettings.shared.videoSkimming {
+            let progressBar = CALayer()
+            progressBar.name = "skimProgressLayer"
+            progressBar.backgroundColor = NSColor.white.withAlphaComponent(0.9).cgColor
+            progressBar.frame = CGRect(x: 0, y: 0, width: 0, height: 3)
+            progressBar.cornerRadius = 1.5
+            coverLayer.addSublayer(progressBar)
+            skimProgressLayer = progressBar
+        }
     }
 
     private func detachVideoPreviewLayer(for url: URL) {
         guard let layer = videoPreviewLayer else { return }
+
+        // Remove skim progress layer
+        skimProgressLayer?.removeFromSuperlayer()
+        skimProgressLayer = nil
 
         // Fade out and remove
         CATransaction.begin()

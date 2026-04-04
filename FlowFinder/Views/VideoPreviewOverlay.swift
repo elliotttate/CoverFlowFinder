@@ -154,6 +154,31 @@ struct AudioPreviewOverlayView: View {
     }
 }
 
+/// Overlay that shows a thin scrub progress bar at the bottom of a video thumbnail during skimming.
+struct VideoSkimProgressBar: View {
+    let progress: Double
+    let size: CGSize
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Spacer()
+            ZStack(alignment: .leading) {
+                // Track
+                Rectangle()
+                    .fill(Color.white.opacity(0.3))
+                    .frame(height: 3)
+
+                // Fill
+                Rectangle()
+                    .fill(Color.white.opacity(0.9))
+                    .frame(width: max(0, size.width * progress), height: 3)
+            }
+        }
+        .frame(width: size.width, height: size.height)
+        .allowsHitTesting(false)
+    }
+}
+
 /// View modifier that adds inline audio/video preview on hover.
 struct MediaPreviewModifier: ViewModifier {
     let item: FileItem
@@ -172,6 +197,12 @@ struct MediaPreviewModifier: ViewModifier {
                         .frame(width: size.width, height: size.height)
                         .allowsHitTesting(false)
                         .transition(.opacity.animation(.easeInOut(duration: 0.15)))
+
+                    // Scrub progress bar during skimming
+                    if videoManager.isSkimming {
+                        VideoSkimProgressBar(progress: videoManager.skimProgress, size: size)
+                            .transition(.opacity.animation(.easeInOut(duration: 0.1)))
+                    }
                 }
                 // Audio preview overlay (progress bar + pause)
                 if item.fileType == .audio && isHovering && audioManager.currentPreviewURL == item.url && audioManager.isPreviewActive {
@@ -179,12 +210,30 @@ struct MediaPreviewModifier: ViewModifier {
                         .transition(.opacity.animation(.easeInOut(duration: 0.15)))
                 }
             }
+            // Use onContinuousHover to get mouse position for video skimming
+            .onContinuousHover { phase in
+                switch phase {
+                case .active(let location):
+                    // Drive video skimming from mouse X position
+                    if item.fileType == .video && AppSettings.shared.videoSkimming && size.width > 0 {
+                        let fraction = location.x / size.width
+                        InlineVideoPreviewManager.shared.seekToFraction(fraction, for: item.url)
+                    }
+                case .ended:
+                    // End skimming when mouse leaves the thumbnail area
+                    if item.fileType == .video {
+                        InlineVideoPreviewManager.shared.endSkimming()
+                    }
+                }
+            }
+            // Preview lifecycle driven by parent's onHover binding
             .onChange(of: isHovering) { _, hovering in
                 if item.fileType == .video {
                     guard AppSettings.shared.inlineVideoPreview else { return }
                     if hovering {
                         InlineVideoPreviewManager.shared.requestPreview(for: item)
                     } else {
+                        InlineVideoPreviewManager.shared.endSkimming()
                         InlineVideoPreviewManager.shared.cancelPreview()
                     }
                 } else if item.fileType == .audio {

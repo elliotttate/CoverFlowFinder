@@ -549,7 +549,7 @@ struct PaneIconView: View {
         let baseTarget = max(192, appSettings.dualPaneIconSize * scale)
         let target = baseTarget * appSettings.thumbnailQualityValue
         let bucket = (target / 64).rounded() * 64
-        return min(512, max(96, bucket))
+        return min(1024, max(96, bucket))
     }
 
     private func calculateColumns(width: CGFloat) -> Int {
