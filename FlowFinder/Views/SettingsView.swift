@@ -64,7 +64,7 @@ struct SettingsView: View {
                 SettingsSliderRow(
                     title: "Thumbnail quality",
                     value: $settings.thumbnailQuality,
-                    range: 0.75...1.6,
+                    range: 0.5...1.6,
                     step: 0.05,
                     format: "%.2fx"
                 )
@@ -73,6 +73,9 @@ struct SettingsView: View {
             Section("Preview") {
                 Toggle("Inline video preview on hover", isOn: $settings.inlineVideoPreview)
                     .help("When hovering over a video file, play a preview within the thumbnail")
+                Toggle("Video skimming", isOn: $settings.videoSkimming)
+                    .help("Scrub through video by moving the mouse across the thumbnail")
+                    .disabled(!settings.inlineVideoPreview)
                 Toggle("Inline audio preview on hover", isOn: $settings.inlineAudioPreview)
                     .help("When hovering over an audio file, play a preview with progress bar and pause control")
             }

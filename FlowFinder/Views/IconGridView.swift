@@ -51,7 +51,7 @@ struct IconGridView: View {
         let baseTarget = max(256, settings.iconGridIconSizeValue * scale)
         let target = baseTarget * settings.thumbnailQualityValue
         let bucket = (target / 64).rounded() * 64
-        return min(768, max(96, bucket))
+        return min(1024, max(96, bucket))
     }
 
     var body: some View {
@@ -652,4 +652,3 @@ struct IconGridItem: View {
         }
     }
 }
-

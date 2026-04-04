@@ -1113,7 +1113,7 @@ struct PhotosMasonryView: View {
             spacing: settings.iconGridSpacing,
             fontSize: settings.iconGridFontSize,
             showFilenames: settings.masonryShowFilenames,
-            thumbnailQuality: settings.thumbnailQuality
+            thumbnailQuality: Double(settings.thumbnailQualityValue)
         )
         .background(Color(nsColor: .controlBackgroundColor))
         .simultaneousGesture(magnificationGesture)
@@ -1403,7 +1403,7 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
         private func thumbnailPixelSize(columnWidth: CGFloat, scale: CGFloat, quality: CGFloat) -> CGFloat {
             let target = columnWidth * scale * quality
             let bucket = (target / 128).rounded() * 128
-            return min(1024, max(256, bucket))
+            return min(1536, max(256, bucket))
         }
 
         private func rebuildIndexMap() {
