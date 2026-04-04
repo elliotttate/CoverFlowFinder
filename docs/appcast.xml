@@ -4,6 +4,14 @@
         <title>FlowFinder Updates</title>
         <language>en</language>
         <item>
+            <title>1.38.0</title>
+            <pubDate>Sat, 04 Apr 2026 12:05:42 -0400</pubDate>
+            <sparkle:version>138</sparkle:version>
+            <sparkle:shortVersionString>1.38.0</sparkle:shortVersionString>
+            <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>
+            <enclosure url="https://github.com/elliotttate/CoverFlowFinder/releases/download/v1.38.0/FlowFinder-1.38.0.dmg" length="6997179" type="application/octet-stream" sparkle:edSignature="IUXzAeyCIlcthPEgeYL21sTgSnfA8qIb7TnvRpEyun4+yLazZFhycqyLCUsVMG59pvdhCTviJFbihVhlIKgcDQ=="/>
+        </item>
+        <item>
             <title>1.37.0</title>
             <pubDate>Thu, 12 Mar 2026 11:15:24 -0400</pubDate>
             <sparkle:version>137</sparkle:version>
