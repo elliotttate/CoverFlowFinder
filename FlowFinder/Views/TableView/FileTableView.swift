@@ -312,7 +312,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var hydrationDebounceTimer: Timer?
     private let hydrationDebounceInterval: TimeInterval = 0.05
     private var isLiveScrolling = false
-    private var requestedCloudStatusURLs: Set<URL> = []
+    private(set) var requestedCloudStatusURLs: Set<URL> = []
 
     // Tags are read off the main thread; FileTagManager's cache is warm for these URLs
     private var loadedTagURLs: Set<URL> = []
@@ -323,6 +323,9 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var thumbnails = TableThumbnailStore(limit: 400)
     var thumbnailCount: Int { thumbnails.count }
     private let thumbnailCache = ThumbnailCacheManager.shared
+    // This table's requests (cancelled on folder change, and when the coordinator goes away)
+    private let thumbnailOwner = ThumbnailRequestOwner()
+    private var thumbnailRequests: [URL: ThumbnailRequestToken] = [:]
     private static let thumbnailPixelSize: CGFloat = 64
 
     // Thumbnail preheat state (like PHCachingImageManager)
@@ -546,6 +549,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             lastFolder = viewModel.currentPath
             pendingScrollAnchor = nil
             thumbnails.removeAll()
+            thumbnailRequests.removeAll()
+            thumbnailCache.cancelRequests(for: thumbnailOwner)
             loadedTagURLs.removeAll()
             requestedCloudStatusURLs.removeAll()
         }
@@ -1538,6 +1543,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         let oldPreheatRange = lastPreheatRange ?? 0..<0
         lastPreheatRange = newPreheatRange
 
+        cancelThumbnailRequests(forRows: oldPreheatRange.filter { !newPreheatRange.contains($0) })
+
         var tagURLs: [URL] = []
         for row in newPreheatRange where !oldPreheatRange.contains(row) {
             let item = items[row]
@@ -1695,13 +1702,18 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         }
     }
 
+    // Item-based APIs throughout: they key on the item's metadata instead of re-reading the file.
     private func loadThumbnailIfNeeded(for item: FileItem) {
         let url = item.url
         let targetPixelSize = Self.thumbnailPixelSize
 
         if cachedThumbnail(for: item) != nil { return }
-        if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) { return }
-        if thumbnailCache.hasFailed(url: url) {
+        if thumbnailRequests[url] != nil { return }
+        if let cached = thumbnailCache.cachedThumbnail(for: item, maxPixelSize: targetPixelSize) {
+            storeThumbnail(cached, for: item)
+            return
+        }
+        if thumbnailCache.hasFailed(item: item) {
             if isLiveScrolling {
                 return
             }
@@ -1709,23 +1721,33 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             return
         }
 
-        if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
-            storeThumbnail(cached, for: item)
-            return
-        }
-
-        thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { [weak self] loadedURL, image in
-            DispatchQueue.main.async {
-                guard let self = self else { return }
-                if self.thumbnailCache.hasFailed(url: loadedURL) {
-                    if self.isLiveScrolling {
-                        return
-                    }
+        // The completion runs on the main queue, or synchronously (returning no token) when the
+        // answer is already known
+        let token = thumbnailCache.requestThumbnail(for: item, maxPixelSize: targetPixelSize, owner: thumbnailOwner) { [weak self] result in
+            guard let self = self else { return }
+            self.thumbnailRequests[url] = nil
+            switch result {
+            case .loaded(let image):
+                self.storeThumbnail(image, for: item)
+            case .failed:
+                // Retried when scrolling ends
+                if !self.isLiveScrolling {
                     self.storeThumbnail(item.icon, for: item)
-                    return
                 }
+            case .cancelled:
+                break
+            }
+        }
+        if let token {
+            thumbnailRequests[url] = token
+        }
+    }
 
-                self.storeThumbnail(image ?? item.icon, for: item)
+    /// Cancels thumbnail requests for rows that scrolled out of the preheat range.
+    private func cancelThumbnailRequests(forRows rows: [Int]) {
+        for row in rows where row < items.count {
+            if let token = thumbnailRequests.removeValue(forKey: items[row].url) {
+                thumbnailCache.cancel(token)
             }
         }
     }
