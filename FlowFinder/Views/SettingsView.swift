@@ -2,6 +2,7 @@ import SwiftUI
 
 struct SettingsView: View {
     @EnvironmentObject private var settings: AppSettings
+    @State private var showingResetConfirmation = false
 
     var body: some View {
         TabView {
@@ -85,11 +86,31 @@ struct SettingsView: View {
             }
 
             Section {
-                Button("Reset to Defaults") {
-                    settings.resetToDefaults()
+                Button("Reset to Defaults…") {
+                    showingResetConfirmation = true
                 }
             }
         }
+        .alert("Reset all settings to their defaults?", isPresented: $showingResetConfirmation) {
+            Button("Reset", role: .destructive) {
+                settings.resetToDefaults()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(resetConfirmationMessage)
+        }
+    }
+
+    private var resetConfirmationMessage: String {
+        var message = "This resets every setting in all tabs (visibility, sorting, thumbnails, previews, sound, "
+            + "view sizes and sidebar sections) and restores the default sidebar Favorites: "
+            + "Documents, Applications, Desktop, Downloads, Movies, Music and Pictures."
+        let customCount = settings.customFavoritesCount
+        if customCount > 0 {
+            message += " Your \(customCount) custom \(customCount == 1 ? "favorite" : "favorites") will be removed from the sidebar."
+        }
+        message += " Files and folders are not affected."
+        return message
     }
 
     private var listTab: some View {

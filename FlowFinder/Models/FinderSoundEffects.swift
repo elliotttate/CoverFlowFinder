@@ -163,7 +163,10 @@ final class FinderSoundEffectsMonitor: ObservableObject {
                 object: nil,
                 queue: .main
             ) { _ in
-                FinderSoundEffects.shared.play(.volumeMount)
+                // Delivered on the main queue.
+                MainActor.assumeIsolated {
+                    FinderSoundEffects.shared.play(.volumeMount)
+                }
             }
         )
 
@@ -173,7 +176,11 @@ final class FinderSoundEffectsMonitor: ObservableObject {
                 object: nil,
                 queue: .main
             ) { _ in
-                FinderSoundEffects.shared.play(.volumeUnmount)
+                // Delivered on the main queue. This is also the eject sound for the sidebar's Eject command:
+                // it only fires once the unmount has succeeded.
+                MainActor.assumeIsolated {
+                    FinderSoundEffects.shared.play(.volumeUnmount)
+                }
             }
         )
     }

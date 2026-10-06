@@ -64,13 +64,13 @@ enum CloudSyncStatus: Equatable, Hashable {
         case .notDownloaded:
             return "Available in iCloud"
         case .downloading(let progress):
-            if let p = progress {
-                return "Downloading (\(Int(p * 100))%)"
+            if let percent = Self.percentString(progress) {
+                return "Downloading (\(percent))"
             }
             return "Downloading..."
         case .uploading(let progress):
-            if let p = progress {
-                return "Uploading (\(Int(p * 100))%)"
+            if let percent = Self.percentString(progress) {
+                return "Uploading (\(percent))"
             }
             return "Uploading..."
         case .waitingForUpload:
@@ -80,6 +80,12 @@ enum CloudSyncStatus: Equatable, Hashable {
         case .error:
             return "Sync error"
         }
+    }
+
+    /// "42%" for a 0...1 progress value; nil when there's no usable value (Int() traps on NaN/infinity).
+    private static func percentString(_ progress: Double?) -> String? {
+        guard let progress, progress.isFinite else { return nil }
+        return "\(Int((min(max(progress, 0), 1) * 100).rounded(.down)))%"
     }
 
     /// Whether this item can be downloaded
