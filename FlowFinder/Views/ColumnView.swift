@@ -6,7 +6,6 @@ import Quartz
 struct ColumnView: View {
     @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
-    @ObservedObject private var columnConfig = ListColumnConfigManager.shared
     let items: [FileItem]
 
     /// Selected item ("path item") of each column, keyed by the column's folder URL
@@ -120,7 +119,7 @@ struct ColumnView: View {
         .onChange(of: appSettings.foldersFirst) { _, _ in
             reloadAllSubColumns()
         }
-        .onChange(of: columnConfig.sortStateSnapshot()) { _, _ in
+        .onChange(of: viewModel.sortState) { _, _ in
             reloadAllSubColumns()
         }
     }
@@ -231,7 +230,7 @@ struct ColumnView: View {
         columnState.loadTokens[depth] = token
         let showHiddenFiles = appSettings.showHiddenFiles
         let foldersFirst = appSettings.foldersFirst
-        let sortState = columnConfig.sortStateSnapshot()
+        let sortState = viewModel.sortState
         let existingIDs: [URL: UUID] = reloading
             ? Dictionary(columnItems(atDepth: depth)?.map { ($0.url, $0.id) } ?? [], uniquingKeysWith: { first, _ in first })
             : [:]

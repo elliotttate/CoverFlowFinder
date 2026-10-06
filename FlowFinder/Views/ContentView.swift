@@ -308,7 +308,7 @@ struct ContentView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
-            ToolbarSortMenu()
+            ToolbarSortMenu(viewModel: activeViewModel)
             ToolbarActionsMenu(viewModel: activeViewModel)
             ToolbarSearchControls(viewModel: activeViewModel)
         }
@@ -553,19 +553,20 @@ private struct ToolbarHistoryButton: View {
     }
 }
 
+/// Sorts the active pane (each pane has its own sort).
 private struct ToolbarSortMenu: View {
-    @ObservedObject private var columnConfig = ListColumnConfigManager.shared
+    @ObservedObject var viewModel: FileBrowserViewModel
 
     var body: some View {
         Menu {
             ForEach(ListColumn.allCases) { column in
                 Button(action: {
-                    columnConfig.setSortColumn(column)
+                    viewModel.setSortColumn(column)
                 }) {
                     HStack {
                         Text(column.rawValue)
-                        if columnConfig.sortColumn == column {
-                            Image(systemName: columnConfig.sortDirection == .ascending ? "chevron.up" : "chevron.down")
+                        if viewModel.sortState.column == column {
+                            Image(systemName: viewModel.sortState.direction == .ascending ? "chevron.up" : "chevron.down")
                         }
                     }
                 }
