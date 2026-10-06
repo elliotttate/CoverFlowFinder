@@ -29,86 +29,151 @@ struct FinderTag: Identifiable, Hashable {
     }
 }
 
+extension URL {
+    /// Path used to compare and key file URLs: standardized, without a trailing slash.
+    /// Directory URLs from `contentsOfDirectory` end in "/" while FSEvents paths and
+    /// `URL(fileURLWithPath:)` for deleted folders don't, so `URL ==` can't be used for lookups.
+    var standardizedPathKey: String {
+        let path = standardizedFileURL.path
+        if path.count > 1, path.hasSuffix("/") {
+            return String(path.dropLast())
+        }
+        return path
+    }
+}
+
 /// Helper to read and write file tags using extended attributes
 enum FileTagManager {
     private static let tagAttributeName = "com.apple.metadata:_kMDItemUserTags"
-    private static var tagCache: [URL: [String]] = [:]
+    /// Cached tags keyed by path. Entries are dropped on our own edits, for files reported by
+    /// directory events and for a whole folder on refresh, so edits made in Finder show up.
+    private static var tagCache: [String: [String]] = [:]
+    private static let maxCachedEntries = 20_000
     private static let cacheQueue = DispatchQueue(label: "com.coverflowfinder.tagcache", qos: .userInitiated)
+
+    private static func cacheKey(for url: URL) -> String {
+        let path = url.path
+        if path.count > 1, path.hasSuffix("/") {
+            return String(path.dropLast())
+        }
+        return path
+    }
 
     /// Read tags from a file URL
     static func getTags(for url: URL) -> [String] {
-        if let cached = cacheQueue.sync(execute: { tagCache[url] }) {
+        let key = cacheKey(for: url)
+        if let cached = cacheQueue.sync(execute: { tagCache[key] }) {
             return cached
         }
-        guard let resourceValues = try? url.resourceValues(forKeys: [.tagNamesKey]),
-              let tags = resourceValues.tagNames else {
-            return []
-        }
-        cacheQueue.sync {
-            tagCache[url] = tags
-        }
+        // URL instances cache resource values; read through a fresh one so external edits are seen.
+        var freshURL = url
+        freshURL.removeAllCachedResourceValues()
+        let tags = (try? freshURL.resourceValues(forKeys: [.tagNamesKey]))?.tagNames ?? []
+        storeInCache(tags, forKey: key)
         return tags
     }
 
-    /// Set tags on a file URL using xattr (compatible with Finder on all macOS versions)
-    static func setTags(_ tags: [String], for url: URL) {
+    /// The cached tags for a URL, without touching the file system (nil when not cached).
+    static func cachedTags(for url: URL) -> [String]? {
+        let key = cacheKey(for: url)
+        return cacheQueue.sync { tagCache[key] }
+    }
+
+    /// Set tags on a file URL using xattr (compatible with Finder on all macOS versions).
+    /// Returns false when the attribute couldn't be written (read-only volume, no permission, …).
+    @discardableResult
+    static func setTags(_ tags: [String], for url: URL) -> Bool {
         // Finder stores tags in the extended attribute as a binary plist array
         // Each tag name has a newline suffix (e.g., "Red\n", "Blue\n")
         // Empty array removes all tags
+        let succeeded: Bool
         if tags.isEmpty {
-            // Remove the attribute entirely when no tags
-            url.withUnsafeFileSystemRepresentation { fileSystemPath in
-                guard let path = fileSystemPath else { return }
-                removexattr(path, tagAttributeName, 0)
+            // Remove the attribute entirely when no tags (ENOATTR: there was nothing to remove)
+            succeeded = url.withUnsafeFileSystemRepresentation { fileSystemPath -> Bool in
+                guard let path = fileSystemPath else { return false }
+                return removexattr(path, tagAttributeName, 0) == 0 || errno == ENOATTR
+            }
+        } else if let plistData = try? PropertyListSerialization.data(fromPropertyList: tags.map { $0 + "\n" }, format: .binary, options: 0) {
+            succeeded = url.withUnsafeFileSystemRepresentation { fileSystemPath -> Bool in
+                guard let path = fileSystemPath else { return false }
+                // setxattr replaces any existing value
+                return plistData.withUnsafeBytes { bytes in
+                    setxattr(path, tagAttributeName, bytes.baseAddress, bytes.count, 0, 0)
+                } == 0
             }
         } else {
-            let tagsWithNewlines = tags.map { $0 + "\n" }
-            if let plistData = try? PropertyListSerialization.data(fromPropertyList: tagsWithNewlines, format: .binary, options: 0) {
-                url.withUnsafeFileSystemRepresentation { fileSystemPath in
-                    guard let path = fileSystemPath else { return }
-                    // Remove existing attribute first to ensure clean write
-                    removexattr(path, tagAttributeName, 0)
-                    _ = plistData.withUnsafeBytes { bytes in
-                        setxattr(path, tagAttributeName, bytes.baseAddress, bytes.count, 0, 0)
-                    }
-                }
-            }
+            succeeded = false
         }
-        // Update cache synchronously so immediate reads get the new value
-        cacheQueue.sync {
-            tagCache[url] = tags
+
+        if succeeded {
+            // Update cache synchronously so immediate reads get the new value
+            storeInCache(tags, forKey: cacheKey(for: url))
+        } else {
+            invalidateCache(for: url)
         }
+        return succeeded
     }
 
     /// Add a tag to a file
-    static func addTag(_ tag: String, to url: URL) {
+    @discardableResult
+    static func addTag(_ tag: String, to url: URL) -> Bool {
         var currentTags = getTags(for: url)
-        if !currentTags.contains(tag) {
-            currentTags.append(tag)
-            setTags(currentTags, for: url)
-        }
+        guard !currentTags.contains(tag) else { return true }
+        currentTags.append(tag)
+        return setTags(currentTags, for: url)
     }
 
     /// Remove a tag from a file
-    static func removeTag(_ tag: String, from url: URL) {
+    @discardableResult
+    static func removeTag(_ tag: String, from url: URL) -> Bool {
         var currentTags = getTags(for: url)
         currentTags.removeAll { $0 == tag }
-        setTags(currentTags, for: url)
+        return setTags(currentTags, for: url)
     }
 
     /// Toggle a tag on a file
-    static func toggleTag(_ tag: String, on url: URL) {
+    @discardableResult
+    static func toggleTag(_ tag: String, on url: URL) -> Bool {
         let currentTags = getTags(for: url)
         if currentTags.contains(tag) {
-            removeTag(tag, from: url)
+            return removeTag(tag, from: url)
         } else {
-            addTag(tag, to: url)
+            return addTag(tag, to: url)
         }
     }
 
     static func invalidateCache(for url: URL) {
+        let key = cacheKey(for: url)
         cacheQueue.sync {
-            tagCache.removeValue(forKey: url)
+            _ = tagCache.removeValue(forKey: key)
+        }
+    }
+
+    static func invalidateCache(for urls: [URL]) {
+        let keys = urls.map(cacheKey(for:))
+        cacheQueue.sync {
+            for key in keys {
+                tagCache.removeValue(forKey: key)
+            }
+        }
+    }
+
+    /// Drop cached tags for the direct children of a folder (used on refresh).
+    static func invalidateCache(forDirectory directoryURL: URL) {
+        let directoryPath = cacheKey(for: directoryURL)
+        cacheQueue.sync {
+            tagCache = tagCache.filter { key, _ in
+                (key as NSString).deletingLastPathComponent != directoryPath
+            }
+        }
+    }
+
+    private static func storeInCache(_ tags: [String], forKey key: String) {
+        cacheQueue.sync {
+            if tagCache.count >= maxCachedEntries {
+                tagCache.removeAll(keepingCapacity: true)
+            }
+            tagCache[key] = tags
         }
     }
 }
@@ -117,6 +182,8 @@ enum FileTagManager {
 private class IconCache {
     static let shared = IconCache()
     private let cache = NSCache<NSString, NSImage>()
+    /// Folder icons keyed by path + change time, so custom icons/colours still show up.
+    private let folderCache = NSCache<NSString, NSImage>()
 
     // Pre-cached generic icons for fast display
     private let genericImageIcon: NSImage
@@ -124,6 +191,7 @@ private class IconCache {
     private let genericAudioIcon: NSImage
     private let genericFolderIcon: NSImage
     private let genericApplicationIcon: NSImage
+    private let genericDataIcon: NSImage
 
     // File extensions that should use generic icons for speed
     private let imageExtensions: Set<String> = ["jpg", "jpeg", "png", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp", "raw", "cr2", "nef", "arw", "dng"]
@@ -132,6 +200,7 @@ private class IconCache {
 
     private init() {
         cache.countLimit = 500
+        folderCache.countLimit = 500
 
         // Pre-load generic icons (these are instant)
         genericImageIcon = NSWorkspace.shared.icon(for: .image)
@@ -139,6 +208,7 @@ private class IconCache {
         genericAudioIcon = NSWorkspace.shared.icon(for: .audio)
         genericFolderIcon = NSWorkspace.shared.icon(for: .folder)
         genericApplicationIcon = NSWorkspace.shared.icon(for: .application)
+        genericDataIcon = NSWorkspace.shared.icon(for: .data)
     }
 
     func icon(for url: URL, isPlainFolder: Bool = false) -> NSImage {
@@ -155,10 +225,21 @@ private class IconCache {
             return genericAudioIcon
         }
 
-        // Don't cache plain folder icons - they can have custom colors
-        // But DO cache bundles (.app, .bundle, etc.) - they have stable icons
+        // Plain folders can have custom icons/colours. Those live in the folder's xattrs or an
+        // "Icon\r" file, and changing either bumps the folder's ctime/mtime, so key on those.
+        // Bundles (.app, .bundle, etc.) have stable icons and use the path-keyed cache below.
         if isPlainFolder {
-            return NSWorkspace.shared.icon(forFile: url.path)
+            var info = stat()
+            guard stat(url.path, &info) == 0 else {
+                return NSWorkspace.shared.icon(forFile: url.path)
+            }
+            let folderKey = "\(url.path)|\(info.st_ctimespec.tv_sec).\(info.st_ctimespec.tv_nsec)|\(info.st_mtimespec.tv_sec).\(info.st_mtimespec.tv_nsec)" as NSString
+            if let cached = folderCache.object(forKey: folderKey) {
+                return cached
+            }
+            let icon = NSWorkspace.shared.icon(forFile: url.path)
+            folderCache.setObject(icon, forKey: folderKey)
+            return icon
         }
 
         // Check cache for non-media, non-folder files (including .app bundles)
@@ -179,19 +260,40 @@ private class IconCache {
         case .audio: return genericAudioIcon
         case .folder: return genericFolderIcon
         case .application: return genericApplicationIcon
-        default: return NSWorkspace.shared.icon(for: .data)
+        default: return genericDataIcon
         }
     }
 }
 
-struct FileItem: Identifiable, Hashable, Transferable {
-    static var transferRepresentation: some TransferRepresentation {
-        FileRepresentation(exportedContentType: .fileURL) { item in
-            SentTransferredFile(item.url)
+/// Finder-style kind strings per content type (LaunchServices lookups are not free, and
+/// sorting by Kind reads the kind of every item).
+private enum KindDescriptionCache {
+    private static let lock = NSLock()
+    private static var descriptions: [String: String] = [:]
+
+    static func description(for type: UTType) -> String? {
+        lock.lock()
+        let cached = descriptions[type.identifier]
+        lock.unlock()
+        if let cached {
+            return cached.isEmpty ? nil : cached
         }
-        ProxyRepresentation(exporting: \.url)
+
+        var description = type.localizedDescription ?? ""
+        if let first = description.first, first.isLowercase {
+            // "application" → "Application", "PNG image" stays as is
+            description = first.uppercased() + description.dropFirst()
+        }
+        lock.lock()
+        descriptions[type.identifier] = description
+        lock.unlock()
+        return description.isEmpty ? nil : description
     }
-    let id: UUID
+}
+
+struct FileItem: Identifiable, Hashable {
+    /// Stable identity. The view model reuses it per path across reloads so views keep their state.
+    private(set) var id: UUID
     let url: URL
     let name: String
     let isDirectory: Bool
@@ -200,6 +302,15 @@ struct FileItem: Identifiable, Hashable, Transferable {
     let creationDate: Date?
     let fileType: FileType
     let hasMetadata: Bool
+    /// Bundles/packages (.app, .rtfd, …): directories that open as a single document.
+    let isPackage: Bool
+    /// The item is a symbolic link. `isDirectory`, `isPackage` and `fileType` describe the
+    /// link's target, while `url` and `name` stay the link's own (the item shows where it's listed).
+    let isSymbolicLink: Bool
+    /// The item is a Finder alias file (resolved when opened, not when listed).
+    let isAliasFile: Bool
+    /// Finder-style kind ("Folder", "PNG image", "Application", …)
+    let kindDescription: String
 
     // Archive support - for items inside ZIP files
     let isFromArchive: Bool
@@ -220,7 +331,7 @@ struct FileItem: Identifiable, Hashable, Transferable {
         cloudStatus?.description ?? ""
     }
 
-    /// Get tags for this file (reads from filesystem each time)
+    /// Get tags for this file (cached by FileTagManager)
     var tags: [String] {
         guard !isFromArchive else { return [] }
         return FileTagManager.getTags(for: url)
@@ -243,8 +354,7 @@ struct FileItem: Identifiable, Hashable, Transferable {
         if !url.isFileURL {
             return IconCache.shared.genericIcon(for: fileType)
         }
-        // Only skip caching for actual folders (not bundles like .app)
-        // Folders can have custom colors that might change
+        // Actual folders (not bundles like .app) can have custom colors that might change
         let isPlainFolder = fileType == .folder
         return IconCache.shared.icon(for: url, isPlainFolder: isPlainFolder)
     }
@@ -305,13 +415,36 @@ struct FileItem: Identifiable, Hashable, Transferable {
         self.archiveURL = nil
         self.archivePath = nil
 
-        let requestedKeys: Set<URLResourceKey> = loadMetadata
-            ? [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey]
-            : [.isDirectoryKey, .contentTypeKey]
+        var requestedKeys: Set<URLResourceKey> = [
+            .isDirectoryKey, .contentTypeKey, .isPackageKey, .isSymbolicLinkKey, .isAliasFileKey
+        ]
+        if loadMetadata {
+            requestedKeys.formUnion([.fileSizeKey, .contentModificationDateKey, .creationDateKey])
+        }
 
         let resourceValues = try? url.resourceValues(forKeys: requestedKeys)
 
-        self.isDirectory = resourceValues?.isDirectory ?? false
+        // Resource values describe a symlink itself (not a directory, type public.symlink).
+        // Classify symlinks by their target so linked folders sort and open as folders.
+        let isSymbolicLink = resourceValues?.isSymbolicLink ?? false
+        var isDirectory = resourceValues?.isDirectory ?? false
+        var isPackage = resourceValues?.isPackage ?? false
+        var contentType = resourceValues?.contentType
+        if isSymbolicLink {
+            let targetURL = url.resolvingSymlinksInPath()
+            if targetURL != url,
+               let targetValues = try? targetURL.resourceValues(forKeys: [.isDirectoryKey, .contentTypeKey, .isPackageKey]) {
+                isDirectory = targetValues.isDirectory ?? false
+                isPackage = targetValues.isPackage ?? false
+                contentType = targetValues.contentType ?? contentType
+            }
+        }
+        self.isDirectory = isDirectory
+        self.isPackage = isPackage
+        self.isSymbolicLink = isSymbolicLink
+        // isAliasFile is also true for symlinks; keep it for Finder aliases only
+        self.isAliasFile = !isSymbolicLink && (resourceValues?.isAliasFile ?? false)
+
         if loadMetadata {
             self.size = Int64(resourceValues?.fileSize ?? 0)
             self.modificationDate = resourceValues?.contentModificationDate
@@ -324,35 +457,45 @@ struct FileItem: Identifiable, Hashable, Transferable {
         self.hasMetadata = loadMetadata
 
         // Determine file type - check content type first for bundles/packages
-        if let contentType = resourceValues?.contentType {
+        let fileType: FileType
+        if let contentType {
             // Check for application bundles BEFORE falling back to folder
-            if contentType.conforms(to: .application) || contentType.conforms(to: .bundle) || contentType.conforms(to: .package) {
-                self.fileType = FileItem.determineFileType(from: contentType)
-            } else if self.isDirectory {
-                self.fileType = .folder
+            if isPackage || contentType.conforms(to: .application) || contentType.conforms(to: .bundle) || contentType.conforms(to: .package) {
+                fileType = FileItem.determineFileType(from: contentType)
+            } else if isDirectory {
+                fileType = .folder
             } else {
-                self.fileType = FileItem.determineFileType(from: contentType)
+                fileType = FileItem.determineFileType(from: contentType)
             }
         } else if let extType = UTType(filenameExtension: url.pathExtension) {
             // Check extension-based type for bundles
             if extType.conforms(to: .application) || extType.conforms(to: .bundle) || extType.conforms(to: .package) {
-                self.fileType = FileItem.determineFileType(from: extType)
-            } else if self.isDirectory {
-                self.fileType = .folder
+                fileType = FileItem.determineFileType(from: extType)
+            } else if isDirectory {
+                fileType = .folder
             } else {
-                self.fileType = FileItem.determineFileType(from: extType)
+                fileType = FileItem.determineFileType(from: extType)
             }
-        } else if self.isDirectory {
-            self.fileType = .folder
+        } else if isDirectory {
+            fileType = .folder
         } else {
-            self.fileType = .other
+            fileType = .other
         }
+        self.fileType = fileType
+        self.kindDescription = FileItem.kindDescription(
+            contentType: contentType,
+            isDirectory: isDirectory,
+            isPackage: isPackage,
+            isLink: isSymbolicLink || self.isAliasFile,
+            fileType: fileType
+        )
 
         // Cloud status is loaded on demand, not during init
         self.cloudStatus = nil
     }
 
-    /// Initialize from archive entry data (for ZIP file contents)
+    /// Initialize from already-known values (ZIP entries, Spotlight results, network hosts, Photos).
+    /// `isPackage` defaults to whether `contentType` is a package type.
     init(id: UUID = UUID(),
          url: URL,
          name: String,
@@ -364,7 +507,8 @@ struct FileItem: Identifiable, Hashable, Transferable {
          icon: NSImage? = nil,
          isFromArchive: Bool = false,
          archiveURL: URL? = nil,
-         archivePath: String? = nil) {
+         archivePath: String? = nil,
+         isPackage: Bool? = nil) {
         self.id = id
         self.url = url
         self.name = name
@@ -376,32 +520,43 @@ struct FileItem: Identifiable, Hashable, Transferable {
         self.isFromArchive = isFromArchive
         self.archiveURL = archiveURL
         self.archivePath = archivePath
+        let isPackage = isPackage ?? (isDirectory && contentType?.conforms(to: .package) == true)
+        self.isPackage = isPackage
+        self.isSymbolicLink = false
+        self.isAliasFile = false
 
         // Determine file type
-        if isDirectory {
-            self.fileType = .folder
+        let fileType: FileType
+        if isDirectory && !isPackage {
+            fileType = .folder
         } else if let ct = contentType {
-            self.fileType = FileItem.determineFileType(from: ct)
+            fileType = FileItem.determineFileType(from: ct)
         } else {
             let ext = (name as NSString).pathExtension
             if let extType = UTType(filenameExtension: ext) {
-                self.fileType = FileItem.determineFileType(from: extType)
+                fileType = FileItem.determineFileType(from: extType)
             } else {
-                self.fileType = .other
+                fileType = isDirectory ? .folder : .other
             }
         }
+        self.fileType = fileType
+        self.kindDescription = FileItem.kindDescription(
+            contentType: contentType,
+            isDirectory: isDirectory,
+            isPackage: isPackage,
+            isLink: false,
+            fileType: fileType
+        )
 
         // Archive items don't have cloud status
         self.cloudStatus = nil
     }
 
-    /// Return a copy of this item with full metadata loaded (reuses the same identity).
-    func hydrated(includeCloudStatus: Bool = false) -> FileItem {
-        var item = FileItem(url: url, id: id, loadMetadata: true)
-        if includeCloudStatus && item.isInICloud {
-            item.cloudStatus = CloudStatusManager.shared.getStatus(for: url)
-        }
-        return item
+    /// Return a copy of this item with a different identity (used to keep IDs stable per path).
+    func withID(_ id: UUID) -> FileItem {
+        var copy = self
+        copy.id = id
+        return copy
     }
 
     /// Return a copy of this item with the specified cloud status
@@ -423,24 +578,14 @@ struct FileItem: Identifiable, Hashable, Transferable {
         return .other
     }
 
-    var formattedSize: String {
-        if isDirectory { return "--" }
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: size)
-    }
-
-    var formattedDate: String {
-        guard let date = modificationDate else { return "--" }
-        let formatter = DateFormatter()
-        formatter.dateStyle = .medium
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
-    }
-
-    var kindDescription: String {
-        if isDirectory { return "Folder" }
+    private static func kindDescription(contentType: UTType?, isDirectory: Bool, isPackage: Bool, isLink: Bool, fileType: FileType) -> String {
+        if isLink { return "Alias" }
+        if isDirectory && !isPackage { return "Folder" }
+        if let contentType, let description = KindDescriptionCache.description(for: contentType) {
+            return description
+        }
         switch fileType {
+        case .folder: return "Folder"
         case .image: return "Image"
         case .video: return "Video"
         case .audio: return "Audio"
@@ -448,8 +593,33 @@ struct FileItem: Identifiable, Hashable, Transferable {
         case .code: return "Source Code"
         case .archive: return "Archive"
         case .application: return "Application"
-        default: return "Document"
+        case .other: return isPackage ? "Package" : "Document"
         }
+    }
+
+    private static let byteCountFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
+    private static let dateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = .autoupdatingCurrent
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    var formattedSize: String {
+        // Folders have no size; packages show theirs when it's known
+        if isDirectory && !(isPackage && size > 0) { return "--" }
+        return Self.byteCountFormatter.string(fromByteCount: size)
+    }
+
+    var formattedDate: String {
+        guard let date = modificationDate else { return "--" }
+        return Self.dateFormatter.string(from: date)
     }
 
     /// Snapshot of the displayed metadata. Changes whenever size, dates, metadata hydration

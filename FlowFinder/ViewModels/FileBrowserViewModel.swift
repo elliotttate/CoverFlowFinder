@@ -8,7 +8,6 @@ import os
 import CoreServices
 
 private let zipNavLogger = Logger(subsystem: "com.flowfinder.app", category: "ZipNav")
-private let sortLogger = Logger(subsystem: "com.flowfinder.app", category: "Sorting")
 private let searchDebugLogger = Logger(subsystem: "com.flowfinder.app", category: "SearchDebug")
 
 // Notification names are defined in UIConstants.swift
@@ -78,6 +77,55 @@ private func sortItemsForBackground(_ items: [FileItem], sortState: SortState, f
     ListColumnConfigManager.sortedItems(items, sortState: sortState, foldersFirst: foldersFirst)
 }
 
+/// realpath(3): resolves every symlink, including /tmp → /private/tmp
+/// (`URL.resolvingSymlinksInPath()` strips /private again).
+private func resolvedFilesystemPath(_ path: String) -> String {
+    guard let resolved = realpath(path, nil) else { return path }
+    defer { free(resolved) }
+    return String(cString: resolved)
+}
+
+/// Thread-safe cancellation flag for background loads (checked between items instead of
+/// hopping to the main thread).
+private final class LoadCancellationFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var cancelled = false
+
+    var isCancelled: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return cancelled
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        lock.unlock()
+    }
+}
+
+/// Collects results produced on many threads and publishes ordered snapshots on the main queue.
+/// Appends are serialized on a private queue and each snapshot is copied there before it is
+/// dispatched, so snapshots arrive on main in append order and never shrink.
+final class SerialResultAccumulator<Element>: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.flowfinder.result-accumulator")
+    private var elements: [Element] = []
+
+    func append(_ element: Element, publish: @escaping ([Element]) -> Void) {
+        queue.async {
+            self.elements.append(element)
+            let snapshot = self.elements
+            DispatchQueue.main.async {
+                publish(snapshot)
+            }
+        }
+    }
+
+    var snapshot: [Element] {
+        queue.sync { elements }
+    }
+}
+
 @MainActor
 class FileBrowserViewModel: ObservableObject {
     @Published var currentPath: URL
@@ -90,58 +138,59 @@ class FileBrowserViewModel: ObservableObject {
     @Published var selectedItems: Set<FileItem> = []
     @Published var viewMode: ViewMode = .coverFlow
     @Published var searchText: String = ""
-    @Published var searchMode: SearchMode = .filter {
-        didSet {
-            objectWillChange.send()
-        }
-    }
-    /// Debug logging for sort functionality
-    static func sortDebugLog(_ message: String) {
-        let timestamp = ISO8601DateFormatter().string(from: Date())
-        let logMessage = "[\(timestamp)] 🔀 [Sort] \(message)\n"
-        let logURL = FileManager.default.temporaryDirectory.appendingPathComponent("flowfinder_sort.log")
-        if let handle = try? FileHandle(forWritingTo: logURL) {
-            handle.seekToEndOfFile()
-            handle.write(logMessage.data(using: .utf8)!)
-            handle.closeFile()
-        } else {
-            try? logMessage.data(using: .utf8)?.write(to: logURL)
-        }
-        print("🔀 [Sort] \(message)")
-    }
+    @Published var searchMode: SearchMode = .filter
     @Published var filterTag: String? = nil
     @Published var isLoading: Bool = false
     @Published var isSearching: Bool = false
 
     // Search results for Finder and Everything modes
-    @Published var searchResults: [FileItem] = []
+    @Published var searchResults: [FileItem] = [] {
+        didSet {
+            searchResultsRevision &+= 1
+        }
+    }
+    private var searchResultsRevision: Int = 0
+    private struct SortedSearchResultsCacheKey: Equatable {
+        let revision: Int
+        let sortState: SortState
+        let foldersFirst: Bool
+        let tagRefreshToken: Int
+    }
+    private var sortedSearchResultsCacheKey: SortedSearchResultsCacheKey?
+    private var sortedSearchResultsCache: [FileItem] = []
 
     /// Sorted search results - uses ListColumnConfigManager for consistency with normal file sorting
-    /// This means clicking column headers in List View sorts search results too
+    /// This means clicking column headers in List View sorts search results too.
+    /// Cached per (results, sort state): views read this several times per render.
     var sortedSearchResults: [FileItem] {
-        let items = searchResults
-        guard !items.isEmpty else {
+        guard !searchResults.isEmpty else {
             sortedSearchResultsStructuralToken = 0
-            return items
+            return []
         }
 
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
-        let foldersFirst = AppSettings.shared.foldersFirst
-
-        Self.sortDebugLog("sortedSearchResults called: \(items.count) items, sortBy: \(sortState.column.rawValue), direction: \(sortState.direction), foldersFirst: \(foldersFirst)")
-
-        let result = ListColumnConfigManager.sortedItems(items, sortState: sortState, foldersFirst: foldersFirst)
-        sortedSearchResultsStructuralToken = structuralToken(for: result)
-
-        if let first = result.first, let last = result.last {
-            Self.sortDebugLog("Result: first=\(first.name), last=\(last.name)")
+        let cacheKey = SortedSearchResultsCacheKey(
+            revision: searchResultsRevision,
+            sortState: sortState,
+            foldersFirst: AppSettings.shared.foldersFirst,
+            tagRefreshToken: sortState.column == .tags ? tagRefreshToken : 0
+        )
+        if sortedSearchResultsCacheKey == cacheKey {
+            return sortedSearchResultsCache
         }
+
+        let result = ListColumnConfigManager.sortedItems(searchResults, sortState: sortState, foldersFirst: cacheKey.foldersFirst)
+        sortedSearchResultsCacheKey = cacheKey
+        sortedSearchResultsCache = result
+        sortedSearchResultsStructuralToken = structuralToken(for: result)
         return result
     }
-    private var searchTask: Task<Void, Never>?
-    private var metadataQuery: NSMetadataQuery?
-    private var metadataQueryDidFinishObserver: NSObjectProtocol?
-    private var metadataQueryDidUpdateObserver: NSObjectProtocol?
+    private var spotlightSearch: SpotlightSearchSession?
+    private var spotlightSearchToken = UUID()
+    /// Stable IDs for Spotlight results, by path (kept while the search UI stays in use).
+    private var spotlightIDsByPath: [String: UUID] = [:]
+    /// A Spotlight search was interrupted by suspending background work; rerun it on resume.
+    private var searchNeedsRerunOnResume = false
     @Published var navigationHistory: [NavigationLocation] = []
     @Published var historyIndex: Int = -1
     @Published var coverFlowSelectedIndex: Int = 0
@@ -197,6 +246,8 @@ class FileBrowserViewModel: ObservableObject {
         let filterTag: String?
         let sortState: SortState
         let foldersFirst: Bool
+        /// Tag edits change what the tag filter and the Tags sort produce
+        let tagRefreshToken: Int
     }
     private var filteredItemsCacheKey: FilteredItemsCacheKey?
     private var filteredItemsCache: [FileItem] = []
@@ -214,6 +265,7 @@ class FileBrowserViewModel: ObservableObject {
     private var didForcePhotosAuthRefresh = false
     private let photosLogger = Logger(subsystem: "com.coverflowfinder.app", category: "Photos")
     private var photosLoadToken = UUID()
+    private var photosLoadCancellation: LoadCancellationFlag?
     private var photosSortState: SortState?
 
     private var networkServiceBrowser: NetworkServiceBrowser?
@@ -221,27 +273,46 @@ class FileBrowserViewModel: ObservableObject {
     private var isNetworkBrowsing = false
     private var smbSubnetScanner: SMBSubnetScanner?
     private var discoveredSMBHosts: [SMBHostInfo] = []
-    private var smbScanComplete = false
     private var isBackgroundWorkActive = true
     private var needsReloadOnResume = false
+    /// Set by `tearDown()`; the view model does no further background work.
+    private var isTornDown = false
 
     // MARK: - Lazy Metadata Loading
     /// Batch size for progressive loading of large directories
     private let directoryBatchSize = 400
-    /// Token to invalidate in-flight loads when navigating away
+    /// Token to invalidate in-flight loads when navigating away or reloading
     private var directoryLoadToken = UUID()
+    private var directoryLoadCancellation: LoadCancellationFlag?
+    /// Key of the location whose complete listing is in `items` (folder path, or archive + internal
+    /// path). Reloading the same location diffs into `items` instead of clearing it.
+    private var loadedLocationKey: String?
+    /// Stable item identities for the current location, by path (see `URL.standardizedPathKey`).
+    /// Reset when a different location is loaded.
+    private var itemIDsByPath: [String: UUID] = [:]
+    /// Whether the current folder is inside iCloud Drive (cloud status is hydrated with metadata)
+    private var currentFolderIsInICloud = false
     /// Track which items have had their metadata loaded
     private var hydratedURLs: Set<URL> = []
     /// Track which items have had their cloud status loaded
     private var cloudStatusLoadedURLs: Set<URL> = []
+    private var pendingCloudStatusURLs: Set<URL> = []
     /// Flag to prevent redundant reloads during navigation
     private var isNavigating = false
     /// Queue for metadata hydration requests
     private var pendingHydrationURLs: Set<URL> = []
     private let hydrationQueue = DispatchQueue(label: "com.coverflowfinder.hydration", qos: .userInitiated)
+    /// Invalidates in-flight metadata/cloud hydration (new folder, suspension)
+    private var hydrationToken = UUID()
+    private var hydrationCancellation = LoadCancellationFlag()
+    /// Lookup of `items` indices by URL, rebuilt lazily when `items` changes
+    private var itemIndexCache: (revision: Int, indexByURL: [URL: Int])?
+    private var sortChangeWorkScheduled = false
     private var directoryWatcher: DirectoryWatcher?
-    private var watchingDirectoryURL: URL?
-    private var pendingDirectoryEventURLs: Set<URL> = []
+    /// Path key of the folder (currentPath) the watcher was started for
+    private var watchedFolderKey: String?
+    private var pendingDirectoryEventPaths: Set<String> = []
+    private var pendingDirectoryRescan = false
     private var directoryEventWorkItem: DispatchWorkItem?
     private let directoryEventDebounce: TimeInterval = 0.25
     struct PhotoAssetDragInfo {
@@ -254,17 +325,10 @@ class FileBrowserViewModel: ObservableObject {
     @Published var currentArchiveURL: URL? = nil
     @Published var currentArchivePath: String = ""
     private var archiveEntries: [ZipEntry] = []
-
-    /// Get a display path for the path bar (shows archive path when inside ZIP)
-    var displayPath: URL {
-        if isInsideArchive, let archiveURL = currentArchiveURL {
-            // Create a virtual URL for display
-            let archiveName = archiveURL.lastPathComponent
-            let virtualPath = currentArchivePath.isEmpty ? archiveName : "\(archiveName)/\(currentArchivePath)"
-            return archiveURL.deletingLastPathComponent().appendingPathComponent(virtualPath)
-        }
-        return currentPath
-    }
+    /// Invalidates in-flight archive reads (ZipArchiveManager.readContents runs off the main thread)
+    private var archiveReadToken = UUID()
+    /// Token of the archive read that turned on the loading spinner (slow reads only)
+    private var archiveReadSpinnerToken: UUID?
 
     /// Path components for breadcrumb navigation (handles both regular paths and archive paths)
     var pathComponents: [(name: String, url: URL?, archivePath: String?)] {
@@ -339,14 +403,7 @@ class FileBrowserViewModel: ObservableObject {
             // When in search mode, return the search results
             // If search text is empty, show current directory items
             if searchText.isEmpty {
-                print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, empty searchText, returning filterCurrentDirectoryItems()")
                 return filterCurrentDirectoryItems()
-            }
-            print("📋 [FileBrowserVM] filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults (sorted by \(ListColumnConfigManager.shared.sortColumn.rawValue))")
-            searchDebugLogger.notice("📋 filteredItems: \(self.searchMode.rawValue) mode, returning \(self.searchResults.count) searchResults")
-            if searchResults.isEmpty {
-                print("⚠️ [FileBrowserVM] filteredItems: searchResults is EMPTY for query '\(self.searchText)'")
-                searchDebugLogger.warning("⚠️ filteredItems: searchResults is EMPTY for query '\(self.searchText)'")
             }
             return sortedSearchResults
 
@@ -377,30 +434,29 @@ class FileBrowserViewModel: ObservableObject {
     private func filterCurrentDirectoryItems() -> [FileItem] {
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
         let foldersFirst = AppSettings.shared.foldersFirst
+        let tagsMatter = (filterTag != nil && !isInsideArchive) || sortState.column == .tags
         let cacheKey = FilteredItemsCacheKey(
             itemsRevision: itemsRevision,
             searchText: searchMode == .filter ? searchText : "",
             filterTag: filterTag,
             sortState: sortState,
-            foldersFirst: foldersFirst
+            foldersFirst: foldersFirst,
+            tagRefreshToken: tagsMatter ? tagRefreshToken : 0
         )
 
         if let cachedKey = filteredItemsCacheKey, cachedKey == cacheKey {
             return filteredItemsCache
         }
 
+        // Photos arrive pre-sorted by PhotoKit for date sorts and are shown in library order otherwise
         if photosLibraryInfo != nil,
            searchText.isEmpty,
-           filterTag == nil {
-            if sortState.column == .dateCreated || sortState.column == .dateModified {
-                if photosSortState == sortState {
-                    filteredItemsStructuralToken = structuralToken(for: items)
-                    return items
-                }
-            } else {
-                filteredItemsStructuralToken = structuralToken(for: items)
-                return items
-            }
+           filterTag == nil,
+           !(sortState.column == .dateCreated || sortState.column == .dateModified) || photosSortState == sortState {
+            filteredItemsCacheKey = cacheKey
+            filteredItemsCache = items
+            filteredItemsStructuralToken = structuralToken(for: items)
+            return items
         }
 
         var filtered = items
@@ -452,23 +508,19 @@ class FileBrowserViewModel: ObservableObject {
             }
             .store(in: &cancellables)
 
-        // Observe search mode changes
+        // Observe search mode changes. @Published emits in willSet, so `self.searchMode` still
+        // holds the old mode here — pass the new one explicitly.
         $searchMode
             .dropFirst()
             .sink { [weak self] newMode in
                 guard let self else { return }
-                print("🔄 [FileBrowserVM] searchMode changed to: \(newMode.rawValue), searchText: '\(self.searchText)'")
-                searchDebugLogger.notice("🔄 searchMode changed to: \(newMode.rawValue), searchText: '\(self.searchText)'")
                 // Clear search results when changing modes
                 self.searchResults = []
                 self.cancelSearch()
                 // If switching to a search mode with existing text, trigger search
                 if newMode != .filter && !self.searchText.isEmpty {
-                    print("🔄 [FileBrowserVM] Triggering performSearch for existing text")
-                    searchDebugLogger.notice("🔄 Triggering performSearch for existing text")
-                    self.performSearch(query: self.searchText)
+                    self.performSearch(query: self.searchText, mode: newMode)
                 }
-                self.objectWillChange.send()
             }
             .store(in: &cancellables)
 
@@ -490,30 +542,23 @@ class FileBrowserViewModel: ObservableObject {
         let columnConfig = ListColumnConfigManager.shared
         columnConfig.$sortColumn
             .dropFirst() // Skip initial value
-            .sink { [weak self] newColumn in
+            .sink { [weak self] _ in
                 guard let self else { return }
                 self.objectWillChange.send()
 
                 // Skip reload during navigation - loadContents will be called with correct sort state
                 guard !self.isNavigating else { return }
-
-                // If the new sort column requires metadata (date/size) and items don't have it,
-                // we need to reload the directory to get proper sorting
-                let sortRequiresMetadata = self.sortStateRequiresMetadata(SortState(column: newColumn, direction: .descending))
-                if sortRequiresMetadata && !self.items.isEmpty {
-                    // Check if items have metadata by looking at hydratedURLs
-                    // If fewer items are hydrated than total items, we need to reload
-                    let itemsNeedMetadata = self.hydratedURLs.count < self.items.count
-                    if itemsNeedMetadata {
-                        self.loadContents()
-                    }
-                }
+                self.scheduleSortChangeHandling()
             }
             .store(in: &cancellables)
 
         columnConfig.$sortDirection
+            .dropFirst()
             .sink { [weak self] _ in
-                self?.objectWillChange.send()
+                guard let self else { return }
+                self.objectWillChange.send()
+                guard !self.isNavigating else { return }
+                self.scheduleSortChangeHandling()
             }
             .store(in: &cancellables)
 
@@ -528,7 +573,7 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     func setBackgroundWorkActive(_ isActive: Bool) {
-        guard isBackgroundWorkActive != isActive else { return }
+        guard !isTornDown, isBackgroundWorkActive != isActive else { return }
         isBackgroundWorkActive = isActive
 
         if isActive {
@@ -536,6 +581,23 @@ class FileBrowserViewModel: ObservableObject {
         } else {
             suspendBackgroundWork()
         }
+    }
+
+    /// Stops all background activity: directory watching, Spotlight, Bonjour/SMB browsing,
+    /// in-flight loads and hydration. Call when the tab or pane that owns this view model
+    /// closes; the view model does no background work afterwards.
+    func tearDown() {
+        guard !isTornDown else { return }
+        suspendBackgroundWork()
+        isTornDown = true
+        isBackgroundWorkActive = false
+        needsReloadOnResume = false
+        searchNeedsRerunOnResume = false
+        directoryWatcher = nil
+        networkServiceBrowser = nil
+        smbSubnetScanner = nil
+        clearPhotosCaches()
+        cancellables.removeAll()
     }
 
     func loadContents() {
@@ -562,218 +624,332 @@ class FileBrowserViewModel: ObservableObject {
             return
         }
         stopNetworkBrowsing()
-        isLoading = true
-        items = []
-        hydratedURLs.removeAll()
-        cloudStatusLoadedURLs.removeAll()
-        pendingHydrationURLs.removeAll()
+
         let pathToLoad = currentPath
+        let locationKey = pathToLoad.standardizedPathKey
+        // Reloading the folder that's already shown (refresh, file operations, re-sort, resume)
+        // diffs into `items`: no spinner, no cleared list, IDs and selection are kept.
+        let isReload = loadedLocationKey == locationKey
+        if !isReload {
+            beginLoadingNewLocation()
+            currentFolderIsInICloud = CloudStatusManager.shared.isInICloud(pathToLoad)
+        }
         let listingURL = resolvedListingURL(for: pathToLoad)
         startDirectoryWatcher(for: listingURL)
-        let pendingURL = pendingSelectionURL  // Capture before async
-        let pendingURLs = pendingSelectionURLs  // Capture multi-selection (paste)
-        if let pendingURL = pendingURL {
-            NSLog("[NewFolder] loadContents captured pendingURL: %@", pendingURL.lastPathComponent)
-        }
+
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
         let showHiddenFiles = AppSettings.shared.showHiddenFiles
-        let foldersFirst = AppSettings.shared.foldersFirst
         let batchSize = directoryBatchSize
+        let existingIDs = itemIDsByPath
+        // Keep metadata that was already loaded so hydrated rows don't fall back to "--"
+        let idsWithMetadata = Set(items.lazy.filter(\.hasMetadata).map(\.id))
         let loadToken = UUID()
         directoryLoadToken = loadToken
+        directoryLoadCancellation?.cancel()
+        let cancellation = LoadCancellationFlag()
+        directoryLoadCancellation = cancellation
         needsReloadOnResume = false
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
+            let listing = try? Self.listDirectory(
+                at: listingURL,
+                showHiddenFiles: showHiddenFiles,
+                sortState: sortState,
+                batchSize: batchSize,
+                existingIDs: existingIDs,
+                idsWithMetadata: idsWithMetadata,
+                cancellation: cancellation
+            )
+            guard !cancellation.isCancelled else { return }
 
-            do {
-                // Special handling for autofs mount points like /Network
-                // These require triggering the automounter before listing
-                let isAutofsMountPoint = listingURL.path == "/Network" ||
-                    listingURL.path.hasPrefix("/Network/")
-
-                if isAutofsMountPoint {
-                    // Trigger automounter by attempting to access the path
-                    // This may take a moment for network discovery
-                    _ = FileManager.default.fileExists(atPath: listingURL.path)
-                    // Give automounter a moment to populate
-                    Thread.sleep(forTimeInterval: 0.5)
-                }
-
-                // Phase 1: Get file list instantly (no stat calls)
-                let contents: [URL] = try autoreleasepool {
-                    try FileManager.default.contentsOfDirectory(
-                        at: listingURL,
-                        includingPropertiesForKeys: [.isDirectoryKey, .contentTypeKey],
-                        options: showHiddenFiles ? [] : [.skipsHiddenFiles]
-                    )
-                }
-
-                let totalCount = contents.count
-                let isLargeDirectory = totalCount > batchSize
-
-                // Phase 2: Create items with or without metadata
-                // For small directories, load metadata upfront for better UX
-                // For large directories, check if sorting requires metadata (date/size columns)
-                // If sorting by date or size, we MUST load metadata to sort correctly
-                let sortRequiresMetadata = self.sortStateRequiresMetadata(sortState)
-                let loadMetadataUpfront = !isLargeDirectory || sortRequiresMetadata
-
-                var allItems = [FileItem]()
-                allItems.reserveCapacity(totalCount)
-
-                // First batch - create items and show immediately
-                let firstBatchCount = min(batchSize, totalCount)
-                for i in 0..<firstBatchCount {
-                    allItems.append(FileItem(url: contents[i], loadMetadata: loadMetadataUpfront))
-                }
-
-                // Calculate selection for first batch
-                var selectedIndex = 0
-                var selectedItem: FileItem?
-                var selectedItemsForPaste: Set<FileItem>?
-                if let pendingURLs = pendingURLs, !pendingURLs.isEmpty {
-                    // Multi-file paste selection
-                    let pendingPaths = Set(pendingURLs.map { $0.standardizedFileURL.path })
-                    let matched = allItems.filter { pendingPaths.contains($0.url.standardizedFileURL.path) }
-                    if !matched.isEmpty {
-                        selectedItemsForPaste = Set(matched)
-                        selectedItem = matched.first
-                        let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
-                        if let first = matched.first, let index = sorted.firstIndex(of: first) {
-                            selectedIndex = index
-                        }
-                    }
-                } else if let pendingURL = pendingURL,
-                   let item = allItems.first(where: { $0.url.standardizedFileURL.path == pendingURL.standardizedFileURL.path }) {
-                    selectedItem = item
-                    let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
-                    if let index = sorted.firstIndex(of: item) {
-                        selectedIndex = index
-                    }
-                    NSLog("[NewFolder] Found pending item '%@' in first batch at sorted index %d (total items: %d)", item.name, selectedIndex, allItems.count)
-                } else if pendingURL != nil {
-                    NSLog("[NewFolder] WARNING: pendingURL '%@' NOT found in first batch of %d items", pendingURL!.lastPathComponent, allItems.count)
-                }
-
-                // Show first batch immediately (unless large directory - we'll show all at once to prevent jumping)
-                if !isLargeDirectory {
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self = self,
-                              self.directoryLoadToken == loadToken,
-                              !self.isInsideArchive,
-                              self.currentPath == pathToLoad else { return }
-
-                        if let pasteItems = selectedItemsForPaste {
-                            self.coverFlowSelectedIndex = selectedIndex
-                            self.selectedItems = pasteItems
-                            self.pendingSelectionURL = nil
-                            self.pendingSelectionURLs = nil
-                        } else if let item = selectedItem {
-                            NSLog("[NewFolder] Setting selection: coverFlowSelectedIndex=%d, item='%@'", selectedIndex, item.name)
-                            self.coverFlowSelectedIndex = selectedIndex
-                            self.selectedItems = [item]
-                            self.pendingSelectionURL = nil
-                        } else {
-                            self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
-                        }
-
-                        if self.pendingNewFolderRenameURL != nil {
-                            NSLog("[NewFolder] Setting self.items (count=%d), pendingNewFolderRenameURL=%@", allItems.count, self.pendingNewFolderRenameURL?.lastPathComponent ?? "nil")
-                        }
-                        self.items = allItems
-                        if !isLargeDirectory {
-                            self.isLoading = false
-                        }
-                        self.navigationGeneration += 1
-
-                        if loadMetadataUpfront {
-                            for item in allItems {
-                                self.hydratedURLs.insert(item.url)
-                            }
-                        }
-
-                        self.triggerPendingNewFolderRename()
-                    }
-                }
-
-                // Phase 3: Load remaining batches for large directories
-                // Always collect ALL items before displaying to prevent visual jumping
-                // as items get re-sorted after each batch append
-                if isLargeDirectory {
-                    // Collect remaining items without updating UI until complete
-                    for batchStart in stride(from: batchSize, to: totalCount, by: batchSize) {
-                        guard DispatchQueue.main.sync(execute: { self.directoryLoadToken == loadToken }) else { return }
-
-                        let batchEnd = min(batchStart + batchSize, totalCount)
-                        for i in batchStart..<batchEnd {
-                            allItems.append(FileItem(url: contents[i], loadMetadata: loadMetadataUpfront))
-                        }
-                    }
-
-                    // Now update UI with complete list
-                    DispatchQueue.main.async { [weak self] in
-                        guard let self = self,
-                              self.directoryLoadToken == loadToken,
-                              !self.isInsideArchive,
-                              self.currentPath == pathToLoad else { return }
-
-                        // Handle selection
-                        if let pendingURLs = pendingURLs, !pendingURLs.isEmpty {
-                            let pendingPaths = Set(pendingURLs.map { $0.standardizedFileURL.path })
-                            let matched = allItems.filter { pendingPaths.contains($0.url.standardizedFileURL.path) }
-                            if !matched.isEmpty {
-                                let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
-                                if let first = matched.first, let index = sorted.firstIndex(of: first) {
-                                    self.coverFlowSelectedIndex = index
-                                }
-                                self.selectedItems = Set(matched)
-                                self.pendingSelectionURL = nil
-                                self.pendingSelectionURLs = nil
-                            }
-                        } else if let pendingURL = pendingURL,
-                           let item = allItems.first(where: { $0.url.standardizedFileURL.path == pendingURL.standardizedFileURL.path }) {
-                            let sorted = sortItemsForBackground(allItems, sortState: sortState, foldersFirst: foldersFirst)
-                            if let index = sorted.firstIndex(of: item) {
-                                self.coverFlowSelectedIndex = index
-                            }
-                            NSLog("[NewFolder] LARGE DIR: Found pending item '%@' at index %d", item.name, self.coverFlowSelectedIndex)
-                            self.selectedItems = [item]
-                            self.pendingSelectionURL = nil
-                        } else {
-                            if pendingURL != nil {
-                                NSLog("[NewFolder] LARGE DIR WARNING: pendingURL '%@' NOT found in %d items", pendingURL!.lastPathComponent, allItems.count)
-                            }
-                            self.coverFlowSelectedIndex = min(self.coverFlowSelectedIndex, max(0, allItems.count - 1))
-                        }
-
-                        if self.pendingNewFolderRenameURL != nil {
-                            NSLog("[NewFolder] LARGE DIR: Setting items (count=%d), pendingNewFolderRenameURL=%@", allItems.count, self.pendingNewFolderRenameURL?.lastPathComponent ?? "nil")
-                        }
-                        self.items = allItems
-                        self.isLoading = false
-                        self.navigationGeneration += 1
-
-                        // Track hydrated items
-                        if loadMetadataUpfront {
-                            for item in allItems {
-                                self.hydratedURLs.insert(item.url)
-                            }
-                        }
-
-                        self.triggerPendingNewFolderRename()
-                    }
-                }
-            } catch {
-                DispatchQueue.main.async { [weak self] in
-                    guard let self = self,
-                          self.directoryLoadToken == loadToken,
-                          !self.isInsideArchive,
-                          self.currentPath == pathToLoad else { return }
-                    self.items = []
-                    self.isLoading = false
-                }
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.directoryLoadToken == loadToken,
+                      !self.isInsideArchive,
+                      self.photosLibraryInfo == nil,
+                      self.currentPath.standardizedPathKey == locationKey else { return }
+                // An unreadable (or vanished) folder shows as empty
+                self.applyListing(listing ?? [], locationKey: locationKey, isReload: isReload)
             }
+        }
+    }
+
+    /// An item produced off the main thread together with its path key.
+    private struct ListedItem {
+        let key: String
+        let item: FileItem
+    }
+
+    /// Lists a folder (off the main thread). Small folders, and folders sorted by date or size,
+    /// load full metadata up front; large ones load it lazily for visible rows. IDs are reused
+    /// per path and items that already had metadata keep it.
+    nonisolated private static func listDirectory(
+        at listingURL: URL,
+        showHiddenFiles: Bool,
+        sortState: SortState,
+        batchSize: Int,
+        existingIDs: [String: UUID],
+        idsWithMetadata: Set<UUID>,
+        cancellation: LoadCancellationFlag
+    ) throws -> [ListedItem] {
+        // Special handling for autofs mount points like /Network
+        // These require triggering the automounter before listing
+        if listingURL.path == "/Network" || listingURL.path.hasPrefix("/Network/") {
+            // Trigger automounter by attempting to access the path, then give it a moment
+            _ = FileManager.default.fileExists(atPath: listingURL.path)
+            Thread.sleep(forTimeInterval: 0.5)
+        }
+
+        // contentsOfDirectory(at:) doesn't follow a symlink in the last path component: list the
+        // link's target, but keep the children under the link's path (browsed where it's listed)
+        var directoryToList = listingURL
+        var info = stat()
+        if lstat(listingURL.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFLNK {
+            directoryToList = URL(fileURLWithPath: resolvedFilesystemPath(listingURL.path), isDirectory: true)
+        }
+
+        // Phase 1: Get file list instantly (no stat calls)
+        var contents: [URL] = try autoreleasepool {
+            try FileManager.default.contentsOfDirectory(
+                at: directoryToList,
+                includingPropertiesForKeys: [.isDirectoryKey, .contentTypeKey, .isPackageKey, .isSymbolicLinkKey, .isAliasFileKey],
+                options: showHiddenFiles ? [] : [.skipsHiddenFiles]
+            )
+        }
+        if directoryToList != listingURL {
+            contents = contents.map { listingURL.appendingPathComponent($0.lastPathComponent, isDirectory: $0.hasDirectoryPath) }
+        }
+
+        // Phase 2: Create items. If sorting by date or size we MUST load metadata to sort correctly.
+        let loadMetadataUpfront = contents.count <= batchSize || sortStateRequiresMetadata(sortState)
+        var listed: [ListedItem] = []
+        listed.reserveCapacity(contents.count)
+        for (index, url) in contents.enumerated() {
+            if index % batchSize == 0, cancellation.isCancelled {
+                throw CancellationError()
+            }
+            let key = url.standardizedPathKey
+            let existingID = existingIDs[key]
+            let loadMetadata = loadMetadataUpfront || existingID.map(idsWithMetadata.contains) == true
+            let item = autoreleasepool {
+                FileItem(url: url, id: existingID ?? UUID(), loadMetadata: loadMetadata)
+            }
+            listed.append(ListedItem(key: key, item: item))
+        }
+        return listed
+    }
+
+    /// Clears per-location state before loading a different location (shows the spinner).
+    private func beginLoadingNewLocation() {
+        isLoading = true
+        loadedLocationKey = nil
+        items = []
+        itemIDsByPath.removeAll()
+        hydratedURLs.removeAll()
+        cloudStatusLoadedURLs.removeAll()
+        currentFolderIsInICloud = false
+        resetHydrationState()
+    }
+
+    /// Applies a completed listing. A first load replaces `items`; a reload of the same location
+    /// merges into them (see `mergeReloadedItems`).
+    private func applyListing(_ listed: [ListedItem], locationKey: String, isReload: Bool) {
+        // IDs registered on main win: a directory event may have added a path meanwhile
+        let reconciled = listed.map { entry -> FileItem in
+            if let registered = itemIDsByPath[entry.key] {
+                return registered == entry.item.id ? entry.item : entry.item.withID(registered)
+            }
+            itemIDsByPath[entry.key] = entry.item.id
+            return entry.item
+        }
+
+        if isReload {
+            mergeReloadedItems(reconciled)
+        } else {
+            items = reconciled
+            navigationGeneration += 1
+        }
+        for item in reconciled where item.hasMetadata {
+            hydratedURLs.insert(item.url)
+        }
+        if isLoading {
+            isLoading = false
+        }
+        loadedLocationKey = locationKey
+        if itemIDsByPath.count > 2 * items.count + 1_000 {
+            pruneItemIDs()
+        }
+
+        applySelectionAfterLoad()
+        triggerPendingNewFolderRename()
+        if currentFolderIsInICloud, items.count <= directoryBatchSize {
+            hydrateCloudStatus(for: items.map(\.url))
+        }
+    }
+
+    /// Merges a reloaded listing into `items` without disturbing what's on screen: existing
+    /// items keep their position and identity (updated in place when their metadata changed),
+    /// vanished ones are removed and new ones appended. `items` is only reassigned when
+    /// something actually changed.
+    private func mergeReloadedItems(_ listed: [FileItem]) {
+        var listedByID = [UUID: FileItem](minimumCapacity: listed.count)
+        for item in listed {
+            listedByID[item.id] = item
+        }
+
+        var merged: [FileItem] = []
+        merged.reserveCapacity(listed.count)
+        var changed = false
+        for old in items {
+            guard let new = listedByID.removeValue(forKey: old.id) else {
+                // Gone
+                changed = true
+                hydratedURLs.remove(old.url)
+                pendingHydrationURLs.remove(old.url)
+                cloudStatusLoadedURLs.remove(old.url)
+                continue
+            }
+            // Keep the known cloud status until it's re-hydrated
+            let updated = new.cloudStatus == nil && old.cloudStatus != nil ? new.withCloudStatus(old.cloudStatus) : new
+            if Self.displaysIdentically(old, updated) {
+                merged.append(old)
+            } else {
+                merged.append(updated)
+                changed = true
+            }
+        }
+        if !listedByID.isEmpty {
+            changed = true
+            for item in listed where listedByID[item.id] != nil {
+                merged.append(item)
+            }
+        }
+
+        if changed {
+            items = merged
+        }
+    }
+
+    nonisolated private static func displaysIdentically(_ lhs: FileItem, _ rhs: FileItem) -> Bool {
+        lhs.id == rhs.id &&
+        lhs.url == rhs.url &&
+        lhs.contentVersion == rhs.contentVersion &&
+        lhs.isDirectory == rhs.isDirectory &&
+        lhs.fileType == rhs.fileType &&
+        lhs.kindDescription == rhs.kindDescription
+    }
+
+    /// Drops remembered IDs for paths that no longer exist (bounded growth across reloads).
+    private func pruneItemIDs() {
+        let liveIDs = Set(items.map(\.id))
+        itemIDsByPath = itemIDsByPath.filter { liveIDs.contains($0.value) }
+    }
+
+    /// After a load: applies a pending selection (paste, new folder, Back, path bar) or re-points
+    /// the existing selection at the reloaded items. A pending selection is consumed by the load
+    /// whether or not its item was found, so it can't select something in a later load.
+    private func applySelectionAfterLoad() {
+        let pendingURLs = pendingSelectionURLs
+        let pendingURL = pendingSelectionURL
+        pendingSelectionURLs = nil
+        pendingSelectionURL = nil
+
+        var targetKeys: [String] = []
+        if let pendingURLs, !pendingURLs.isEmpty {
+            targetKeys = pendingURLs.map(\.standardizedPathKey)
+        } else if let pendingURL {
+            targetKeys = [pendingURL.standardizedPathKey]
+        }
+        let targetIDs = Set(targetKeys.compactMap { itemIDsByPath[$0] })
+        let matched = targetIDs.isEmpty ? [] : items.filter { targetIDs.contains($0.id) }
+
+        if !matched.isEmpty {
+            selectedItems = Set(matched)
+            if let index = filteredItems.firstIndex(where: { targetIDs.contains($0.id) }) {
+                coverFlowSelectedIndex = index
+                lastSelectedIndex = index
+                selectionAnchorIndex = index
+            }
+        } else {
+            refreshSelectedItems()
+            let clampedIndex = min(coverFlowSelectedIndex, max(0, items.count - 1))
+            if clampedIndex != coverFlowSelectedIndex {
+                coverFlowSelectedIndex = clampedIndex
+            }
+        }
+    }
+
+    /// Points the selection at the current versions of the selected items (fresh metadata) and
+    /// drops items of this location that no longer exist. Publishes only when something changed.
+    private func refreshSelectedItems() {
+        guard !selectedItems.isEmpty else { return }
+        let indexByURL = itemIndexByURL()
+        let locationKey = isInsideArchive ? nil : currentPath.standardizedPathKey
+        var updated = Set<FileItem>()
+        var changed = false
+        for item in selectedItems {
+            if let index = indexByURL[item.url] {
+                let current = items[index]
+                updated.insert(current)
+                if current.id != item.id || current.contentVersion != item.contentVersion {
+                    changed = true
+                }
+            } else if item.isFromArchive || item.url.deletingLastPathComponent().standardizedPathKey == locationKey {
+                // Was listed here and is gone
+                changed = true
+            } else {
+                // e.g. a Spotlight result from another folder
+                updated.insert(item)
+            }
+        }
+        if changed {
+            selectedItems = updated
+        }
+    }
+
+    /// Index of `items` by URL, rebuilt lazily when `items` changes.
+    private func itemIndexByURL() -> [URL: Int] {
+        if let cache = itemIndexCache, cache.revision == itemsRevision {
+            return cache.indexByURL
+        }
+        var indexByURL = [URL: Int](minimumCapacity: items.count)
+        for (offset, item) in items.enumerated() {
+            indexByURL[item.url] = offset
+        }
+        itemIndexCache = (itemsRevision, indexByURL)
+        return indexByURL
+    }
+
+    /// Handles a sort column/direction change on the next run-loop turn: `@Published` emits in
+    /// willSet and `setSortColumn` sets the column and then the direction, so the final sort
+    /// state is only readable afterwards.
+    private func scheduleSortChangeHandling() {
+        guard !sortChangeWorkScheduled else { return }
+        sortChangeWorkScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.sortChangeWorkScheduled = false
+            self.handleSortChange()
+        }
+    }
+
+    private func handleSortChange() {
+        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        guard Self.sortStateRequiresMetadata(sortState),
+              !isInsideArchive,
+              photosLibraryInfo == nil,
+              !isNetworkBrowsing else { return }
+        guard loadedLocationKey != nil else {
+            // Restart an in-flight first load so it loads metadata for the new sort
+            if isLoading {
+                loadContents()
+            }
+            return
+        }
+        // Sorting by date/size needs metadata for every item: reload in place with metadata
+        // (one re-sort, no cleared list) instead of reshuffling rows as visible ones hydrate.
+        if items.contains(where: { !$0.hasMetadata }) {
+            loadContents()
         }
     }
 
@@ -785,14 +961,9 @@ class FileBrowserViewModel: ObservableObject {
 
         stopNetworkBrowsing()
         isNetworkBrowsing = true
-        isLoading = true
-        items = []
-        hydratedURLs.removeAll()
-        cloudStatusLoadedURLs.removeAll()
-        pendingHydrationURLs.removeAll()
+        beginLoadingNewLocation()
         navigationGeneration += 1
         discoveredSMBHosts = []
-        smbScanComplete = false
 
         // Start Bonjour discovery (finds Macs and other Bonjour-advertising devices)
         if networkServiceBrowser == nil {
@@ -829,11 +1000,18 @@ class FileBrowserViewModel: ObservableObject {
     private var lastBonjourServices: [NetworkServiceInfo] = []
 
     private func suspendBackgroundWork() {
-        needsReloadOnResume = needsReloadOnResume || isLoading || isSearching
+        needsReloadOnResume = needsReloadOnResume || isLoading
+        searchNeedsRerunOnResume = searchNeedsRerunOnResume || (isSearching && spotlightSearch != nil)
         isLoading = false
-        isSearching = false
         directoryLoadToken = UUID()
+        directoryLoadCancellation?.cancel()
+        directoryLoadCancellation = nil
         photosLoadToken = UUID()
+        photosLoadCancellation?.cancel()
+        photosLoadCancellation = nil
+        archiveReadToken = UUID()
+        // In-flight hydration is dropped; forget it so visible rows are requested again on resume
+        resetHydrationState()
         pendingRenameWorkItem?.cancel()
         pendingRenameWorkItem = nil
         pendingNewFolderRenameURL = nil
@@ -843,13 +1021,16 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     private func resumeBackgroundWork() {
-        if needsReloadOnResume || items.isEmpty || isInsideArchive || photosLibraryInfo != nil || currentPath.path == "/Network" {
-            needsReloadOnResume = false
-            loadContents()
-            return
+        needsReloadOnResume = false
+        // Always re-list: changes made while suspended weren't watched. Reloading the location
+        // that's already shown is incremental, so scroll position and selection are kept.
+        loadContents()
+        if searchNeedsRerunOnResume {
+            searchNeedsRerunOnResume = false
+            if searchMode == .finder, !searchText.isEmpty {
+                performSearch(query: searchText)
+            }
         }
-
-        startDirectoryWatcher(for: resolvedListingURL(for: currentPath))
     }
 
     private func updateNetworkItems(from services: [NetworkServiceInfo], isFinal: Bool) {
@@ -955,30 +1136,6 @@ class FileBrowserViewModel: ObservableObject {
         return hostName
     }
 
-    private func networkServiceURL(for info: NetworkServiceInfo) -> URL? {
-        guard let hostName = normalizedHostName(info.hostName) else { return nil }
-
-        var components = URLComponents()
-        components.scheme = info.scheme
-        components.host = hostName
-
-        let defaultPort: Int?
-        switch info.scheme {
-        case "smb":
-            defaultPort = 445
-        case "afp":
-            defaultPort = 548
-        default:
-            defaultPort = nil
-        }
-
-        if info.port > 0, let defaultPort, info.port != defaultPort {
-            components.port = info.port
-        }
-
-        return components.url
-    }
-
     private func resolvedListingURL(for url: URL) -> URL {
         if url.path == "/Network" {
             let serversURL = URL(fileURLWithPath: "/Network/Servers")
@@ -991,99 +1148,136 @@ class FileBrowserViewModel: ObservableObject {
 
     // MARK: - Lazy Metadata Hydration
 
-    /// Request metadata loading for specific items (call from visible row detection)
+    /// Request metadata loading for specific items (call from visible row detection).
+    /// In iCloud folders this also loads the items' cloud status (badges, iCloud column,
+    /// Download/Remove Download), so views only need to call this one API.
     func hydrateMetadata(for urls: [URL]) {
-        let urlsToHydrate = urls.filter { !hydratedURLs.contains($0) && !pendingHydrationURLs.contains($0) }
-        guard !urlsToHydrate.isEmpty else { return }
-
-        for url in urlsToHydrate {
-            pendingHydrationURLs.insert(url)
+        guard !urls.isEmpty else { return }
+        let indexByURL = itemIndexByURL()
+        var metadataURLs: [URL] = []
+        var cloudURLs: [URL] = []
+        var idByURL: [URL: UUID] = [:]
+        for url in urls {
+            guard let index = indexByURL[url] else { continue }
+            let item = items[index]
+            if !item.hasMetadata, !hydratedURLs.contains(url), !pendingHydrationURLs.contains(url) {
+                metadataURLs.append(url)
+                idByURL[url] = item.id
+            }
+            if needsCloudStatus(url) {
+                cloudURLs.append(url)
+            }
         }
 
-        let idByURL = Dictionary(uniqueKeysWithValues: items.map { ($0.url, $0.id) })
-        let loadToken = directoryLoadToken
+        if !cloudURLs.isEmpty {
+            hydrateCloudStatus(for: cloudURLs)
+        }
+        guard !metadataURLs.isEmpty else { return }
+        pendingHydrationURLs.formUnion(metadataURLs)
+
+        let token = hydrationToken
+        let cancellation = hydrationCancellation
         hydrationQueue.async { [weak self] in
-            guard let self = self else { return }
-
-            var hydratedItems: [(url: URL, item: FileItem)] = []
-
-            for url in urlsToHydrate {
-                // Check if still valid
-                guard DispatchQueue.main.sync(execute: { self.directoryLoadToken == loadToken }) else { return }
-
-                // Load full metadata
-                let existingID = idByURL[url]
-                let hydratedItem = FileItem(url: url, id: existingID ?? UUID(), loadMetadata: true)
-                hydratedItems.append((url: url, item: hydratedItem))
+            var hydratedItems: [FileItem] = []
+            hydratedItems.reserveCapacity(metadataURLs.count)
+            for url in metadataURLs {
+                guard !cancellation.isCancelled else { return }
+                hydratedItems.append(FileItem(url: url, id: idByURL[url] ?? UUID(), loadMetadata: true))
             }
 
             // Batch update on main thread
             DispatchQueue.main.async { [weak self] in
-                guard let self = self,
-                      self.directoryLoadToken == loadToken else { return }
-
-                var updatedItems = self.items
-                let indicesByURL = Dictionary(uniqueKeysWithValues: updatedItems.enumerated().map { ($0.element.url, $0.offset) })
-                var didUpdate = false
-
-                for (url, hydratedItem) in hydratedItems {
-                    self.pendingHydrationURLs.remove(url)
-                    self.hydratedURLs.insert(url)
-
-                    // Replace item in-place
-                    if let index = indicesByURL[url] {
-                        updatedItems[index] = hydratedItem
-                        didUpdate = true
-                    }
-                }
-
-                if didUpdate {
-                    self.items = updatedItems
-                    // Post notification so table view can force reload of visible rows
-                    NotificationCenter.default.post(name: .metadataHydrationCompleted, object: self)
-                }
+                guard let self, self.hydrationToken == token else { return }
+                self.applyHydratedItems(hydratedItems)
             }
         }
     }
 
-    /// Check if an item needs metadata hydration
+    private func applyHydratedItems(_ hydratedItems: [FileItem]) {
+        var updatedItems = items
+        let indexByURL = itemIndexByURL()
+        var didUpdate = false
+
+        for hydratedItem in hydratedItems {
+            pendingHydrationURLs.remove(hydratedItem.url)
+            hydratedURLs.insert(hydratedItem.url)
+
+            // Replace item in-place, keeping its identity and the cloud status loaded so far
+            guard let index = indexByURL[hydratedItem.url] else { continue }
+            let existing = updatedItems[index]
+            var replacement = existing.id == hydratedItem.id ? hydratedItem : hydratedItem.withID(existing.id)
+            if replacement.cloudStatus == nil {
+                replacement.cloudStatus = existing.cloudStatus
+            }
+            updatedItems[index] = replacement
+            didUpdate = true
+        }
+
+        if didUpdate {
+            items = updatedItems
+            refreshSelectedItems()
+            // Post notification so table view can force reload of visible rows
+            NotificationCenter.default.post(name: .metadataHydrationCompleted, object: self)
+        }
+    }
+
+    /// Check if an item needs hydration: metadata, or (in iCloud folders) its cloud status.
+    /// Views pass the URLs of items for which this is true to `hydrateMetadata(for:)`.
     func needsHydration(_ item: FileItem) -> Bool {
-        !item.hasMetadata && !hydratedURLs.contains(item.url)
+        (!item.hasMetadata && !hydratedURLs.contains(item.url)) || needsCloudStatus(item.url)
+    }
+
+    private func needsCloudStatus(_ url: URL) -> Bool {
+        currentFolderIsInICloud &&
+        !isInsideArchive &&
+        !cloudStatusLoadedURLs.contains(url) &&
+        !pendingCloudStatusURLs.contains(url)
+    }
+
+    /// Forget in-flight metadata/cloud hydration (new location, suspension). Rows that were
+    /// pending are requested again by the views.
+    private func resetHydrationState() {
+        hydrationCancellation.cancel()
+        hydrationCancellation = LoadCancellationFlag()
+        hydrationToken = UUID()
+        pendingHydrationURLs.removeAll()
+        pendingCloudStatusURLs.removeAll()
     }
 
     // MARK: - Cloud Status Hydration
 
-    /// Request cloud status loading for specific items (call from visible row detection)
+    /// Request cloud status loading for specific items. `hydrateMetadata(for:)` calls this for
+    /// iCloud folders, and loads call it for small iCloud folders.
     func hydrateCloudStatus(for urls: [URL]) {
         let urlsToHydrate = urls.filter {
             !cloudStatusLoadedURLs.contains($0) &&
+            !pendingCloudStatusURLs.contains($0) &&
             CloudStatusManager.shared.isInICloud($0)
         }
         guard !urlsToHydrate.isEmpty else { return }
+        pendingCloudStatusURLs.formUnion(urlsToHydrate)
 
-        let loadToken = directoryLoadToken
+        let token = hydrationToken
+        let cancellation = hydrationCancellation
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            guard let self = self else { return }
-
             var updates: [(URL, CloudSyncStatus)] = []
+            updates.reserveCapacity(urlsToHydrate.count)
             for url in urlsToHydrate {
-                // Check if still valid
-                guard DispatchQueue.main.sync(execute: { self.directoryLoadToken == loadToken }) else { return }
-                let status = CloudStatusManager.shared.getStatus(for: url)
-                updates.append((url, status))
+                guard !cancellation.isCancelled else { return }
+                updates.append((url, CloudStatusManager.shared.getStatus(for: url)))
             }
 
             DispatchQueue.main.async { [weak self] in
-                guard let self = self,
-                      self.directoryLoadToken == loadToken else { return }
+                guard let self, self.hydrationToken == token else { return }
 
                 var updatedItems = self.items
-                let indicesByURL = Dictionary(uniqueKeysWithValues: updatedItems.enumerated().map { ($0.element.url, $0.offset) })
+                let indexByURL = self.itemIndexByURL()
                 var didUpdate = false
 
                 for (url, status) in updates {
+                    self.pendingCloudStatusURLs.remove(url)
                     self.cloudStatusLoadedURLs.insert(url)
-                    if let index = indicesByURL[url] {
+                    if let index = indexByURL[url], updatedItems[index].cloudStatus != status {
                         updatedItems[index] = updatedItems[index].withCloudStatus(status)
                         didUpdate = true
                     }
@@ -1091,15 +1285,11 @@ class FileBrowserViewModel: ObservableObject {
 
                 if didUpdate {
                     self.items = updatedItems
+                    self.refreshSelectedItems()
                     NotificationCenter.default.post(name: .cloudStatusHydrationCompleted, object: self)
                 }
             }
         }
-    }
-
-    /// Check if an item needs cloud status hydration
-    func needsCloudStatusHydration(_ item: FileItem) -> Bool {
-        item.isInICloud && item.cloudStatus == nil && !cloudStatusLoadedURLs.contains(item.url)
     }
 
     /// Download an iCloud item to make it available locally
@@ -1146,42 +1336,43 @@ class FileBrowserViewModel: ObservableObject {
     // MARK: - Directory Watching
 
     private func startDirectoryWatcher(for url: URL) {
-        if watchingDirectoryURL == url, directoryWatcher != nil { return }
+        let folderKey = currentPath.standardizedPathKey
+        let watchPath = url.standardizedPathKey
+        if watchedFolderKey == folderKey, directoryWatcher?.watchedPath == watchPath { return }
         if directoryWatcher == nil {
-            directoryWatcher = DirectoryWatcher { [weak self] urls in
-                guard let self else { return }
-                Task { @MainActor in
-                    self.queueDirectoryEvents(urls)
-                }
+            directoryWatcher = DirectoryWatcher { [weak self] paths, needsRescan, watchedPath in
+                self?.queueDirectoryEvents(paths, needsRescan: needsRescan, watchedPath: watchedPath)
             }
         }
-        watchingDirectoryURL = url
-        directoryWatcher?.start(watching: url)
+        watchedFolderKey = folderKey
+        directoryWatcher?.start(watching: watchPath)
     }
 
     private func stopDirectoryWatcher() {
-        watchingDirectoryURL = nil
+        watchedFolderKey = nil
         directoryEventWorkItem?.cancel()
         directoryEventWorkItem = nil
-        pendingDirectoryEventURLs.removeAll()
+        pendingDirectoryEventPaths.removeAll()
+        pendingDirectoryRescan = false
         directoryWatcher?.stop()
     }
 
-    private func queueDirectoryEvents(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
-        guard !isInsideArchive, photosLibraryInfo == nil else { return }
-        guard let watchURL = watchingDirectoryURL else { return }
-        let isNetworkRootListing = currentPath.path == "/Network" && watchURL.path == "/Network/Servers"
-        guard watchURL == currentPath || isNetworkRootListing else { return }
+    /// `paths` are direct children of the watched folder, already mapped to the folder's
+    /// displayed path form (FSEvents reports resolved paths, e.g. /private/tmp for /tmp).
+    private func queueDirectoryEvents(_ paths: [String], needsRescan: Bool, watchedPath: String) {
+        guard !isTornDown, !isInsideArchive, photosLibraryInfo == nil else { return }
+        guard let folderKey = watchedFolderKey,
+              folderKey == currentPath.standardizedPathKey,
+              directoryWatcher?.watchedPath == watchedPath else { return }
+        guard needsRescan || !paths.isEmpty else { return }
 
-        let filtered = urls.filter { url in
-            url.deletingLastPathComponent() == watchURL || url == watchURL
-        }
-        guard !filtered.isEmpty else { return }
+        pendingDirectoryEventPaths.formUnion(paths)
+        pendingDirectoryRescan = pendingDirectoryRescan || needsRescan
+        scheduleDirectoryEventProcessing()
+    }
 
-        pendingDirectoryEventURLs.formUnion(filtered)
+    private func scheduleDirectoryEventProcessing() {
         directoryEventWorkItem?.cancel()
-
         let workItem = DispatchWorkItem { [weak self] in
             self?.processDirectoryEvents()
         }
@@ -1191,93 +1382,166 @@ class FileBrowserViewModel: ObservableObject {
 
     private func processDirectoryEvents() {
         if isLoading {
-            let workItem = DispatchWorkItem { [weak self] in
-                self?.processDirectoryEvents()
-            }
-            directoryEventWorkItem = workItem
-            DispatchQueue.main.asyncAfter(deadline: .now() + directoryEventDebounce, execute: workItem)
+            // Apply after the first load of this folder completes
+            scheduleDirectoryEventProcessing()
             return
         }
-        let urls = pendingDirectoryEventURLs
-        pendingDirectoryEventURLs.removeAll()
-        applyDirectoryEventUpdates(for: urls)
+        let paths = pendingDirectoryEventPaths
+        let needsRescan = pendingDirectoryRescan
+        pendingDirectoryEventPaths.removeAll()
+        pendingDirectoryRescan = false
+
+        if needsRescan {
+            // FSEvents dropped or coalesced events: re-list (incremental)
+            loadContents()
+        } else {
+            applyDirectoryEventUpdates(for: paths)
+        }
     }
 
-    private func applyDirectoryEventUpdates(for urls: Set<URL>) {
-        guard let watchURL = watchingDirectoryURL, watchURL == currentPath else { return }
-        guard !urls.isEmpty else { return }
-        if pendingNewFolderRenameURL != nil || renamingURL != nil {
-            NSLog("[NewFolder] applyDirectoryEventUpdates firing while pendingNewFolderRename=%@, renamingURL=%@, urls=%@",
-                  pendingNewFolderRenameURL?.lastPathComponent ?? "nil",
-                  renamingURL?.lastPathComponent ?? "nil",
-                  urls.map { $0.lastPathComponent }.joined(separator: ", "))
-        }
+    private enum DirectoryEventChange {
+        case removed(key: String)
+        case present(key: String, item: FileItem)
+    }
+
+    /// Re-reads the changed paths off the main thread and applies the result on main.
+    private func applyDirectoryEventUpdates(for paths: Set<String>) {
+        guard !paths.isEmpty,
+              let locationKey = loadedLocationKey,
+              locationKey == currentPath.standardizedPathKey,
+              !isInsideArchive, photosLibraryInfo == nil else { return }
 
         let showHidden = AppSettings.shared.showHiddenFiles
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
-        let shouldLoadMetadata = items.count <= directoryBatchSize || sortStateRequiresMetadata(sortState)
+        let shouldLoadMetadata = items.count <= directoryBatchSize || Self.sortStateRequiresMetadata(sortState)
+        var existingIDs: [String: UUID] = [:]
+        for path in paths {
+            existingIDs[path] = itemIDsByPath[path]
+        }
+        let affectedIDs = Set(existingIDs.values)
+        let idsWithMetadata = Set(items.lazy.filter { affectedIDs.contains($0.id) && $0.hasMetadata }.map(\.id))
+        // Build URLs the way the listing does (same base, e.g. /private/tmp rather than /tmp)
+        let listingURL = resolvedListingURL(for: currentPath)
 
-        var updatedItems = items
-        var updatedSelection = selectedItems
-        var indicesByURL = Dictionary(uniqueKeysWithValues: updatedItems.enumerated().map { ($0.element.url, $0.offset) })
-        var indicesToRemove: [Int] = []
-        var urlsToUpdate: [URL] = []
-        var urlsToAdd: [URL] = []
-
-        for url in urls {
-            if url == watchURL { continue }
-            guard url.deletingLastPathComponent() == watchURL else { continue }
-
-            if !showHidden, url.lastPathComponent.hasPrefix(".") {
-                if let idx = indicesByURL[url] {
-                    indicesToRemove.append(idx)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            var changes: [DirectoryEventChange] = []
+            var tagsChanged = false
+            for path in paths {
+                var info = stat()
+                guard lstat(path, &info) == 0 else {
+                    changes.append(.removed(key: path))
+                    continue
                 }
-                continue
+                let url = listingURL.appendingPathComponent((path as NSString).lastPathComponent)
+                if !showHidden,
+                   url.lastPathComponent.hasPrefix(".") || (try? url.resourceValues(forKeys: [.isHiddenKey]))?.isHidden == true {
+                    changes.append(.removed(key: path))
+                    continue
+                }
+
+                // Tags may have been edited elsewhere (e.g. in Finder): drop the cached value and
+                // tell the views if what they showed is now different.
+                let cachedTags = FileTagManager.cachedTags(for: url)
+                FileTagManager.invalidateCache(for: url)
+                if let cachedTags, FileTagManager.getTags(for: url) != cachedTags {
+                    tagsChanged = true
+                }
+
+                let existingID = existingIDs[path]
+                let loadMetadata = shouldLoadMetadata || existingID.map(idsWithMetadata.contains) == true
+                let item = FileItem(url: url, id: existingID ?? UUID(), loadMetadata: loadMetadata)
+                changes.append(.present(key: path, item: item))
             }
 
-            var isDir: ObjCBool = false
-            let exists = FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir)
-            if exists {
-                if indicesByURL[url] != nil {
-                    urlsToUpdate.append(url)
-                } else {
-                    urlsToAdd.append(url)
-                }
-            } else if let idx = indicesByURL[url] {
-                indicesToRemove.append(idx)
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.loadedLocationKey == locationKey,
+                      self.currentPath.standardizedPathKey == locationKey,
+                      !self.isInsideArchive,
+                      self.photosLibraryInfo == nil else { return }
+                self.applyDirectoryChanges(changes, tagsChanged: tagsChanged)
             }
         }
-
-        if indicesToRemove.isEmpty && urlsToUpdate.isEmpty && urlsToAdd.isEmpty { return }
-
-        for idx in indicesToRemove.sorted(by: >) {
-            let removed = updatedItems.remove(at: idx)
-            updatedSelection.remove(removed)
-            hydratedURLs.remove(removed.url)
-            pendingHydrationURLs.remove(removed.url)
-        }
-
-        indicesByURL = Dictionary(uniqueKeysWithValues: updatedItems.enumerated().map { ($0.element.url, $0.offset) })
-
-        for url in urlsToUpdate {
-            guard let idx = indicesByURL[url] else { continue }
-            let existing = updatedItems[idx]
-            let loadMetadata = existing.hasMetadata || shouldLoadMetadata
-            updatedItems[idx] = FileItem(url: url, id: existing.id, loadMetadata: loadMetadata)
-        }
-
-        for url in urlsToAdd {
-            let newItem = FileItem(url: url, loadMetadata: shouldLoadMetadata)
-            updatedItems.append(newItem)
-        }
-
-        items = updatedItems
-        selectedItems = updatedSelection
-        // NOTE: Don't increment navigationGeneration here - incremental updates
-        // should not cause full view recreation which loses scroll position
     }
 
-    private func sortStateRequiresMetadata(_ sortState: SortState) -> Bool {
+    private func applyDirectoryChanges(_ changes: [DirectoryEventChange], tagsChanged: Bool) {
+        var updatedItems = items
+        var indexByID = [UUID: Int](minimumCapacity: updatedItems.count)
+        for (offset, item) in updatedItems.enumerated() {
+            indexByID[item.id] = offset
+        }
+        var removedIDs = Set<UUID>()
+        var cloudURLsToRefresh: [URL] = []
+        var changed = false
+
+        for change in changes {
+            switch change {
+            case .removed(let key):
+                if let id = itemIDsByPath[key], indexByID[id] != nil {
+                    removedIDs.insert(id)
+                }
+            case .present(let key, let newItem):
+                let id: UUID
+                if let registered = itemIDsByPath[key] {
+                    id = registered
+                } else {
+                    id = newItem.id
+                    itemIDsByPath[key] = id
+                }
+                var item = newItem.id == id ? newItem : newItem.withID(id)
+                removedIDs.remove(id)
+                if let index = indexByID[id] {
+                    let existing = updatedItems[index]
+                    if item.cloudStatus == nil {
+                        item.cloudStatus = existing.cloudStatus
+                    }
+                    if !Self.displaysIdentically(existing, item) {
+                        updatedItems[index] = item
+                        changed = true
+                    }
+                } else {
+                    indexByID[id] = updatedItems.count
+                    updatedItems.append(item)
+                    changed = true
+                }
+                if item.hasMetadata {
+                    hydratedURLs.insert(item.url)
+                }
+                if currentFolderIsInICloud {
+                    cloudURLsToRefresh.append(item.url)
+                }
+            }
+        }
+
+        if !removedIDs.isEmpty {
+            for item in updatedItems where removedIDs.contains(item.id) {
+                hydratedURLs.remove(item.url)
+                pendingHydrationURLs.remove(item.url)
+                cloudStatusLoadedURLs.remove(item.url)
+            }
+            updatedItems.removeAll { removedIDs.contains($0.id) }
+            changed = true
+        }
+
+        if changed {
+            items = updatedItems
+            refreshSelectedItems()
+            // NOTE: Don't increment navigationGeneration here - incremental updates
+            // should not cause full view recreation which loses scroll position
+        }
+        if tagsChanged {
+            tagRefreshToken &+= 1
+        }
+        if !cloudURLsToRefresh.isEmpty {
+            for url in cloudURLsToRefresh {
+                CloudStatusManager.shared.invalidateCache(for: url)
+                cloudStatusLoadedURLs.remove(url)
+            }
+            hydrateCloudStatus(for: cloudURLsToRefresh)
+        }
+    }
+
+    nonisolated private static func sortStateRequiresMetadata(_ sortState: SortState) -> Bool {
         switch sortState.column {
         case .dateModified, .dateCreated, .size:
             return true
@@ -1286,44 +1550,62 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
-    /// Load contents from within a ZIP archive
+    /// Load contents from within a ZIP archive (the listing is built off the main thread)
     private func loadArchiveContents() {
         guard let archiveURL = currentArchiveURL else {
-            exitArchive()
+            isInsideArchive = false
+            currentArchivePath = ""
+            archiveEntries = []
+            loadContents()
             return
         }
 
-        isLoading = true
-        items = []
-
-        // Get entries at the current path within the archive
-        let entriesAtPath = ZipArchiveManager.shared.entriesAtPath(currentArchivePath, in: archiveEntries)
-        var fileItems = ZipArchiveManager.shared.fileItems(from: entriesAtPath, archiveURL: archiveURL)
-
-        let showHiddenFiles = AppSettings.shared.showHiddenFiles
-        let foldersFirst = AppSettings.shared.foldersFirst
-        if !showHiddenFiles {
-            fileItems = fileItems.filter { !$0.name.hasPrefix(".") }
+        let archivePath = currentArchivePath
+        let locationKey = "\(archiveURL.standardizedPathKey)#\(archivePath)"
+        let isReload = loadedLocationKey == locationKey
+        if !isReload {
+            beginLoadingNewLocation()
         }
 
-        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
-        let sorted = sortItemsForBackground(fileItems, sortState: sortState, foldersFirst: foldersFirst)
+        let entries = archiveEntries
+        let showHiddenFiles = AppSettings.shared.showHiddenFiles
+        let loadToken = UUID()
+        directoryLoadToken = loadToken
+        directoryLoadCancellation?.cancel()
+        directoryLoadCancellation = nil
+        needsReloadOnResume = false
 
-        items = sorted
-        coverFlowSelectedIndex = min(coverFlowSelectedIndex, max(0, sorted.count - 1))
-        isLoading = false
-        navigationGeneration += 1
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            // Get entries at the current path within the archive
+            let entriesAtPath = ZipArchiveManager.shared.entriesAtPath(archivePath, in: entries)
+            var fileItems = ZipArchiveManager.shared.fileItems(from: entriesAtPath, archiveURL: archiveURL)
+            if !showHiddenFiles {
+                fileItems = fileItems.filter { !$0.name.hasPrefix(".") }
+            }
+            let listed = fileItems.map { ListedItem(key: $0.url.standardizedPathKey, item: $0) }
+
+            DispatchQueue.main.async { [weak self] in
+                guard let self,
+                      self.directoryLoadToken == loadToken,
+                      self.isInsideArchive,
+                      self.currentArchiveURL == archiveURL,
+                      self.currentArchivePath == archivePath else { return }
+                self.applyListing(listed, locationKey: locationKey, isReload: isReload)
+            }
+        }
     }
 
     private func loadPhotosLibraryContents(info: PhotosLibraryInfo) {
-        isLoading = true
-        items = []
+        beginLoadingNewLocation()
         let infoSnapshot = info
         let pendingURL = pendingSelectionURL
         let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
         let useOriginalFilenames = AppSettings.shared.masonryShowFilenames
         let loadToken = UUID()
         photosLoadToken = loadToken
+        photosLoadCancellation?.cancel()
+        let cancellation = LoadCancellationFlag()
+        photosLoadCancellation = cancellation
 
         photosLogger.info("Starting Photos library load: \(info.libraryURL.path, privacy: .public)")
 
@@ -1410,6 +1692,7 @@ class FileBrowserViewModel: ObservableObject {
                 }
 
                 let initialBatch = buildBatch(range: 0..<initialCount)
+                let isComplete = totalCount <= initialCount
                 DispatchQueue.main.async {
                     let infoMatches = self.photosLibraryInfo == infoSnapshot
                     let pathMatches = self.currentPath == infoSnapshot.libraryURL
@@ -1426,6 +1709,8 @@ class FileBrowserViewModel: ObservableObject {
                     if let item = initialBatch.selectedItem {
                         self.selectedItems = [item]
                         self.pendingSelectionURL = nil
+                    } else if isComplete {
+                        self.pendingSelectionURL = nil
                     }
 
                     self.items = initialBatch.items
@@ -1436,11 +1721,38 @@ class FileBrowserViewModel: ObservableObject {
                     }
                 }
 
-                guard totalCount > initialCount else { return }
+                guard !isComplete else { return }
+
+                // Publish the rest in a few large chunks: every publish re-renders the whole grid,
+                // so appending each 400-item batch would redo that work hundreds of times.
+                var pendingItems: [FileItem] = []
+                var pendingAssetCache: [String: PHAsset] = [:]
+                var pendingRatioCache: [String: CGFloat] = [:]
+                var pendingSelectedItem: FileItem?
+                var lastPublish = Date()
 
                 for start in stride(from: initialCount, to: totalCount, by: batchSize) {
+                    guard !cancellation.isCancelled else { return }
                     let range = start..<min(start + batchSize, totalCount)
                     let batch = buildBatch(range: range)
+                    pendingItems.append(contentsOf: batch.items)
+                    pendingAssetCache.merge(batch.assetCache) { current, _ in current }
+                    pendingRatioCache.merge(batch.ratioCache) { current, _ in current }
+                    pendingSelectedItem = pendingSelectedItem ?? batch.selectedItem
+
+                    let isLastBatch = range.upperBound >= totalCount
+                    guard isLastBatch || pendingItems.count >= 5_000 || Date().timeIntervalSince(lastPublish) >= 0.5 else { continue }
+
+                    let chunkItems = pendingItems
+                    let chunkAssetCache = pendingAssetCache
+                    let chunkRatioCache = pendingRatioCache
+                    let chunkSelectedItem = pendingSelectedItem
+                    pendingItems = []
+                    pendingAssetCache = [:]
+                    pendingRatioCache = [:]
+                    pendingSelectedItem = nil
+                    lastPublish = Date()
+
                     DispatchQueue.main.async { [weak self] in
                         guard let self else { return }
                         let infoMatches = self.photosLibraryInfo == infoSnapshot
@@ -1448,12 +1760,16 @@ class FileBrowserViewModel: ObservableObject {
                         let tokenMatches = self.photosLoadToken == loadToken
                         guard infoMatches, pathMatches, tokenMatches else { return }
 
-                        self.photosAssetCache.merge(batch.assetCache) { current, _ in current }
-                        self.photosAspectRatioCache.merge(batch.ratioCache) { current, _ in current }
-                        self.items.append(contentsOf: batch.items)
+                        self.photosAssetCache.merge(chunkAssetCache) { current, _ in current }
+                        self.photosAspectRatioCache.merge(chunkRatioCache) { current, _ in current }
+                        self.items.append(contentsOf: chunkItems)
 
-                        if self.pendingSelectionURL != nil, let item = batch.selectedItem {
+                        if self.pendingSelectionURL != nil, let item = chunkSelectedItem {
                             self.selectedItems = [item]
+                            self.pendingSelectionURL = nil
+                        }
+                        if isLastBatch {
+                            // Consumed by this load whether or not it was found
                             self.pendingSelectionURL = nil
                         }
                     }
@@ -1682,27 +1998,6 @@ class FileBrowserViewModel: ObservableObject {
         return PhotoAssetDragInfo(filename: filename, uti: uti)
     }
 
-    func writePhotoAsset(for item: FileItem, to destinationURL: URL, completion: @escaping (Bool) -> Void) {
-        guard let identifier = photosAssetIdentifier(from: item.url),
-              let asset = photosAsset(for: identifier),
-              let resource = primaryResource(for: asset) else {
-            completion(false)
-            return
-        }
-
-        let options = PHAssetResourceRequestOptions()
-        options.isNetworkAccessAllowed = true
-
-        try? FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? FileManager.default.removeItem(at: destinationURL)
-
-        PHAssetResourceManager.default().writeData(for: resource, toFile: destinationURL, options: options) { error in
-            DispatchQueue.main.async {
-                completion(error == nil)
-            }
-        }
-    }
-
     func exportPhotoAsset(for item: FileItem, completion: @escaping (URL?) -> Void) {
         guard let identifier = photosAssetIdentifier(from: item.url),
               let asset = photosAsset(for: identifier) else {
@@ -1822,6 +2117,8 @@ class FileBrowserViewModel: ObservableObject {
         photosImageManager.stopCachingImagesForAllAssets()
         photosSortState = nil
         photosLoadToken = UUID()
+        photosLoadCancellation?.cancel()
+        photosLoadCancellation = nil
     }
 
     private func refreshFinderSearchScopeIfNeeded() {
@@ -1835,68 +2132,101 @@ class FileBrowserViewModel: ObservableObject {
         clearSearchQuery()
     }
 
+    // MARK: - Navigation
 
-    func navigateTo(_ url: URL) {
-        guard url != currentPath else { return }
-
-        // Stop inline video previews when navigating
-        InlineVideoPreviewManager.shared.stopAllPreviews()
-
-        // Save column state for current folder before navigating
-        ListColumnConfigManager.shared.saveCurrentStateForFolder(currentPath, appSettings: AppSettings.shared)
-
-        photosLibraryInfo = nil
-        clearPhotosCaches()
-        currentPath = url
+    /// Bookkeeping before leaving the current location: stops inline previews, saves the
+    /// folder's column state and resets per-folder selection state.
+    private func prepareForNavigation() {
+        InlinePreviews.stopAll()
+        cancelPendingRename()
+        if !isInsideArchive, photosLibraryInfo == nil, currentPath.path != "/Network" {
+            ListColumnConfigManager.shared.saveCurrentStateForFolder(currentPath, appSettings: AppSettings.shared)
+        }
+        archiveReadToken = UUID()
         selectedItems.removeAll()
-        coverFlowSelectedIndex = 0
-
-        // Apply column state for new folder (set flag to prevent redundant reload from sortColumn sink)
-        isNavigating = true
-        ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
-        isNavigating = false
-
-        loadContents()
-        refreshFinderSearchScopeIfNeeded()
-        addToHistory(.filesystem(url))
+        lastSelectedIndex = 0
+        selectionAnchorIndex = 0
+        pendingSelectionURL = nil
+        pendingSelectionURLs = nil
+        pendingNewFolderRenameURL = nil
     }
 
-    /// Navigate to a URL and select the folder we came from (for path bar navigation)
-    func navigateToAndSelectCurrent(_ url: URL) {
-        guard url != currentPath else { return }
-
-        // Save column state for current folder before navigating
-        ListColumnConfigManager.shared.saveCurrentStateForFolder(currentPath, appSettings: AppSettings.shared)
-
-        photosLibraryInfo = nil
-        clearPhotosCaches()
-        // Remember current path to select it after navigating
-        pendingSelectionURL = currentPath
-        currentPath = url
-        selectedItems.removeAll()
-        // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
-
-        // Apply column state for new folder (set flag to prevent redundant reload from sortColumn sink)
-        isNavigating = true
-        ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
-        isNavigating = false
-
-        loadContents()
-        refreshFinderSearchScopeIfNeeded()
-        addToHistory(.filesystem(url))
-    }
-
-    func navigateToPhotosLibrary(_ info: PhotosLibraryInfo) {
-        clearFinderSearchIfNeeded()
-        clearPhotosCaches()
-        photosLibraryInfo = info
-        photosLogger.info("Navigate to Photos library: \(info.libraryURL.path, privacy: .public)")
+    private func resetArchiveState() {
         isInsideArchive = false
         currentArchiveURL = nil
         currentArchivePath = ""
         archiveEntries = []
+    }
+
+    /// Applies the folder's saved column state without the sort sink reloading (a load follows).
+    private func applyFolderColumnState(for url: URL) {
+        isNavigating = true
+        ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
+        isNavigating = false
+    }
+
+    /// Whether `url` is the folder that's already shown. Inside an archive or the Photos
+    /// library `currentPath` names the enclosing folder, so that never counts.
+    private func isShowingFolder(_ url: URL) -> Bool {
+        !isInsideArchive && photosLibraryInfo == nil && url.standardizedPathKey == currentPath.standardizedPathKey
+    }
+
+    /// Navigates to a folder, leaving archive / Photos browsing if needed.
+    func navigateTo(_ url: URL) {
+        guard !isShowingFolder(url) else { return }
+
+        prepareForNavigation()
+        resetArchiveState()
+        photosLibraryInfo = nil
+        clearPhotosCaches()
+        currentPath = url
+        coverFlowSelectedIndex = 0
+        applyFolderColumnState(for: url)
+        loadContents()
+        refreshFinderSearchScopeIfNeeded()
+        addToHistory(.filesystem(url))
+    }
+
+    /// Navigate to a URL and select the item we came from (path bar, window title menu,
+    /// leaving an archive). Leaves archive / Photos browsing in a single history step, so callers
+    /// don't need to call `exitArchive()` first.
+    func navigateToAndSelectCurrent(_ url: URL) {
+        guard !isShowingFolder(url) else { return }
+        let origin: URL? = isInsideArchive ? currentArchiveURL : (photosLibraryInfo == nil ? currentPath : nil)
+
+        prepareForNavigation()
+        resetArchiveState()
+        photosLibraryInfo = nil
+        clearPhotosCaches()
+        // Select the child of the target on the way to where we were (the folder or archive itself
+        // when going to its parent)
+        pendingSelectionURL = origin.flatMap { Self.childURL(of: url, leadingTo: $0) }
+        currentPath = url
+        // Note: Don't reset coverFlowSelectedIndex here - let loadContents set the correct index
+        applyFolderColumnState(for: url)
+        loadContents()
+        refreshFinderSearchScopeIfNeeded()
+        addToHistory(.filesystem(url))
+    }
+
+    /// The child of `ancestor` on the way to `descendant` ("/a" and "/a/b/c" → "/a/b"), or nil.
+    nonisolated static func childURL(of ancestor: URL, leadingTo descendant: URL) -> URL? {
+        let ancestorPath = ancestor.standardizedPathKey
+        let prefix = ancestorPath == "/" ? "/" : ancestorPath + "/"
+        let descendantPath = descendant.standardizedPathKey
+        guard descendantPath.hasPrefix(prefix),
+              let component = descendantPath.dropFirst(prefix.count).split(separator: "/").first else { return nil }
+        return URL(fileURLWithPath: prefix + component)
+    }
+
+    func navigateToPhotosLibrary(_ info: PhotosLibraryInfo) {
+        prepareForNavigation()
+        clearFinderSearchIfNeeded()
+        clearPhotosCaches()
+        photosLibraryInfo = info
+        photosLogger.info("Navigate to Photos library: \(info.libraryURL.path, privacy: .public)")
+        resetArchiveState()
         currentPath = info.libraryURL
-        selectedItems.removeAll()
         coverFlowSelectedIndex = 0
         loadContents()
         addToHistory(.photosLibrary(info))
@@ -1911,80 +2241,100 @@ class FileBrowserViewModel: ObservableObject {
 
     func goBack() {
         guard canGoBack else { return }
+        // Going back to a folder selects the folder (or archive) we're leaving
+        let selection = enteredFolderURL ?? (isInsideArchive ? currentArchiveURL : currentPath)
         historyIndex -= 1
         let location = navigationHistory[historyIndex]
-        if case .filesystem = location {
-            pendingSelectionURL = enteredFolderURL ?? currentPath
-        } else if case .photosLibrary = location {
-            pendingSelectionURL = nil
-        } else {
-            pendingSelectionURL = nil
-        }
-        pendingSelectionURLs = nil
         enteredFolderURL = nil
-        applyNavigationLocation(location)
+        if case .filesystem = location {
+            applyNavigationLocation(location, selecting: selection)
+        } else {
+            applyNavigationLocation(location, selecting: nil)
+        }
     }
 
     func goForward() {
         guard canGoForward else { return }
         historyIndex += 1
-        let location = navigationHistory[historyIndex]
-        pendingSelectionURL = nil
-        pendingSelectionURLs = nil
-        applyNavigationLocation(location)
+        applyNavigationLocation(navigationHistory[historyIndex], selecting: nil)
     }
 
-    private func applyNavigationLocation(_ location: NavigationLocation) {
+    private func applyNavigationLocation(_ location: NavigationLocation, selecting selection: URL?) {
         switch location {
         case .filesystem(let url):
-            isInsideArchive = false
-            currentArchiveURL = nil
-            currentArchivePath = ""
-            archiveEntries = []
+            prepareForNavigation()
+            resetArchiveState()
             photosLibraryInfo = nil
             clearPhotosCaches()
+            pendingSelectionURL = selection
             currentPath = url
-            selectedItems.removeAll()
-            isNavigating = true
-            ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
-            isNavigating = false
+            applyFolderColumnState(for: url)
             loadContents()
             refreshFinderSearchScopeIfNeeded()
         case .archive(let archiveURL, let internalPath):
-            do {
-                if currentArchiveURL != archiveURL || archiveEntries.isEmpty {
-                    archiveEntries = try ZipArchiveManager.shared.readContents(of: archiveURL)
+            if currentArchiveURL == archiveURL, !archiveEntries.isEmpty {
+                showArchive(archiveURL, entries: archiveEntries, at: internalPath)
+                return
+            }
+            InlinePreviews.stopAll()
+            readArchiveEntries(at: archiveURL) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let entries):
+                    self.showArchive(archiveURL, entries: entries, at: internalPath)
+                case .failure(let error):
+                    zipNavLogger.error("Failed to restore archive state: \(error.localizedDescription)")
+                    self.applyNavigationLocation(.filesystem(archiveURL.deletingLastPathComponent()), selecting: archiveURL)
                 }
-                currentArchiveURL = archiveURL
-                currentArchivePath = internalPath
-                isInsideArchive = true
-                selectedItems.removeAll()
-                coverFlowSelectedIndex = 0
-                loadContents()
-            } catch {
-                zipNavLogger.error("Failed to restore archive state: \(error.localizedDescription)")
-                isInsideArchive = false
-                currentArchiveURL = nil
-                currentArchivePath = ""
-                archiveEntries = []
-                photosLibraryInfo = nil
-                clearPhotosCaches()
-                currentPath = archiveURL.deletingLastPathComponent()
-                loadContents()
-                refreshFinderSearchScopeIfNeeded()
             }
         case .photosLibrary(let info):
+            prepareForNavigation()
             clearFinderSearchIfNeeded()
-            isInsideArchive = false
-            currentArchiveURL = nil
-            currentArchivePath = ""
-            archiveEntries = []
+            resetArchiveState()
             photosLibraryInfo = info
             photosLogger.info("Apply navigation to Photos library: \(info.libraryURL.path, privacy: .public)")
             currentPath = info.libraryURL
-            selectedItems.removeAll()
             coverFlowSelectedIndex = 0
             loadContents()
+        }
+    }
+
+    /// Shows a location inside an archive whose entries are already read.
+    private func showArchive(_ archiveURL: URL, entries: [ZipEntry], at internalPath: String) {
+        prepareForNavigation()
+        photosLibraryInfo = nil
+        clearPhotosCaches()
+        archiveEntries = entries
+        currentArchiveURL = archiveURL
+        currentArchivePath = internalPath
+        currentPath = archiveURL.deletingLastPathComponent()
+        isInsideArchive = true
+        coverFlowSelectedIndex = 0
+        loadContents()
+    }
+
+    /// Reads an archive's entries off the main thread; the spinner only shows if that takes a while.
+    private func readArchiveEntries(at archiveURL: URL, completion: @escaping (Result<[ZipEntry], Error>) -> Void) {
+        let token = UUID()
+        archiveReadToken = token
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+            // Still reading (the token is replaced when the read completes or is superseded)
+            guard let self, self.archiveReadToken == token else { return }
+            self.archiveReadSpinnerToken = token
+            self.isLoading = true
+        }
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try ZipArchiveManager.shared.readContents(of: archiveURL) }
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.archiveReadToken == token else { return }
+                self.archiveReadToken = UUID()
+                if case .failure = result, self.archiveReadSpinnerToken == token {
+                    self.isLoading = false
+                }
+                self.archiveReadSpinnerToken = nil
+                completion(result)
+            }
         }
     }
 
@@ -2027,107 +2377,116 @@ class FileBrowserViewModel: ObservableObject {
             return
         }
 
-        // Check if this is a package/bundle (like .app) - should be opened, not navigated into
-        if NSWorkspace.shared.isFilePackage(atPath: item.url.path) {
+        // Finder aliases are resolved when opened
+        if item.isAliasFile {
+            openAlias(at: item.url)
+            return
+        }
+
+        // Packages/bundles (like .app) are opened, not navigated into. Symlinks to folders are
+        // directories here (FileItem classifies them by target) and are browsed under their own path.
+        if item.isPackage || NSWorkspace.shared.isFilePackage(atPath: item.url.path) {
             NSWorkspace.shared.open(item.url)
         } else if item.isDirectory {
-            // Regular directory - navigate into it
-            // Clear search when navigating to a folder from search results
-            if searchMode != .filter && !searchText.isEmpty {
-                searchText = ""
-                searchResults = []
-            }
-            enteredFolderURL = item.url
-            navigateTo(item.url)
+            enterFolder(item.url, from: item.url)
         } else {
             NSWorkspace.shared.open(item.url)
+        }
+    }
+
+    /// Navigate into a folder; `itemURL` is selected when going Back.
+    private func enterFolder(_ url: URL, from itemURL: URL) {
+        // Clear search when navigating to a folder from search results
+        if searchMode != .filter && !searchText.isEmpty {
+            searchText = ""
+            searchResults = []
+        }
+        enteredFolderURL = itemURL
+        navigateTo(url)
+    }
+
+    /// Resolves a Finder alias (off the main thread: it may have to reach another volume) and
+    /// browses into it when it points to a folder, otherwise opens the original.
+    private func openAlias(at aliasURL: URL) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let resolvedURL = try? URL(resolvingAliasFileAt: aliasURL, options: [.withoutUI])
+            let values = try? resolvedURL?.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                guard let resolvedURL else {
+                    // The original item can't be found
+                    NSSound.beep()
+                    return
+                }
+                if values?.isDirectory == true, values?.isPackage != true {
+                    self.enterFolder(resolvedURL, from: aliasURL)
+                } else {
+                    NSWorkspace.shared.open(resolvedURL)
+                }
+            }
         }
     }
 
     /// Show the contents of a package/bundle (navigate into it like a folder)
     func showPackageContents(_ item: FileItem) {
         cancelPendingRename()
-        // Clear search when navigating into package
-        if searchMode != .filter && !searchText.isEmpty {
-            searchText = ""
-            searchResults = []
-        }
-        enteredFolderURL = item.url
-        navigateTo(item.url)
+        enterFolder(item.url, from: item.url)
     }
 
     // MARK: - Archive Navigation
 
-    /// Enter a ZIP archive and browse its contents
+    /// Enter a ZIP archive and browse its contents (the archive is read off the main thread)
     func enterArchive(at url: URL) {
-        do {
-            // Read archive entries
-            let entries = try ZipArchiveManager.shared.readContents(of: url)
-            archiveEntries = entries
+        InlinePreviews.stopAll()
+        readArchiveEntries(at: url) { [weak self] result in
+            guard let self else { return }
+            switch result {
+            case .success(let entries):
+                self.prepareForNavigation()
+                // Clear search text and tag filter when entering an archive
+                // since we're now browsing different content
+                if !self.searchText.isEmpty {
+                    self.searchText = ""
+                }
+                if self.filterTag != nil {
+                    self.filterTag = nil
+                }
 
-            // Store the archive URL and set archive mode
-            currentArchiveURL = url
-            currentArchivePath = ""
-            isInsideArchive = true
-
-            // Clear search text and tag filter when entering an archive
-            // since we're now browsing different content
-            if !searchText.isEmpty {
-                searchText = ""
+                self.archiveEntries = entries
+                self.currentArchiveURL = url
+                self.currentArchivePath = ""
+                self.currentPath = url.deletingLastPathComponent()
+                self.isInsideArchive = true
+                // Remember where we came from for back navigation
+                self.enteredFolderURL = url
+                self.coverFlowSelectedIndex = 0
+                self.loadContents()
+                self.addToHistory(.archive(archiveURL: url, internalPath: ""))
+            case .failure(let error):
+                // Fall back to opening with default app
+                zipNavLogger.error("Error reading archive: \(error.localizedDescription)")
+                NSWorkspace.shared.open(url)
             }
-            if filterTag != nil {
-                filterTag = nil
-            }
-
-            // Remember where we came from for back navigation
-            enteredFolderURL = url
-
-            // Reset selection and load archive contents
-            selectedItems.removeAll()
-            coverFlowSelectedIndex = 0
-            loadContents()
-
-            // Add to history (use a virtual URL)
-            addToHistory(.archive(archiveURL: url, internalPath: ""))
-        } catch {
-            // Fall back to opening with default app
-            zipNavLogger.error("Error reading archive: \(error.localizedDescription)")
-            NSWorkspace.shared.open(url)
         }
     }
 
-    /// Navigate to a path within the current archive
+    /// Navigate to a path within the current archive ("" is the archive root)
     func navigateInArchive(to path: String) {
-        guard isInsideArchive else { return }
-
-        // Ensure path ends with / for directories
-        let normalizedPath = path.hasSuffix("/") ? String(path.dropLast()) : path
-        currentArchivePath = normalizedPath
-        selectedItems.removeAll()
-        coverFlowSelectedIndex = 0
-        loadContents()
-
-        // Add to history
-        if let archiveURL = currentArchiveURL {
-            addToHistory(.archive(archiveURL: archiveURL, internalPath: normalizedPath))
-        }
-    }
-
-    /// Exit the current archive and return to the filesystem
-    func exitArchive() {
         guard isInsideArchive, let archiveURL = currentArchiveURL else { return }
 
-        isInsideArchive = false
-        currentArchiveURL = nil
-        currentArchivePath = ""
-        archiveEntries = []
-
-        // Navigate to the folder containing the archive
-        currentPath = archiveURL.deletingLastPathComponent()
-        pendingSelectionURL = archiveURL
-        selectedItems.removeAll()
+        // Directory paths are stored without a trailing slash
+        let normalizedPath = path.hasSuffix("/") ? String(path.dropLast()) : path
+        prepareForNavigation()
+        currentArchivePath = normalizedPath
+        coverFlowSelectedIndex = 0
         loadContents()
-        addToHistory(.filesystem(currentPath))
+        addToHistory(.archive(archiveURL: archiveURL, internalPath: normalizedPath))
+    }
+
+    /// Exit the current archive and return to the folder containing it (the archive is selected)
+    func exitArchive() {
+        guard isInsideArchive, let archiveURL = currentArchiveURL else { return }
+        navigateToAndSelectCurrent(archiveURL.deletingLastPathComponent())
     }
 
     /// Navigate up one level (handles both archive and filesystem)
@@ -2137,18 +2496,9 @@ class FileBrowserViewModel: ObservableObject {
                 // At archive root, exit the archive
                 exitArchive()
             } else {
-                // Go up one level within the archive
+                // Go up one level within the archive (to the root for a top-level folder)
                 let components = currentArchivePath.split(separator: "/")
-                if components.count > 1 {
-                    let parentPath = components.dropLast().joined(separator: "/")
-                    navigateInArchive(to: parentPath)
-                } else {
-                    // Go to archive root
-                    currentArchivePath = ""
-                    selectedItems.removeAll()
-                    coverFlowSelectedIndex = 0
-                    loadContents()
-                }
+                navigateInArchive(to: components.dropLast().joined(separator: "/"))
             }
         } else {
             navigateToParent()
@@ -2172,31 +2522,16 @@ class FileBrowserViewModel: ObservableObject {
                     NSWorkspace.shared.open(tempURL)
                 }
             } catch {
+                zipNavLogger.error("Failed to extract archive item: \(error.localizedDescription)")
                 DispatchQueue.main.async {
                     NSSound.beep()
                 }
-                print("Failed to extract file: \(error.localizedDescription)")
             }
         }
     }
 
-    private func archiveEntry(for item: FileItem) -> ZipEntry? {
-        guard let archivePath = item.archivePath else { return nil }
-        if let entry = archiveEntries.first(where: { $0.path == archivePath }) {
-            return entry
-        }
-        if let entry = archiveEntries.first(where: { $0.path == archivePath + "/" }) {
-            return entry
-        }
-        if archivePath.hasSuffix("/") {
-            let trimmed = String(archivePath.dropLast())
-            return archiveEntries.first(where: { $0.path == trimmed })
-        }
-        return nil
-    }
-
     func previewURL(for item: FileItem) -> URL? {
-        // For archive items, return nil - caller should use async version
+        // Quick Look is disabled for archive items
         if item.isFromArchive {
             return nil
         }
@@ -2206,14 +2541,8 @@ class FileBrowserViewModel: ObservableObject {
         return item.url
     }
 
-    /// Async version for archive items - extracts on background thread
+    /// Completion-based variant used by the Quick Look callers (archive items have no preview URL)
     func previewURL(for item: FileItem, completion: @escaping (URL?) -> Void) {
-        if item.isFromArchive {
-            // TEMP: Skip archive preview entirely to diagnose freeze
-            completion(nil)
-            return
-        }
-        // Non-archive items return immediately
         completion(previewURL(for: item))
     }
 
@@ -2367,16 +2696,23 @@ class FileBrowserViewModel: ObservableObject {
         historyIndex = navigationHistory.count - 1
     }
 
+    /// Re-lists the current location. Reloading the folder that's shown is incremental
+    /// (no spinner, scroll position, selection and item IDs are kept).
     func refresh() {
-        InlineVideoPreviewManager.shared.stopAllPreviews()
+        InlinePreviews.stopAll()
+        if !isInsideArchive, photosLibraryInfo == nil, currentPath.path != "/Network" {
+            // Tags and iCloud status can change behind our back (e.g. edited in Finder)
+            FileTagManager.invalidateCache(forDirectory: currentPath)
+            CloudStatusManager.shared.invalidateCacheForDirectory(currentPath)
+            cloudStatusLoadedURLs.removeAll()
+            tagRefreshToken &+= 1
+        }
         loadContents()
     }
 
     func refreshTags(for urls: [URL], invalidateCache: Bool = true) {
         if invalidateCache {
-            for url in urls {
-                FileTagManager.invalidateCache(for: url)
-            }
+            FileTagManager.invalidateCache(for: urls)
         }
         tagRefreshToken &+= 1
         // Force UI refresh by sending objectWillChange
@@ -2576,16 +2912,22 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
+    @discardableResult
     private func applyTags(
         _ tags: [String],
         to url: URL,
         actionName: String,
         registerUndo: Bool,
         invalidateCache: Bool
-    ) {
+    ) -> Bool {
         let beforeTags = FileTagManager.getTags(for: url)
-        guard beforeTags != tags else { return }
-        FileTagManager.setTags(tags, for: url)
+        guard beforeTags != tags else { return true }
+        guard FileTagManager.setTags(tags, for: url) else {
+            // Nothing changed on disk: no undo entry, show what's really there
+            refreshTags(for: [url], invalidateCache: true)
+            presentTagEditFailure(for: url)
+            return false
+        }
 
         if registerUndo {
             let beforeSnapshot = beforeTags
@@ -2602,9 +2944,12 @@ class FileBrowserViewModel: ObservableObject {
         }
 
         refreshTags(for: [url], invalidateCache: invalidateCache)
+        return true
     }
 
-    func toggleTag(_ tagName: String, for url: URL, invalidateCache: Bool = true) {
+    /// Toggles a tag; returns false (and tells the user) when the tags couldn't be written.
+    @discardableResult
+    func toggleTag(_ tagName: String, for url: URL, invalidateCache: Bool = true) -> Bool {
         let currentTags = FileTagManager.getTags(for: url)
         var updatedTags = currentTags
         if let index = updatedTags.firstIndex(of: tagName) {
@@ -2612,11 +2957,27 @@ class FileBrowserViewModel: ObservableObject {
         } else {
             updatedTags.append(tagName)
         }
-        applyTags(updatedTags, to: url, actionName: "Tags", registerUndo: true, invalidateCache: invalidateCache)
+        return applyTags(updatedTags, to: url, actionName: "Tags", registerUndo: true, invalidateCache: invalidateCache)
     }
 
-    func setTags(_ tags: [String], for url: URL, invalidateCache: Bool = true) {
+    /// Sets tags; returns false (and tells the user) when the tags couldn't be written.
+    @discardableResult
+    func setTags(_ tags: [String], for url: URL, invalidateCache: Bool = true) -> Bool {
         applyTags(tags, to: url, actionName: "Tags", registerUndo: true, invalidateCache: invalidateCache)
+    }
+
+    private func presentTagEditFailure(for url: URL) {
+        // Only when running as an app (not headless, e.g. in tests)
+        guard let app = NSApp, app.isRunning else { return }
+        let alert = NSAlert()
+        alert.messageText = "The tags of “\(url.lastPathComponent)” couldn’t be changed."
+        alert.informativeText = "You may not have permission to change this item, or its volume may be read-only."
+        alert.alertStyle = .warning
+        if let window = app.keyWindow ?? app.mainWindow {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
+        }
     }
 
     // MARK: - Clipboard Operations
@@ -3062,7 +3423,7 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     func getInfo() {
-        guard let item = selectedItems.first else { return }
+        guard let item = primarySelectedItem else { return }
         guard !item.isFromArchive else {
             NSSound.beep()
             return
@@ -3183,168 +3544,64 @@ class FileBrowserViewModel: ObservableObject {
 
     /// Perform search based on current search mode
     func performSearch(query: String) {
-        print("🔍 [FileBrowserVM] performSearch() called with query: '\(query)', mode: \(self.searchMode.rawValue)")
-        searchDebugLogger.notice("🔍 performSearch() called with query: '\(query)', mode: \(self.searchMode.rawValue)")
+        performSearch(query: query, mode: searchMode)
+    }
 
+    private func performSearch(query: String, mode: SearchMode) {
         // Cancel any existing search
         cancelSearch()
 
         guard !query.isEmpty else {
-            print("🔍 [FileBrowserVM] performSearch: empty query, clearing results")
-            searchDebugLogger.notice("🔍 performSearch: empty query, clearing results")
             searchResults = []
-            isSearching = false
             return
         }
 
-        isSearching = true
-
-        switch searchMode {
+        switch mode {
         case .filter:
             // Filter mode doesn't use async search
-            print("🔍 [FileBrowserVM] performSearch: Filter mode, skipping async search")
-            searchDebugLogger.notice("🔍 performSearch: Filter mode, skipping async search")
-            isSearching = false
             return
-
         case .finder:
-            print("🔍 [FileBrowserVM] performSearch: Calling performFinderSearch")
-            searchDebugLogger.notice("🔍 performSearch: Calling performFinderSearch")
+            guard isBackgroundWorkActive else {
+                searchNeedsRerunOnResume = true
+                return
+            }
+            isSearching = true
             performFinderSearch(query: query)
         }
     }
 
     /// Cancel any ongoing search
     func cancelSearch() {
-        searchTask?.cancel()
-        searchTask = nil
-        metadataQuery?.stop()
-        metadataQuery = nil
-        removeMetadataQueryObservers()
+        spotlightSearch?.stop()
+        spotlightSearch = nil
+        spotlightSearchToken = UUID()
+        isSearching = false
     }
 
     func clearSearchQuery() {
         cancelSearch()
         searchResults = []
         searchText = ""
-        isSearching = false
+        spotlightIDsByPath.removeAll()
     }
 
     /// Perform Finder search using NSMetadataQuery (Spotlight)
     private func performFinderSearch(query: String) {
-        searchDebugLogger.info("🔎 performFinderSearch() starting for query: '\(query)'")
-        searchDebugLogger.info("🔎 Search scope: \(self.currentPath.path)")
-
-        let mdQuery = NSMetadataQuery()
-        self.metadataQuery = mdQuery
-
-        // Build predicate for filename search
-        let predicate = NSPredicate(format: "kMDItemFSName CONTAINS[cd] %@", query)
-        mdQuery.predicate = predicate
-        searchDebugLogger.info("🔎 Predicate: \(predicate)")
-
-        // Search in current directory and subdirectories
-        mdQuery.searchScopes = [currentPath]
-
-        // Observe results
-        metadataQueryDidFinishObserver = NotificationCenter.default.addObserver(
-            forName: .NSMetadataQueryDidFinishGathering,
-            object: mdQuery,
-            queue: .main
-        ) { [weak self] _ in
-            searchDebugLogger.info("🔎 NSMetadataQueryDidFinishGathering received")
-            Task { @MainActor in
-                self?.handleFinderSearchResults()
-            }
+        searchDebugLogger.debug("Starting Spotlight search, \(query.count) characters")
+        let token = UUID()
+        spotlightSearchToken = token
+        let session = SpotlightSearchSession(
+            queryString: query,
+            scope: currentPath,
+            idsByPath: spotlightIDsByPath
+        ) { [weak self] results, idsByPath in
+            guard let self, self.spotlightSearchToken == token else { return }
+            self.spotlightIDsByPath = idsByPath
+            self.searchResults = results
+            self.isSearching = false
         }
-
-        // Also handle updates during gathering
-        metadataQueryDidUpdateObserver = NotificationCenter.default.addObserver(
-            forName: .NSMetadataQueryDidUpdate,
-            object: mdQuery,
-            queue: .main
-        ) { [weak self] _ in
-            searchDebugLogger.info("🔎 NSMetadataQueryDidUpdate received")
-            Task { @MainActor in
-                self?.handleFinderSearchResults()
-            }
-        }
-
-        searchDebugLogger.info("🔎 Starting NSMetadataQuery...")
-        mdQuery.start()
-    }
-
-    private func removeMetadataQueryObservers() {
-        if let observer = metadataQueryDidFinishObserver {
-            NotificationCenter.default.removeObserver(observer)
-            metadataQueryDidFinishObserver = nil
-        }
-
-        if let observer = metadataQueryDidUpdateObserver {
-            NotificationCenter.default.removeObserver(observer)
-            metadataQueryDidUpdateObserver = nil
-        }
-    }
-
-    /// Handle results from NSMetadataQuery
-    private func handleFinderSearchResults() {
-        searchDebugLogger.info("🔎 handleFinderSearchResults() called")
-        guard let mdQuery = metadataQuery else {
-            searchDebugLogger.error("❌ handleFinderSearchResults: metadataQuery is nil!")
-            return
-        }
-
-        mdQuery.disableUpdates()
-        defer { mdQuery.enableUpdates() }
-
-        searchDebugLogger.info("🔎 NSMetadataQuery resultCount: \(mdQuery.resultCount)")
-
-        var results: [FileItem] = []
-        for i in 0..<mdQuery.resultCount {
-            guard let item = mdQuery.result(at: i) as? NSMetadataItem,
-                  let path = item.value(forAttribute: kMDItemPath as String) as? String else {
-                continue
-            }
-
-            let url = URL(fileURLWithPath: path)
-            if let fileItem = createFileItem(from: url) {
-                results.append(fileItem)
-            }
-        }
-
-        searchDebugLogger.info("🔎 Finder search found \(results.count) results")
-        if results.count > 0 {
-            searchDebugLogger.info("🔎 First few results: \(results.prefix(3).map { $0.name })")
-        }
-
-        searchResults = results
-        isSearching = false
-        searchDebugLogger.info("🔎 searchResults updated, isSearching=false")
-    }
-
-    /// Create a FileItem from a URL (for search results)
-    private func createFileItem(from url: URL) -> FileItem? {
-        guard let resourceValues = try? url.resourceValues(forKeys: [
-            .isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey
-        ]) else {
-            return nil
-        }
-
-        let isDirectory = resourceValues.isDirectory ?? false
-        let size = Int64(resourceValues.fileSize ?? 0)
-        let modDate = resourceValues.contentModificationDate
-        let createDate = resourceValues.creationDate
-        let contentType = resourceValues.contentType
-
-        return FileItem(
-            url: url,
-            name: url.lastPathComponent,
-            isDirectory: isDirectory,
-            size: size,
-            modificationDate: modDate,
-            creationDate: createDate,
-            contentType: contentType
-        )
+        spotlightSearch = session
+        session.start()
     }
 
 }
@@ -3366,13 +3623,138 @@ extension FileBrowserViewModel: SMBSubnetScannerDelegate {
     }
 
     fileprivate func smbSubnetScannerDidFinish(_ scanner: SMBSubnetScanner) {
-        smbScanComplete = true
         // Ensure we rebuild one final time with all results
         if isNetworkBrowsing, currentPath.path == "/Network" {
             rebuildNetworkItems()
         }
     }
 }
+
+// MARK: - Spotlight Search
+
+/// Runs one Spotlight query with its notifications on a private serial queue and builds the
+/// FileItems there from the attributes Spotlight returns (no per-result file system reads on
+/// main). IDs stay stable per path across result updates and successive queries.
+private final class SpotlightSearchSession: @unchecked Sendable {
+    private let query = NSMetadataQuery()
+    private let queue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.flowfinder.spotlight"
+        queue.maxConcurrentOperationCount = 1
+        queue.qualityOfService = .userInitiated
+        return queue
+    }()
+    private let cancellation = LoadCancellationFlag()
+    private var observers: [NSObjectProtocol] = []
+    /// Accessed on `queue` only
+    private var idsByPath: [String: UUID]
+    private let deliver: @MainActor (_ results: [FileItem], _ idsByPath: [String: UUID]) -> Void
+    private static let maxRememberedIDs = 50_000
+
+    init(queryString: String,
+         scope: URL,
+         idsByPath: [String: UUID],
+         deliver: @escaping @MainActor (_ results: [FileItem], _ idsByPath: [String: UUID]) -> Void) {
+        self.idsByPath = idsByPath
+        self.deliver = deliver
+        // Build predicate for filename search in the scope folder and its subfolders
+        query.predicate = NSPredicate(format: "kMDItemFSName CONTAINS[cd] %@", queryString)
+        query.searchScopes = [scope]
+        query.operationQueue = queue
+    }
+
+    deinit {
+        stop()
+    }
+
+    func start() {
+        for name in [Notification.Name.NSMetadataQueryDidFinishGathering, .NSMetadataQueryDidUpdate] {
+            let observer = NotificationCenter.default.addObserver(forName: name, object: query, queue: nil) { [weak self] _ in
+                // Posted on the query's operation queue
+                self?.collectResults()
+            }
+            observers.append(observer)
+        }
+        let query = self.query
+        queue.addOperation {
+            query.start()
+        }
+    }
+
+    func stop() {
+        guard !cancellation.isCancelled else { return }
+        cancellation.cancel()
+        for observer in observers {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        observers.removeAll()
+        let query = self.query
+        queue.addOperation {
+            query.stop()
+        }
+    }
+
+    /// Runs on `queue`
+    private func collectResults() {
+        guard !cancellation.isCancelled else { return }
+        query.disableUpdates()
+        if idsByPath.count > Self.maxRememberedIDs {
+            idsByPath.removeAll()
+        }
+
+        var results: [FileItem] = []
+        results.reserveCapacity(query.resultCount)
+        for index in 0..<query.resultCount {
+            guard let result = query.result(at: index) as? NSMetadataItem,
+                  let path = result.value(forAttribute: NSMetadataItemPathKey) as? String else {
+                continue
+            }
+            let id: UUID
+            if let existing = idsByPath[path] {
+                id = existing
+            } else {
+                id = UUID()
+                idsByPath[path] = id
+            }
+            results.append(Self.makeItem(from: result, path: path, id: id))
+        }
+        query.enableUpdates()
+
+        let idsSnapshot = idsByPath
+        let cancellation = self.cancellation
+        let deliver = self.deliver
+        DispatchQueue.main.async {
+            guard !cancellation.isCancelled else { return }
+            MainActor.assumeIsolated {
+                deliver(results, idsSnapshot)
+            }
+        }
+    }
+
+    private static func makeItem(from result: NSMetadataItem, path: String, id: UUID) -> FileItem {
+        guard let typeIdentifier = result.value(forAttribute: kMDItemContentType as String) as? String,
+              let contentType = UTType(typeIdentifier) else {
+            // Not fully indexed: read from the file system (we're off the main thread)
+            return FileItem(url: URL(fileURLWithPath: path), id: id, loadMetadata: true)
+        }
+        // Folders and packages conform to public.directory
+        let isDirectory = contentType.conforms(to: .directory)
+        let url = URL(fileURLWithPath: path, isDirectory: isDirectory)
+        let size = (result.value(forAttribute: kMDItemFSSize as String) as? NSNumber)?.int64Value ?? 0
+        return FileItem(
+            id: id,
+            url: url,
+            name: url.lastPathComponent,
+            isDirectory: isDirectory,
+            size: size,
+            modificationDate: result.value(forAttribute: kMDItemFSContentChangeDate as String) as? Date,
+            creationDate: result.value(forAttribute: kMDItemFSCreationDate as String) as? Date,
+            contentType: contentType
+        )
+    }
+}
+
+// MARK: - Bonjour Browsing
 
 fileprivate struct NetworkServiceInfo: Hashable {
     let key: String
@@ -3383,10 +3765,13 @@ fileprivate struct NetworkServiceInfo: Hashable {
     let priority: Int
 }
 
+@MainActor
 fileprivate protocol NetworkServiceBrowserDelegate: AnyObject {
     func networkServiceBrowser(_ browser: NetworkServiceBrowser, didUpdate services: [NetworkServiceInfo], isFinal: Bool)
 }
 
+/// Bonjour browsing for SMB/AFP hosts. Used on the main thread (NetService callbacks arrive on
+/// the run loop it was scheduled on); delegate updates are delivered on the main queue.
 fileprivate final class NetworkServiceBrowser: NSObject, NetServiceBrowserDelegate, NetServiceDelegate {
     private weak var delegate: NetworkServiceBrowserDelegate?
     private var browsers: [NetServiceBrowser] = []
@@ -3396,6 +3781,10 @@ fileprivate final class NetworkServiceBrowser: NSObject, NetServiceBrowserDelega
 
     init(delegate: NetworkServiceBrowserDelegate) {
         self.delegate = delegate
+    }
+
+    deinit {
+        stop()
     }
 
     func start() {
@@ -3410,9 +3799,14 @@ fileprivate final class NetworkServiceBrowser: NSObject, NetServiceBrowserDelega
 
     func stop() {
         for browser in browsers {
+            browser.delegate = nil
             browser.stop()
         }
         browsers.removeAll()
+        for service in netServices.values {
+            service.delegate = nil
+            service.stop()
+        }
         netServices.removeAll()
         services.removeAll()
     }
@@ -3464,7 +3858,9 @@ fileprivate final class NetworkServiceBrowser: NSObject, NetServiceBrowserDelega
         let snapshot = Array(services.values)
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
-            self.delegate?.networkServiceBrowser(self, didUpdate: snapshot, isFinal: isFinal)
+            MainActor.assumeIsolated {
+                self.delegate?.networkServiceBrowser(self, didUpdate: snapshot, isFinal: isFinal)
+            }
         }
     }
 
@@ -3493,27 +3889,76 @@ fileprivate final class NetworkServiceBrowser: NSObject, NetServiceBrowserDelega
     }
 }
 
+// MARK: - Directory Watcher
+
+/// Watches one folder with FSEvents and reports changed direct children. Paths are mapped to
+/// the folder's displayed form (FSEvents reports resolved paths such as /private/tmp for /tmp
+/// or a symlinked folder's target). Callbacks are delivered on the main queue.
 private final class DirectoryWatcher {
+    typealias Callback = @MainActor (_ childPaths: [String], _ needsRescan: Bool, _ watchedPath: String) -> Void
+
+    /// Per-stream state, retained by the stream through its context
+    fileprivate final class StreamContext {
+        let displayPath: String
+        let callback: Callback
+        /// Resolved on the stream's queue on first use (realpath may touch the disk)
+        lazy var resolvedPath: String = resolvedFilesystemPath(displayPath)
+
+        init(displayPath: String, callback: @escaping Callback) {
+            self.displayPath = displayPath
+            self.callback = callback
+        }
+
+        /// Maps an event path to the displayed form, or nil when it's outside the watched folder.
+        func displayFormPath(for eventPath: String) -> String? {
+            var path = eventPath
+            if path.count > 1, path.hasSuffix("/") {
+                path.removeLast()
+            }
+            let displayPrefix = displayPath == "/" ? "/" : displayPath + "/"
+            if path == displayPath || path.hasPrefix(displayPrefix) {
+                return path
+            }
+            let resolved = resolvedPath
+            guard resolved != displayPath else { return nil }
+            if path == resolved {
+                return displayPath
+            }
+            let resolvedPrefix = resolved == "/" ? "/" : resolved + "/"
+            if path.hasPrefix(resolvedPrefix) {
+                return displayPrefix + path.dropFirst(resolvedPrefix.count)
+            }
+            return nil
+        }
+    }
+
     private var stream: FSEventStreamRef?
     private let queue = DispatchQueue(label: "com.coverflowfinder.directorywatcher", qos: .utility)
-    private let callback: ([URL]) -> Void
-    private var watchedPath: String?
+    private let callback: Callback
+    /// Displayed path of the watched folder (nil when stopped)
+    private(set) var watchedPath: String?
 
-    init(callback: @escaping ([URL]) -> Void) {
+    init(callback: @escaping Callback) {
         self.callback = callback
     }
 
-    func start(watching url: URL) {
-        let path = url.path
-        if watchedPath == path { return }
+    func start(watching path: String) {
+        if watchedPath == path, stream != nil { return }
         stop()
-        watchedPath = path
 
-        var context = FSEventStreamContext(
+        let context = StreamContext(displayPath: path, callback: callback)
+        var streamContext = FSEventStreamContext(
             version: 0,
-            info: UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()),
-            retain: nil,
-            release: nil,
+            info: Unmanaged.passUnretained(context).toOpaque(),
+            retain: { info in
+                guard let info else { return nil }
+                _ = Unmanaged<StreamContext>.fromOpaque(info).retain()
+                return info
+            },
+            release: { info in
+                guard let info else { return }
+                Unmanaged<StreamContext>.fromOpaque(info).release()
+            },
             copyDescription: nil
         )
 
@@ -3523,24 +3968,25 @@ private final class DirectoryWatcher {
             kFSEventStreamCreateFlagNoDefer
         )
 
-        let pathsToWatch = [path] as CFArray
-        stream = FSEventStreamCreate(
+        guard let stream = FSEventStreamCreate(
             kCFAllocatorDefault,
             DirectoryWatcher.eventCallback,
-            &context,
-            pathsToWatch,
+            &streamContext,
+            [path] as CFArray,
             FSEventStreamEventId(kFSEventStreamEventIdSinceNow),
             0.2,
             flags
-        )
+        ) else { return }
 
-        if let stream {
-            FSEventStreamSetDispatchQueue(stream, queue)
-            FSEventStreamStart(stream)
-        }
+        self.stream = stream
+        watchedPath = path
+        FSEventStreamSetDispatchQueue(stream, queue)
+        FSEventStreamStart(stream)
     }
 
+    /// Stops watching; `start` then watches again even for the same path.
     func stop() {
+        watchedPath = nil
         guard let stream else { return }
         FSEventStreamStop(stream)
         FSEventStreamInvalidate(stream)
@@ -3552,12 +3998,48 @@ private final class DirectoryWatcher {
         stop()
     }
 
-    private static let eventCallback: FSEventStreamCallback = { _, clientInfo, numEvents, eventPaths, _, _ in
+    private static let eventCallback: FSEventStreamCallback = { _, clientInfo, numEvents, eventPaths, eventFlags, _ in
         guard let clientInfo else { return }
-        let watcher = Unmanaged<DirectoryWatcher>.fromOpaque(clientInfo).takeUnretainedValue()
+        let context = Unmanaged<StreamContext>.fromOpaque(clientInfo).takeUnretainedValue()
         let paths = unsafeBitCast(eventPaths, to: NSArray.self) as? [String] ?? []
-        let urls = paths.map { URL(fileURLWithPath: $0) }
-        watcher.callback(urls)
+        let droppedFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagUserDropped | kFSEventStreamEventFlagKernelDropped)
+        let scanFlag = FSEventStreamEventFlags(kFSEventStreamEventFlagMustScanSubDirs)
+
+        var childPaths: [String] = []
+        var needsRescan = false
+        for (index, eventPath) in paths.enumerated() where index < numEvents {
+            let flags = eventFlags[index]
+            if flags & droppedFlags != 0 {
+                needsRescan = true
+                continue
+            }
+            guard let path = context.displayFormPath(for: eventPath) else {
+                // Coalesced events for an ancestor of the watched folder
+                if flags & scanFlag != 0, context.displayPath.hasPrefix(eventPath) {
+                    needsRescan = true
+                }
+                continue
+            }
+            if path == context.displayPath {
+                if flags & scanFlag != 0 {
+                    needsRescan = true
+                }
+                continue
+            }
+            // Only direct children affect the listing
+            if (path as NSString).deletingLastPathComponent == context.displayPath {
+                childPaths.append(path)
+            }
+        }
+        guard needsRescan || !childPaths.isEmpty else { return }
+
+        let callback = context.callback
+        let watchedPath = context.displayPath
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                callback(childPaths, needsRescan, watchedPath)
+            }
+        }
     }
 }
 
@@ -3569,58 +4051,99 @@ fileprivate struct SMBHostInfo: Hashable {
     let port: Int
 }
 
+@MainActor
 fileprivate protocol SMBSubnetScannerDelegate: AnyObject {
     func smbSubnetScanner(_ scanner: SMBSubnetScanner, didDiscover hosts: [SMBHostInfo])
     func smbSubnetScannerDidFinish(_ scanner: SMBSubnetScanner)
 }
 
-/// Scans the local subnet for SMB hosts (port 445)
+/// Scans the local subnet for SMB hosts (port 445). `start`/`stop` and the delegate callbacks
+/// run on the main thread; probes run on a bounded operation queue and their results are
+/// accumulated serially, then published to main.
 fileprivate final class SMBSubnetScanner {
     private weak var delegate: SMBSubnetScannerDelegate?
-    private let scanQueue = DispatchQueue(label: "com.flowfinder.smbscanner", qos: .utility, attributes: .concurrent)
-    private let resultQueue = DispatchQueue(label: "com.flowfinder.smbscanner.results", qos: .utility)
-    private var discoveredHosts: [SMBHostInfo] = []
+    /// At most this many blocking connect/reverse-DNS probes run at once
+    static let maxConcurrentProbes = 16
+    private let probeQueue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.flowfinder.smbscanner"
+        queue.qualityOfService = .utility
+        queue.maxConcurrentOperationCount = SMBSubnetScanner.maxConcurrentProbes
+        return queue
+    }()
+    /// Main thread only
     private var isScanning = false
-    private var scanWorkItem: DispatchWorkItem?
-    private let smbPort: UInt16 = 445
-    private let connectionTimeout: TimeInterval = 0.3
+    private var scanCancellation: LoadCancellationFlag?
+    private static let smbPort: UInt16 = 445
+    private static let connectionTimeout: TimeInterval = 0.3
 
     init(delegate: SMBSubnetScannerDelegate) {
         self.delegate = delegate
     }
 
+    deinit {
+        scanCancellation?.cancel()
+        probeQueue.cancelAllOperations()
+    }
+
     func start() {
         guard !isScanning else { return }
         isScanning = true
-        discoveredHosts = []
+        let cancellation = LoadCancellationFlag()
+        scanCancellation = cancellation
 
-        // Get local network info
-        guard let (localIP, netmask) = getLocalNetworkInfo() else {
-            finishScanning()
+        // Get local network info and calculate subnet range
+        guard let (localIP, netmask) = Self.getLocalNetworkInfo() else {
+            finishScanning(cancellation)
             return
         }
-
-        // Calculate subnet range
-        let ipRange = calculateIPRange(localIP: localIP, netmask: netmask)
+        let ipRange = Self.calculateIPRange(localIP: localIP, netmask: netmask)
         guard !ipRange.isEmpty else {
-            finishScanning()
+            finishScanning(cancellation)
             return
         }
 
-        let workItem = DispatchWorkItem { [weak self] in
-            self?.scanIPRange(ipRange, localIP: localIP)
+        let results = SerialResultAccumulator<SMBHostInfo>()
+        // Skip our own IP
+        for ip in ipRange where ip != localIP {
+            probeQueue.addOperation { [weak self] in
+                guard !cancellation.isCancelled, Self.checkSMBPort(ip: ip) else { return }
+                let hostName = Self.resolveHostName(ip: ip) ?? ip
+                let hostInfo = SMBHostInfo(ipAddress: ip, name: hostName, port: Int(Self.smbPort))
+                results.append(hostInfo) { [weak self] hosts in
+                    // Main queue, snapshots in discovery order
+                    guard let self, !cancellation.isCancelled else { return }
+                    MainActor.assumeIsolated {
+                        self.delegate?.smbSubnetScanner(self, didDiscover: hosts)
+                    }
+                }
+            }
         }
-        scanWorkItem = workItem
-        scanQueue.async(execute: workItem)
+        // Runs once every probe has finished
+        probeQueue.addBarrierBlock { [weak self] in
+            self?.finishScanning(cancellation)
+        }
     }
 
     func stop() {
-        scanWorkItem?.cancel()
-        scanWorkItem = nil
+        scanCancellation?.cancel()
+        scanCancellation = nil
+        probeQueue.cancelAllOperations()
         isScanning = false
     }
 
-    private func getLocalNetworkInfo() -> (ip: String, netmask: String)? {
+    private func finishScanning(_ cancellation: LoadCancellationFlag) {
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !cancellation.isCancelled else { return }
+            self.isScanning = false
+            self.scanCancellation = nil
+            MainActor.assumeIsolated {
+                self.delegate?.smbSubnetScannerDidFinish(self)
+            }
+        }
+    }
+
+    private static func getLocalNetworkInfo() -> (ip: String, netmask: String)? {
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else { return nil }
         defer { freeifaddrs(ifaddr) }
@@ -3662,7 +4185,7 @@ fileprivate final class SMBSubnetScanner {
         return nil
     }
 
-    private func calculateIPRange(localIP: String, netmask: String) -> [String] {
+    private static func calculateIPRange(localIP: String, netmask: String) -> [String] {
         let ipParts = localIP.split(separator: ".").compactMap { UInt32($0) }
         let maskParts = netmask.split(separator: ".").compactMap { UInt32($0) }
 
@@ -3701,40 +4224,7 @@ fileprivate final class SMBSubnetScanner {
         return range
     }
 
-    private func scanIPRange(_ ips: [String], localIP: String) {
-        let group = DispatchGroup()
-
-        for ip in ips {
-            guard isScanning else { break }
-            // Skip our own IP
-            guard ip != localIP else { continue }
-
-            group.enter()
-            scanQueue.async { [weak self] in
-                defer { group.leave() }
-                guard let self, self.isScanning else { return }
-
-                if self.checkSMBPort(ip: ip) {
-                    let hostName = self.resolveHostName(ip: ip) ?? ip
-                    let hostInfo = SMBHostInfo(ipAddress: ip, name: hostName, port: Int(self.smbPort))
-
-                    self.resultQueue.async {
-                        self.discoveredHosts.append(hostInfo)
-                        // Notify delegate of progress
-                        DispatchQueue.main.async {
-                            self.delegate?.smbSubnetScanner(self, didDiscover: self.discoveredHosts)
-                        }
-                    }
-                }
-            }
-        }
-
-        group.notify(queue: .main) { [weak self] in
-            self?.finishScanning()
-        }
-    }
-
-    private func checkSMBPort(ip: String) -> Bool {
+    private static func checkSMBPort(ip: String) -> Bool {
         let socket = Darwin.socket(AF_INET, SOCK_STREAM, 0)
         guard socket >= 0 else { return false }
         defer { Darwin.close(socket) }
@@ -3775,7 +4265,7 @@ fileprivate final class SMBSubnetScanner {
         return false
     }
 
-    private func resolveHostName(ip: String) -> String? {
+    private static func resolveHostName(ip: String) -> String? {
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         inet_pton(AF_INET, ip, &addr.sin_addr)
@@ -3801,13 +4291,5 @@ fileprivate final class SMBSubnetScanner {
             }
         }
         return nil
-    }
-
-    private func finishScanning() {
-        isScanning = false
-        DispatchQueue.main.async { [weak self] in
-            guard let self else { return }
-            self.delegate?.smbSubnetScannerDidFinish(self)
-        }
     }
 }
