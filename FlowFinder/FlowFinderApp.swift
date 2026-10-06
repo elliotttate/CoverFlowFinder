@@ -152,6 +152,13 @@ struct BrowserCommands: Commands {
             }
             .keyboardShortcut(.delete, modifiers: .command)
             .disabled(!hasSelection || menuState.usesStandardEditing)
+
+            // Asks for confirmation; can't be undone.
+            Button("Delete Immediately…") {
+                perform(.deleteImmediately)
+            }
+            .keyboardShortcut(.delete, modifiers: [.command, .option])
+            .disabled(!hasSelection || menuState.usesStandardEditing)
         }
 
         // View menu commands

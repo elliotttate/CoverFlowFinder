@@ -69,6 +69,7 @@ enum FileAreaKeyCommand: Equatable {
     case quickLook
     case typeAhead(Character)
     case cancelTypeAhead
+    case closeQuickLook
 }
 
 /// Everything the routing decision depends on, captured from a key event and its window.
@@ -81,6 +82,7 @@ struct KeyRoutingContext {
     var isModalSessionActive: Bool
     var responder: KeyboardResponderKind
     var isTypeAheadActive: Bool
+    var isQuickLookVisible: Bool = false
 }
 
 enum KeyboardRouting {
@@ -105,8 +107,7 @@ enum KeyboardRouting {
     static func command(for context: KeyRoutingContext) -> FileAreaKeyCommand? {
         guard context.isBrowserWindow,
               !context.hasAttachedSheet,
-              !context.isModalSessionActive,
-              context.responder == .fileArea else {
+              !context.isModalSessionActive else {
             return nil
         }
 
@@ -115,6 +116,16 @@ enum KeyboardRouting {
         let option = flags.contains(.option)
         let control = flags.contains(.control)
         let shift = flags.contains(.shift)
+
+        // Escape closes an open Quick Look panel (Finder) wherever the browser window's focus is,
+        // except in a text field, whose own Escape (cancel rename, clear search) comes first. When
+        // the panel itself is key the event isn't from a browser window and the panel handles it.
+        if context.keyCode == KeyCode.escape, context.isQuickLookVisible,
+           context.responder != .textEditing, !command, !option, !control, !shift {
+            return .closeQuickLook
+        }
+
+        guard context.responder == .fileArea else { return nil }
 
         switch context.keyCode {
         case KeyCode.upArrow, KeyCode.downArrow, KeyCode.leftArrow, KeyCode.rightArrow:
@@ -169,6 +180,7 @@ enum EditCommand: Equatable {
     case selectAll
     case duplicate
     case moveToTrash
+    case deleteImmediately
     case enclosingFolder
 }
 
@@ -198,7 +210,7 @@ enum EditCommandRouting {
                 return isKeyEquivalent ? .forward(#selector(NSResponder.deleteToBeginningOfLine(_:))) : .ignore
             case .enclosingFolder:
                 return isKeyEquivalent ? .forward(#selector(NSResponder.moveToBeginningOfDocument(_:))) : .files
-            case .duplicate:
+            case .duplicate, .deleteImmediately:
                 return .ignore
             }
         }
@@ -218,7 +230,7 @@ enum EditCommandRouting {
         case .cut: return #selector(NSText.cut(_:))
         case .paste: return #selector(NSText.paste(_:))
         case .selectAll: return #selector(NSText.selectAll(_:))
-        case .duplicate, .moveToTrash, .enclosingFolder: return nil
+        case .duplicate, .moveToTrash, .deleteImmediately, .enclosingFolder: return nil
         }
     }
 }
@@ -408,12 +420,15 @@ final class KeyboardManager {
             hasAttachedSheet: window.attachedSheet != nil,
             isModalSessionActive: NSApp.modalWindow != nil,
             responder: effectiveResponderKind(in: window),
-            isTypeAheadActive: isTypeAheadActive(in: window)
+            isTypeAheadActive: isTypeAheadActive(in: window),
+            isQuickLookVisible: QuickLookControllerView.isPanelVisible
         )
-        guard let command = KeyboardRouting.command(for: context),
-              let handlers = activeHandlers(for: window) else {
-            return false
+        guard let command = KeyboardRouting.command(for: context) else { return false }
+        // Closing Quick Look needs no file view (Cover Flow handles its own keys)
+        if command == .closeQuickLook {
+            return perform(command, with: KeyboardHandlers(), in: window)
         }
+        guard let handlers = activeHandlers(for: window) else { return false }
         return perform(command, with: handlers, in: window)
     }
 
@@ -431,6 +446,9 @@ final class KeyboardManager {
             onTypeAhead(typeAheadBuffer)
         case .cancelTypeAhead:
             clearTypeAhead()
+        case .closeQuickLook:
+            clearTypeAhead()
+            QuickLookControllerView.shared.hidePreview()
         }
         return true
     }
@@ -463,8 +481,9 @@ final class KeyboardManager {
         return route
     }
 
-    /// File side of Copy/Cut/Paste/Select All/Duplicate/Move to Trash. Prefers the handlers of the
-    /// window's file view (e.g. Column view pastes into the active column), falling back to the view model.
+    /// File side of Copy/Cut/Paste/Select All/Duplicate/Move to Trash/Delete Immediately. Prefers
+    /// the handlers of the window's file view (e.g. Column view pastes into the active column),
+    /// falling back to the view model.
     private func performFileCommand(_ command: EditCommand, viewModel: FileBrowserViewModel?, in window: NSWindow?) {
         let handlers = window.flatMap { activeHandlers(for: $0) }
         guard let viewModel else {
@@ -494,6 +513,8 @@ final class KeyboardManager {
             viewModel.duplicateSelectedItems()
         case .moveToTrash:
             if let handlers { handlers.onDelete() } else { viewModel.deleteSelectedItems() }
+        case .deleteImmediately:
+            viewModel.deleteSelectionImmediately()
         case .enclosingFolder:
             viewModel.navigateUp()
         }
@@ -814,7 +835,7 @@ enum PaneKeyboardNavigation {
         guard !prefix.isEmpty else { return }
         let lowercased = prefix.lowercased()
         let items = viewModel.filteredItems
-        guard let index = items.firstIndex(where: { $0.name.lowercased().hasPrefix(lowercased) }) else { return }
+        guard let index = items.firstIndex(where: { $0.displayName.lowercased().hasPrefix(lowercased) }) else { return }
         viewModel.selectItem(items[index])
         viewModel.lastSelectedIndex = index
         viewModel.selectionAnchorIndex = index
@@ -948,7 +969,7 @@ struct InlineRenameField: View {
                 .onExitCommand { cancelRename() }
                 .onAppear {
                     hasCommitted = false
-                    editText = item.nameWithoutExtension
+                    editText = item.editingName
                     // Install synchronously so a rename that ends before the field takes focus
                     // still removes them (no monitors installed after the field is gone).
                     installMonitors()
@@ -1033,18 +1054,9 @@ struct InlineRenameField: View {
         viewModel.renamingURL = nil
     }
 
-    /// The full new name for the text typed in the field, or nil when nothing should change.
-    /// Files are edited without their extension, which is re-appended unless the user typed it;
-    /// folders and packages are edited with their full name, so nothing is appended ("my.folder"
-    /// → "x" stays "x", "Foo.app" stays "Foo.app"). Whitespace is kept, as in Finder.
+    /// The full new name for the text typed in the field (see `FileItem.newName(forEditedText:)`).
     static func newName(forEditedText text: String, of item: FileItem) -> String? {
-        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        let hiddenExtension = item.isDirectory ? "" : item.url.pathExtension
-        var name = text
-        if !hiddenExtension.isEmpty && !text.lowercased().hasSuffix("." + hiddenExtension.lowercased()) {
-            name += "." + hiddenExtension
-        }
-        return name == item.name ? nil : name
+        item.newName(forEditedText: text)
     }
 
     private func commitRenameAndNext() {
@@ -1081,5 +1093,43 @@ extension FileItem {
         let ext = url.pathExtension
         if ext.isEmpty { return name }
         return String(name.dropLast(ext.count + 1))
+    }
+
+    /// The text a rename field starts with: files without their extension, folders and packages
+    /// with their full name; ":" on disk shown as "/".
+    var editingName: String {
+        nameWithoutExtension.finderDisplayName
+    }
+
+    /// The full new name for `text` typed in a rename field (inline field, list, Tab/⇧Tab), or nil
+    /// when nothing should change. A file's extension is re-appended unless the user typed it
+    /// (any case: "Notes.TXT" changes the extension's case); folders and packages are edited with
+    /// their full name, so nothing is appended ("my.folder" → "x" stays "x", "Foo.app" stays
+    /// "Foo.app"). Whitespace is kept, as in Finder; "/" is stored as ":" by the rename itself.
+    func newName(forEditedText text: String) -> String? {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let hiddenExtension = isDirectory ? "" : url.pathExtension
+        var newName = text
+        if !hiddenExtension.isEmpty && !text.lowercased().hasSuffix("." + hiddenExtension.lowercased()) {
+            newName += "." + hiddenExtension
+        }
+        return FileOperationEngine.fileSystemName(forDisplayName: newName) == name ? nil : newName
+    }
+}
+
+// MARK: - Display Names
+
+extension String {
+    /// This file-system name as Finder shows it: ":" on disk is displayed as "/".
+    var finderDisplayName: String {
+        contains(":") ? replacingOccurrences(of: ":", with: "/") : self
+    }
+}
+
+extension URL {
+    /// The last path component as Finder shows it (":" on disk is displayed as "/"). For display
+    /// only; paths keep the on-disk name.
+    var finderDisplayName: String {
+        lastPathComponent.finderDisplayName
     }
 }

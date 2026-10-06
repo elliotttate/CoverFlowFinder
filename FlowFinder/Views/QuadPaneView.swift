@@ -195,7 +195,7 @@ struct QuadPaneCell: View {
                 .disabled(viewModel.historyIndex >= viewModel.navigationHistory.count - 1)
                 .buttonStyle(.borderless)
 
-                Text(viewModel.currentPath.lastPathComponent)
+                Text(viewModel.currentPath.finderDisplayName)
                     .font(.caption.bold())
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -249,7 +249,7 @@ struct QuadPaneCell: View {
                     } else {
                         HStack(spacing: 2) {
                             ForEach(pathComponents, id: \.self) { component in
-                                Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
+                                Text(component.lastPathComponent.isEmpty ? "/" : component.finderDisplayName)
                                     .font(.caption2)
                                     .padding(.horizontal, 4)
                                     .padding(.vertical, 1)
@@ -563,6 +563,10 @@ struct QuadPaneIconView: View {
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
                 }
                 .onChange(of: appSettings.thumbnailQuality) { _, _ in
+                    refreshThumbnails()
+                }
+                // Edited in place: reload the thumbnails of changed files
+                .onChange(of: viewModel.filteredItems.map(\.contentVersion)) { _, _ in
                     refreshThumbnails()
                 }
                 .onChange(of: viewModel.currentPath) { _, _ in

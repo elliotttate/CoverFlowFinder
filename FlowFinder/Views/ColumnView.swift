@@ -92,10 +92,8 @@ struct ColumnView: View {
             // When leaving column view (e.g. switching view modes), navigate to the
             // deepest selected folder so other views show where the user drilled into.
             // Skip this during normal folder loads while we remain in Columns mode.
-            if viewModel.viewMode != .columns, let deepestFolder = deepestSelectedFolder {
-                if deepestFolder != viewModel.currentPath {
-                    viewModel.navigateTo(deepestFolder)
-                }
+            if viewModel.viewMode != .columns {
+                showDeepestFolderInViewModel()
             }
         }
         .onChange(of: columns.map(\.url)) { _, urls in
@@ -136,21 +134,38 @@ struct ColumnView: View {
         return columnSelections[viewModel.currentPath]
     }
 
-    /// The deepest folder the user has drilled into via sub-columns.
-    private var deepestSelectedFolder: URL? {
-        // Walk columns in reverse to find the deepest selected directory
+    /// Navigates the view model to the deepest folder the user has drilled into via sub-columns.
+    private func showDeepestFolderInViewModel() {
         if let column = columns.last {
             if let selection = columnSelections[column.url], ColumnBrowsing.isBrowsableFolder(selection) {
-                return selection.url
+                show(selection, listedAt: nil)
+            } else {
+                // The column itself represents a folder the user drilled into
+                show(column.folder, listedAt: column.url)
             }
-            // The column itself represents a folder the user drilled into
-            return column.url
+        } else if let rootSelection = columnSelections[viewModel.currentPath], ColumnBrowsing.isBrowsableFolder(rootSelection) {
+            // No sub-columns: the root selection is a folder
+            show(rootSelection, listedAt: nil)
         }
-        // No sub-columns — check if root selection is a directory
-        if let rootSelection = columnSelections[viewModel.currentPath], ColumnBrowsing.isBrowsableFolder(rootSelection) {
-            return rootSelection.url
+    }
+
+    /// Shows `folder` in the view model. `contentsURL` is where its column listed it (an alias's
+    /// original); nil when it hasn't been listed.
+    private func show(_ folder: FileItem, listedAt contentsURL: URL?) {
+        if let archiveFolder = ColumnBrowsing.archiveColumnSource(for: folder) {
+            // A folder inside the archive being browsed: go there within the archive
+            if viewModel.isInsideArchive, viewModel.currentArchiveURL == archiveFolder.archiveURL {
+                viewModel.navigateInArchive(to: archiveFolder.path)
+            }
+        } else if folder.isAliasFile && contentsURL == nil {
+            // Resolves the alias, then navigates to its original
+            viewModel.openItem(folder)
+        } else {
+            let url = contentsURL ?? folder.url
+            if url != viewModel.currentPath {
+                viewModel.navigateTo(url)
+            }
         }
-        return nil
     }
 
     // MARK: - Columns
@@ -183,9 +198,9 @@ struct ColumnView: View {
 
         if ColumnBrowsing.isBrowsableFolder(item) {
             // Keep the open child column when the same folder is selected again
-            let isAlreadyOpen = previous?.url == item.url && columns.count > depth && columns[depth].url == item.url
+            let isAlreadyOpen = previous?.url == item.url && columns.count > depth && columns[depth].folder.url == item.url
             if !isAlreadyOpen {
-                openColumn(for: item.url, atDepth: depth + 1)
+                openColumn(for: item, atDepth: depth + 1)
             }
         } else {
             truncateColumns(keepingThrough: depth)
@@ -207,14 +222,14 @@ struct ColumnView: View {
         }
     }
 
-    private func openColumn(for folderURL: URL, atDepth depth: Int) {
+    private func openColumn(for folder: FileItem, atDepth depth: Int) {
         truncateColumns(keepingThrough: depth - 1)
-        loadColumn(for: folderURL, atDepth: depth, reloading: false)
+        loadColumn(for: folder, atDepth: depth, reloading: false)
     }
 
     private func reloadColumn(at url: URL) {
         guard let depth = depth(ofColumn: url), depth > 0 else { return }
-        loadColumn(for: url, atDepth: depth, reloading: true)
+        loadColumn(for: columns[depth - 1].folder, atDepth: depth, reloading: true)
     }
 
     private func reloadAllSubColumns() {
@@ -223,9 +238,11 @@ struct ColumnView: View {
         }
     }
 
-    /// Lists a folder in the background. Each depth has one current request: a newer open or a
-    /// truncation invalidates older ones, so holding ↓ over folders never stacks columns.
-    private func loadColumn(for url: URL, atDepth depth: Int, reloading: Bool) {
+    /// Lists a folder (or a folder inside a ZIP archive) in the background. Each depth has one
+    /// current request: a newer open or a truncation invalidates older ones, so holding ↓ over
+    /// folders never stacks columns.
+    private func loadColumn(for folder: FileItem, atDepth depth: Int, reloading: Bool) {
+        let archiveFolder = ColumnBrowsing.archiveColumnSource(for: folder)
         let token = UUID()
         columnState.loadTokens[depth] = token
         let showHiddenFiles = appSettings.showHiddenFiles
@@ -236,32 +253,49 @@ struct ColumnView: View {
             : [:]
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let loaded = try? ColumnBrowsing.loadItems(
-                in: url,
-                showHiddenFiles: showHiddenFiles,
-                sortState: sortState,
-                foldersFirst: foldersFirst,
-                reusingIDs: existingIDs
-            )
+            let loaded: [FileItem]?
+            var contentsURL = folder.url
+            if let archiveFolder {
+                // Archive entries keep their IDs while the archive is unchanged
+                loaded = try? ColumnBrowsing.loadArchiveItems(
+                    in: archiveFolder.archiveURL,
+                    at: archiveFolder.path,
+                    showHiddenFiles: showHiddenFiles,
+                    sortState: sortState,
+                    foldersFirst: foldersFirst
+                )
+            } else if let resolved = ColumnBrowsing.contentsURL(of: folder) {
+                contentsURL = resolved
+                loaded = try? ColumnBrowsing.loadItems(
+                    in: resolved,
+                    showHiddenFiles: showHiddenFiles,
+                    sortState: sortState,
+                    foldersFirst: foldersFirst,
+                    reusingIDs: existingIDs
+                )
+            } else {
+                // An alias whose original can't be found
+                loaded = nil
+            }
 
             DispatchQueue.main.async {
                 guard columnState.loadTokens[depth] == token else { return }
                 columnState.loadTokens.removeValue(forKey: depth)
 
                 if reloading {
-                    applyReload(of: url, atDepth: depth, loaded: loaded)
+                    applyReload(of: folder.url, atDepth: depth, loaded: loaded)
                     return
                 }
                 guard let loaded else { return }
                 // Replace whatever is at this depth (and drop anything deeper)
-                columns = Array(columns.prefix(depth - 1)) + [ColumnData(url: url, items: loaded)]
+                columns = Array(columns.prefix(depth - 1)) + [ColumnData(folder: folder, url: contentsURL, items: loaded)]
                 resolvePendingSelection()
             }
         }
     }
 
-    private func applyReload(of url: URL, atDepth depth: Int, loaded: [FileItem]?) {
-        guard columns.indices.contains(depth - 1), columns[depth - 1].url == url else { return }
+    private func applyReload(of folderURL: URL, atDepth depth: Int, loaded: [FileItem]?) {
+        guard columns.indices.contains(depth - 1), columns[depth - 1].folder.url == folderURL else { return }
         guard let loaded else {
             // The folder itself is gone: close it and everything to its right. Its parent column
             // reloads too and moves its selection.
@@ -269,7 +303,7 @@ struct ColumnView: View {
             return
         }
         let old = columns[depth - 1]
-        columns[depth - 1] = ColumnData(id: old.id, url: url, items: loaded)
+        columns[depth - 1] = ColumnData(id: old.id, folder: old.folder, url: old.url, items: loaded)
         reconcileSelection(depth: depth, oldItems: old.items, newItems: loaded)
         resolvePendingSelection()
     }
@@ -525,7 +559,7 @@ struct ColumnView: View {
         let lowercased = searchString.lowercased()
         let (columnItems, _) = getActiveColumnData()
 
-        if let matchIndex = columnItems.firstIndex(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
+        if let matchIndex = columnItems.firstIndex(where: { $0.displayName.lowercased().hasPrefix(lowercased) }) {
             let matchItem = columnItems[matchIndex]
             selectInColumn(depth: activeColumnIndex, item: matchItem)
             pushSelection([matchItem], index: matchIndex)
@@ -545,12 +579,16 @@ struct ColumnView: View {
 
 struct ColumnData: Identifiable {
     let id: UUID
+    /// The item that was opened: a folder, a symlink or Finder alias to one, or a folder in a ZIP
+    let folder: FileItem
+    /// The folder whose contents are listed (the item's own path; an alias's original)
     let url: URL
     let items: [FileItem]
 
-    init(id: UUID = UUID(), url: URL, items: [FileItem]) {
+    init(id: UUID = UUID(), folder: FileItem, url: URL? = nil, items: [FileItem]) {
         self.id = id
-        self.url = url
+        self.folder = folder
+        self.url = url ?? folder.url
         self.items = items
     }
 }
@@ -641,12 +679,53 @@ final class ColumnDirectoryWatcher {
 enum ColumnBrowsing {
     private static let packageCacheLock = NSLock()
     private static var packageCache: [String: Bool] = [:]
+    private static var aliasCache: [String: Bool] = [:]
 
-    /// Folders open as columns; packages (.app, .rtfd, .photoslibrary…) behave like files.
+    /// Folders open as columns, and so do symbolic links and Finder aliases to folders; packages
+    /// (.app, .rtfd, .photoslibrary…) behave like files.
     static func isBrowsableFolder(_ item: FileItem) -> Bool {
+        if item.isAliasFile { return isAliasToFolder(item.url) }
         guard item.isDirectory else { return false }
         if item.isFromArchive || !item.url.isFileURL { return true }
-        return !isPackage(item.url)
+        // For a symlink, `isPackage` describes its target (the link itself is never a package)
+        return !item.isPackage && !isPackage(item.url)
+    }
+
+    /// Whether a Finder alias points to a folder, from the alias's bookmark data (a small file
+    /// read, cached by path; the alias isn't resolved).
+    static func isAliasToFolder(_ url: URL) -> Bool {
+        let path = url.path
+        packageCacheLock.lock()
+        if let cached = aliasCache[path] {
+            packageCacheLock.unlock()
+            return cached
+        }
+        packageCacheLock.unlock()
+
+        var isFolder = false
+        if let data = try? URL.bookmarkData(withContentsOf: url),
+           let values = URL.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey], fromBookmarkData: data) {
+            isFolder = values.isDirectory == true && values.isPackage != true
+        }
+        packageCacheLock.lock()
+        if aliasCache.count > 1000 {
+            aliasCache.removeAll()
+        }
+        aliasCache[path] = isFolder
+        packageCacheLock.unlock()
+        return isFolder
+    }
+
+    /// The folder whose contents a column for `folder` lists: the item itself (a symlink is browsed
+    /// under its own path), or a Finder alias's original — resolved without UI or mounting, nil
+    /// when it can't be found. Call off the main thread.
+    static func contentsURL(of folder: FileItem) -> URL? {
+        guard folder.isAliasFile else { return folder.url }
+        guard let resolved = try? URL(resolvingAliasFileAt: folder.url, options: [.withoutUI, .withoutMounting]),
+              (try? resolved.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory == true else {
+            return nil
+        }
+        return resolved
     }
 
     static func isPackage(_ url: URL) -> Bool {
@@ -677,15 +756,57 @@ enum ColumnBrowsing {
         foldersFirst: Bool,
         reusingIDs existingIDs: [URL: UUID] = [:]
     ) throws -> [FileItem] {
-        let contents = try FileManager.default.contentsOfDirectory(
-            at: folder,
+        // contentsOfDirectory(at:) doesn't follow a symlink in the last path component: list the
+        // link's target, but keep the children under the link's path (browsed where it's listed)
+        var directoryToList = folder
+        var info = stat()
+        if lstat(folder.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFLNK {
+            directoryToList = folder.resolvingSymlinksInPath()
+        }
+        var contents = try FileManager.default.contentsOfDirectory(
+            at: directoryToList,
             includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey, .isPackageKey],
             options: showHiddenFiles ? [] : [.skipsHiddenFiles]
         )
+        if directoryToList != folder {
+            contents = contents.map { folder.appendingPathComponent($0.lastPathComponent, isDirectory: $0.hasDirectoryPath) }
+        }
         let fileItems = contents.map { url in
             // Warm the package cache from the prefetched value
             _ = isPackage(url)
             return FileItem(url: url, id: existingIDs[url] ?? UUID())
+        }
+        return ListColumnConfigManager.sortedItems(fileItems, sortState: sortState, foldersFirst: foldersFirst)
+    }
+
+    /// A folder inside a ZIP archive, shown as a column from the archive's entries.
+    struct ArchiveFolder: Equatable {
+        let archiveURL: URL
+        /// The folder's path inside the archive
+        let path: String
+    }
+
+    /// Where an archive folder's column gets its contents; nil for anything else.
+    static func archiveColumnSource(for folder: FileItem) -> ArchiveFolder? {
+        guard folder.isFromArchive, folder.isDirectory,
+              let archiveURL = folder.archiveURL, let path = folder.archivePath else { return nil }
+        return ArchiveFolder(archiveURL: archiveURL, path: path)
+    }
+
+    /// Contents of a folder inside a ZIP archive, filtered and sorted like `loadItems`. The archive
+    /// is read through ZipArchiveManager's cache, so item IDs stay the same while it's unchanged.
+    static func loadArchiveItems(
+        in archiveURL: URL,
+        at path: String,
+        showHiddenFiles: Bool,
+        sortState: SortState,
+        foldersFirst: Bool
+    ) throws -> [FileItem] {
+        let archive = ZipArchiveManager.shared
+        let entries = try archive.readContents(of: archiveURL)
+        var fileItems = archive.fileItems(from: archive.entriesAtPath(path, in: entries), archiveURL: archiveURL)
+        if !showHiddenFiles {
+            fileItems = fileItems.filter { !$0.name.hasPrefix(".") }
         }
         return ListColumnConfigManager.sortedItems(fileItems, sortState: sortState, foldersFirst: foldersFirst)
     }
@@ -752,7 +873,7 @@ struct SingleColumnView: View {
                         )
                         .contentShape(Rectangle())
                         .internalDrag(url: item.url)
-                        .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
+                        .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                             item: item,
                             viewModel: viewModel,
                             dropTargetedItemID: $dropTargetedItemID
@@ -785,7 +906,7 @@ struct SingleColumnView: View {
                 }
             }
             .frame(width: appSettings.columnWidthValue)
-            .onDrop(of: [.fileURL], delegate: ColumnBackgroundDropDelegate(
+            .onDrop(of: DropHelper.acceptedDropTypes, delegate: ColumnBackgroundDropDelegate(
                 columnURL: columnURL,
                 viewModel: viewModel,
                 dropTargetedItemID: $dropTargetedItemID,
@@ -917,7 +1038,7 @@ struct PreviewColumn: View {
                     .frame(width: 100)
 
                 VStack(alignment: .leading, spacing: 4) {
-                    InfoRow(label: "Kind", value: item.isDirectory ? "Folder" : kindDescription)
+                    InfoRow(label: "Kind", value: item.kindDescription)
                     InfoRow(label: "Size", value: item.formattedSize)
                     InfoRow(label: "Modified", value: item.formattedDate)
                 }
@@ -943,10 +1064,6 @@ struct PreviewColumn: View {
                 isHovering = false
             }
         }
-    }
-
-    private var kindDescription: String {
-        item.kindDescription
     }
 
     private func cancelThumbnailRequest() {
@@ -996,22 +1113,31 @@ struct InfoRow: View {
 
 // MARK: - Column Background Drop Delegate
 
+/// Drops onto a column's background go into the folder the column shows. Internal drags are
+/// allowed (e.g. from another column or pane); dropping a folder into itself or one of its
+/// descendants, or items into the folder they're already in, is refused.
 struct ColumnBackgroundDropDelegate: DropDelegate {
     let columnURL: URL
     let viewModel: FileBrowserViewModel
     @Binding var dropTargetedItemID: UUID?
     @Binding var isColumnDropTargeted: Bool
 
+    private var acceptsDrops: Bool {
+        !viewModel.isInsideArchive && columnURL.isFileURL && !DropHelper.isSidebarFavoriteDrag()
+    }
+
+    private func isUsefulDrop() -> Bool {
+        let sources = DropHelper.dragSourceURLs()
+        return !DropHelper.isSelfOrDescendantDrop(sources: sources, destination: columnURL)
+            && !DropHelper.isNoOpDrop(sources: sources, destination: columnURL)
+    }
+
     func validateDrop(info: DropInfo) -> Bool {
-        // Don't accept drops during internal drag operations
-        if InternalDragState.shared.isDragging { return false }
-        return !viewModel.isInsideArchive && info.hasItemsConforming(to: [.fileURL])
+        acceptsDrops && info.hasItemsConforming(to: DropHelper.acceptedDropTypes)
     }
 
     func dropEntered(info: DropInfo) {
-        // Don't show drop target during internal drags
-        if InternalDragState.shared.isDragging { return }
-        if dropTargetedItemID == nil {
+        if dropTargetedItemID == nil, acceptsDrops, isUsefulDrop() {
             isColumnDropTargeted = true
         }
     }
@@ -1021,71 +1147,33 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        // Don't show drop indicator during internal drags
-        if InternalDragState.shared.isDragging {
+        guard acceptsDrops, isUsefulDrop() else {
             isColumnDropTargeted = false
             return DropProposal(operation: .forbidden)
         }
-        guard !viewModel.isInsideArchive else {
-            isColumnDropTargeted = false
-            return DropProposal(operation: .forbidden)
-        }
-        // Show column highlight when not over a folder
-        if dropTargetedItemID == nil {
-            isColumnDropTargeted = true
-        } else {
-            isColumnDropTargeted = false
-        }
-        let operation: DropOperation = FileDropOperation(modifierFlags: NSEvent.modifierFlags) == .copy ? .copy : .move
-        return DropProposal(operation: operation)
+        // Over a folder row that row's delegate takes the drop; highlight the column otherwise
+        isColumnDropTargeted = dropTargetedItemID == nil
+        let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
+        return DropProposal(operation: DropHelper.dropOperation(
+            for: operation,
+            sources: DropHelper.dragSourceURLs(),
+            destination: columnURL
+        ))
     }
 
     func performDrop(info: DropInfo) -> Bool {
-        // Don't accept drops during internal drag operations
-        if InternalDragState.shared.isDragging { return false }
+        isColumnDropTargeted = false
+        defer { InternalDragState.shared.endDrag() }
         // If hovering over a folder, that delegate handles it
-        guard dropTargetedItemID == nil, !viewModel.isInsideArchive else { return false }
+        guard dropTargetedItemID == nil, acceptsDrops, isUsefulDrop() else { return false }
 
         // Resolve copy/move now, from the modifiers held at drop time
         let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
-        let providers = info.itemProviders(for: [.fileURL])
-        let collector = DroppedURLCollector()
-        let group = DispatchGroup()
-        for provider in providers {
-            group.enter()
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                if let data = data as? Data,
-                   let url = URL(dataRepresentation: data, relativeTo: nil) {
-                    collector.append(url)
-                }
-                group.leave()
-            }
-        }
-        let destination = columnURL
-        let viewModel = viewModel
-        group.notify(queue: .main) {
-            let urls = collector.urls
-            guard !urls.isEmpty else { return }
-            viewModel.handleDrop(urls: urls, to: destination, operation: operation)
-        }
-        return true
-    }
-}
-
-/// Thread-safe accumulator for URLs delivered by item providers.
-private final class DroppedURLCollector: @unchecked Sendable {
-    private let lock = NSLock()
-    private var collected: [URL] = []
-
-    func append(_ url: URL) {
-        lock.lock()
-        collected.append(url)
-        lock.unlock()
-    }
-
-    var urls: [URL] {
-        lock.lock()
-        defer { lock.unlock() }
-        return collected
+        return DropHelper.performDrop(
+            providers: info.itemProviders(for: [.fileURL]),
+            into: columnURL,
+            viewModel: viewModel,
+            operation: operation
+        )
     }
 }

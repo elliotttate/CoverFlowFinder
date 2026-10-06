@@ -162,9 +162,14 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
         return NSApp.mainWindow
     }
 
-    private var isPanelVisible: Bool {
+    /// Whether the Quick Look panel is on screen (never creates the panel).
+    static var isPanelVisible: Bool {
         guard QLPreviewPanel.sharedPreviewPanelExists() else { return false }
         return QLPreviewPanel.shared()?.isVisible == true
+    }
+
+    private var isPanelVisible: Bool {
+        Self.isPanelVisible
     }
 
     func showPreview(for url: URL, navigate: @escaping (Int) -> Void) {

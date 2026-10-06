@@ -146,7 +146,7 @@ struct PaneView: View {
                 .buttonStyle(.borderless)
 
                 // Path display
-                Text(viewModel.currentPath.lastPathComponent)
+                Text(viewModel.currentPath.finderDisplayName)
                     .font(.headline)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -202,7 +202,7 @@ struct PaneView: View {
                     } else {
                         HStack(spacing: 4) {
                             ForEach(pathComponents, id: \.self) { component in
-                                Text(component.lastPathComponent.isEmpty ? "/" : component.lastPathComponent)
+                                Text(component.lastPathComponent.isEmpty ? "/" : component.finderDisplayName)
                                     .font(.caption)
                                     .padding(.horizontal, 6)
                                     .padding(.vertical, 2)
@@ -421,20 +421,31 @@ final class PaneThumbnailState {
     let owner = ThumbnailRequestOwner()
     var visibleURLs: Set<URL> = []
     var requestedURLs: Set<URL> = []
+    /// The file version each stored thumbnail was made from (an in-place edit needs a new one)
+    var loadedVersions: [URL: FileItem.ContentVersion] = [:]
 
     func cancelAll() {
         ThumbnailCacheManager.shared.cancelRequests(for: owner)
         requestedURLs.removeAll()
+        loadedVersions.removeAll()
     }
 
     /// Shared loader for the dual and quad pane icon views. `store` receives the image (or the
-    /// item's placeholder when it has no thumbnail) on the main queue.
+    /// item's placeholder when it has no thumbnail) on the main queue. `current` is kept when it's
+    /// big enough and was made from the item's current version.
     func load(_ item: FileItem, maxPixelSize: CGFloat, current: NSImage?, store: @escaping (NSImage, URL) -> Void) {
         let url = item.url
-        if let current, PaneThumbnailState.image(current, satisfies: maxPixelSize) { return }
+        let version = item.contentVersion
+        if let current, PaneThumbnailState.image(current, satisfies: maxPixelSize),
+           loadedVersions[url].map({ $0 == version }) ?? true {
+            return
+        }
         let cache = ThumbnailCacheManager.shared
         if let cached = cache.cachedThumbnail(for: item, maxPixelSize: maxPixelSize) {
-            DispatchQueue.main.async { store(cached, url) }
+            DispatchQueue.main.async { [weak self] in
+                self?.loadedVersions[url] = version
+                store(cached, url)
+            }
             return
         }
         guard !requestedURLs.contains(url) else { return }
@@ -444,8 +455,10 @@ final class PaneThumbnailState {
                 self?.requestedURLs.remove(url)
                 switch result {
                 case .loaded(let image):
+                    self?.loadedVersions[url] = version
                     store(image, url)
                 case .failed:
+                    self?.loadedVersions[url] = version
                     store(item.placeholderIcon, url)
                 case .cancelled:
                     break
@@ -616,6 +629,10 @@ struct PaneIconView: View {
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
                 }
                 .onChange(of: appSettings.thumbnailQuality) { _, _ in
+                    refreshThumbnails()
+                }
+                // Edited in place: reload the thumbnails of changed files
+                .onChange(of: viewModel.filteredItems.map(\.contentVersion)) { _, _ in
                     refreshThumbnails()
                 }
                 .onChange(of: viewModel.currentPath) { _, _ in

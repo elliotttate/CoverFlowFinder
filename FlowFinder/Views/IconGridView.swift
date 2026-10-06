@@ -94,7 +94,7 @@ struct IconGridView: View {
                                 thumbnailLoader.setOnScreen(item.url, isVisible)
                             }
                             .internalDrag(url: item.url)
-                            .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
+                            .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                                 item: item,
                                 viewModel: viewModel,
                                 dropTargetedItemID: $dropTargetedItemID
@@ -223,7 +223,7 @@ struct IconGridView: View {
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .featheredTopBlur(height: 50)
-        .onDrop(of: [.fileURL], delegate: ContainerDropDelegate(
+        .onDrop(of: DropHelper.acceptedDropTypes, delegate: ContainerDropDelegate(
             viewModel: viewModel,
             isDropTargeted: $isDropTargeted,
             containerHeight: currentHeight,
@@ -330,7 +330,7 @@ struct IconGridView: View {
         let lowercased = searchString.lowercased()
 
         // Find the first item that starts with the typed string
-        if let matchIndex = items.firstIndex(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
+        if let matchIndex = items.firstIndex(where: { $0.displayName.lowercased().hasPrefix(lowercased) }) {
             let matchItem = items[matchIndex]
             viewModel.selectItem(matchItem)
             viewModel.lastSelectedIndex = matchIndex
@@ -440,7 +440,8 @@ struct IconGridItem: View {
                     )
                     .foregroundColor(isSelected && viewModel.renamingURL != item.url ? .white : .primary)
 
-                if !item.tags.isEmpty {
+                // Tags are only read (from disk the first time) when they're shown
+                if appSettings.showItemTags, !item.tags.isEmpty {
                     TagDotsView(tags: item.tags)
                 }
             }

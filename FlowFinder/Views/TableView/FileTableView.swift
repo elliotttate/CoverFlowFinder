@@ -1290,7 +1290,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     func tableView(_ tableView: NSTableView, typeSelectStringFor tableColumn: NSTableColumn?, row: Int) -> String? {
         // Type-select matches names only (not dates or sizes)
         guard tableColumn?.identifier.rawValue == ListColumn.name.rawValue, row < items.count else { return nil }
-        return items[row].name
+        return items[row].displayName
     }
 
     func tableViewSelectionDidChange(_ notification: Notification) {
@@ -2165,8 +2165,11 @@ extension FileTableCoordinator {
 
     // Customize drag image for multi-selection (shows stacked icons)
     func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, willBeginAt screenPoint: NSPoint, forRowIndexes rowIndexes: IndexSet) {
-        // Mark internal drag as active to suppress drop overlays
-        InternalDragState.shared.isDragging = true
+        // Mark the drag as internal (suppresses drop overlays; drop targets validate the URLs)
+        let urls = rowIndexes.compactMap { row in
+            row < items.count && !items[row].isFromArchive ? items[row].url : nil
+        }
+        InternalDragState.shared.beginDrag(urls: urls)
 
         // Use stack formation for multiple items (like Finder)
         if rowIndexes.count > 1 {
@@ -2176,7 +2179,7 @@ extension FileTableCoordinator {
 
     // Clear internal drag state when drag ends
     func tableView(_ tableView: NSTableView, draggingSession session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
-        InternalDragState.shared.isDragging = false
+        InternalDragState.shared.endDrag()
     }
 
     /// The folder row a drop lands in, or nil when the drop goes into the folder being shown.

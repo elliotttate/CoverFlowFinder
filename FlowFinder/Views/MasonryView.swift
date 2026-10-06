@@ -30,6 +30,8 @@ struct MasonryView: View {
     // CACHED LAYOUT - calculated when items, dimensions or settings change, never during scroll.
     // nil until the first dimensions are known, so the folder doesn't open with estimated sizes.
     @State private var cachedLayout: MasonryLayout?
+    /// Finder tags of the items that have any, read off the main thread (see `startTagRead`)
+    @State private var tagsByURL: [URL: [String]] = [:]
 
     private var columnSpacing: CGFloat {
         max(12, settings.iconGridSpacingValue * 0.6)
@@ -77,7 +79,7 @@ struct MasonryView: View {
     }
 
     private func tagHeight(for item: FileItem) -> CGFloat {
-        settings.showItemTags && !item.tags.isEmpty ? 12 : 0
+        settings.showItemTags && tagsByURL[item.url] != nil ? 12 : 0
     }
 
     private func shouldShowLabel(for item: FileItem) -> Bool {
@@ -187,6 +189,7 @@ struct MasonryView: View {
                     }
                     // Dimensions are read in the background first; the layout follows
                     startDimensionPrefetch()
+                    startTagRead()
                 }
                 .onDisappear {
                     // Abandon pending dimension reads; the next appearance starts over
@@ -289,7 +292,7 @@ struct MasonryView: View {
         }
         .background(Color(nsColor: .controlBackgroundColor))
         .featheredTopBlur(height: 50)
-        .onDrop(of: [.fileURL], delegate: ContainerDropDelegate(
+        .onDrop(of: DropHelper.acceptedDropTypes, delegate: ContainerDropDelegate(
             viewModel: viewModel,
             isDropTargeted: $isDropTargeted,
             containerHeight: currentHeight,
@@ -318,6 +321,11 @@ struct MasonryView: View {
         }
         .onChange(of: settings.showItemTags) { _, _ in
             recalculateLayoutIfReady()
+            startTagRead()
+        }
+        // Tags edited here or elsewhere (the cache entries were dropped): read them again
+        .onChange(of: viewModel.tagRefreshToken) { _, _ in
+            startTagRead()
         }
         .onChange(of: settings.iconGridFontSize) { _, _ in
             recalculateLayoutIfReady()
@@ -356,6 +364,7 @@ struct MasonryView: View {
             imageHeight: imageHeight,
             labelHeight: labelHeight(for: item),
             showLabels: shouldShowLabel(for: item),
+            tags: settings.showItemTags ? tagsByURL[item.url] ?? [] : [],
             dropTargetedItemID: $dropTargetedItemID,
             onSelect: { item, clickedOnTextArea in
                 selectItem(item, clickedOnTextArea: clickedOnTextArea)
@@ -390,6 +399,26 @@ struct MasonryView: View {
         thumbnailLoader.setItems(newItems)
         recalculateLayoutIfReady()
         startDimensionPrefetch()
+        startTagRead()
+    }
+
+    /// Tags live in an extended attribute per file, so they're read in the background (through
+    /// FileTagManager's cache) and the layout only uses what was read; tiles grow a tag row when
+    /// the read finds tags. Only the latest read applies.
+    private func startTagRead() {
+        guard settings.showItemTags else { return }
+        runtime.tagReadGeneration += 1
+        let generation = runtime.tagReadGeneration
+        let urls = runtime.items.filter { !$0.isFromArchive && $0.url.isFileURL }.map(\.url)
+        let state = runtime
+        DispatchQueue.global(qos: .userInitiated).async {
+            let tags = MasonryRuntime.readTags(for: urls)
+            DispatchQueue.main.async {
+                guard state.tagReadGeneration == generation, tags != tagsByURL else { return }
+                tagsByURL = tags
+                recalculateLayoutIfReady()
+            }
+        }
     }
 
     private func recalculateLayoutIfReady() {
@@ -571,7 +600,7 @@ struct MasonryView: View {
         let lowercased = searchString.lowercased()
 
         // Find the first item that starts with the typed string
-        if let matchItem = items.first(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
+        if let matchItem = items.first(where: { $0.displayName.lowercased().hasPrefix(lowercased) }) {
             selectItem(matchItem)
         }
     }
@@ -712,9 +741,24 @@ final class MasonryRuntime: ObservableObject {
     var prefetchingURLs: Set<URL> = []
     /// Bumped when the view disappears so in-flight dimension reads stop
     var prefetchGeneration = 0
+    /// Identifies the latest tag read (older ones are dropped)
+    var tagReadGeneration = 0
 
     private var lookupSource: [FileItem] = []
     private var itemsByURL: [URL: FileItem] = [:]
+
+    /// The tags of the files that have any (call off the main thread: reads extended attributes
+    /// the first time, and warms FileTagManager's cache for everything else that shows tags).
+    static func readTags(for urls: [URL]) -> [URL: [String]] {
+        var tagsByURL: [URL: [String]] = [:]
+        for url in urls {
+            let tags = FileTagManager.getTags(for: url)
+            if !tags.isEmpty {
+                tagsByURL[url] = tags
+            }
+        }
+        return tagsByURL
+    }
 
     /// URL → current item, rebuilt only when the array changes.
     func lookup(for items: [FileItem]) -> [URL: FileItem] {
@@ -735,6 +779,8 @@ struct MasonryItemView: View {
     let imageHeight: CGFloat
     let labelHeight: CGFloat
     let showLabels: Bool
+    /// The item's tags, as read by the parent (never read here: that would hit the disk on main)
+    let tags: [String]
     @Binding var dropTargetedItemID: UUID?
     let onSelect: (FileItem, Bool) -> Void  // Bool indicates if clicked on text area
     let onDoubleClick: (FileItem) -> Void
@@ -816,8 +862,8 @@ struct MasonryItemView: View {
                 }
             }
 
-            if settings.showItemTags, !item.tags.isEmpty {
-                TagDotsView(tags: item.tags)
+            if !tags.isEmpty {
+                TagDotsView(tags: tags)
                     .frame(width: columnWidth, alignment: .center)
             }
         }
@@ -837,7 +883,7 @@ struct MasonryItemView: View {
             isHovering = hovering
         }
         .internalDrag(url: item.url)
-        .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
+        .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
             dropTargetedItemID: $dropTargetedItemID
@@ -1763,7 +1809,7 @@ private final class PhotosMasonryItem: NSCollectionViewItem {
         self.labelHeight = labelHeight
         self.showTitle = showTitle
 
-        titleField.stringValue = item.name
+        titleField.stringValue = item.displayName
         titleField.font = NSFont.systemFont(ofSize: fontSize)
         titleField.isHidden = !showTitle
         titleBackground.isHidden = !showTitle || !isSelected

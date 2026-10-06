@@ -1,7 +1,6 @@
 import SwiftUI
 import AppKit
 import Quartz
-import UniformTypeIdentifiers
 
 struct FileListView: View {
     @EnvironmentObject private var settings: AppSettings
@@ -20,10 +19,15 @@ struct FileListView: View {
             tagRefreshToken: viewModel.tagRefreshToken
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-            handleDrop(providers: providers)
-            return true
-        }
+        // The table takes file drops itself; this catches what it doesn't (file promises from
+        // Mail, Photos, Safari) and shows the badge of the operation that will happen.
+        .onDrop(of: DropHelper.acceptedDropTypes, delegate: ContainerDropDelegate(
+            viewModel: viewModel,
+            isDropTargeted: $isDropTargeted,
+            containerHeight: 0,
+            items: items,
+            autoScroll: false
+        ))
         .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging)
         .allowsHitTesting(true)
         .onChange(of: viewModel.selectedItems) {
@@ -67,34 +71,6 @@ struct FileListView: View {
     private func updateQuickLook(for item: FileItem?) {
         viewModel.updateQuickLookPreview(for: item)
     }
-
-    private func handleDrop(providers: [NSItemProvider]) {
-        // Resolve the operation now, from the modifiers held at drop time
-        let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
-        let collector = DroppedURLCollector()
-        let group = DispatchGroup()
-        for provider in providers {
-            group.enter()
-            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { data, _ in
-                let url = (data as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
-                DispatchQueue.main.async {
-                    if let url {
-                        collector.urls.append(url)
-                    }
-                    group.leave()
-                }
-            }
-        }
-        group.notify(queue: .main) { [viewModel] in
-            guard !collector.urls.isEmpty else { return }
-            viewModel.handleDrop(urls: collector.urls, operation: operation)
-        }
-    }
-}
-
-/// URLs from a drop's item providers, appended on the main queue only.
-private final class DroppedURLCollector: @unchecked Sendable {
-    var urls: [URL] = []
 }
 
 // MARK: - Keyboard Navigation
@@ -145,12 +121,12 @@ enum FileListKeyboardNavigation {
         select(newIndex, in: items, viewModel: viewModel)
     }
 
-    /// Type-ahead: selects the first item whose name starts with `prefix`.
+    /// Type-ahead: selects the first item whose name (as displayed) starts with `prefix`.
     static func jumpToMatch(_ viewModel: FileBrowserViewModel, prefix: String) {
         guard !prefix.isEmpty else { return }
         let items = viewModel.filteredItems
         guard let index = items.firstIndex(where: {
-            $0.name.range(of: prefix, options: [.caseInsensitive, .diacriticInsensitive, .anchored]) != nil
+            $0.displayName.range(of: prefix, options: [.caseInsensitive, .diacriticInsensitive, .anchored]) != nil
         }) else { return }
         select(index, in: items, viewModel: viewModel)
     }

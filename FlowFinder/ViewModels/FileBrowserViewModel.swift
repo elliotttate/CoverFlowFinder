@@ -3948,6 +3948,16 @@ class FileBrowserViewModel: ObservableObject {
         return ordered + selectedItems.filter { !included.contains($0) }.sorted { $0.url.path < $1.url.path }
     }
 
+    /// A copy out of an archive that is taking a while: shown with its progress and a Cancel button.
+    struct ArchiveCopyActivity {
+        let progress: Progress
+        let title: String
+    }
+
+    /// The archive copy-out in progress, once it has run longer than `archiveCopyProgressDelay`.
+    @Published private(set) var archiveCopyProgress: ArchiveCopyActivity?
+    static let archiveCopyProgressDelay: TimeInterval = 0.5
+
     func copySelectedItems() {
         let itemsToCopy = selectedItemsInOrder
         guard !itemsToCopy.isEmpty else { return }
@@ -3957,25 +3967,60 @@ class FileBrowserViewModel: ObservableObject {
             return
         }
 
-        // Archive entries are extracted to a temp folder first, off the main thread.
+        // Archive entries are extracted to a temp folder first, off the main thread. Each archive
+        // item's extraction is a child of `progress` (measured in bytes), cancelled by Cancel.
+        let archiveItems = itemsToCopy.filter(\.isFromArchive)
+        let progress = Progress(totalUnitCount: Int64(archiveItems.count))
+        let title = itemsToCopy.count == 1
+            ? "Copying “\(itemsToCopy[0].displayName)”"
+            : "Copying \(itemsToCopy.count) items"
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.archiveCopyProgressDelay) { [weak self] in
+            // Still running (the copy marks `progress` finished or cancelled when it ends)
+            guard let self, !progress.isFinished, !progress.isCancelled else { return }
+            self.archiveCopyProgress = ArchiveCopyActivity(progress: progress, title: title)
+        }
+
         let entriesSnapshot = archiveEntries
         let pendingWrite = FileClipboard.shared.beginDeferredWrite()
         DispatchQueue.global(qos: .userInitiated).async { [weak self, itemsToCopy, entriesSnapshot] in
             guard let self else { return }
             var urlsToCopy: [URL] = []
+            var extractedURLs: [URL] = []
             var failures: [FileOperationFailure] = []
             for item in itemsToCopy {
+                if progress.isCancelled { break }
                 if !item.isFromArchive {
                     urlsToCopy.append(item.url)
-                } else if let extractedURL = self.extractArchiveItemForCopy(item, entries: entriesSnapshot) {
+                    continue
+                }
+                let itemProgress = Progress(totalUnitCount: 0)
+                progress.addChild(itemProgress, withPendingUnitCount: 1)
+                if let extractedURL = self.extractArchiveItemForCopy(item, entries: entriesSnapshot, progress: itemProgress) {
                     urlsToCopy.append(extractedURL)
-                } else {
+                    extractedURLs.append(extractedURL)
+                } else if !progress.isCancelled {
                     let error = FileOperationEngine.makeError("It couldn’t be extracted from the archive.")
                     failures.append(FileOperationFailure(url: item.url, error: error))
                 }
             }
 
-            DispatchQueue.main.async {
+            let wasCancelled = progress.isCancelled
+            if wasCancelled {
+                // Nothing is copied: drop what was already extracted (the interrupted item's
+                // partial output is removed by the extraction itself)
+                for url in extractedURLs {
+                    ZipArchiveManager.shared.discardCopyExtraction(url)
+                }
+            }
+
+            DispatchQueue.main.async { [weak self] in
+                if !wasCancelled {
+                    progress.completedUnitCount = progress.totalUnitCount
+                }
+                if let self, self.archiveCopyProgress?.progress === progress {
+                    self.archiveCopyProgress = nil
+                }
+                guard !wasCancelled else { return }
                 if !urlsToCopy.isEmpty {
                     FileClipboard.shared.finishDeferredWrite(pendingWrite, urls: urlsToCopy)
                 }
@@ -3984,10 +4029,16 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
+    /// Stops the archive copy-out in progress; nothing is put on the clipboard.
+    func cancelArchiveCopy() {
+        archiveCopyProgress?.progress.cancel()
+    }
+
     /// Extract an archive item into a fresh private temp directory for copy/paste operations.
     /// `entries` is the view's snapshot; ZipArchiveManager re-validates against the archive on disk
-    /// (path containment, size caps, CRC, permissions, quarantine). Problems are shown in a sheet.
-    nonisolated private func extractArchiveItemForCopy(_ item: FileItem, entries: [ZipEntry]) -> URL? {
+    /// (path containment, size caps, CRC, permissions, quarantine). Problems are shown in a sheet;
+    /// a cancelled extraction (via `progress`) returns nil without one.
+    nonisolated private func extractArchiveItemForCopy(_ item: FileItem, entries: [ZipEntry], progress: Progress? = nil) -> URL? {
         guard let archiveURL = item.archiveURL,
               let archivePath = item.archivePath else { return nil }
 
@@ -4007,7 +4058,9 @@ class FileBrowserViewModel: ObservableObject {
 
         let result: ZipExtractionResult
         do {
-            result = try ZipArchiveManager.shared.extractItemForCopy(archivePath: archivePath, from: archiveURL)
+            result = try ZipArchiveManager.shared.extractItemForCopy(archivePath: archivePath, from: archiveURL, progress: progress)
+        } catch let error as CocoaError where error.code == .userCancelled {
+            return nil
         } catch {
             zipNavLogger.error("Couldn't extract archive item for copy: \(error.localizedDescription)")
             showProblem("“\(item.name)” couldn't be copied from “\(archiveURL.lastPathComponent)”.",
@@ -4083,41 +4136,8 @@ class FileBrowserViewModel: ObservableObject {
             return
         }
 
-        // Find the URL to select after deletion (next item, or previous if at end)
-        let currentItems = filteredItems
-        let deletedURLs = Set(itemsToDelete.map { $0.url })
-        var nextSelectionItem: FileItem? = nil
-        var nextSelectionIndex: Int = 0
-
-        // Find the first item that's NOT being deleted, preferring items after the deleted ones
-        if let firstDeletedIndex = currentItems.firstIndex(where: { deletedURLs.contains($0.url) }) {
-            // Look for first non-deleted item after the deleted range
-            for i in firstDeletedIndex..<currentItems.count {
-                if !deletedURLs.contains(currentItems[i].url) {
-                    nextSelectionItem = currentItems[i]
-                    // Calculate what index this will be after deletion
-                    let deletedBefore = currentItems[0..<i].filter { deletedURLs.contains($0.url) }.count
-                    nextSelectionIndex = i - deletedBefore
-                    break
-                }
-            }
-
-            // If no item after, look before
-            if nextSelectionItem == nil && firstDeletedIndex > 0 {
-                for i in stride(from: firstDeletedIndex - 1, through: 0, by: -1) {
-                    if !deletedURLs.contains(currentItems[i].url) {
-                        nextSelectionItem = currentItems[i]
-                        let deletedBefore = currentItems[0..<i].filter { deletedURLs.contains($0.url) }.count
-                        nextSelectionIndex = i - deletedBefore
-                        break
-                    }
-                }
-            }
-        }
-
-        // Store selection info to use after deletion
-        let targetIndex = nextSelectionIndex
-        let targetItem = nextSelectionItem
+        // Find the item to select after deletion (next item, or previous if at end)
+        let nextSelection = selectionAfterRemoving(Set(itemsToDelete.map { $0.url }))
         let urls = selectedItemsInOrder.filter { !$0.isFromArchive }.map { $0.url }
 
         runFileOperation(
@@ -4129,7 +4149,7 @@ class FileBrowserViewModel: ObservableObject {
             let trashedURLs = Set(journal.trashedOriginals)
             if !trashedURLs.isEmpty {
                 // Don't do full refresh - update incrementally
-                self.removeItems(at: trashedURLs, selectingIndex: targetIndex, preferredItem: targetItem)
+                self.removeItems(at: trashedURLs, nextSelection: nextSelection)
                 FinderSoundEffects.shared.play(.moveToTrash)
             }
             if !result.trashUnsupported.isEmpty {
@@ -4138,26 +4158,88 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
-    /// Removes deleted items from the listing and selects the next item.
-    private func removeItems(at removedURLs: Set<URL>, selectingIndex targetIndex: Int, preferredItem targetItem: FileItem?) {
+    /// ⌥⌘⌫: deletes the selection permanently, without the Trash, after the user confirms.
+    /// Can't be undone (no undo action is registered).
+    func deleteSelectionImmediately() {
+        let urls = selectedItemsInOrder.filter { !$0.isFromArchive && $0.url.isFileURL && !isPhotosItem($0) }.map(\.url)
+        guard !urls.isEmpty else {
+            NSSound.beep()
+            return
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        if urls.count == 1, let url = urls.first {
+            alert.messageText = "Are you sure you want to delete “\(FileOperationAlerts.displayName(url))” immediately?"
+        } else {
+            alert.messageText = "Are you sure you want to delete the \(urls.count) selected items immediately?"
+        }
+        alert.informativeText = "You can’t undo this action."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Delete").hasDestructiveAction = true
+
+        FileOperationAlerts.show(alert) { [weak self] response in
+            guard response == .alertSecondButtonReturn, let self else { return }
+            // Chosen now: the listing may have changed while the alert was up
+            let nextSelection = self.selectionAfterRemoving(Set(urls))
+            self.runFileOperation(
+                actionName: nil,
+                failureVerb: "deleted",
+                work: { _ in FileOperationEngine.deleteImmediately(urls) }
+            ) { [weak self] _, result in
+                guard let self else { return }
+                let failedURLs = Set(result.failures.map(\.url))
+                let deletedURLs = Set(urls).subtracting(failedURLs)
+                if !deletedURLs.isEmpty {
+                    self.removeItems(at: deletedURLs, nextSelection: nextSelection)
+                }
+            }
+        }
+    }
+
+    /// The item to select once `deletedURLs` are gone: the first remaining item after the first
+    /// deleted one in display order, else the closest one before it, with its index after the
+    /// removal. Nil when none of them is displayed (e.g. deleted from a Column-view sub-column):
+    /// the view showing them picks the next selection.
+    private func selectionAfterRemoving(_ deletedURLs: Set<URL>) -> (index: Int, item: FileItem?)? {
+        let currentItems = filteredItems
+        guard let firstDeletedIndex = currentItems.firstIndex(where: { deletedURLs.contains($0.url) }) else {
+            return nil
+        }
+        let candidates = Array(currentItems[firstDeletedIndex...]) + currentItems[..<firstDeletedIndex].reversed()
+        guard let next = candidates.first(where: { !deletedURLs.contains($0.url) }),
+              let nextIndex = currentItems.firstIndex(of: next) else {
+            return (0, nil)
+        }
+        let deletedBefore = currentItems[..<nextIndex].filter { deletedURLs.contains($0.url) }.count
+        return (nextIndex - deletedBefore, next)
+    }
+
+    /// Removes deleted items from the listing and selects `nextSelection` (see
+    /// `selectionAfterRemoving`). Without one, the deleted items just leave the selection.
+    private func removeItems(at removedURLs: Set<URL>, nextSelection: (index: Int, item: FileItem?)?) {
         // Remove deleted items from the items array directly (incremental update)
         items.removeAll { removedURLs.contains($0.url) }
         if searchResults.contains(where: { removedURLs.contains($0.url) }) {
             searchResults.removeAll { removedURLs.contains($0.url) }
         }
 
-        // Update selection to the next/previous item
-        let safeTargetIndex = items.isEmpty ? 0 : min(targetIndex, items.count - 1)
-        coverFlowSelectedIndex = safeTargetIndex
-        lastSelectedIndex = safeTargetIndex
-        selectionAnchorIndex = safeTargetIndex
-        if let targetItem = targetItem, !removedURLs.contains(targetItem.url) {
-            selectedItems = [targetItem]
-        } else if !items.isEmpty {
-            // Select item at the target index if original target was deleted
-            selectedItems = [items[safeTargetIndex]]
-        } else {
-            selectedItems.removeAll()
+        if let nextSelection {
+            // Update selection to the next/previous item
+            let safeTargetIndex = items.isEmpty ? 0 : min(nextSelection.index, items.count - 1)
+            coverFlowSelectedIndex = safeTargetIndex
+            lastSelectedIndex = safeTargetIndex
+            selectionAnchorIndex = safeTargetIndex
+            if let targetItem = nextSelection.item, !removedURLs.contains(targetItem.url) {
+                selectedItems = [targetItem]
+            } else if !items.isEmpty {
+                // Select item at the target index if original target was deleted
+                selectedItems = [items[safeTargetIndex]]
+            } else {
+                selectedItems.removeAll()
+            }
+        } else if selectedItems.contains(where: { removedURLs.contains($0.url) }) {
+            selectedItems = selectedItems.filter { !removedURLs.contains($0.url) }
         }
 
         // Clean up hydration tracking
@@ -4297,6 +4379,7 @@ class FileBrowserViewModel: ObservableObject {
         journal.steps = [.moved(from: source, to: destination)]
         FileBrowserViewModel.registerUndo(reversing: journal, actionName: "Rename", undoManager: undoManager, viewModel: self)
         FileClipboard.shared.itemDidMove(from: source, to: destination)
+        carryItemID(from: source, to: destination)
         if selectRenamedItem {
             // Keep the renamed item selected once the listing reloads.
             pendingSelectionURL = destination
@@ -4304,6 +4387,14 @@ class FileBrowserViewModel: ObservableObject {
         }
         refresh()
         return .renamed(destination)
+    }
+
+    /// A renamed item keeps its identity: its ID moves to the new path before the reload, so the
+    /// listing updates it in place (views keep its thumbnail and selection) instead of removing it
+    /// and inserting a new item. Only for items listed here (not search results from elsewhere).
+    private func carryItemID(from source: URL, to destination: URL) {
+        guard let id = itemIDsByPath.removeValue(forKey: source.standardizedPathKey) else { return }
+        itemIDsByPath[destination.standardizedPathKey] = id
     }
 
     /// Commit current rename and start renaming the next item (Tab behavior)
@@ -4316,8 +4407,10 @@ class FileBrowserViewModel: ObservableObject {
         commitRenameAndAdvance(currentItem: currentItem, newName: newName, offset: -1)
     }
 
-    /// `newName` is the edited name without the extension (for files). Next/previous follow the
-    /// displayed order.
+    /// `newName` is the text typed in the rename field ("" = don't rename). It gets the same naming
+    /// rule as a plain commit (`FileItem.newName(forEditedText:)`): a typed extension is kept as
+    /// typed, a file's hidden extension is re-appended, folders get nothing appended.
+    /// Next/previous follow the displayed order.
     private func commitRenameAndAdvance(currentItem: FileItem, newName: String, offset: Int) {
         // Find the item to rename next before the rename reloads the listing
         let displayedItems = filteredItems
@@ -4333,9 +4426,7 @@ class FileBrowserViewModel: ObservableObject {
 
         // Commit the current rename
         var didRename = false
-        if !newName.isEmpty && newName != currentItem.nameWithoutExtension {
-            let ext = currentItem.isDirectory ? "" : currentItem.url.pathExtension
-            let finalName = ext.isEmpty ? newName : "\(newName).\(ext)"
+        if let finalName = currentItem.newName(forEditedText: newName) {
             switch performRename(currentItem, to: finalName, selectRenamedItem: false) {
             case .failed:
                 renamingURL = nil

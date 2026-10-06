@@ -131,7 +131,7 @@ struct TabItemView: View {
                 .font(.system(size: 11))
                 .foregroundColor(isSelected ? .accentColor : .secondary)
 
-            Text(viewModel.currentPath.lastPathComponent)
+            Text(viewModel.currentPath.finderDisplayName)
                 .font(.system(size: 12))
                 .lineLimit(1)
                 .frame(maxWidth: 120)
