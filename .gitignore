@@ -2,8 +2,15 @@
 build/
 DerivedData/
 *.xcuserstate
-*.xcworkspace
-!*.xcworkspace/contents.xcworkspacedata
+# Workspaces: ignore their contents except the shared SwiftPM pins (Package.resolved). The directories themselves
+# must not be ignored, or nothing inside them can be re-included.
+**/*.xcworkspace/*
+!**/*.xcworkspace/contents.xcworkspacedata
+!**/*.xcworkspace/xcshareddata/
+**/*.xcworkspace/xcshareddata/*
+!**/*.xcworkspace/xcshareddata/swiftpm/
+**/*.xcworkspace/xcshareddata/swiftpm/*
+!**/*.xcworkspace/xcshareddata/swiftpm/Package.resolved
 xcuserdata/
 *.pbxuser
 !default.pbxuser
@@ -22,8 +29,9 @@ xcuserdata/
 # Swift Package Manager
 .build/
 Packages/
+# Only the Xcode project's Package.resolved (above) is tracked, so builds use the pinned Sparkle version.
 Package.resolved
-*.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/
+!FlowFinder.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 
 # CocoaPods
 Pods/
@@ -45,5 +53,11 @@ CoverFlowDebug.log
 # DMG files
 *.dmg
 
+# Release zips in the repo root (distribute them through GitHub Releases)
+/*.zip
+
 # Archive
 *.xcarchive
+
+# Playwright / test-run artifacts
+output/

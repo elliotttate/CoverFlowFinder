@@ -1,6 +1,25 @@
 Sidebar Favorites Drag/Drop Deep Dive
 =====================================
 
+> **Status (October 2026): historical.** This analysis describes the old SwiftUI `List` + `DropDelegate`
+> sidebar. The sidebar has since been rewritten as an `NSOutlineView` (`FlowFinder/Views/SidebarView.swift`,
+> `SidebarOutlineView`), whose `validateDrop`/`acceptDrop` work in the outline view's own coordinates. That
+> removed the root causes below (coordinate-space mismatch, `List` row geometry, the container-only drop
+> delegate), so the "line stuck at the bottom" and most dead-zone symptoms are gone.
+>
+> Leftovers fixed in the October 2026 pass:
+> - Hovering the "Favorites" header inserted at the *end*; it now inserts at the start.
+> - Just below the last favorite (over the next section's header) there was no drop target; that strip now
+>   appends to the end, and pointer positions between rows use the nearest row.
+> - "Insert after" needed the bottom 6 px of a row; rows now split at the midpoint (upper half = before, lower
+>   half = after). External files dropped on the middle half of an available favorite still go *into* that folder.
+> - Dragging a favorite put the folder's file URL on the pasteboard with a `.move` mask, so dropping it on a folder
+>   in the file area moved the real folder. Favorite drags now carry only the internal reorder type.
+> - Clicking the already-highlighted row did nothing; clicks now go through the outline view's action.
+> - File promises dropped on a favorite are written on a background queue.
+>
+> Not done: dragging a favorite out of the sidebar to remove it (Finder's "poof") and multi-item favorite drags.
+
 Scope
 -----
 This document focuses on the Favorites sidebar drag/drop behavior in
