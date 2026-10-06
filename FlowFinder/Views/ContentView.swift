@@ -627,7 +627,7 @@ private struct ToolbarSearchControls: View {
             .fixedSize()
             .help("Search mode: \(viewModel.searchMode.rawValue)")
 
-            SearchField(text: $viewModel.searchText, placeholder: viewModel.searchMode.placeholder)
+            SearchField(text: $viewModel.searchText, placeholder: viewModel.searchMode.placeholder, focusTarget: viewModel)
                 .frame(width: 180)
                 .id("main-search-field")
 
@@ -1459,6 +1459,9 @@ enum VolumePaths {
 struct SearchField: NSViewRepresentable {
     @Binding var text: String
     var placeholder: String = "Search"
+    /// Posted as the `.focusFileList` object when Escape leaves the field (the active pane's view
+    /// model), so only that pane's list takes focus. Falls back to the field's window.
+    var focusTarget: AnyObject? = nil
 
     func makeNSView(context: Context) -> NSSearchField {
         let searchField = NSSearchField()
@@ -1529,8 +1532,8 @@ struct SearchField: NSViewRepresentable {
         // Handle Escape key to unfocus the search field and return focus to file list
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-                // Escape pressed - return focus to the file list of this window
-                NotificationCenter.default.post(name: .focusFileList, object: control.window)
+                // Escape pressed - return focus to the active pane's file list
+                NotificationCenter.default.post(name: .focusFileList, object: parent.focusTarget ?? control.window)
 
                 // Fallback: if no view took focus (still on search field), focus content view
                 // This allows KeyboardManager to handle keyboard for SwiftUI views
