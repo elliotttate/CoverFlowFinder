@@ -120,11 +120,24 @@ enum OpenWithMenuBuilder {
 
     // MARK: - Open Actions
 
-    /// Open file URLs with a specific application.
+    /// Open file URLs with a specific application. Failures (e.g. the app can't be launched) are reported in an alert.
     static func openFiles(_ fileURLs: [URL], withAppAt appURL: URL) {
         let config = NSWorkspace.OpenConfiguration()
         config.promptsUserIfNeeded = true
-        NSWorkspace.shared.open(fileURLs, withApplicationAt: appURL, configuration: config)
+        NSWorkspace.shared.open(fileURLs, withApplicationAt: appURL, configuration: config) { _, error in
+            guard let error = error as NSError?,
+                  !(error.domain == NSCocoaErrorDomain && error.code == NSUserCancelledError) else { return }
+            let message = error.localizedDescription
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    let alert = NSAlert()
+                    alert.alertStyle = .warning
+                    alert.messageText = "Couldn’t open with “\(FileManager.default.displayName(atPath: appURL.path))”"
+                    alert.informativeText = message
+                    alert.runModal()
+                }
+            }
+        }
     }
 
     /// Show an NSOpenPanel to choose an application, then open the files with it.

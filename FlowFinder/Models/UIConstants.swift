@@ -75,4 +75,21 @@ extension Notification.Name {
     static let cloudStatusHydrationCompleted = Notification.Name("cloudStatusHydrationCompleted")
     static let focusSearch = Notification.Name("focusSearch")
     static let focusFileList = Notification.Name("focusFileList")
+
+    /// A volume is about to be unmounted: posted by the sidebar right before it asks the system to eject one, and
+    /// forwarded from `NSWorkspace.willUnmountNotification` for ejects started elsewhere. `object` is nil,
+    /// `userInfo[AppNotificationKey.url]` is the volume's root URL. Panes showing that volume should navigate away
+    /// (and stop watching it) so the eject isn't refused as "in use". Can arrive more than once per unmount.
+    static let volumeWillUnmount = Notification.Name("volumeWillUnmount")
+    /// A volume was unmounted (forwarded from `NSWorkspace.didUnmountNotification`). Same payload as `volumeWillUnmount`.
+    static let volumeDidUnmount = Notification.Name("volumeDidUnmount")
+    /// Something outside the window shell (e.g. the sidebar's Photos Library item) wants a view mode change.
+    /// `object` is the `FileBrowserViewModel` it applies to, `userInfo[AppNotificationKey.viewMode]` the `ViewMode`.
+    static let requestViewModeChange = Notification.Name("requestViewModeChange")
+}
+
+/// `userInfo` keys for the app notifications above.
+enum AppNotificationKey {
+    static let url = "url"
+    static let viewMode = "viewMode"
 }

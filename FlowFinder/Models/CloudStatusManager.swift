@@ -5,91 +5,91 @@ import Combine
 final class CloudStatusManager: ObservableObject {
     static let shared = CloudStatusManager()
 
-    /// Publisher for status changes
+    /// Publisher for status changes (sent on the main queue)
     let statusChanged = PassthroughSubject<URL, Never>()
 
-    /// Cache for cloud status to avoid repeated filesystem queries
-    private var statusCache: [URL: CloudSyncStatus] = [:]
-    private let cacheQueue = DispatchQueue(label: "com.flowfinder.cloudstatus", qos: .userInitiated)
+    /// How long a cached status is trusted. Transitional states (and errors) change on their own, so they expire quickly.
+    static let transitionalStatusTTL: TimeInterval = 5
+    static let stableStatusTTL: TimeInterval = 60
 
-    /// Known iCloud container paths (cached for performance)
-    private var iCloudPaths: [String] = []
-    private var iCloudPathsInitialized = false
+    private struct CacheEntry {
+        let status: CloudSyncStatus
+        let fetchedAt: Date
+    }
+
+    /// Cache for cloud status to avoid repeated filesystem queries
+    private var statusCache: [URL: CacheEntry] = [:]
+    private let cacheQueue = DispatchQueue(label: "com.flowfinder.cloudstatus", qos: .userInitiated)
+    private static let maxCacheEntries = 20_000
+
+    /// iCloud locations (standardized paths without trailing slash). Anything outside them is local.
+    private let iCloudRoots: [String]
+    private let now: () -> Date
+    private let fetcher: ((URL) -> CloudSyncStatus)?
 
     /// URLResourceKeys needed for iCloud status detection
     static let cloudResourceKeys: Set<URLResourceKey> = [
         .isUbiquitousItemKey,
         .ubiquitousItemDownloadingStatusKey,
         .ubiquitousItemIsDownloadingKey,
+        .ubiquitousItemDownloadingErrorKey,
         .ubiquitousItemIsUploadedKey,
         .ubiquitousItemIsUploadingKey,
+        .ubiquitousItemUploadingErrorKey,
         .ubiquitousItemDownloadRequestedKey,
         .ubiquitousItemHasUnresolvedConflictsKey
     ]
 
-    private init() {
-        initializeICloudPaths()
+    /// - Parameters:
+    ///   - iCloudRoots: Paths treated as iCloud locations; defaults to the current user's iCloud folders.
+    ///   - now: Clock used for cache expiry (injectable for tests).
+    ///   - fetcher: Replaces the file-system status lookup (tests only).
+    init(iCloudRoots: [String]? = nil,
+         now: @escaping () -> Date = Date.init,
+         fetcher: ((URL) -> CloudSyncStatus)? = nil) {
+        self.iCloudRoots = (iCloudRoots ?? Self.defaultICloudRoots()).map { URL(fileURLWithPath: $0).standardizedFileURL.path }
+        self.now = now
+        self.fetcher = fetcher
     }
 
-    /// Initialize known iCloud paths
-    private func initializeICloudPaths() {
-        var paths: [String] = []
+    /// The current user's iCloud locations.
+    static func defaultICloudRoots(fileManager: FileManager = .default) -> [String] {
+        let home = NSHomeDirectory()
+        // iCloud Drive (com~apple~CloudDocs) and app containers.
+        var roots = [home + "/Library/Mobile Documents"]
 
-        // Modern iCloud Drive path (via CloudStorage)
-        let cloudStoragePath = NSHomeDirectory() + "/Library/CloudStorage"
-        if FileManager.default.fileExists(atPath: cloudStoragePath) {
-            // Look for iCloud Drive specifically
-            if let contents = try? FileManager.default.contentsOfDirectory(atPath: cloudStoragePath) {
-                for item in contents {
-                    if item.contains("iCloud") {
-                        paths.append(cloudStoragePath + "/" + item)
-                    }
-                }
+        // iCloud Drive exposed through a File Provider domain.
+        let cloudStoragePath = home + "/Library/CloudStorage"
+        if let contents = try? fileManager.contentsOfDirectory(atPath: cloudStoragePath) {
+            roots += contents.filter { $0.contains("iCloud") }.map { cloudStoragePath + "/" + $0 }
+        }
+
+        // With "Desktop & Documents Folders" turned on, these sync to iCloud in place.
+        for name in ["Desktop", "Documents"] {
+            let url = URL(fileURLWithPath: home).appendingPathComponent(name, isDirectory: true)
+            if (try? url.resourceValues(forKeys: [.isUbiquitousItemKey]))?.isUbiquitousItem == true {
+                roots.append(url.path)
             }
         }
-
-        // Legacy Mobile Documents path
-        let mobileDocsPath = NSHomeDirectory() + "/Library/Mobile Documents"
-        if FileManager.default.fileExists(atPath: mobileDocsPath) {
-            paths.append(mobileDocsPath)
-        }
-
-        // iCloud Drive symlink path
-        let iCloudDrivePath = NSHomeDirectory() + "/Library/Mobile Documents/com~apple~CloudDocs"
-        if FileManager.default.fileExists(atPath: iCloudDrivePath) {
-            paths.append(iCloudDrivePath)
-        }
-
-        iCloudPaths = paths
-        iCloudPathsInitialized = true
+        return roots
     }
 
-    /// Check if a URL is within an iCloud container
+    /// Whether a URL is inside an iCloud location. A cheap path check (no I/O); `getStatus` then confirms
+    /// with `isUbiquitousItemKey`.
     func isInICloud(_ url: URL) -> Bool {
-        let path = url.path
-
-        // Check for .icloud placeholder files
-        if path.contains(".icloud") || url.lastPathComponent.hasPrefix(".") && url.pathExtension == "icloud" {
-            return true
+        guard url.isFileURL else { return false }
+        let path = url.standardizedFileURL.path
+        return iCloudRoots.contains { root in
+            path == root || path.hasPrefix(root.hasSuffix("/") ? root : root + "/")
         }
-
-        // Check against known iCloud paths
-        for iCloudPath in iCloudPaths {
-            if path.hasPrefix(iCloudPath) {
-                return true
-            }
-        }
-
-        // Fallback: check common path patterns
-        return path.contains("/Library/Mobile Documents/") ||
-               path.contains("/Library/CloudStorage/") && path.contains("iCloud")
     }
 
-    /// Get the cloud sync status for a URL (cached)
+    /// Get the cloud sync status for a URL (cached; see `transitionalStatusTTL` / `stableStatusTTL`)
     func getStatus(for url: URL) -> CloudSyncStatus {
-        // Check cache first
-        if let cached = cacheQueue.sync(execute: { statusCache[url] }) {
-            return cached
+        let now = self.now()
+        if let entry = cacheQueue.sync(execute: { statusCache[url] }),
+           now.timeIntervalSince(entry.fetchedAt) < Self.timeToLive(for: entry.status) {
+            return entry.status
         }
 
         // Not in iCloud = local file
@@ -97,89 +97,125 @@ final class CloudStatusManager: ObservableObject {
             return .local
         }
 
-        // Query filesystem
-        let status = fetchStatus(for: url)
-        cacheQueue.sync { statusCache[url] = status }
+        let status = fetcher?(url) ?? fetchStatus(for: url)
+        cacheQueue.sync {
+            if statusCache.count >= Self.maxCacheEntries {
+                statusCache = statusCache.filter { now.timeIntervalSince($0.value.fetchedAt) < Self.timeToLive(for: $0.value.status) }
+                if statusCache.count >= Self.maxCacheEntries {
+                    statusCache.removeAll()
+                }
+            }
+            statusCache[url] = CacheEntry(status: status, fetchedAt: now)
+        }
         return status
+    }
+
+    static func timeToLive(for status: CloudSyncStatus) -> TimeInterval {
+        switch status {
+        case .downloading, .uploading, .waitingForUpload, .error:
+            return transitionalStatusTTL
+        case .local, .downloaded, .notDownloaded, .hasConflict:
+            return stableStatusTTL
+        }
+    }
+
+    /// The iCloud-related resource values of an item, decoupled from `URLResourceValues` so the mapping is testable.
+    struct ItemState: Equatable {
+        var isUbiquitous = false
+        var hasUnresolvedConflicts = false
+        var isUploading = false
+        var isUploaded: Bool?
+        var hasUploadError = false
+        var isDownloading = false
+        var downloadRequested = false
+        var hasDownloadError = false
+        var downloadingStatus: URLUbiquitousItemDownloadingStatus?
+
+        init() {}
+
+        init(_ values: URLResourceValues) {
+            isUbiquitous = values.isUbiquitousItem ?? false
+            hasUnresolvedConflicts = values.ubiquitousItemHasUnresolvedConflicts ?? false
+            isUploading = values.ubiquitousItemIsUploading ?? false
+            isUploaded = values.ubiquitousItemIsUploaded
+            hasUploadError = values.ubiquitousItemUploadingError != nil
+            isDownloading = values.ubiquitousItemIsDownloading ?? false
+            downloadRequested = values.ubiquitousItemDownloadRequested ?? false
+            hasDownloadError = values.ubiquitousItemDownloadingError != nil
+            downloadingStatus = values.ubiquitousItemDownloadingStatus
+        }
+    }
+
+    static func status(for state: ItemState) -> CloudSyncStatus {
+        guard state.isUbiquitous else { return .local }
+        if state.hasUnresolvedConflicts { return .hasConflict }
+        if state.isUploading { return .uploading(progress: nil) }
+        if state.isDownloading { return .downloading(progress: nil) }
+        if state.hasUploadError || state.hasDownloadError { return .error }
+
+        if state.downloadingStatus == .notDownloaded {
+            return state.downloadRequested ? .downloading(progress: nil) : .notDownloaded
+        }
+        // Present locally (downloaded/current). Not uploaded yet means changes are still queued for iCloud.
+        if state.isUploaded == false {
+            return .waitingForUpload
+        }
+        return .downloaded
     }
 
     /// Fetch status from filesystem
     private func fetchStatus(for url: URL) -> CloudSyncStatus {
-        // Handle .icloud placeholder files (not-downloaded items)
-        if url.lastPathComponent.hasPrefix(".") && url.pathExtension == "icloud" {
+        // Legacy placeholder for an item that isn't downloaded (".Name.ext.icloud")
+        if Self.isPlaceholderName(url.lastPathComponent) {
             return .notDownloaded
         }
 
-        do {
-            let resourceValues = try url.resourceValues(forKeys: Self.cloudResourceKeys)
-
-            // Check if it's actually an iCloud item
-            guard resourceValues.isUbiquitousItem == true else {
-                return .local
-            }
-
-            // Check for conflicts first (highest priority)
-            if resourceValues.ubiquitousItemHasUnresolvedConflicts == true {
-                return .hasConflict
-            }
-
-            // Check upload status
-            if resourceValues.ubiquitousItemIsUploading == true {
-                return .uploading(progress: nil)
-            }
-
-            // Check download status
-            if resourceValues.ubiquitousItemIsDownloading == true {
-                return .downloading(progress: nil)
-            }
-
-            // Check download status key for detailed state
-            if let downloadStatus = resourceValues.ubiquitousItemDownloadingStatus {
-                switch downloadStatus {
-                case URLUbiquitousItemDownloadingStatus.notDownloaded:
-                    return .notDownloaded
-                case URLUbiquitousItemDownloadingStatus.downloaded,
-                     URLUbiquitousItemDownloadingStatus.current:
-                    // Check if also uploaded (fully synced)
-                    if resourceValues.ubiquitousItemIsUploaded == true {
-                        return .downloaded
-                    }
-                    return .downloaded
-                default:
-                    break
-                }
-            }
-
-            // If uploaded, it's synced
-            if resourceValues.ubiquitousItemIsUploaded == true {
-                return .downloaded
-            }
-
-            // Default to downloaded if we can't determine
-            return .downloaded
-        } catch {
-            // If we can't read the attributes, assume local or error
-            return isInICloud(url) ? .error : .local
+        guard let values = try? url.resourceValues(forKeys: Self.cloudResourceKeys) else {
+            return .error
         }
+        return Self.status(for: ItemState(values))
     }
 
-    /// Invalidate cache for a URL
-    func invalidateCache(for url: URL) {
-        cacheQueue.sync { statusCache.removeValue(forKey: url) }
+    private static func isPlaceholderName(_ name: String) -> Bool {
+        name.hasPrefix(".") && name.hasSuffix(".icloud") && name.count > ".icloud".count + 1
+    }
+
+    // MARK: - Invalidation
+
+    /// Drops the cached status of `url` and announces it on `statusChanged`. Call when the item changed on disk.
+    func invalidate(url: URL) {
+        cacheQueue.sync { _ = statusCache.removeValue(forKey: url) }
         DispatchQueue.main.async {
             self.statusChanged.send(url)
         }
     }
 
-    /// Invalidate cache for all URLs in a directory
-    func invalidateCacheForDirectory(_ directoryURL: URL) {
-        let directoryPath = directoryURL.path
+    /// Drops the cached statuses of `directory` and everything inside it (e.g. on file-system events for that folder).
+    func invalidate(directory: URL) {
+        let directoryPath = directory.standardizedFileURL.path
+        let prefix = directoryPath.hasSuffix("/") ? directoryPath : directoryPath + "/"
         cacheQueue.sync {
-            let keysToRemove = statusCache.keys.filter { $0.path.hasPrefix(directoryPath) }
+            let keysToRemove = statusCache.keys.filter {
+                let path = $0.standardizedFileURL.path
+                return path == directoryPath || path.hasPrefix(prefix)
+            }
             for key in keysToRemove {
                 statusCache.removeValue(forKey: key)
             }
         }
+        DispatchQueue.main.async {
+            self.statusChanged.send(directory)
+        }
+    }
+
+    /// Invalidate cache for a URL
+    func invalidateCache(for url: URL) {
+        invalidate(url: url)
+    }
+
+    /// Invalidate cache for all URLs in a directory
+    func invalidateCacheForDirectory(_ directoryURL: URL) {
+        invalidate(directory: directoryURL)
     }
 
     /// Clear all cached statuses
@@ -195,14 +231,30 @@ final class CloudStatusManager: ObservableObject {
         let actualURL = resolveICloudPlaceholder(url)
 
         try FileManager.default.startDownloadingUbiquitousItem(at: actualURL)
-        invalidateCache(for: url)
-        invalidateCache(for: actualURL)
+        invalidate(url: url)
+        invalidate(url: actualURL)
+        watchUntilSettled(actualURL)
     }
 
     /// Evict (remove local copy of) an iCloud item
     func evictItem(at url: URL) throws {
         try FileManager.default.evictUbiquitousItem(at: url)
-        invalidateCache(for: url)
+        invalidate(url: url)
+    }
+
+    /// Re-checks a transferring item until it leaves the transitional state, then invalidates it so the new status
+    /// (e.g. Downloaded) is published on `statusChanged`.
+    private func watchUntilSettled(_ url: URL, attempt: Int = 0) {
+        let maxAttempts = 240 // 2 s apart: up to 8 minutes
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [weak self] in
+            guard let self else { return }
+            let status = self.fetcher?(url) ?? self.fetchStatus(for: url)
+            if Self.timeToLive(for: status) == Self.stableStatusTTL || attempt >= maxAttempts {
+                self.invalidate(url: url)
+            } else {
+                self.watchUntilSettled(url, attempt: attempt + 1)
+            }
+        }
     }
 
     /// Resolve .icloud placeholder to actual file URL
@@ -210,7 +262,7 @@ final class CloudStatusManager: ObservableObject {
         let filename = url.lastPathComponent
 
         // Check if it's a .icloud placeholder (format: .filename.icloud)
-        if filename.hasPrefix(".") && filename.hasSuffix(".icloud") {
+        if Self.isPlaceholderName(filename) {
             // Extract actual filename: .Document.pdf.icloud -> Document.pdf
             var actualName = filename
             actualName.removeFirst() // Remove leading dot
