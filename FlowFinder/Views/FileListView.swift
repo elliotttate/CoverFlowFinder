@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import Quartz
+import UniformTypeIdentifiers
 
 struct FileListView: View {
     @EnvironmentObject private var settings: AppSettings
@@ -25,77 +26,41 @@ struct FileListView: View {
         }
         .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging)
         .allowsHitTesting(true)
-        .onChange(of: viewModel.selectedItems) { newSelection in
-            if let firstSelected = newSelection.first {
-                updateQuickLook(for: firstSelected)
-            } else {
-                updateQuickLook(for: nil)
-            }
+        .onChange(of: viewModel.selectedItems) {
+            // Quick Look follows the lead item of the selection (refreshes if visible)
+            updateQuickLook(for: viewModel.primarySelectedItem)
         }
+        // These closures are registered once and outlive this view value, so they read the
+        // view model's current (sorted, filtered) items when called, never the `items` snapshot.
         .keyboardNavigable(
-            onUpArrow: { shift in navigateSelection(by: -1, extend: shift) },
-            onDownArrow: { shift in navigateSelection(by: 1, extend: shift) },
-            onReturn: { openSelectedItem() },
+            onUpArrow: { shift in FileListKeyboardNavigation.navigate(viewModel, by: -1, extend: shift) },
+            onDownArrow: { shift in FileListKeyboardNavigation.navigate(viewModel, by: 1, extend: shift) },
+            onReturn: { openSelectedItems() },
             onSpace: { toggleQuickLook() },
             onDelete: { viewModel.deleteSelectedItems() },
             onCopy: { viewModel.copySelectedItems() },
             onCut: { viewModel.cutSelectedItems() },
             onPaste: { viewModel.paste() },
-            onTypeAhead: { searchString in jumpToMatch(searchString) }
+            onTypeAhead: { searchString in FileListKeyboardNavigation.jumpToMatch(viewModel, prefix: searchString) }
         )
     }
 
-    private func jumpToMatch(_ searchString: String) {
-        guard !searchString.isEmpty else { return }
-        let lowercased = searchString.lowercased()
-
-        if let matchItem = items.first(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
-            viewModel.selectItem(matchItem)
-            updateQuickLook(for: matchItem)
-        }
-    }
-
-    private func navigateSelection(by offset: Int, extend: Bool = false) {
-        guard !items.isEmpty else { return }
-
-        // When extending selection, use lastSelectedIndex to track the moving end
-        // of the range. Using selectedItems.first would pick an arbitrary item from
-        // the Set, causing the cursor to jump around during shift+arrow.
-        let currentIndex: Int
-        if extend {
-            currentIndex = viewModel.lastSelectedIndex
-        } else if let selected = viewModel.selectedItems.first,
-                  let idx = items.firstIndex(of: selected) {
-            currentIndex = idx
-        } else {
-            currentIndex = viewModel.lastSelectedIndex
-        }
-        let clampedCurrentIndex = max(0, min(items.count - 1, currentIndex))
-        let newIndex = max(0, min(items.count - 1, clampedCurrentIndex + offset))
-        guard newIndex != clampedCurrentIndex || viewModel.selectedItems.isEmpty else { return }
-
-        if extend {
-            viewModel.selectRange(to: newIndex, in: items)
-        } else {
-            let newItem = items[newIndex]
-            viewModel.selectItem(newItem)
-            viewModel.lastSelectedIndex = newIndex
-            viewModel.selectionAnchorIndex = newIndex
-        }
-
-        // Refresh Quick Look if visible
-        updateQuickLook(for: items[newIndex])
-    }
-
-    private func openSelectedItem() {
-        if let selectedItem = viewModel.selectedItems.first {
-            viewModel.openItem(selectedItem)
-        }
+    private func openSelectedItems() {
+        FileListActions.open(viewModel.orderedSelectedItems, primary: viewModel.primarySelectedItem, viewModel: viewModel)
     }
 
     private func toggleQuickLook() {
-        viewModel.toggleQuickLookForSelection { [self] offset in
-            navigateSelection(by: offset)
+        guard let item = viewModel.primarySelectedItem else { return }
+        let viewModel = viewModel
+        // Use async version to avoid blocking during archive extraction
+        viewModel.previewURL(for: item) { previewURL in
+            guard let previewURL else {
+                NSSound.beep()
+                return
+            }
+            QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
+                FileListKeyboardNavigation.navigate(viewModel, by: offset, extend: false)
+            }
         }
     }
 
@@ -104,7 +69,96 @@ struct FileListView: View {
     }
 
     private func handleDrop(providers: [NSItemProvider]) {
-        DropHelper.handleDrop(providers: providers, viewModel: viewModel)
+        // Resolve the operation now, from the modifiers held at drop time
+        let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
+        let collector = DroppedURLCollector()
+        let group = DispatchGroup()
+        for provider in providers {
+            group.enter()
+            provider.loadItem(forTypeIdentifier: UTType.fileURL.identifier, options: nil) { data, _ in
+                let url = (data as? Data).flatMap { URL(dataRepresentation: $0, relativeTo: nil) }
+                DispatchQueue.main.async {
+                    if let url {
+                        collector.urls.append(url)
+                    }
+                    group.leave()
+                }
+            }
+        }
+        group.notify(queue: .main) { [viewModel] in
+            guard !collector.urls.isEmpty else { return }
+            viewModel.handleDrop(urls: collector.urls, operation: operation)
+        }
+    }
+}
+
+/// URLs from a drop's item providers, appended on the main queue only.
+private final class DroppedURLCollector: @unchecked Sendable {
+    var urls: [URL] = []
+}
+
+// MARK: - Keyboard Navigation
+
+@MainActor
+enum FileListKeyboardNavigation {
+    /// ↑/↓ (and ⇧↑/⇧↓) over the view model's current filtered items.
+    /// Plain arrows move past the ends of a multi-selection (Finder); ⇧ extends from the anchor.
+    static func navigate(_ viewModel: FileBrowserViewModel, by offset: Int, extend: Bool) {
+        let items = viewModel.filteredItems
+        guard !items.isEmpty else { return }
+        let maxIndex = items.count - 1
+        let selection = viewModel.selectedItems
+
+        var selectedIndices: [Int] = []
+        if selection.count == 1, let only = selection.first, let index = items.firstIndex(of: only) {
+            selectedIndices = [index]
+        } else if !selection.isEmpty {
+            selectedIndices = items.indices.filter { selection.contains(items[$0]) }
+        }
+
+        guard let lowest = selectedIndices.first, let highest = selectedIndices.last else {
+            // Nothing (visible) selected: start at the end the arrow points to
+            let index = offset > 0 ? 0 : maxIndex
+            select(index, in: items, viewModel: viewModel)
+            return
+        }
+
+        if extend {
+            var anchor = viewModel.selectionAnchorIndex
+            var cursor = viewModel.lastSelectedIndex
+            if !items.indices.contains(cursor) || !selection.contains(items[cursor]) {
+                // Stale cursor (filter or sort changed): extend from the end in the arrow's direction
+                cursor = offset > 0 ? highest : lowest
+                anchor = offset > 0 ? lowest : highest
+            } else if !items.indices.contains(anchor) {
+                anchor = cursor
+            }
+            let newIndex = max(0, min(maxIndex, cursor + offset))
+            guard newIndex != cursor else { return }
+            viewModel.selectionAnchorIndex = anchor
+            viewModel.selectRange(to: newIndex, in: items)
+            return
+        }
+
+        let newIndex = offset > 0 ? min(highest + 1, maxIndex) : max(lowest - 1, 0)
+        if selectedIndices.count == 1 && newIndex == lowest { return }  // already at the end
+        select(newIndex, in: items, viewModel: viewModel)
+    }
+
+    /// Type-ahead: selects the first item whose name starts with `prefix`.
+    static func jumpToMatch(_ viewModel: FileBrowserViewModel, prefix: String) {
+        guard !prefix.isEmpty else { return }
+        let items = viewModel.filteredItems
+        guard let index = items.firstIndex(where: {
+            $0.name.range(of: prefix, options: [.caseInsensitive, .diacriticInsensitive, .anchored]) != nil
+        }) else { return }
+        select(index, in: items, viewModel: viewModel)
+    }
+
+    private static func select(_ index: Int, in items: [FileItem], viewModel: FileBrowserViewModel) {
+        viewModel.selectItem(items[index])
+        viewModel.lastSelectedIndex = index
+        viewModel.selectionAnchorIndex = index
     }
 }
 

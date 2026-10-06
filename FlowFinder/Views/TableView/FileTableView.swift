@@ -2,74 +2,6 @@ import AppKit
 import SwiftUI
 import Combine
 
-// MARK: - Custom Scroll View for Empty Space Click Detection
-
-// Custom clip view that handles clicks in empty space below table rows
-final class TableClipView: NSClipView {
-    weak var coordinator: FileTableCoordinator?
-
-    override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-
-        // Check if click is in empty space (below the document view's content)
-        if let documentView = documentView {
-            let docFrame = documentView.frame
-
-            // In a flipped clip view, check if click Y is beyond document content
-            // documentView frame origin.y is the scroll position (negative when scrolled down)
-            let contentBottom = docFrame.origin.y + docFrame.height
-            NSLog("[TableClipView] mouseDown - point.y: %.1f, contentBottom: %.1f, docFrame: %@", point.y, contentBottom, "\(docFrame)")
-
-            if point.y > contentBottom {
-                NSLog("[TableClipView] Empty space click - deselecting all")
-                coordinator?.handleEmptySpaceClick()
-                if let tableView = documentView as? NSTableView {
-                    tableView.deselectAll(nil)
-                    window?.makeFirstResponder(tableView)
-                }
-                return
-            }
-        }
-
-        super.mouseDown(with: event)
-    }
-}
-
-final class TableScrollView: NSScrollView {
-    weak var coordinator: FileTableCoordinator?
-
-    override func mouseDown(with event: NSEvent) {
-        let point = convert(event.locationInWindow, from: nil)
-        NSLog("[TableScrollView] mouseDown at: %@", "\(point)")
-
-        // Check if click is in empty space below table rows
-        if let tableView = documentView as? NSTableView {
-            let tablePoint = tableView.convert(event.locationInWindow, from: nil)
-            let clickedRow = tableView.row(at: tablePoint)
-
-            // Check if below all rows
-            if clickedRow < 0 && tableView.numberOfRows > 0 {
-                let lastRowRect = tableView.rect(ofRow: tableView.numberOfRows - 1)
-                if tablePoint.y > lastRowRect.maxY {
-                    NSLog("[TableScrollView] Empty space click detected below rows")
-                    coordinator?.handleEmptySpaceClick()
-                    tableView.deselectAll(nil)
-                    window?.makeFirstResponder(tableView)
-                    return
-                }
-            } else if tableView.numberOfRows == 0 {
-                // Empty table - any click is empty space
-                NSLog("[TableScrollView] Empty table click detected")
-                coordinator?.handleEmptySpaceClick()
-                window?.makeFirstResponder(tableView)
-                return
-            }
-        }
-
-        super.mouseDown(with: event)
-    }
-}
-
 // MARK: - NSViewRepresentable Wrapper
 
 struct FileTableView: NSViewRepresentable {
@@ -90,209 +22,20 @@ struct FileTableView: NSViewRepresentable {
     }
 
     func makeNSView(context: Context) -> NSScrollView {
-        let scrollView = TableScrollView()
-        scrollView.coordinator = context.coordinator
-        scrollView.hasVerticalScroller = true
-        scrollView.hasHorizontalScroller = true
-        scrollView.autohidesScrollers = true
-        scrollView.borderType = .noBorder
-        scrollView.drawsBackground = true
-
-        // Use custom clip view to handle clicks in empty space
-        let clipView = TableClipView()
-        clipView.coordinator = context.coordinator
-        scrollView.contentView = clipView
-        NSLog("[FileTableView] Created with custom TableClipView")
-
-        let tableView = KeyboardTableView()
-        tableView.coordinator = context.coordinator
-        tableView.style = .automatic  // Use automatic for best native appearance
-        tableView.usesAlternatingRowBackgroundColors = true
-        tableView.allowsMultipleSelection = true
-        tableView.allowsColumnReordering = true
-        tableView.allowsColumnResizing = true
-        tableView.allowsColumnSelection = false
-        tableView.columnAutoresizingStyle = .noColumnAutoresizing
-        tableView.intercellSpacing = NSSize(width: 0, height: 0)
-        tableView.rowHeight = 22
-        tableView.gridStyleMask = []
-        tableView.focusRingType = .none
-
-        // Register for drag and drop
-        tableView.registerForDraggedTypes([.fileURL])
-        tableView.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
-        tableView.setDraggingSourceOperationMask([.copy], forLocal: false)
-
-        // Set delegate and data source
-        tableView.delegate = context.coordinator
-        tableView.dataSource = context.coordinator
-        context.coordinator.tableView = tableView
-
-        // Double-click to open
-        tableView.doubleAction = #selector(context.coordinator.tableViewDoubleClicked(_:))
-        tableView.target = context.coordinator
-
-        // Setup columns first
-        context.coordinator.setupColumns()
-
-        // Ensure the table view is properly configured as the document view
-        scrollView.documentView = tableView
-
-        // Register for notifications
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(context.coordinator.columnDidResize(_:)),
-            name: NSTableView.columnDidResizeNotification,
-            object: tableView
-        )
-
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(context.coordinator.columnDidMove(_:)),
-            name: NSTableView.columnDidMoveNotification,
-            object: tableView
-        )
-
-        // Observe scroll for lazy metadata hydration
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(context.coordinator.scrollViewDidScroll(_:)),
-            name: NSScrollView.didLiveScrollNotification,
-            object: scrollView
-        )
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(context.coordinator.scrollViewDidEndScroll(_:)),
-            name: NSScrollView.didEndLiveScrollNotification,
-            object: scrollView
-        )
-
-        // Observe hydration completion to refresh visible rows with metadata
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(context.coordinator.handleHydrationCompleted(_:)),
-            name: .metadataHydrationCompleted,
-            object: nil
-        )
-
-        // Observe focus file list notification (e.g., after Escape from search)
-        NotificationCenter.default.addObserver(
-            context.coordinator,
-            selector: #selector(context.coordinator.handleFocusFileList(_:)),
-            name: .focusFileList,
-            object: nil
-        )
-
-        // Setup menus after a short delay to ensure view hierarchy is ready
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-            context.coordinator.setupHeaderMenu()
-            context.coordinator.setupRowMenu()
-        }
-
-        return scrollView
+        context.coordinator.makeScrollView()
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
-        context.coordinator.viewModel = viewModel
-        context.coordinator.columnConfig = columnConfig
-        context.coordinator.appSettings = appSettings
-        context.coordinator.onEmptySpaceClick = onEmptySpaceClick
+        let coordinator = context.coordinator
+        coordinator.bind(viewModel: viewModel)
+        coordinator.columnConfig = columnConfig
+        coordinator.appSettings = appSettings
+        coordinator.onEmptySpaceClick = onEmptySpaceClick
 
         // Ensure header menu is set up (in case it wasn't ready before)
-        context.coordinator.ensureHeaderMenu()
+        coordinator.ensureHeaderMenu()
 
-        // Check if we're currently editing - if so, skip most updates to avoid disrupting focus
-        if context.coordinator.isCurrentlyEditing {
-            return
-        }
-
-        // Check metadata status of incoming items vs what we already have
-        let incomingMetadataCount = items.filter { $0.hasMetadata }.count
-        let currentMetadataCount = context.coordinator.items.filter { $0.hasMetadata }.count
-
-        // Check if tags were refreshed (force reload visible rows to show new tags)
-        let tagsRefreshed = tagRefreshToken != context.coordinator.lastTagRefreshToken
-        context.coordinator.lastTagRefreshToken = tagRefreshToken
-
-        // Check if clipboard state changed (for cut item dimming)
-        let clipboardChanged = viewModel.clipboardItems.count != context.coordinator.lastClipboardCount ||
-            viewModel.clipboardOperation != context.coordinator.lastClipboardOperation
-        context.coordinator.lastClipboardCount = viewModel.clipboardItems.count
-        context.coordinator.lastClipboardOperation = viewModel.clipboardOperation
-
-        // If SwiftUI is passing stale items (less metadata than what hydration gave us), reject the update
-        // This happens because SwiftUI's update cycle captures data before our hydration notification runs
-        if items.count == context.coordinator.items.count &&
-           incomingMetadataCount < context.coordinator.lastHydrationItemCount &&
-           currentMetadataCount >= context.coordinator.lastHydrationItemCount {
-            // Still sync columns, selection, and clipboard-driven dimming
-            if clipboardChanged {
-                context.coordinator.tableView?.reloadData()
-            }
-            context.coordinator.syncColumnsIfNeeded()
-            context.coordinator.syncSelectionFromViewModel()
-            context.coordinator.checkForPendingRename()
-            return
-        }
-
-        // Update items
-        let oldItems = context.coordinator.items
-        context.coordinator.items = items
-
-        if oldItems.count != items.count {
-            NSLog("[TABLE-UPDATE] updateNSView: items count changed %d -> %d, tableView.selectedRowIndexes=%@",
-                  oldItems.count, items.count,
-                  context.coordinator.tableView?.selectedRowIndexes.map { String($0) }.joined(separator: ",") ?? "nil")
-        }
-
-        // Check if items actually changed (including order change from sorting)
-        let changed: Bool
-        if oldItems.count != items.count {
-            changed = true
-        } else {
-            // Check if order changed (important for sorting)
-            var orderChanged = false
-            for i in 0..<items.count {
-                if oldItems[i].id != items[i].id {
-                    orderChanged = true
-                    break
-                }
-            }
-            changed = orderChanged
-        }
-
-        if changed {
-            NSLog("[TABLE-UPDATE] Items changed - calling reloadData. tableView.selectedRowIndexes before=%@",
-                  context.coordinator.tableView?.selectedRowIndexes.map { String($0) }.joined(separator: ",") ?? "nil")
-            context.coordinator.resetThumbnailState()
-            // Reset lastVisibleRange so hydration can trigger
-            context.coordinator.resetHydrationRange()
-            // Reset hydration tracking since we have new items
-            context.coordinator.lastHydrationItemCount = 0
-            context.coordinator.tableView?.reloadData()
-            NSLog("[TABLE-UPDATE] After reloadData. tableView.selectedRowIndexes=%@",
-                  context.coordinator.tableView?.selectedRowIndexes.map { String($0) }.joined(separator: ",") ?? "nil")
-            // Trigger hydration for newly visible rows
-            context.coordinator.hydrateVisibleRows()
-            // Retry after layout settles to ensure visible rows are detected
-            DispatchQueue.main.async { [weak coordinator = context.coordinator] in
-                coordinator?.hydrateVisibleRows()
-            }
-        } else if tagsRefreshed || clipboardChanged {
-            // Tags or clipboard changed but items didn't - reload visible rows to update display
-            context.coordinator.tableView?.reloadData()
-        } else {
-            context.coordinator.reloadVisibleRowsIfNeeded(previousItems: oldItems)
-        }
-
-        // Sync columns if configuration changed
-        context.coordinator.syncColumnsIfNeeded()
-
-        // Sync selection from SwiftUI to NSTableView
-        context.coordinator.syncSelectionFromViewModel()
-
-        // Check if we need to start editing (triggered by renamingURL)
-        context.coordinator.checkForPendingRename()
+        coordinator.update(items: items, tagRefreshToken: tagRefreshToken)
     }
 }
 
@@ -301,10 +44,10 @@ struct FileTableView: NSViewRepresentable {
 @MainActor
 final class KeyboardTableView: NSTableView {
     weak var coordinator: FileTableCoordinator?
-    var shouldRefuseFirstResponder = false
 
     override var acceptsFirstResponder: Bool {
-        if shouldRefuseFirstResponder {
+        // Don't take focus away from the inline rename field while it's editing
+        if coordinator?.isCurrentlyEditing == true {
             return false
         }
         return super.acceptsFirstResponder
@@ -318,71 +61,79 @@ final class KeyboardTableView: NSTableView {
     // Auto-scroll when dragging near edges
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
         // Call autoscroll on enclosing scroll view for Finder-style edge scrolling
-        if let scrollView = enclosingScrollView {
-            let event = NSApp.currentEvent
-            if let event = event {
-                scrollView.contentView.autoscroll(with: event)
-            }
+        if let scrollView = enclosingScrollView, let event = NSApp.currentEvent {
+            scrollView.contentView.autoscroll(with: event)
         }
         return super.draggingUpdated(sender)
     }
 
     override func keyDown(with event: NSEvent) {
-        let hasCommand = event.modifierFlags.contains(.command)
-        let hasShift = event.modifierFlags.contains(.shift)
-
-        switch event.keyCode {
-        case 49: // Space - Quick Look
-            coordinator?.triggerQuickLook()
-        case 36: // Return - Open item
-            coordinator?.openSelectedItem()
-        case 51 where hasCommand: // Cmd+Backspace - Delete
-            coordinator?.deleteSelectedItems()
-        case 8 where hasCommand && !hasShift: // Cmd+C - Copy
-            coordinator?.copySelectedItems()
-        case 7 where hasCommand && !hasShift: // Cmd+X - Cut
-            coordinator?.cutSelectedItems()
-        case 9 where hasCommand && !hasShift: // Cmd+V - Paste
-            coordinator?.pasteItems()
-        case 0 where hasCommand && !hasShift: // Cmd+A - Select All
-            coordinator?.selectAllItems()
-        default:
-            super.keyDown(with: event)
+        // ⌘-shortcuts (copy, cut, paste, select all, trash) belong to the menu bar; arrows and
+        // type-select fall through to NSTableView. Space and Return work here as well as through
+        // the window's keyboard handler, so the table works whichever one sees the key first.
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if modifiers.isEmpty {
+            switch event.charactersIgnoringModifiers {
+            case " ":
+                coordinator?.triggerQuickLook()
+                return
+            case "\r", "\u{3}": // Return, keypad Enter
+                coordinator?.openSelectedItems()
+                return
+            default:
+                break
+            }
         }
+        super.keyDown(with: event)
     }
 
     override func mouseDown(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
-        let clickedRow = row(at: point)
+        var clickedRow = row(at: point)
+        let modifiers = event.modifierFlags
 
-        // Check if click is actually in empty space below all rows
-        // row(at:) can return the last row index when clicking near it
-        var isEmptySpaceClick = clickedRow < 0 || numberOfRows == 0
+        // A click anywhere outside the rename field commits the rename first (Finder)
+        coordinator?.commitEditingForMouseDown()
 
-        if !isEmptySpaceClick && numberOfRows > 0 {
-            // Check if click point is below the last row's frame
-            let lastRowRect = rect(ofRow: numberOfRows - 1)
-            NSLog("[TableView] mouseDown - point.y: %.1f, lastRowRect.maxY: %.1f, clickedRow: %d", point.y, lastRowRect.maxY, clickedRow)
-            if point.y > lastRowRect.maxY {
-                isEmptySpaceClick = true
-            }
+        if clickedRow >= 0, numberOfRows > 0, point.y > rect(ofRow: numberOfRows - 1).maxY {
+            clickedRow = -1
         }
 
-        // Handle empty space click (below all rows or empty table)
-        if isEmptySpaceClick {
-            NSLog("[TableView] Empty space click - deselecting all")
+        // Control-click opens the context menu; it must not trigger click-to-rename
+        if modifiers.contains(.control) {
+            super.mouseDown(with: event)
+            return
+        }
+
+        if clickedRow < 0 {
+            // Empty space below the rows
+            if modifiers.contains(.command) || modifiers.contains(.shift) {
+                // ⌘/⇧-click on empty space keeps the selection (Finder)
+                window?.makeFirstResponder(self)
+                return
+            }
             coordinator?.handleEmptySpaceClick()
-            deselectAll(nil)
+            // Let NSTableView track the mouse so a drag-select can start from empty space
+            coordinator?.beginMouseSelection(row: -1)
+            super.mouseDown(with: event)
+            coordinator?.endMouseSelection()
+            return
+        }
+
+        if modifiers.contains(.shift) && !modifiers.contains(.command) {
+            // Range from the view model's anchor, the same anchor ⇧↑/⇧↓ extend from
+            coordinator?.handleShiftClick(row: clickedRow)
             window?.makeFirstResponder(self)
-            return  // Don't call super - prevents NSTableView from selecting
+            return
         }
 
         // Call coordinator's handleClick before super to capture pre-selection state
         coordinator?.handleRowClick(row: clickedRow, event: event)
 
+        coordinator?.beginMouseSelection(row: clickedRow)
         super.mouseDown(with: event)
+        coordinator?.endMouseSelection()
     }
-
 }
 
 // MARK: - Custom Row View with Always-Emphasized Selection
@@ -394,49 +145,212 @@ final class EmphasizedTableRowView: NSTableRowView {
     }
 }
 
+// MARK: - Opening Items
+
+@MainActor
+enum FileListActions {
+    /// Opening more external items than this at once asks for confirmation.
+    static let openConfirmationThreshold = 20
+
+    /// True if opening `item` navigates inside the browser (folders, ZIPs, folders in archives)
+    /// rather than handing it to another app.
+    static func navigatesInApp(_ item: FileItem) -> Bool {
+        if item.isFromArchive { return item.isDirectory }
+        if item.isZipArchive { return true }
+        guard item.url.isFileURL, item.isDirectory else { return false }
+        return !NSWorkspace.shared.isFilePackage(atPath: item.url.path)
+    }
+
+    /// Opens every item (Finder). Only one folder can be shown, so of several folders the lead
+    /// item (or the first) is entered after the other items have been opened.
+    static func open(_ items: [FileItem], primary: FileItem?, viewModel: FileBrowserViewModel) {
+        guard !items.isEmpty else { return }
+        if items.count == 1 {
+            viewModel.openItem(items[0])
+            return
+        }
+
+        let navigable = items.filter { navigatesInApp($0) }
+        let external = items.filter { !navigatesInApp($0) }
+
+        if external.count > openConfirmationThreshold {
+            let alert = NSAlert()
+            alert.messageText = "Are you sure you want to open \(external.count) items?"
+            alert.informativeText = "Each item opens in its own application window."
+            alert.addButton(withTitle: "Open")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else { return }
+        }
+
+        for item in external {
+            viewModel.openItem(item)
+        }
+        if let target = navigable.first(where: { $0 == primary }) ?? navigable.first {
+            viewModel.openItem(target)
+        }
+    }
+}
+
+// MARK: - Thumbnail Store
+
+/// The table's row thumbnails: bounded by the coordinator (pruned to the rows around the visible
+/// ones) and dropped when a file's modification date or size changes, so edited files refresh.
+struct TableThumbnailStore {
+    private struct Entry {
+        let image: NSImage
+        var modificationDate: Date?
+        var size: Int64
+        var hasMetadata: Bool
+    }
+
+    private var entries: [URL: Entry] = [:]
+    let limit: Int
+
+    init(limit: Int) {
+        self.limit = limit
+    }
+
+    var count: Int { entries.count }
+    var isOverLimit: Bool { entries.count > limit }
+
+    func contains(_ url: URL) -> Bool {
+        entries[url] != nil
+    }
+
+    /// The stored thumbnail for `item`, unless the file changed since it was made.
+    mutating func image(for item: FileItem) -> NSImage? {
+        guard var entry = entries[item.url] else { return nil }
+        if item.hasMetadata {
+            if entry.hasMetadata {
+                if entry.modificationDate != item.modificationDate || entry.size != item.size {
+                    entries[item.url] = nil
+                    return nil
+                }
+            } else {
+                // Made before the item's metadata was loaded: adopt its version now
+                entry.modificationDate = item.modificationDate
+                entry.size = item.size
+                entry.hasMetadata = true
+                entries[item.url] = entry
+            }
+        }
+        return entry.image
+    }
+
+    mutating func store(_ image: NSImage, for item: FileItem) {
+        entries[item.url] = Entry(
+            image: image,
+            modificationDate: item.modificationDate,
+            size: item.size,
+            hasMetadata: item.hasMetadata
+        )
+    }
+
+    mutating func prune(keeping shouldKeep: (URL) -> Bool) {
+        entries = entries.filter { shouldKeep($0.key) }
+    }
+
+    mutating func removeAll() {
+        entries.removeAll()
+    }
+}
+
 // MARK: - Coordinator (NSTableViewDataSource & NSTableViewDelegate)
 
 @MainActor
 final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDelegate, FileNameCellViewDelegate, OpenWithActionTarget {
-    var viewModel: FileBrowserViewModel
+    private(set) var viewModel: FileBrowserViewModel
     var columnConfig: ListColumnConfigManager
     var appSettings: AppSettings
     weak var tableView: NSTableView?
 
-    var items: [FileItem] = []
-    private var thumbnails: [URL: NSImage] = [:]
-    private var pendingThumbnailRows = IndexSet()
-    private let thumbnailCache = ThumbnailCacheManager.shared
+    /// Rows shown by the table. Content always comes from the view model's current items.
+    private(set) var items: [FileItem] = []
+    /// Row of each URL in `items`; rebuilt whenever rows are added, removed or reordered.
+    private(set) var rowIndex: [URL: Int] = [:]
+
+    // Freshest item per URL (from viewModel.items); nil = rebuild on next use
+    private var freshItemsByURL: [URL: FileItem]?
+    private var viewModelItemsCancellable: AnyCancellable?
+    private var observedViewModel: FileBrowserViewModel?
+
+    // Items that arrived while renaming and would add, remove or move rows; applied when editing ends
+    private var deferredItems: [FileItem]?
+    // Scroll position kept across a reload that briefly empties the list (same folder)
+    private var pendingScrollAnchor: ScrollAnchor?
+    private var lastFolder: URL?
+    private struct SortKey: Equatable {
+        let sort: SortState
+        let foldersFirst: Bool
+    }
+    private var lastSortKey: SortKey?
+    // The last items array SwiftUI passed in, retained so its storage identity can't be reused
+    private var lastIncomingItems: [FileItem] = []
+
     private var isUpdatingSelection = false
     private var isUpdatingSort = false  // Prevent sort feedback loop
-    private var lastColumnSnapshot: [ColumnSettings] = []
     private var lastSortColumn: ListColumn?
     private var lastSortDirection: SortDirection?
+    private var lastSyncedSelection: Set<FileItem>?
+    private var activeMouseSelection: Int?  // row the current mouse-down started on (-1 = empty space)
+
+    // Columns
+    private var appliedColumns: [ColumnSettings] = []
+    private var isApplyingColumnLayout = false
+    private var columnCommitWorkItem: DispatchWorkItem?
+    private static let columnCommitDelay: TimeInterval = 0.15
+
+    // Display settings
+    private var lastDisplaySettings: DisplaySettings?
+    var lastTagRefreshToken: Int = 0  // Track tag changes for UI refresh
+
+    // Cut dimming
+    private var lastClipboardItems: [URL] = []
+    private var lastClipboardOperation: ClipboardOperation = .copy
+    private(set) var cutURLs: Set<URL> = []
 
     // Lazy loading state
     private var lastVisibleRange: Range<Int>?
     private var hydrationDebounceTimer: Timer?
     private let hydrationDebounceInterval: TimeInterval = 0.05
     private var isLiveScrolling = false
-    var lastHydrationItemCount: Int = 0  // Track items with metadata after hydration (public for updateNSView access)
-    var lastTagRefreshToken: Int = 0  // Track tag changes for UI refresh
-    var lastClipboardCount: Int = 0  // Track clipboard changes for cut dimming
-    var lastClipboardOperation: ClipboardOperation = .copy
+    private var requestedCloudStatusURLs: Set<URL> = []
+
+    // Tags are read off the main thread; FileTagManager's cache is warm for these URLs
+    private var loadedTagURLs: Set<URL> = []
+    private var pendingTagURLs: Set<URL> = []
+    private static let tagQueue = DispatchQueue(label: "com.flowfinder.table.tags", qos: .userInitiated)
+
+    // Thumbnails, bounded to the rows around the visible ones
+    private var thumbnails = TableThumbnailStore(limit: 400)
+    var thumbnailCount: Int { thumbnails.count }
+    private let thumbnailCache = ThumbnailCacheManager.shared
+    private static let thumbnailPixelSize: CGFloat = 64
 
     // Thumbnail preheat state (like PHCachingImageManager)
     private var lastPreheatRange: Range<Int>?
-    private var preheatBuffer = 20  // Rows to preheat beyond visible
-    private var preheatURLs: Set<URL> = []  // Currently preheating
+    private let preheatBuffer = 20  // Rows to preheat beyond visible
 
     // Renaming state
     private var lastProcessedRenamingURL: URL?
     private weak var currentEditingCell: FileNameCellView?
+    private var pendingRenameWorkItem: DispatchWorkItem?
+
+    // Drag and drop (cached per dragging session)
+    private var dropSessionNumber: Int?
+    private var dropSessionURLs: [URL] = []
+    private var dropVolumeCache: [URL: Bool] = [:]
+
+    // Context menu targets, captured when the menu opens
+    private var contextMenuItems: [FileItem] = []
+    private var contextMenuClickedItem: FileItem?
 
     // Callback for empty space click (used by CoverFlow view)
     var onEmptySpaceClick: (() -> Void)?
 
+    /// True while an inline rename is in progress (derived from the cell's field editor).
     var isCurrentlyEditing: Bool {
-        return currentEditingCell?.isEditing ?? false
+        currentEditingCell?.isEditingActive ?? false
     }
 
     init(viewModel: FileBrowserViewModel, columnConfig: ListColumnConfigManager, appSettings: AppSettings, onEmptySpaceClick: (() -> Void)? = nil) {
@@ -445,11 +359,388 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         self.appSettings = appSettings
         self.onEmptySpaceClick = onEmptySpaceClick
         super.init()
+        bind(viewModel: viewModel)
     }
 
     deinit {
         hydrationDebounceTimer?.invalidate()
     }
+
+    // MARK: - View Setup
+
+    func makeScrollView() -> NSScrollView {
+        let scrollView = NSScrollView()
+        scrollView.hasVerticalScroller = true
+        scrollView.hasHorizontalScroller = true
+        scrollView.autohidesScrollers = true
+        scrollView.borderType = .noBorder
+        scrollView.drawsBackground = true
+
+        let tableView = KeyboardTableView()
+        tableView.coordinator = self
+        tableView.style = .automatic  // Use automatic for best native appearance
+        tableView.usesAlternatingRowBackgroundColors = true
+        tableView.allowsMultipleSelection = true
+        tableView.allowsColumnReordering = true
+        tableView.allowsColumnResizing = true
+        tableView.allowsColumnSelection = false
+        tableView.columnAutoresizingStyle = .noColumnAutoresizing
+        tableView.intercellSpacing = NSSize(width: 0, height: 0)
+        tableView.rowHeight = Self.rowHeight(fontSize: appSettings.listFontSize, iconSize: appSettings.listIconSizeValue)
+        tableView.gridStyleMask = []
+        tableView.focusRingType = .none
+
+        // Register for drag and drop
+        tableView.registerForDraggedTypes([.fileURL])
+        tableView.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
+        tableView.setDraggingSourceOperationMask([.copy], forLocal: false)
+
+        // Set delegate and data source
+        tableView.delegate = self
+        tableView.dataSource = self
+        self.tableView = tableView
+
+        // Double-click to open
+        tableView.doubleAction = #selector(tableViewDoubleClicked(_:))
+        tableView.target = self
+
+        // Setup columns first
+        setupColumns()
+
+        // Ensure the table view is properly configured as the document view
+        scrollView.documentView = tableView
+
+        NotificationCenter.default.addObserver(self, selector: #selector(columnDidResize(_:)), name: NSTableView.columnDidResizeNotification, object: tableView)
+        NotificationCenter.default.addObserver(self, selector: #selector(columnDidMove(_:)), name: NSTableView.columnDidMoveNotification, object: tableView)
+
+        // Observe scroll for lazy metadata hydration
+        NotificationCenter.default.addObserver(self, selector: #selector(scrollViewDidScroll(_:)), name: NSScrollView.didLiveScrollNotification, object: scrollView)
+        NotificationCenter.default.addObserver(self, selector: #selector(scrollViewDidEndScroll(_:)), name: NSScrollView.didEndLiveScrollNotification, object: scrollView)
+
+        // Observe focus file list notification (e.g., after Escape from search)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleFocusFileList(_:)), name: .focusFileList, object: nil)
+
+        // Setup menus after a short delay to ensure view hierarchy is ready
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.setupHeaderMenu()
+            self?.setupRowMenu()
+        }
+
+        return scrollView
+    }
+
+    /// Observes `newViewModel`'s items and its own hydration notifications (not other windows').
+    func bind(viewModel newViewModel: FileBrowserViewModel) {
+        guard observedViewModel !== newViewModel else { return }
+        if let old = observedViewModel {
+            NotificationCenter.default.removeObserver(self, name: .metadataHydrationCompleted, object: old)
+            NotificationCenter.default.removeObserver(self, name: .cloudStatusHydrationCompleted, object: old)
+        }
+        viewModel = newViewModel
+        observedViewModel = newViewModel
+        freshItemsByURL = nil
+        viewModelItemsCancellable = newViewModel.$items.sink { [weak self] _ in
+            // Sent before the new value is stored; rebuilt lazily on next use
+            self?.freshItemsByURL = nil
+        }
+        NotificationCenter.default.addObserver(self, selector: #selector(handleHydrationCompleted(_:)), name: .metadataHydrationCompleted, object: newViewModel)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleHydrationCompleted(_:)), name: .cloudStatusHydrationCompleted, object: newViewModel)
+    }
+
+    // MARK: - Updates
+
+    /// Applies a SwiftUI update: rows, display settings, tags, cut dimming, columns, selection, rename.
+    func update(items newItems: [FileItem], tagRefreshToken: Int) {
+        guard tableView != nil else { return }
+        reconcileEditingState()
+        applyDisplaySettingsIfNeeded()
+
+        let changedCutURLs = refreshCutURLs()
+
+        // Most updates (selection, clipboard…) pass the very same array and the view model's items
+        // haven't changed: nothing to do for the rows.
+        let rowsUnchanged = freshItemsByURL != nil && deferredItems == nil && Self.sameStorage(newItems, lastIncomingItems)
+        lastIncomingItems = newItems
+        if !rowsUnchanged {
+            let resolved = resolveFreshContent(newItems)
+            if isCurrentlyEditing && !Self.sameURLs(resolved, items) {
+                // Don't add, remove or move rows under the rename field; apply when editing ends
+                deferredItems = newItems
+            } else {
+                deferredItems = nil
+                applyItems(resolved)
+            }
+        }
+
+        if tagRefreshToken != lastTagRefreshToken {
+            lastTagRefreshToken = tagRefreshToken
+            reloadRows(loadedRows())
+        }
+        applyCutDimming(to: changedCutURLs)
+
+        syncColumnsIfNeeded()
+
+        if !isCurrentlyEditing {
+            syncSelectionFromViewModel()
+        }
+
+        checkForPendingRename()
+    }
+
+    /// The freshest version of each item. viewModel.items is updated in place by metadata and
+    /// cloud-status hydration, while the `items` SwiftUI passes in can lag behind it (e.g. Cover Flow's
+    /// sorted copy), so row content always comes from the view model.
+    func resolveFreshContent(_ incoming: [FileItem]) -> [FileItem] {
+        let index = freshIndex()
+        guard !index.isEmpty else { return incoming }
+        return incoming.map { index[$0.url] ?? $0 }
+    }
+
+    private func freshIndex() -> [URL: FileItem] {
+        if let cached = freshItemsByURL { return cached }
+        var index = [URL: FileItem](minimumCapacity: viewModel.items.count)
+        for item in viewModel.items {
+            index[item.url] = item
+        }
+        freshItemsByURL = index
+        return index
+    }
+
+    /// Same array storage (cheap identity check; `rhs` is retained by the caller, so its storage
+    /// can't have been freed and reused).
+    static func sameStorage(_ lhs: [FileItem], _ rhs: [FileItem]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        if lhs.isEmpty { return true }
+        return lhs.withUnsafeBufferPointer { left in
+            rhs.withUnsafeBufferPointer { right in left.baseAddress == right.baseAddress }
+        }
+    }
+
+    static func sameURLs(_ lhs: [FileItem], _ rhs: [FileItem]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        for index in lhs.indices where lhs[index].url != rhs[index].url {
+            return false
+        }
+        return true
+    }
+
+    /// Replaces the rows. Same URLs in the same order only reloads rows whose content changed;
+    /// anything else reloads the table, keeping the scroll position and the selection (by URL).
+    func applyItems(_ newItems: [FileItem]) {
+        guard let tableView else { return }
+        let oldItems = items
+
+        // A re-sort by the user shows the selection (or the top); data-driven changes keep the position
+        let sortKey = SortKey(sort: columnConfig.sortStateSnapshot(), foldersFirst: appSettings.foldersFirst)
+        let sortChanged = lastSortKey != nil && lastSortKey != sortKey
+        lastSortKey = sortKey
+
+        if Self.sameURLs(oldItems, newItems) {
+            items = newItems
+            reloadRows(Self.rowsWithChangedContent(old: oldItems, new: newItems, in: loadedRows()))
+            return
+        }
+
+        let folderChanged = lastFolder != nil && lastFolder != viewModel.currentPath
+        if lastFolder != viewModel.currentPath {
+            lastFolder = viewModel.currentPath
+            pendingScrollAnchor = nil
+            thumbnails.removeAll()
+            loadedTagURLs.removeAll()
+            requestedCloudStatusURLs.removeAll()
+        }
+
+        let anchor = folderChanged || sortChanged ? nil : (captureScrollAnchor() ?? pendingScrollAnchor)
+        items = newItems
+        rebuildRowIndex()
+        pruneThumbnails(force: true)
+        isLiveScrolling = false
+        lastVisibleRange = nil
+        lastPreheatRange = nil
+
+        // reloadData may trim the selection; the view model's selection is re-applied below
+        isUpdatingSelection = true
+        tableView.reloadData()
+        isUpdatingSelection = false
+
+        syncSelectionFromViewModel(allowScroll: false)
+
+        if folderChanged || sortChanged {
+            pendingScrollAnchor = nil
+            if let row = sortChanged ? cursorRow(in: tableView.selectedRowIndexes) : nil {
+                tableView.scrollRowToVisible(row)
+            } else if !newItems.isEmpty {
+                tableView.scrollRowToVisible(0)
+            }
+        } else if newItems.isEmpty {
+            // e.g. a refresh that empties the list first: restore once the rows are back
+            pendingScrollAnchor = anchor
+        } else {
+            pendingScrollAnchor = nil
+            restoreScrollAnchor(anchor)
+        }
+
+        // Trigger hydration for newly visible rows, and again once layout has settled
+        hydrateVisibleRows()
+        DispatchQueue.main.async { [weak self] in
+            self?.hydrateVisibleRows()
+        }
+    }
+
+    private func rebuildRowIndex() {
+        var index = [URL: Int](minimumCapacity: items.count)
+        for (row, item) in items.enumerated() {
+            index[item.url] = row
+        }
+        rowIndex = index
+    }
+
+    static func rowsWithChangedContent(old: [FileItem], new: [FileItem], in rows: IndexSet) -> IndexSet {
+        var changed = IndexSet()
+        for row in rows where row < old.count && row < new.count {
+            if old[row].contentVersion != new[row].contentVersion || old[row].creationDate != new[row].creationDate {
+                changed.insert(row)
+            }
+        }
+        return changed
+    }
+
+    /// Rows that currently have cell views (visible plus the table's prepared overdraw).
+    func loadedRows() -> IndexSet {
+        guard let tableView, !items.isEmpty else { return IndexSet() }
+        var rows = IndexSet()
+        for rect in [tableView.visibleRect, tableView.preparedContentRect] {
+            let range = tableView.rows(in: rect)
+            guard range.location != NSNotFound, range.length > 0 else { continue }
+            let end = min(range.location + range.length, items.count)
+            if range.location < end {
+                rows.insert(integersIn: range.location..<end)
+            }
+        }
+        return rows
+    }
+
+    /// Reloads the given rows, never recycling the name cell that is being edited.
+    private func reloadRows(_ rows: IndexSet) {
+        guard let tableView, !rows.isEmpty, tableView.numberOfColumns > 0 else { return }
+        var rows = rows.filteredIndexSet { $0 < items.count }
+        let allColumns = IndexSet(integersIn: 0..<tableView.numberOfColumns)
+
+        if let editingRow = editingRow, rows.contains(editingRow) {
+            rows.remove(editingRow)
+            var otherColumns = allColumns
+            otherColumns.remove(nameColumnIndex(in: tableView))
+            if !otherColumns.isEmpty {
+                tableView.reloadData(forRowIndexes: IndexSet(integer: editingRow), columnIndexes: otherColumns)
+            }
+        }
+        guard !rows.isEmpty else { return }
+        tableView.reloadData(forRowIndexes: rows, columnIndexes: allColumns)
+    }
+
+    private var editingRow: Int? {
+        guard isCurrentlyEditing, let url = currentEditingCell?.representedURL else { return nil }
+        return rowIndex[url]
+    }
+
+    // MARK: - Scroll Position
+
+    private struct ScrollAnchor {
+        let url: URL
+        let offset: CGFloat
+        let folder: URL
+    }
+
+    /// The first visible row and its distance from the top of the visible area.
+    private func captureScrollAnchor() -> ScrollAnchor? {
+        guard let tableView, let clipView = tableView.enclosingScrollView?.contentView else { return nil }
+        let visible = tableView.rows(in: tableView.visibleRect)
+        guard visible.location != NSNotFound, visible.length > 0, visible.location < items.count else { return nil }
+        let row = visible.location
+        return ScrollAnchor(
+            url: items[row].url,
+            offset: tableView.rect(ofRow: row).minY - clipView.bounds.minY,
+            folder: viewModel.currentPath
+        )
+    }
+
+    private func restoreScrollAnchor(_ anchor: ScrollAnchor?) {
+        guard let anchor, anchor.folder == viewModel.currentPath,
+              let row = rowIndex[anchor.url],
+              let tableView, let scrollView = tableView.enclosingScrollView else { return }
+        let clipView = scrollView.contentView
+        var bounds = clipView.bounds
+        bounds.origin.y = tableView.rect(ofRow: row).minY - anchor.offset
+        let target = clipView.constrainBoundsRect(bounds).origin
+        guard abs(target.y - clipView.bounds.origin.y) > 0.5 else { return }
+        clipView.scroll(to: target)
+        scrollView.reflectScrolledClipView(clipView)
+    }
+
+    // MARK: - Display Settings
+
+    struct DisplaySettings: Equatable {
+        let fontSize: Double
+        let iconSize: Double
+        let showTags: Bool
+        let showFileExtensions: Bool
+    }
+
+    /// Row height that fits the list's icon and font size settings.
+    static func rowHeight(fontSize: Double, iconSize: CGFloat) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: CGFloat(fontSize))
+        let textHeight = ceil(font.ascender - font.descender + font.leading)
+        return max(22, ceil(iconSize) + 2, textHeight + 4)
+    }
+
+    private func applyDisplaySettingsIfNeeded() {
+        guard let tableView else { return }
+        let settings = DisplaySettings(
+            fontSize: appSettings.listFontSize,
+            iconSize: appSettings.listIconSize,
+            showTags: appSettings.showItemTags,
+            showFileExtensions: appSettings.showFileExtensions
+        )
+        guard settings != lastDisplaySettings else { return }
+        let isInitial = lastDisplaySettings == nil
+        lastDisplaySettings = settings
+
+        let height = Self.rowHeight(fontSize: settings.fontSize, iconSize: CGFloat(settings.iconSize))
+        if tableView.rowHeight != height {
+            tableView.rowHeight = height
+        }
+        if !isInitial {
+            reloadRows(loadedRows())
+        }
+    }
+
+    // MARK: - Cut Dimming
+
+    /// Updates the set of cut URLs; returns the URLs whose dimming changed.
+    private func refreshCutURLs() -> Set<URL> {
+        let clipboardItems = viewModel.clipboardItems
+        let operation = viewModel.clipboardOperation
+        guard clipboardItems != lastClipboardItems || operation != lastClipboardOperation else { return [] }
+        lastClipboardItems = clipboardItems
+        lastClipboardOperation = operation
+        let newCutURLs: Set<URL> = operation == .cut ? Set(clipboardItems) : []
+        let changed = newCutURLs.symmetricDifference(cutURLs)
+        cutURLs = newCutURLs
+        return changed
+    }
+
+    private func applyCutDimming(to urls: Set<URL>) {
+        guard let tableView, !urls.isEmpty else { return }
+        for url in urls {
+            guard let row = rowIndex[url] else { continue }
+            let alpha: CGFloat = cutURLs.contains(url) ? 0.5 : 1.0
+            for column in 0..<tableView.numberOfColumns {
+                tableView.view(atColumn: column, row: row, makeIfNecessary: false)?.alphaValue = alpha
+            }
+        }
+    }
+
+    // MARK: - Inline Rename
 
     /// Called from updateNSView to check if we should start editing
     func checkForPendingRename() {
@@ -464,74 +755,118 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         // Don't start if we're already editing
         guard !isCurrentlyEditing else { return }
 
+        // Not in the table yet (e.g. a new folder whose row hasn't arrived): retry on a later update
+        guard let row = rowIndex[renamingURL], let tableView = tableView else { return }
         lastProcessedRenamingURL = renamingURL
-
-        // Find the row for this URL
-        guard let row = items.firstIndex(where: { $0.url == renamingURL }),
-              let tableView = tableView else { return }
-
-        // Find the name column index
-        let nameColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
-        guard nameColumnIndex >= 0 else { return }
 
         // Scroll to make the row visible
         tableView.scrollRowToVisible(row)
 
-        // Get or create the cell and start editing after a delay for view to settle
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
-            guard let self = self,
-                  let tableView = self.tableView,
-                  let cell = tableView.view(atColumn: nameColumnIndex, row: row, makeIfNecessary: true) as? FileNameCellView else {
-                return
+        // Start editing after a delay for the view to settle. The row is looked up again then:
+        // a directory event or re-sort may have moved it in the meantime.
+        pendingRenameWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.beginEditing(url: renamingURL)
+        }
+        pendingRenameWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: work)
+    }
+
+    private func beginEditing(url: URL) {
+        pendingRenameWorkItem = nil
+        guard viewModel.renamingURL == url, !isCurrentlyEditing, let tableView else { return }
+        let nameColumn = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
+        guard nameColumn >= 0, let row = rowIndex[url] else {
+            // Row is gone for now; let a later update try again
+            lastProcessedRenamingURL = nil
+            return
+        }
+        tableView.scrollRowToVisible(row)
+        guard let cell = tableView.view(atColumn: nameColumn, row: row, makeIfNecessary: true) as? FileNameCellView,
+              cell.representedURL == url else {
+            lastProcessedRenamingURL = nil
+            return
+        }
+        currentEditingCell = cell
+        cell.delegate = self
+        cell.startEditing()
+    }
+
+    /// Commits an in-progress rename before a click elsewhere in the table is handled.
+    func commitEditingForMouseDown() {
+        guard let cell = currentEditingCell, cell.isEditing else { return }
+        cell.commitEditingFromOutsideClick()
+    }
+
+    /// Ends editing state that outlived its field editor (so it can never block updates).
+    private func reconcileEditingState() {
+        guard let cell = currentEditingCell else { return }
+        if cell.isEditing && !cell.isEditingActive {
+            // Async: this runs during a SwiftUI update, where the cancel can't publish changes
+            DispatchQueue.main.async { [weak cell] in
+                guard let cell, cell.isEditing, !cell.isEditingActive else { return }
+                cell.abandonEditing()
             }
-            self.currentEditingCell = cell
-            cell.delegate = self
-            cell.startEditing()
+        } else if !cell.isEditing {
+            currentEditingCell = nil
+        }
+    }
+
+    private func editingDidEnd() {
+        currentEditingCell = nil
+        lastProcessedRenamingURL = nil
+        // Not synchronously: this runs inside the text field's end-editing callback
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.isCurrentlyEditing, let deferred = self.deferredItems else { return }
+            self.deferredItems = nil
+            self.applyItems(self.resolveFreshContent(deferred))
+            self.syncSelectionFromViewModel()
         }
     }
 
     // MARK: - FileNameCellViewDelegate
 
     func fileNameCellView(_ cell: FileNameCellView, didRenameItem item: FileItem, to newName: String) {
-        currentEditingCell = nil
-        lastProcessedRenamingURL = nil
+        editingDidEnd()
         viewModel.renameItem(item, to: newName)
         viewModel.renamingURL = nil
     }
 
     func fileNameCellViewDidCancelRename(_ cell: FileNameCellView) {
-        currentEditingCell = nil
-        lastProcessedRenamingURL = nil
+        editingDidEnd()
         viewModel.renamingURL = nil
     }
 
     func fileNameCellView(_ cell: FileNameCellView, commitRenameAndMoveNext item: FileItem, newName: String) {
-        currentEditingCell = nil
-        lastProcessedRenamingURL = nil
+        editingDidEnd()
         viewModel.commitRenameAndNext(currentItem: item, newName: newName)
     }
 
     func fileNameCellView(_ cell: FileNameCellView, commitRenameAndMovePrevious item: FileItem, newName: String) {
-        currentEditingCell = nil
-        lastProcessedRenamingURL = nil
+        editingDidEnd()
         viewModel.commitRenameAndPrevious(currentItem: item, newName: newName)
     }
 
-    // MARK: - Click Handling for Rename
+    func fileNameCellView(_ cell: FileNameCellView, didAbortEditingOf item: FileItem) {
+        if currentEditingCell === cell || currentEditingCell == nil {
+            editingDidEnd()
+        }
+        if viewModel.renamingURL == item.url {
+            viewModel.renamingURL = nil
+        }
+    }
+
+    // MARK: - Click Handling
 
     func handleRowClick(row: Int, event: NSEvent) {
         guard row >= 0, row < items.count else { return }
         guard let tableView = tableView else { return }
 
         let item = items[row]
-        let modifiers = event.modifierFlags
-        let hasShift = modifiers.contains(.shift)
-        let hasCommand = modifiers.contains(.command)
 
-        // For Cmd+click and Shift+click, let NSTableView handle selection natively
-        // via tableViewSelectionDidChange. Calling handleSelection here would double-toggle
-        // because both handleSelection AND NSTableView's mouseDown modify selection.
-        if hasCommand || hasShift {
+        // ⌘-click toggles natively in NSTableView (via tableViewSelectionDidChange);
+        // calling handleSelection here too would toggle twice.
+        if event.modifierFlags.contains(.command) {
             viewModel.cancelPendingRename()
             if viewModel.renamingURL != nil {
                 viewModel.renamingURL = nil
@@ -542,10 +877,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         // If clicking on an already-selected item without modifiers,
         // preserve the multi-selection (for potential drag)
         // handleSelection would reset to single selection otherwise
-        let isAlreadySelected = viewModel.selectedItems.contains(item)
-
-        if isAlreadySelected && viewModel.selectedItems.count > 1 {
-            // Don't change selection - allows multi-file drag
+        if viewModel.selectedItems.count > 1 && viewModel.selectedItems.contains(item) {
             return
         }
 
@@ -563,12 +895,37 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         )
     }
 
+    /// ⇧-click: select from the view model's anchor to `row`.
+    func handleShiftClick(row: Int) {
+        guard row >= 0, row < items.count else { return }
+        viewModel.cancelPendingRename()
+        if viewModel.renamingURL != nil {
+            viewModel.renamingURL = nil
+        }
+        if viewModel.selectedItems.isEmpty || !items.indices.contains(viewModel.selectionAnchorIndex) {
+            viewModel.selectionAnchorIndex = row
+        }
+        viewModel.selectRange(to: row, in: items)
+        syncSelectionFromViewModel(allowScroll: false)
+        lastSyncedSelection = viewModel.selectedItems
+    }
+
     /// Handle click on empty space (below all rows) - deselect all items
     func handleEmptySpaceClick() {
         // Call callback first (used by CoverFlow to set userClearedSelection before clearing items)
         onEmptySpaceClick?()
-        viewModel.selectedItems.removeAll()
+        if !viewModel.selectedItems.isEmpty {
+            viewModel.selectedItems.removeAll()
+        }
         viewModel.cancelPendingRename()
+    }
+
+    func beginMouseSelection(row: Int) {
+        activeMouseSelection = row
+    }
+
+    func endMouseSelection() {
+        activeMouseSelection = nil
     }
 
     /// Determine if a click event was on the text area of the name column
@@ -596,55 +953,89 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     // MARK: - Column Setup
 
     func setupColumns() {
+        applyColumnConfiguration()
+    }
+
+    private func makeTableColumn(for settings: ColumnSettings) -> NSTableColumn {
+        let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(settings.column.rawValue))
+        column.title = settings.column.rawValue
+        column.width = settings.width
+        column.minWidth = settings.column.minWidth
+        column.maxWidth = 600
+        column.isEditable = false
+        column.resizingMask = .userResizingMask
+
+        // Sort descriptor - set ascending based on column type
+        // NSTableView will toggle direction automatically on subsequent clicks
+        let usesStringCompare: Bool
+        switch settings.column {
+        case .name, .kind, .tags, .cloudStatus:
+            usesStringCompare = true
+        case .dateModified, .dateCreated, .size:
+            usesStringCompare = false
+        }
+        column.sortDescriptorPrototype = NSSortDescriptor(
+            key: settings.column.rawValue,
+            ascending: settings.column.defaultSortDirection == .ascending,
+            selector: usesStringCompare ? #selector(NSString.localizedStandardCompare(_:)) : nil
+        )
+
+        // Configure header cell
+        column.headerCell.alignment = .left
+        return column
+    }
+
+    /// Makes the table's columns match the configuration in place (visibility, order, width)
+    /// instead of rebuilding them, so nothing is reloaded for a width or order change.
+    private func applyColumnConfiguration() {
         guard let tableView = tableView else { return }
+        let desired = columnConfig.visibleColumns
+        let desiredIDs = Set(desired.map { $0.column.rawValue })
 
-        // Remove existing columns
-        for column in tableView.tableColumns.reversed() {
+        isApplyingColumnLayout = true
+        defer { isApplyingColumnLayout = false }
+
+        var columnsChanged = false
+        for column in tableView.tableColumns where !desiredIDs.contains(column.identifier.rawValue) {
             tableView.removeTableColumn(column)
+            columnsChanged = true
         }
 
-        // Add columns based on configuration
-        for settings in columnConfig.visibleColumns {
-            let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(settings.column.rawValue))
-            column.title = settings.column.rawValue
-            column.width = settings.width
-            column.minWidth = settings.column.minWidth
-            column.maxWidth = 600
-            column.isEditable = false
-            column.resizingMask = .userResizingMask
-
-            // Sort descriptor - set ascending based on column type
-            // NSTableView will toggle direction automatically on subsequent clicks
-            let ascending: Bool
-            switch settings.column {
-            case .name, .kind, .tags, .cloudStatus:
-                ascending = true
-            case .dateModified, .dateCreated, .size:
-                ascending = false
+        var addedIDs: [NSUserInterfaceItemIdentifier] = []
+        for (targetIndex, settings) in desired.enumerated() {
+            let identifier = NSUserInterfaceItemIdentifier(settings.column.rawValue)
+            var currentIndex = tableView.column(withIdentifier: identifier)
+            if currentIndex < 0 {
+                tableView.addTableColumn(makeTableColumn(for: settings))
+                currentIndex = tableView.numberOfColumns - 1
+                addedIDs.append(identifier)
+                columnsChanged = true
             }
-
-            let sortDescriptor = NSSortDescriptor(
-                key: settings.column.rawValue,
-                ascending: ascending,
-                selector: settings.column == .name || settings.column == .kind || settings.column == .tags || settings.column == .cloudStatus
-                    ? #selector(NSString.localizedStandardCompare(_:))
-                    : nil
-            )
-            column.sortDescriptorPrototype = sortDescriptor
-
-            // Configure header cell
-            let headerCell = column.headerCell
-            headerCell.alignment = .left
-
-            tableView.addTableColumn(column)
+            if currentIndex != targetIndex {
+                tableView.moveColumn(currentIndex, toColumn: targetIndex)
+            }
+            let column = tableView.tableColumns[targetIndex]
+            if abs(column.width - settings.width) > 0.5 {
+                column.width = settings.width
+            }
         }
+        appliedColumns = columnConfig.columns
 
-        // Set the current sort descriptor on the table view to match our config
-        lastSortColumn = nil  // Force update on first setup
-        lastSortDirection = nil
-        applySortDescriptorToTableView()
-
-        lastColumnSnapshot = columnConfig.visibleColumns
+        if columnsChanged {
+            // The sort column may have just been added
+            lastSortColumn = nil
+            lastSortDirection = nil
+        }
+        if !addedIDs.isEmpty {
+            let addedIndexes = IndexSet(addedIDs.map { tableView.column(withIdentifier: $0) }.filter { $0 >= 0 })
+            let rows = loadedRows()
+            if !rows.isEmpty, !addedIndexes.isEmpty {
+                tableView.reloadData(forRowIndexes: rows, columnIndexes: addedIndexes)
+            }
+            if addedIDs.contains(NSUserInterfaceItemIdentifier(ListColumn.cloudStatus.rawValue)) {
+                requestCloudStatusForVisibleRows()
+            }
+        }
     }
 
     private func applySortDescriptorToTableView() {
@@ -676,14 +1067,11 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     func syncColumnsIfNeeded() {
-        let currentVisible = columnConfig.visibleColumns
-        if currentVisible != lastColumnSnapshot {
-            setupColumns()
-            tableView?.reloadData()
-        } else {
-            // Even if columns haven't changed, update sort indicator if sort changed
-            applySortDescriptorToTableView()
+        // While a resize/reorder drag is uncommitted the table is ahead of the configuration
+        if columnCommitWorkItem == nil && columnConfig.columns != appliedColumns {
+            applyColumnConfiguration()
         }
+        applySortDescriptorToTableView()
     }
 
     private func updateSortIndicator() {
@@ -703,6 +1091,53 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             tableView.setIndicatorImage(image, in: column)
             tableView.highlightedTableColumn = column
         }
+    }
+
+    // MARK: - Column Resize/Move Notifications
+
+    // Live resizes and reorders stay local to the table; the configuration is updated (and
+    // published/persisted) once, after the mouse button is released.
+
+    @objc func columnDidResize(_ notification: Notification) {
+        guard !isApplyingColumnLayout else { return }
+        scheduleColumnLayoutCommit()
+    }
+
+    @objc func columnDidMove(_ notification: Notification) {
+        guard !isApplyingColumnLayout else { return }
+        scheduleColumnLayoutCommit()
+    }
+
+    private func scheduleColumnLayoutCommit() {
+        columnCommitWorkItem?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.commitColumnLayoutWhenMouseUp()
+        }
+        columnCommitWorkItem = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.columnCommitDelay, execute: work)
+    }
+
+    private func commitColumnLayoutWhenMouseUp() {
+        if NSEvent.pressedMouseButtons & 1 != 0 {
+            scheduleColumnLayoutCommit()
+            return
+        }
+        columnCommitWorkItem = nil
+        commitColumnLayout()
+    }
+
+    /// Stores the table's current column order and widths in the configuration.
+    func commitColumnLayout() {
+        guard let tableView = tableView else { return }
+        var order: [ListColumn] = []
+        var widths: [ListColumn: CGFloat] = [:]
+        for column in tableView.tableColumns {
+            guard let listColumn = ListColumn(rawValue: column.identifier.rawValue) else { continue }
+            order.append(listColumn)
+            widths[listColumn] = column.width
+        }
+        columnConfig.applyColumnLayout(visibleOrder: order, widths: widths)
+        appliedColumns = columnConfig.columns
     }
 
     // MARK: - Header Menu
@@ -775,9 +1210,9 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         case .name:
             cellView = makeNameCell(for: item, tableView: tableView)
         case .dateModified:
-            cellView = makeDateCell(for: item.modificationDate, tableView: tableView, identifier: columnID, itemName: item.name)
+            cellView = makeDateCell(for: item.modificationDate, tableView: tableView, identifier: columnID)
         case .dateCreated:
-            cellView = makeDateCell(for: item.creationDate, tableView: tableView, identifier: columnID, itemName: item.name)
+            cellView = makeDateCell(for: item.creationDate, tableView: tableView, identifier: columnID)
         case .size:
             cellView = makeSizeCell(for: item, tableView: tableView)
         case .kind:
@@ -789,7 +1224,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         }
 
         // Dim cut items (Finder-style visual feedback)
-        cellView.alphaValue = viewModel.isItemCut(item) ? 0.5 : 1.0
+        cellView.alphaValue = cutURLs.contains(item.url) ? 0.5 : 1.0
 
         return cellView
     }
@@ -798,33 +1233,78 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         return EmphasizedTableRowView()
     }
 
+    func tableView(_ tableView: NSTableView, typeSelectStringFor tableColumn: NSTableColumn?, row: Int) -> String? {
+        // Type-select matches names only (not dates or sizes)
+        guard tableColumn?.identifier.rawValue == ListColumn.name.rawValue, row < items.count else { return nil }
+        return items[row].name
+    }
+
     func tableViewSelectionDidChange(_ notification: Notification) {
         guard !isUpdatingSelection else { return }
-
         guard let tableView = tableView else { return }
         let selectedRows = tableView.selectedRowIndexes
 
-        let selectedItems = Set(selectedRows.compactMap { row -> FileItem? in
-            guard row < items.count else { return nil }
-            return items[row]
-        })
+        var selectedItems = Set<FileItem>(minimumCapacity: selectedRows.count)
+        for row in selectedRows where row < items.count {
+            selectedItems.insert(items[row])
+        }
 
-        NSLog("[TABLE-SEL] tableViewSelectionDidChange: selectedRows=%@, coordItems.count=%d, vmItems.count=%d, names=%@",
-              selectedRows.map { String($0) }.joined(separator: ","),
-              items.count,
-              viewModel.items.count,
-              selectedItems.map { $0.name }.joined(separator: ", "))
+        let positions = Self.anchorAndCursor(
+            selectedRows: selectedRows,
+            previousAnchor: viewModel.selectionAnchorIndex,
+            mouseDownRow: activeMouseSelection,
+            currentMouseRow: activeMouseSelection == nil ? nil : currentMouseRow()
+        )
 
         isUpdatingSelection = true
-        viewModel.selectedItems = selectedItems
-        // Update lastSelectedIndex and selectionAnchorIndex so keyboard navigation
-        // (in all view modes) starts from the correct position after native NSTableView
-        // arrow key navigation or programmatic selection changes.
-        if let lastRow = selectedRows.last, lastRow < items.count {
-            viewModel.lastSelectedIndex = lastRow
-            viewModel.selectionAnchorIndex = lastRow
+        if viewModel.selectedItems != selectedItems {
+            viewModel.selectedItems = selectedItems
         }
+        // Keep the anchor and cursor in step with the table so keyboard navigation (in all
+        // view modes) continues from where the user clicked or moved.
+        if let positions {
+            viewModel.selectionAnchorIndex = positions.anchor
+            viewModel.lastSelectedIndex = positions.cursor
+        }
+        lastSyncedSelection = selectedItems
         isUpdatingSelection = false
+    }
+
+    /// Row under the mouse during a click or drag-select.
+    private func currentMouseRow() -> Int? {
+        guard let tableView, let event = NSApp.currentEvent, event.window === tableView.window else { return nil }
+        let row = tableView.row(at: tableView.convert(event.locationInWindow, from: nil))
+        return row >= 0 ? row : nil
+    }
+
+    /// Anchor (fixed end) and cursor (moving end) after the table changed the selection itself.
+    /// - mouseDownRow: the row a click/drag started on (-1 = empty space), nil for keyboard changes.
+    static func anchorAndCursor(selectedRows: IndexSet, previousAnchor: Int, mouseDownRow: Int?, currentMouseRow: Int?) -> (anchor: Int, cursor: Int)? {
+        guard let first = selectedRows.first, let last = selectedRows.last else {
+            // Nothing selected: a click still moves the anchor (⌘-click deselecting the last item)
+            if let mouseDownRow, mouseDownRow >= 0 { return (mouseDownRow, mouseDownRow) }
+            return nil
+        }
+
+        if let mouseDownRow {
+            let cursor = currentMouseRow.map { min(max($0, first), last) }
+            if mouseDownRow >= 0 {
+                // Click or drag that started on a row: that row is the anchor
+                return (mouseDownRow, cursor ?? mouseDownRow)
+            }
+            // Drag-select that started in empty space: the anchor is the far end
+            let resolvedCursor = cursor ?? last
+            let anchor = abs(first - resolvedCursor) > abs(last - resolvedCursor) ? first : last
+            return (anchor, resolvedCursor)
+        }
+
+        // Keyboard (native navigation or type-select)
+        if first == last { return (first, first) }
+        if selectedRows.contains(previousAnchor) {
+            let cursor = previousAnchor == last ? first : last
+            return (previousAnchor, cursor)
+        }
+        return (first, last)
     }
 
     func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
@@ -851,35 +1331,41 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     // MARK: - Selection Sync
 
-    func syncSelectionFromViewModel() {
+    /// Selects the view model's selection (matched by URL, so it survives reloads that create new
+    /// items). Scrolls to the cursor only when the selection itself changed, not on reloads.
+    func syncSelectionFromViewModel(allowScroll: Bool = true) {
         guard !isUpdatingSelection else { return }
         guard let tableView = tableView else { return }
 
-        let selectedIDs = Set(viewModel.selectedItems.map { $0.id })
-        let rowsToSelect = items.enumerated().compactMap { index, item -> Int? in
-            selectedIDs.contains(item.id) ? index : nil
-        }
-
-        let newIndexSet = IndexSet(rowsToSelect)
-        let currentSelection = tableView.selectedRowIndexes
-
-        // Only update selection and scroll if selection actually changed
-        // This prevents scroll jumping when user is manually scrolling the list
-        if newIndexSet != currentSelection {
-            NSLog("[TABLE-SYNC] syncSelectionFromViewModel: coordItems.count=%d, vmSelectedItems=%@, rowsToSelect=%@, currentTableSelection=%@",
-                  items.count,
-                  viewModel.selectedItems.map { $0.name }.joined(separator: ", "),
-                  rowsToSelect.map { String($0) }.joined(separator: ","),
-                  currentSelection.map { String($0) }.joined(separator: ","))
-            isUpdatingSelection = true
-            tableView.selectRowIndexes(newIndexSet, byExtendingSelection: false)
-            isUpdatingSelection = false
-
-            // Only scroll to selection when selection changed (e.g., from cover flow navigation)
-            if let firstSelectedRow = rowsToSelect.first {
-                tableView.scrollRowToVisible(firstSelectedRow)
+        let selected = viewModel.selectedItems
+        var rows = IndexSet()
+        for item in selected {
+            if let row = rowIndex[item.url] {
+                rows.insert(row)
             }
         }
+
+        if rows != tableView.selectedRowIndexes {
+            isUpdatingSelection = true
+            tableView.selectRowIndexes(rows, byExtendingSelection: false)
+            isUpdatingSelection = false
+        }
+
+        guard allowScroll else { return }
+        let selectionChanged = selected != lastSyncedSelection
+        lastSyncedSelection = selected
+        if selectionChanged, let row = cursorRow(in: rows) {
+            tableView.scrollRowToVisible(row)
+        }
+    }
+
+    /// The lead row of the selection (the clicked or keyboard-moved end), else the first selected row.
+    private func cursorRow(in rows: IndexSet) -> Int? {
+        guard !rows.isEmpty else { return nil }
+        if let primary = viewModel.primarySelectedItem, let row = rowIndex[primary.url], rows.contains(row) {
+            return row
+        }
+        return rows.first
     }
 
     // MARK: - Actions
@@ -896,7 +1382,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     // MARK: - Keyboard Actions
 
     func triggerQuickLook() {
-        guard let item = viewModel.selectedItems.first else {
+        guard let item = viewModel.primarySelectedItem else {
             NSSound.beep()
             return
         }
@@ -912,82 +1398,18 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         }
     }
 
-    func openSelectedItem() {
-        guard let item = viewModel.selectedItems.first else { return }
-        viewModel.openItem(item)
-    }
-
-    func deleteSelectedItems() {
-        viewModel.deleteSelectedItems()
-    }
-
-    func copySelectedItems() {
-        viewModel.copySelectedItems()
-    }
-
-    func cutSelectedItems() {
-        viewModel.cutSelectedItems()
-    }
-
-    func pasteItems() {
-        viewModel.paste()
-    }
-
-    func selectAllItems() {
-        guard let tableView = tableView else { return }
-        let allItems = Set(items)
-        isUpdatingSelection = true
-        viewModel.selectedItems = allItems
-        tableView.selectRowIndexes(IndexSet(integersIn: 0..<items.count), byExtendingSelection: false)
-        isUpdatingSelection = false
+    func openSelectedItems() {
+        FileListActions.open(viewModel.orderedSelectedItems, primary: viewModel.primarySelectedItem, viewModel: viewModel)
     }
 
     private func navigateSelection(by offset: Int) {
-        guard let tableView = tableView else { return }
-        let currentRow = tableView.selectedRow
+        guard let tableView = tableView, !items.isEmpty else { return }
+        let currentRow = cursorRow(in: tableView.selectedRowIndexes) ?? -1
         let newRow = max(0, min(items.count - 1, currentRow + offset))
-        if newRow != currentRow && newRow >= 0 && newRow < items.count {
+        if newRow != currentRow {
             tableView.selectRowIndexes(IndexSet(integer: newRow), byExtendingSelection: false)
             tableView.scrollRowToVisible(newRow)
         }
-    }
-
-    // MARK: - Column Resize/Move Notifications
-
-    @objc func columnDidResize(_ notification: Notification) {
-        guard let userInfo = notification.userInfo,
-              let column = userInfo["NSTableColumn"] as? NSTableColumn else { return }
-
-        let columnID = column.identifier.rawValue
-        guard let listColumn = ListColumn(rawValue: columnID) else { return }
-
-        columnConfig.setColumnWidth(listColumn, width: column.width)
-    }
-
-    @objc func columnDidMove(_ notification: Notification) {
-        guard let tableView = tableView else { return }
-
-        // Get new column order from table view
-        let newOrder = tableView.tableColumns.compactMap { column -> ListColumn? in
-            ListColumn(rawValue: column.identifier.rawValue)
-        }
-
-        // Update column config to match new order
-        var reorderedColumns: [ColumnSettings] = []
-        for listColumn in newOrder {
-            if let settings = columnConfig.columns.first(where: { $0.column == listColumn }) {
-                reorderedColumns.append(settings)
-            }
-        }
-
-        // Add hidden columns at the end
-        for settings in columnConfig.columns where !settings.isVisible {
-            if !reorderedColumns.contains(where: { $0.column == settings.column }) {
-                reorderedColumns.append(settings)
-            }
-        }
-
-        columnConfig.columns = reorderedColumns
     }
 
     // MARK: - Scroll & Lazy Hydration
@@ -1009,61 +1431,53 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         isLiveScrolling = false
         hydrateVisibleRows()
         loadThumbnailsForVisibleRows()
-        flushPendingThumbnailRowReloads()
     }
 
     @objc func handleHydrationCompleted(_ notification: Notification) {
-        // Fetch fresh items from the view model (bypasses SwiftUI caching)
-        let freshItems = viewModel.filteredItems
-        let freshMetadataCount = freshItems.filter { $0.hasMetadata }.count
-
-        // Update coordinator's items with fresh data
-        items = freshItems
-        // Track the hydrated count so we can reject stale SwiftUI updates
-        lastHydrationItemCount = freshMetadataCount
-
-        // Reload all data since hydrated items may be at any index
-        // (user may have scrolled since hydration was requested)
-        guard let tableView = tableView else { return }
-        tableView.reloadData()
+        guard tableView != nil else { return }
+        // Same rows, fresher content: reloads only the loaded rows whose content changed.
+        // A new order (e.g. sorted by date) arrives with the next SwiftUI update.
+        applyItems(resolveFreshContent(items))
+        requestCloudStatusForVisibleRows()
     }
 
     @objc func handleFocusFileList(_ notification: Notification) {
-        // Focus the table view (e.g., after pressing Escape in search field)
-        // Only take focus if we're actually visible in the window
+        // Focus the table view (e.g., after pressing Escape in search field). Only the table in the
+        // key window, and only one that's on screen; the poster may also name a window or view model.
         guard let tableView = tableView,
               let window = tableView.window,
+              window.isKeyWindow,
+              !tableView.isHiddenOrHasHiddenAncestor,
               tableView.visibleRect.size.height > 0 else { return }
+        if let targetWindow = notification.object as? NSWindow, targetWindow !== window { return }
+        if let targetViewModel = notification.object as? FileBrowserViewModel, targetViewModel !== viewModel { return }
         window.makeFirstResponder(tableView)
     }
 
-    /// Hydrate metadata for currently visible rows
-    func hydrateVisibleRows() {
-        guard let tableView = tableView else { return }
-
-        let visibleRect = tableView.visibleRect
-        let visibleRows = tableView.rows(in: visibleRect)
-
-        guard visibleRows.location != NSNotFound else { return }
-
+    private func visibleRowRange(buffer: Int = 0) -> (visible: Range<Int>, extended: Range<Int>)? {
+        guard let tableView = tableView else { return nil }
+        let visibleRows = tableView.rows(in: tableView.visibleRect)
+        guard visibleRows.location != NSNotFound, visibleRows.length > 0 else { return nil }
         let start = visibleRows.location
         let end = min(start + visibleRows.length, items.count)
+        guard start < end else { return nil }
+        return (start..<end, max(0, start - buffer)..<min(items.count, end + buffer))
+    }
 
-        // Extend range for metadata hydration
-        let hydrationBuffer = 10
-        let hydrationStart = max(0, start - hydrationBuffer)
-        let hydrationEnd = min(items.count, end + hydrationBuffer)
+    /// Hydrate metadata (and cloud status, when that column is shown) for currently visible rows
+    func hydrateVisibleRows() {
+        guard let ranges = visibleRowRange(buffer: 10) else { return }
+        let newRange = ranges.extended
 
-        guard hydrationStart < hydrationEnd else { return }
+        requestCloudStatus(forRows: newRange)
 
         // Check if range actually changed
-        let newRange = hydrationStart..<hydrationEnd
         if newRange == lastVisibleRange { return }
         lastVisibleRange = newRange
 
         // Collect URLs that need hydration
         var urlsToHydrate: [URL] = []
-        for i in hydrationStart..<hydrationEnd {
+        for i in newRange {
             let item = items[i]
             if viewModel.needsHydration(item) {
                 urlsToHydrate.append(item.url)
@@ -1074,114 +1488,130 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             viewModel.hydrateMetadata(for: urlsToHydrate)
         }
 
-        // Also preheat thumbnails
-        preheatThumbnails(visibleStart: start, visibleEnd: end)
+        // Also preheat thumbnails and tags
+        preheat(visibleStart: ranges.visible.lowerBound, visibleEnd: ranges.visible.upperBound)
     }
 
-    func reloadVisibleRowsIfNeeded(previousItems: [FileItem]) {
-        guard let tableView = tableView else { return }
-        guard previousItems.count == items.count else { return }
+    private func requestCloudStatusForVisibleRows() {
+        guard let ranges = visibleRowRange(buffer: 10) else { return }
+        requestCloudStatus(forRows: ranges.extended)
+    }
 
-        let visibleRect = tableView.visibleRect
-        let visibleRows = tableView.rows(in: visibleRect)
+    private var isCloudStatusColumnVisible: Bool {
+        guard let tableView else { return false }
+        return tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.cloudStatus.rawValue)) >= 0
+    }
 
-        guard visibleRows.location != NSNotFound else { return }
-
-        let start = visibleRows.location
-        let end = min(start + visibleRows.length, items.count)
-        guard start < end else { return }
-
-        var rowsToReload = IndexSet()
-        for row in start..<end {
-            let oldItem = previousItems[row]
-            let newItem = items[row]
-            if needsRowReload(oldItem: oldItem, newItem: newItem) {
-                rowsToReload.insert(row)
-            }
+    /// Loads iCloud status for the given rows while the iCloud Status column is shown.
+    private func requestCloudStatus(forRows rows: Range<Int>) {
+        guard isCloudStatusColumnVisible else { return }
+        var urls: [URL] = []
+        for row in rows where row < items.count {
+            let item = items[row]
+            // Wait for metadata first: hydrating metadata replaces the item, dropping a cloud status
+            // loaded before it.
+            guard item.hasMetadata, item.cloudStatus == nil,
+                  !requestedCloudStatusURLs.contains(item.url), item.isInICloud else { continue }
+            urls.append(item.url)
         }
-
-        guard !rowsToReload.isEmpty else { return }
-        let columnCount = tableView.numberOfColumns
-        guard columnCount > 0 else { return }
-        tableView.reloadData(
-            forRowIndexes: rowsToReload,
-            columnIndexes: IndexSet(integersIn: 0..<columnCount)
-        )
-    }
-
-    private func needsRowReload(oldItem: FileItem, newItem: FileItem) -> Bool {
-        if oldItem.id != newItem.id { return true }
-        if oldItem.url != newItem.url { return true }
-        if oldItem.name != newItem.name { return true }
-        if oldItem.isDirectory != newItem.isDirectory { return true }
-        if oldItem.fileType != newItem.fileType { return true }
-        if oldItem.hasMetadata != newItem.hasMetadata { return true }
-        if oldItem.size != newItem.size { return true }
-        if oldItem.modificationDate != newItem.modificationDate { return true }
-        if oldItem.creationDate != newItem.creationDate { return true }
-        return false
+        guard !urls.isEmpty else { return }
+        requestedCloudStatusURLs.formUnion(urls)
+        viewModel.hydrateCloudStatus(for: urls)
     }
 
     private func loadThumbnailsForVisibleRows() {
-        guard let tableView = tableView else { return }
-
-        let visibleRect = tableView.visibleRect
-        let visibleRows = tableView.rows(in: visibleRect)
-
-        guard visibleRows.location != NSNotFound else { return }
-
-        let start = visibleRows.location
-        let end = min(start + visibleRows.length, items.count)
-
-        guard start < end else { return }
-
-        for row in start..<end {
-            loadThumbnailIfNeeded(for: items[row])
+        guard let ranges = visibleRowRange() else { return }
+        for row in ranges.visible {
+            let item = items[row]
+            if !thumbnails.contains(item.url), let cell = nameCell(atRow: row) {
+                // Replace the scrolling placeholder; the thumbnail follows when it's ready
+                cell.setIcon(item.icon)
+            }
+            loadThumbnailIfNeeded(for: item)
         }
     }
 
-    /// Preheat thumbnails for rows coming into view (like PHCachingImageManager)
-    private func preheatThumbnails(visibleStart: Int, visibleEnd: Int) {
+    /// Preheat thumbnails and tags for rows coming into view (like PHCachingImageManager)
+    private func preheat(visibleStart: Int, visibleEnd: Int) {
         let preheatStart = max(0, visibleStart - preheatBuffer)
         let preheatEnd = min(items.count, visibleEnd + preheatBuffer)
 
         guard preheatStart < preheatEnd else { return }
 
         let newPreheatRange = preheatStart..<preheatEnd
-
-        // Calculate what's added and removed
         let oldPreheatRange = lastPreheatRange ?? 0..<0
         lastPreheatRange = newPreheatRange
 
-        // Find items that entered the preheat zone
-        let addedURLs: [URL] = (preheatStart..<preheatEnd).compactMap { i in
-            guard !oldPreheatRange.contains(i) else { return nil }
-            let item = items[i]
-            guard !item.isDirectory && thumbnails[item.url] == nil else { return nil }
-            return item.url
-        }
-
-        // Find items that left the preheat zone (cancel their requests)
-        let removedURLs: [URL] = oldPreheatRange.compactMap { i in
-            guard !newPreheatRange.contains(i), i < items.count else { return nil }
-            return items[i].url
-        }
-
-        // Update preheat set
-        for url in removedURLs {
-            preheatURLs.remove(url)
-        }
-
-        // Start preheating new items
-        for url in addedURLs where !preheatURLs.contains(url) {
-            preheatURLs.insert(url)
-            if let item = items.first(where: { $0.url == url }) {
+        var tagURLs: [URL] = []
+        for row in newPreheatRange where !oldPreheatRange.contains(row) {
+            let item = items[row]
+            if !item.isDirectory {
                 loadThumbnailIfNeeded(for: item)
+            }
+            if appSettings.showItemTags, Self.hasReadableTags(item) {
+                tagURLs.append(item.url)
+            }
+        }
+        requestTags(for: tagURLs)
+    }
+
+    // MARK: - Tags
+
+    private static func hasReadableTags(_ item: FileItem) -> Bool {
+        !item.isFromArchive && item.url.isFileURL
+    }
+
+    /// Tags to display, or nil while they're being read in the background (no disk reads here).
+    func displayTags(for item: FileItem) -> [String]? {
+        guard appSettings.showItemTags, Self.hasReadableTags(item) else { return [] }
+        if loadedTagURLs.contains(item.url) {
+            return item.tags  // FileTagManager's cache is warm
+        }
+        requestTags(for: [item.url])
+        return nil
+    }
+
+    private func requestTags(for urls: [URL]) {
+        let needed = urls.filter { !loadedTagURLs.contains($0) && !pendingTagURLs.contains($0) }
+        guard !needed.isEmpty else { return }
+        pendingTagURLs.formUnion(needed)
+        Self.tagQueue.async { [weak self] in
+            let results = needed.map { ($0, FileTagManager.getTags(for: $0)) }
+            DispatchQueue.main.async {
+                self?.tagsLoaded(results)
             }
         }
     }
 
+    private func tagsLoaded(_ results: [(URL, [String])]) {
+        for (url, tags) in results {
+            pendingTagURLs.remove(url)
+            loadedTagURLs.insert(url)
+            if !tags.isEmpty, let row = rowIndex[url] {
+                updateTagViews(row: row, tags: tags)
+            }
+        }
+    }
+
+    private func updateTagViews(row: Int, tags: [String]) {
+        guard let tableView else { return }
+        nameCell(atRow: row)?.setTags(tags, showTags: appSettings.showItemTags)
+        let tagsColumn = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.tags.rawValue))
+        if tagsColumn >= 0, let cell = tableView.view(atColumn: tagsColumn, row: row, makeIfNecessary: false) as? TagsCellView {
+            cell.configure(tags: tags, appSettings: appSettings)
+        }
+    }
+
     // MARK: - Cell Factories
+
+    private func nameCell(atRow row: Int) -> FileNameCellView? {
+        guard let tableView, row < items.count else { return nil }
+        let column = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
+        guard column >= 0,
+              let cell = tableView.view(atColumn: column, row: row, makeIfNecessary: false) as? FileNameCellView,
+              cell.representedURL == items[row].url else { return nil }
+        return cell
+    }
 
     private func makeNameCell(for item: FileItem, tableView: NSTableView) -> NSTableCellView {
         let identifier = NSUserInterfaceItemIdentifier("NameCell")
@@ -1190,8 +1620,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         cell.identifier = identifier
         cell.delegate = self
 
-        let thumbnail = thumbnails[item.url] ?? (isLiveScrolling ? item.placeholderIcon : item.icon)
-        cell.configure(item: item, thumbnail: thumbnail, appSettings: appSettings)
+        let thumbnail = cachedThumbnail(for: item) ?? (isLiveScrolling ? item.placeholderIcon : item.icon)
+        cell.configure(item: item, thumbnail: thumbnail, tags: displayTags(for: item), appSettings: appSettings)
 
         // Load thumbnail if needed
         loadThumbnailIfNeeded(for: item)
@@ -1199,7 +1629,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         return cell
     }
 
-    private func makeDateCell(for date: Date?, tableView: NSTableView, identifier: String, itemName: String = "") -> NSTableCellView {
+    private func makeDateCell(for date: Date?, tableView: NSTableView, identifier: String) -> NSTableCellView {
         let id = NSUserInterfaceItemIdentifier(identifier + "Cell")
         let cell = tableView.makeView(withIdentifier: id, owner: nil) as? DateCellView
             ?? DateCellView()
@@ -1231,7 +1661,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         let cell = tableView.makeView(withIdentifier: identifier, owner: nil) as? TagsCellView
             ?? TagsCellView()
         cell.identifier = identifier
-        cell.configure(item: item, appSettings: appSettings)
+        cell.configure(tags: displayTags(for: item), appSettings: appSettings)
         return cell
     }
 
@@ -1246,24 +1676,45 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     // MARK: - Thumbnail Loading
 
+    private func cachedThumbnail(for item: FileItem) -> NSImage? {
+        thumbnails.image(for: item)
+    }
+
+    private func storeThumbnail(_ image: NSImage, for item: FileItem) {
+        thumbnails.store(image, for: item)
+        pruneThumbnails()
+        // Update the cell in place: no reload, so a cell being edited is never recycled
+        if let row = rowIndex[item.url], let cell = nameCell(atRow: row) {
+            cell.setIcon(image)
+        }
+    }
+
+    /// Keeps the thumbnail store bounded to the rows around the visible ones.
+    private func pruneThumbnails(force: Bool = false) {
+        guard force || thumbnails.isOverLimit else { return }
+        let keep = visibleRowRange(buffer: preheatBuffer * 2)?.extended ?? 0..<0
+        thumbnails.prune { url in
+            guard let row = rowIndex[url] else { return false }
+            return keep.contains(row)
+        }
+    }
+
     private func loadThumbnailIfNeeded(for item: FileItem) {
         let url = item.url
-        let targetPixelSize: CGFloat = 64
+        let targetPixelSize = Self.thumbnailPixelSize
 
-        if thumbnails[url] != nil { return }
+        if cachedThumbnail(for: item) != nil { return }
         if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) { return }
         if thumbnailCache.hasFailed(url: url) {
             if isLiveScrolling {
                 return
             }
-            thumbnails[url] = item.icon
-            queueThumbnailRowReload(for: url)
+            storeThumbnail(item.icon, for: item)
             return
         }
 
         if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
-            thumbnails[url] = cached
-            queueThumbnailRowReload(for: url)
+            storeThumbnail(cached, for: item)
             return
         }
 
@@ -1274,59 +1725,13 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
                     if self.isLiveScrolling {
                         return
                     }
-                    self.thumbnails[loadedURL] = item.icon
-                    self.queueThumbnailRowReload(for: loadedURL)
+                    self.storeThumbnail(item.icon, for: item)
                     return
                 }
 
-                self.thumbnails[loadedURL] = image ?? item.icon
-                self.queueThumbnailRowReload(for: loadedURL)
+                self.storeThumbnail(image ?? item.icon, for: item)
             }
         }
-    }
-
-    func resetThumbnailState() {
-        pendingThumbnailRows.removeAll()
-        isLiveScrolling = false
-    }
-
-    func resetHydrationRange() {
-        lastVisibleRange = nil
-    }
-
-    private func queueThumbnailRowReload(for url: URL) {
-        guard let tableView = tableView else { return }
-        guard let row = items.firstIndex(where: { $0.url == url }) else { return }
-
-        if isLiveScrolling {
-            pendingThumbnailRows.insert(row)
-            return
-        }
-
-        let columnIndex = nameColumnIndex(in: tableView)
-        tableView.reloadData(
-            forRowIndexes: IndexSet(integer: row),
-            columnIndexes: IndexSet(integer: columnIndex)
-        )
-    }
-
-    private func flushPendingThumbnailRowReloads() {
-        guard let tableView = tableView else { return }
-        guard !pendingThumbnailRows.isEmpty else { return }
-
-        let maxIndex = items.count - 1
-        var validRows = IndexSet()
-        if maxIndex >= 0 {
-            for row in pendingThumbnailRows where row <= maxIndex {
-                validRows.insert(row)
-            }
-        }
-
-        pendingThumbnailRows.removeAll()
-        guard !validRows.isEmpty else { return }
-
-        let columnIndex = nameColumnIndex(in: tableView)
-        tableView.reloadData(forRowIndexes: validRows, columnIndexes: IndexSet(integer: columnIndex))
     }
 
     private func nameColumnIndex(in tableView: NSTableView) -> Int {
@@ -1382,6 +1787,30 @@ extension FileTableCoordinator: NSMenuDelegate {
         menu.addItem(resetItem)
     }
 
+    /// Finder: right-clicking an item inside the selection acts on the whole selection;
+    /// right-clicking outside it selects just that item first.
+    func prepareContextMenuTargets(clickedRow: Int) {
+        guard let tableView, clickedRow >= 0, clickedRow < items.count else {
+            contextMenuItems = []
+            contextMenuClickedItem = nil
+            return
+        }
+        let clickedItem = items[clickedRow]
+        if !tableView.selectedRowIndexes.contains(clickedRow) {
+            isUpdatingSelection = true
+            tableView.selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
+            viewModel.selectedItems = [clickedItem]
+            viewModel.selectionAnchorIndex = clickedRow
+            viewModel.lastSelectedIndex = clickedRow
+            lastSyncedSelection = viewModel.selectedItems
+            isUpdatingSelection = false
+        }
+        contextMenuItems = tableView.selectedRowIndexes.compactMap { $0 < items.count ? items[$0] : nil }
+        contextMenuClickedItem = clickedItem
+    }
+
+    var contextMenuTargets: [FileItem] { contextMenuItems }
+
     private func buildRowMenu(_ menu: NSMenu) {
         guard let tableView = tableView else { return }
         let clickedRow = tableView.clickedRow
@@ -1392,15 +1821,11 @@ extension FileTableCoordinator: NSMenuDelegate {
             return
         }
 
-        let item = items[clickedRow]
-
-        // Select the clicked row if not already selected
-        if !tableView.selectedRowIndexes.contains(clickedRow) {
-            tableView.selectRowIndexes(IndexSet(integer: clickedRow), byExtendingSelection: false)
-            viewModel.selectedItems = [item]
-        }
-
-        let isFromArchive = item.isFromArchive
+        prepareContextMenuTargets(clickedRow: clickedRow)
+        let targets = contextMenuItems
+        guard let item = contextMenuClickedItem, !targets.isEmpty else { return }
+        let isSingle = targets.count == 1
+        let anyFromArchive = targets.contains { $0.isFromArchive }
 
         // Open
         let openItem = NSMenuItem(title: "Open", action: #selector(menuOpen(_:)), keyEquivalent: "")
@@ -1408,16 +1833,16 @@ extension FileTableCoordinator: NSMenuDelegate {
         menu.addItem(openItem)
 
         // Show Package Contents (for .app, .bundle, etc.)
-        if isPackage(item) {
+        if isSingle && isPackage(item) {
             let packageItem = NSMenuItem(title: "Show Package Contents", action: #selector(menuShowPackageContents(_:)), keyEquivalent: "")
             packageItem.target = self
             menu.addItem(packageItem)
         }
 
         // Open With submenu
-        if !isFromArchive && !item.isDirectory {
+        if !anyFromArchive && !targets.contains(where: { $0.isDirectory }) {
             let openWithItem = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
-            openWithItem.submenu = OpenWithMenuBuilder.buildNSMenu(for: [item.url], target: self)
+            openWithItem.submenu = OpenWithMenuBuilder.buildNSMenu(for: targets.map(\.url), target: self)
             menu.addItem(openWithItem)
         }
 
@@ -1426,19 +1851,21 @@ extension FileTableCoordinator: NSMenuDelegate {
         // Get Info
         let getInfoItem = NSMenuItem(title: "Get Info", action: #selector(menuGetInfo(_:)), keyEquivalent: "")
         getInfoItem.target = self
-        getInfoItem.isEnabled = !isFromArchive
+        getInfoItem.isEnabled = !anyFromArchive
         menu.addItem(getInfoItem)
 
         menu.addItem(NSMenuItem.separator())
 
         // Tags submenu (only for non-archive items)
-        if !isFromArchive {
+        if !anyFromArchive {
+            let targetTags = targets.map { $0.tags }
             let tagsMenu = NSMenu(title: "Tags")
             for tag in FinderTag.allTags {
                 let tagItem = NSMenuItem(title: tag.name, action: #selector(menuToggleTag(_:)), keyEquivalent: "")
                 tagItem.target = self
                 tagItem.representedObject = tag.name
-                tagItem.state = item.tags.contains(tag.name) ? .on : .off
+                let taggedCount = targetTags.filter { $0.contains(tag.name) }.count
+                tagItem.state = taggedCount == 0 ? .off : (taggedCount == targets.count ? .on : .mixed)
 
                 // Add color indicator
                 let colorImage = NSImage(size: NSSize(width: 12, height: 12))
@@ -1451,7 +1878,7 @@ extension FileTableCoordinator: NSMenuDelegate {
                 tagsMenu.addItem(tagItem)
             }
 
-            if !item.tags.isEmpty {
+            if targetTags.contains(where: { !$0.isEmpty }) {
                 tagsMenu.addItem(NSMenuItem.separator())
                 let removeAllItem = NSMenuItem(title: "Remove All Tags", action: #selector(menuRemoveAllTags(_:)), keyEquivalent: "")
                 removeAllItem.target = self
@@ -1478,7 +1905,7 @@ extension FileTableCoordinator: NSMenuDelegate {
         // Duplicate
         let duplicateItem = NSMenuItem(title: "Duplicate", action: #selector(menuDuplicate(_:)), keyEquivalent: "")
         duplicateItem.target = self
-        duplicateItem.isEnabled = !isFromArchive
+        duplicateItem.isEnabled = !anyFromArchive
         menu.addItem(duplicateItem)
 
         menu.addItem(NSMenuItem.separator())
@@ -1486,13 +1913,13 @@ extension FileTableCoordinator: NSMenuDelegate {
         // Rename
         let renameItem = NSMenuItem(title: "Rename", action: #selector(menuRename(_:)), keyEquivalent: "")
         renameItem.target = self
-        renameItem.isEnabled = !isFromArchive
+        renameItem.isEnabled = isSingle && !anyFromArchive
         menu.addItem(renameItem)
 
         // Move to Trash
         let trashItem = NSMenuItem(title: "Move to Trash", action: #selector(menuMoveToTrash(_:)), keyEquivalent: "")
         trashItem.target = self
-        trashItem.isEnabled = !isFromArchive
+        trashItem.isEnabled = !anyFromArchive
         menu.addItem(trashItem)
 
         menu.addItem(NSMenuItem.separator())
@@ -1504,6 +1931,9 @@ extension FileTableCoordinator: NSMenuDelegate {
     }
 
     private func buildEmptySpaceMenu(_ menu: NSMenu) {
+        contextMenuItems = []
+        contextMenuClickedItem = nil
+
         // New Folder
         let newFolderItem = NSMenuItem(title: "New Folder", action: #selector(menuNewFolder(_:)), keyEquivalent: "")
         newFolderItem.target = self
@@ -1528,23 +1958,18 @@ extension FileTableCoordinator: NSMenuDelegate {
     @objc private func toggleColumnVisibility(_ sender: NSMenuItem) {
         guard let column = sender.representedObject as? ListColumn else { return }
         columnConfig.toggleColumnVisibility(column)
-        setupColumns()
-        tableView?.reloadData()
+        syncColumnsIfNeeded()
     }
 
     @objc private func resetColumnsToDefaults(_ sender: NSMenuItem) {
         columnConfig.resetToDefaults()
-        setupColumns()
-        tableView?.reloadData()
+        syncColumnsIfNeeded()
     }
 
     // MARK: - Row Menu Actions
 
     @objc private func menuOpen(_ sender: NSMenuItem) {
-        guard let tableView = tableView else { return }
-        let row = tableView.clickedRow
-        guard row >= 0, row < items.count else { return }
-        viewModel.openItem(items[row])
+        FileListActions.open(contextMenuItems, primary: contextMenuClickedItem, viewModel: viewModel)
     }
 
     @objc func openWithApp(_ sender: NSMenuItem) {
@@ -1561,55 +1986,38 @@ extension FileTableCoordinator: NSMenuDelegate {
         viewModel.getInfo()
     }
 
+    /// Adds the tag to every target, or removes it from all of them if they all have it.
     @objc private func menuToggleTag(_ sender: NSMenuItem) {
         guard let tagName = sender.representedObject as? String else { return }
-        guard let tableView = tableView else { return }
-        let row = tableView.clickedRow
-        guard row >= 0, row < items.count else { return }
+        let targets = contextMenuItems.filter { !$0.isFromArchive }
+        guard !targets.isEmpty else { return }
 
-        let item = items[row]
-        viewModel.toggleTag(tagName, for: item.url, invalidateCache: false)
-
-        // Directly reconfigure the Name cell which shows tag dots
-        let nameColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
-        if nameColumnIndex >= 0,
-           let nameCell = tableView.view(atColumn: nameColumnIndex, row: row, makeIfNecessary: false) as? FileNameCellView {
-            nameCell.configure(item: item, thumbnail: thumbnails[item.url], appSettings: appSettings)
+        let allTagged = targets.allSatisfy { $0.tags.contains(tagName) }
+        for item in targets {
+            var tags = item.tags
+            if allTagged {
+                tags.removeAll { $0 == tagName }
+            } else if !tags.contains(tagName) {
+                tags.append(tagName)
+            } else {
+                continue
+            }
+            viewModel.setTags(tags, for: item.url, invalidateCache: false)
+            loadedTagURLs.insert(item.url)
+            if let row = rowIndex[item.url] {
+                updateTagViews(row: row, tags: tags)
+            }
         }
-
-        // Also try Tags column if it exists
-        let tagsColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.tags.rawValue))
-        if tagsColumnIndex >= 0,
-           let tagsCell = tableView.view(atColumn: tagsColumnIndex, row: row, makeIfNecessary: false) as? TagsCellView {
-            tagsCell.configure(item: item, appSettings: appSettings)
-        }
-
-        // refreshTags is triggered by the view model using the cached tag values.
     }
 
     @objc private func menuRemoveAllTags(_ sender: NSMenuItem) {
-        guard let tableView = tableView else { return }
-        let row = tableView.clickedRow
-        guard row >= 0, row < items.count else { return }
-
-        let item = items[row]
-        viewModel.setTags([], for: item.url, invalidateCache: false)
-
-        // Directly reconfigure the Name cell which shows tag dots
-        let nameColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.name.rawValue))
-        if nameColumnIndex >= 0,
-           let nameCell = tableView.view(atColumn: nameColumnIndex, row: row, makeIfNecessary: false) as? FileNameCellView {
-            nameCell.configure(item: item, thumbnail: thumbnails[item.url], appSettings: appSettings)
+        for item in contextMenuItems where !item.isFromArchive && !item.tags.isEmpty {
+            viewModel.setTags([], for: item.url, invalidateCache: false)
+            loadedTagURLs.insert(item.url)
+            if let row = rowIndex[item.url] {
+                updateTagViews(row: row, tags: [])
+            }
         }
-
-        // Also try Tags column if it exists
-        let tagsColumnIndex = tableView.column(withIdentifier: NSUserInterfaceItemIdentifier(ListColumn.tags.rawValue))
-        if tagsColumnIndex >= 0,
-           let tagsCell = tableView.view(atColumn: tagsColumnIndex, row: row, makeIfNecessary: false) as? TagsCellView {
-            tagsCell.configure(item: item, appSettings: appSettings)
-        }
-
-        // refreshTags is triggered by the view model using the cached tag values.
     }
 
     @objc private func menuCopy(_ sender: NSMenuItem) {
@@ -1625,10 +2033,8 @@ extension FileTableCoordinator: NSMenuDelegate {
     }
 
     @objc private func menuRename(_ sender: NSMenuItem) {
-        guard let tableView = tableView else { return }
-        let row = tableView.clickedRow
-        guard row >= 0, row < items.count else { return }
-        viewModel.renamingURL = items[row].url
+        guard contextMenuItems.count == 1, let item = contextMenuItems.first else { return }
+        viewModel.renamingURL = item.url
     }
 
     @objc private func menuMoveToTrash(_ sender: NSMenuItem) {
@@ -1652,10 +2058,7 @@ extension FileTableCoordinator: NSMenuDelegate {
     }
 
     @objc private func menuShowPackageContents(_ sender: NSMenuItem) {
-        guard let tableView = tableView else { return }
-        let row = tableView.clickedRow
-        guard row >= 0, row < items.count else { return }
-        let item = items[row]
+        guard let item = contextMenuClickedItem else { return }
         viewModel.showPackageContents(item)
     }
 
@@ -1695,39 +2098,125 @@ extension FileTableCoordinator {
         InternalDragState.shared.isDragging = false
     }
 
-    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
-        // Allow dropping on folders
-        if dropOperation == .on, row < items.count {
-            let targetItem = items[row]
-            if targetItem.isDirectory && !targetItem.isFromArchive {
-                return NSEvent.modifierFlags.contains(.option) ? .copy : .move
+    /// The folder row a drop lands in, or nil when the drop goes into the folder being shown.
+    func dropTargetFolder(row: Int, dropOperation: NSTableView.DropOperation) -> FileItem? {
+        guard dropOperation == .on, row >= 0, row < items.count else { return nil }
+        let item = items[row]
+        guard item.isDirectory, !item.isFromArchive, item.url.isFileURL,
+              !NSWorkspace.shared.isFilePackage(atPath: item.url.path) else { return nil }
+        return item
+    }
+
+    private var acceptsDrops: Bool {
+        !viewModel.isInsideArchive && !viewModel.isPhotosLibraryActive && viewModel.currentPath.isFileURL
+    }
+
+    private func draggedURLs(_ info: NSDraggingInfo) -> [URL] {
+        if dropSessionNumber != info.draggingSequenceNumber {
+            dropSessionNumber = info.draggingSequenceNumber
+            dropVolumeCache.removeAll()
+            dropSessionURLs = info.draggingPasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+            ) as? [URL] ?? []
+        }
+        return dropSessionURLs
+    }
+
+    /// Finder's rule for a plain drag: move within a volume, copy across volumes.
+    static func isSameVolume(_ source: URL, _ destination: URL) -> Bool {
+        let key = URLResourceKey.volumeIdentifierKey
+        guard let sourceVolume = (try? source.resourceValues(forKeys: [key]))?.volumeIdentifier,
+              let destinationVolume = (try? destination.resourceValues(forKeys: [key]))?.volumeIdentifier else {
+            return true
+        }
+        return sourceVolume.isEqual(destinationVolume)
+    }
+
+    /// The operation for dropping `urls` into `destination`, or [] to refuse.
+    /// - sourceMask: what the drag source allows (AppKit already narrows it for ⌥/⌘).
+    /// - sameVolume: whether the first dragged item is on the destination's volume.
+    static func dropOperation(
+        for urls: [URL],
+        into destination: URL,
+        sourceMask: NSDragOperation,
+        modifierFlags: NSEvent.ModifierFlags,
+        sameVolume: () -> Bool
+    ) -> NSDragOperation {
+        guard !urls.isEmpty else { return [] }
+        let destinationPath = destination.standardizedFileURL.path
+
+        // A folder can't be dropped into itself or one of its own subfolders
+        for url in urls {
+            let path = url.standardizedFileURL.path
+            if destinationPath == path || destinationPath.hasPrefix(path.hasSuffix("/") ? path : path + "/") {
+                return []
             }
         }
 
-        // Allow dropping between items (into current folder)
-        if dropOperation == .above {
-            return NSEvent.modifierFlags.contains(.option) ? .copy : .move
+        // Everything is already in the destination: nothing to do
+        if urls.allSatisfy({ $0.deletingLastPathComponent().standardizedFileURL.path == destinationPath }) {
+            return []
         }
 
-        return []
+        let canMove = sourceMask.contains(.move) || sourceMask.contains(.generic)
+        let canCopy = sourceMask.contains(.copy)
+
+        switch FileDropOperation(modifierFlags: modifierFlags) {
+        case .copy:
+            return canCopy ? .copy : []
+        case .move:
+            return canMove ? .move : (canCopy ? .copy : [])
+        case .automatic:
+            if !canMove { return canCopy ? .copy : [] }
+            if !canCopy { return .move }
+            return sameVolume() ? .move : .copy
+        }
+    }
+
+    func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
+        guard acceptsDrops else { return [] }
+        let urls = draggedURLs(info)
+        guard !urls.isEmpty else { return [] }
+
+        let destination: URL
+        if let folder = dropTargetFolder(row: row, dropOperation: dropOperation) {
+            destination = folder.url
+        } else {
+            // Not on a folder row: the drop goes into the folder being shown (highlight the whole list)
+            tableView.setDropRow(-1, dropOperation: .on)
+            destination = viewModel.currentPath
+        }
+
+        return Self.dropOperation(
+            for: urls,
+            into: destination,
+            sourceMask: info.draggingSourceOperationMask,
+            modifierFlags: NSEvent.modifierFlags,
+            sameVolume: {
+                if let cached = dropVolumeCache[destination] { return cached }
+                let result = Self.isSameVolume(urls[0], destination)
+                dropVolumeCache[destination] = result
+                return result
+            }
+        )
     }
 
     func tableView(_ tableView: NSTableView, acceptDrop info: NSDraggingInfo, row: Int, dropOperation: NSTableView.DropOperation) -> Bool {
-        guard let urls = info.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL],
-              !urls.isEmpty else {
-            return false
-        }
+        guard acceptsDrops else { return false }
+        let urls = draggedURLs(info)
+        dropSessionNumber = nil
+        guard !urls.isEmpty else { return false }
 
-        if dropOperation == .on, row < items.count {
-            let targetItem = items[row]
-            if targetItem.isDirectory && !targetItem.isFromArchive {
-                viewModel.handleDrop(urls: urls, to: targetItem.url)
-                return true
-            }
-        }
+        // Resolve the operation now, from the modifiers held at drop time
+        let sourceMask = info.draggingSourceOperationMask
+        let operation: FileDropOperation = sourceMask.contains(.move) || sourceMask.contains(.generic)
+            ? FileDropOperation(modifierFlags: NSEvent.modifierFlags)
+            : .copy
 
-        // Drop into current folder
-        viewModel.handleDrop(urls: urls)
+        // nil destination = the folder being shown
+        let destination = dropTargetFolder(row: row, dropOperation: dropOperation)?.url
+        viewModel.handleDrop(urls: urls, to: destination, operation: operation)
         return true
     }
 }
