@@ -156,48 +156,104 @@ struct VideoSkimProgressBar: View {
     }
 }
 
+/// Whether the current inline preview belongs to one cell. Subscribes once per cell and publishes
+/// only when the answer changes, so cells don't re-render on every preview change elsewhere.
+@MainActor
+private final class MediaPreviewMatch: ObservableObject {
+    @Published private(set) var isVideoPreviewing = false
+    @Published private(set) var isVideoSkimming = false
+    @Published private(set) var isAudioPreviewing = false
+
+    private var cancellables: Set<AnyCancellable> = []
+
+    init(url: URL, fileType: FileItem.FileType) {
+        switch fileType {
+        case .video:
+            let manager = InlineVideoPreviewManager.shared
+            manager.$currentPreviewURL
+                .combineLatest(manager.$isPreviewActive, manager.$isSkimming)
+                .map { [weak manager] previewURL, isActive, isSkimming -> VideoMatch in
+                    // Previews requested by CALayer hosts (Cover Flow) are shown by those hosts
+                    let isMine = isActive && previewURL == url && manager?.currentHost == nil
+                    return VideoMatch(isPreviewing: isMine, isSkimming: isMine && isSkimming)
+                }
+                .removeDuplicates()
+                .sink { [weak self] match in
+                    MainActor.assumeIsolated {
+                        self?.apply(match)
+                    }
+                }
+                .store(in: &cancellables)
+        case .audio:
+            let manager = InlineAudioPreviewManager.shared
+            manager.$currentPreviewURL
+                .combineLatest(manager.$isPreviewActive)
+                .map { previewURL, isActive in isActive && previewURL == url }
+                .removeDuplicates()
+                .sink { [weak self] isMine in
+                    MainActor.assumeIsolated {
+                        guard let self, self.isAudioPreviewing != isMine else { return }
+                        self.isAudioPreviewing = isMine
+                    }
+                }
+                .store(in: &cancellables)
+        default:
+            break
+        }
+    }
+
+    private struct VideoMatch: Equatable {
+        var isPreviewing: Bool
+        var isSkimming: Bool
+    }
+
+    private func apply(_ match: VideoMatch) {
+        if isVideoPreviewing != match.isPreviewing { isVideoPreviewing = match.isPreviewing }
+        if isVideoSkimming != match.isSkimming { isVideoSkimming = match.isSkimming }
+    }
+}
+
 /// View modifier that adds inline audio/video preview on hover.
 ///
 /// Cells don't observe the preview managers directly (every visible cell would re-render on each
-/// preview change); each cell subscribes to "is the preview for my URL" and only re-renders when
-/// that answer changes. High-frequency progress values are observed only by the overlay drawing them.
+/// preview change); each cell observes whether the preview is its own. High-frequency progress
+/// values are observed only by the overlay drawing them.
 struct MediaPreviewModifier: ViewModifier {
     let item: FileItem
     @Binding var isHovering: Bool
     let size: CGSize
 
-    @State private var videoStatus = VideoMatch()
-    @State private var isAudioPreviewing = false
+    @StateObject private var match: MediaPreviewMatch
 
-    fileprivate struct VideoMatch: Equatable {
-        var isPreviewing = false
-        var isSkimming = false
+    init(item: FileItem, isHovering: Binding<Bool>, size: CGSize) {
+        self.item = item
+        self._isHovering = isHovering
+        self.size = size
+        self._match = StateObject(wrappedValue: MediaPreviewMatch(url: item.url, fileType: item.fileType))
     }
 
     func body(content: Content) -> some View {
         content
             .overlay {
                 // Video preview overlay
-                if item.fileType == .video && isHovering && videoStatus.isPreviewing {
-                    VideoPreviewLayerView(url: item.url, isActive: videoStatus.isPreviewing)
+                if item.fileType == .video && isHovering && match.isVideoPreviewing {
+                    VideoPreviewLayerView(url: item.url, isActive: match.isVideoPreviewing)
                         .frame(width: size.width, height: size.height)
                         .allowsHitTesting(false)
                         .transition(.opacity.animation(.easeInOut(duration: 0.15)))
 
                     // Scrub progress bar during skimming
-                    if videoStatus.isSkimming {
+                    if match.isVideoSkimming {
                         VideoSkimProgressBar(progress: InlineVideoPreviewManager.shared.skimProgressState, size: size)
                             .transition(.opacity.animation(.easeInOut(duration: 0.1)))
                     }
                 }
                 // Audio preview overlay (progress bar + pause)
-                if item.fileType == .audio && isHovering && isAudioPreviewing {
+                if item.fileType == .audio && isHovering && match.isAudioPreviewing {
                     AudioPreviewOverlayView(url: item.url, size: size)
                         .transition(.opacity.animation(.easeInOut(duration: 0.15)))
                 }
             }
-            .onReceive(videoMatchPublisher) { videoStatus = $0 }
-            .onReceive(audioMatchPublisher) { isAudioPreviewing = $0 }
             // Use onContinuousHover to get mouse position for video skimming
             .onContinuousHover { phase in
                 switch phase {
@@ -245,36 +301,6 @@ struct MediaPreviewModifier: ViewModifier {
                     InlineAudioPreviewManager.shared.cancelPreview(for: item.url)
                 }
             }
-    }
-
-    private var videoMatchPublisher: AnyPublisher<VideoMatch, Never> {
-        guard item.fileType == .video else {
-            return Just(VideoMatch()).eraseToAnyPublisher()
-        }
-        let manager = InlineVideoPreviewManager.shared
-        let url = item.url
-        return manager.$currentPreviewURL
-            .combineLatest(manager.$isPreviewActive, manager.$isSkimming)
-            .map { [weak manager] previewURL, isActive, isSkimming in
-                // Previews requested by CALayer hosts (Cover Flow) are shown by those hosts
-                let isMine = isActive && previewURL == url && manager?.currentHost == nil
-                return VideoMatch(isPreviewing: isMine, isSkimming: isMine && isSkimming)
-            }
-            .removeDuplicates()
-            .eraseToAnyPublisher()
-    }
-
-    private var audioMatchPublisher: AnyPublisher<Bool, Never> {
-        guard item.fileType == .audio else {
-            return Just(false).eraseToAnyPublisher()
-        }
-        let manager = InlineAudioPreviewManager.shared
-        let url = item.url
-        return manager.$currentPreviewURL
-            .combineLatest(manager.$isPreviewActive)
-            .map { previewURL, isActive in isActive && previewURL == url }
-            .removeDuplicates()
-            .eraseToAnyPublisher()
     }
 }
 

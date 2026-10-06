@@ -16,6 +16,8 @@ private class SelectionFlag {
 private final class CoverFlowThumbnailState {
     /// What each displayed image is good for, and which requests are in flight
     var ledger = CoverFlowThumbnailLedger()
+    /// This view's thumbnail requests, cancelled together (other views' requests are untouched)
+    let requestOwner = ThumbnailRequestOwner()
     /// Finished thumbnails waiting for the next batched apply
     var pendingUpdates: [URL: NSImage] = [:]
     var batchTimer: Timer?
@@ -60,6 +62,7 @@ private final class CoverFlowThumbnailState {
         isScrolling = false
         isRapidNavigation = false
         ledger.cancelAllRequests()
+        ThumbnailCacheManager.shared.cancelRequests(for: requestOwner)
         generation &+= 1
     }
 }
@@ -385,16 +388,16 @@ struct CoverFlowView: View {
 
         if tokenChanged {
             if viewModel.currentPath != thumbState.loadedFolderPath {
-                // A different folder in the same view: start over
+                // A different folder in the same view: start over (cancels only our requests)
                 thumbState.loadedFolderPath = viewModel.currentPath
                 selectionFlag.userClearedSelection = false
                 thumbState.suspend()
                 thumbState.ledger.removeAll()
                 thumbState.lastHydrationRange = nil
                 thumbnails = [:]
-                thumbnailCache.clearForNewFolder()
-            } else {
-                // Adds, renames, deletions and refreshes: keep the thumbnails of items still shown
+            } else if !newItems.isEmpty {
+                // Adds, renames, deletions and refreshes: keep the thumbnails of items still shown.
+                // (A reload empties the list first; keep everything through that.)
                 retainThumbnailsForDisplayedItems()
             }
             scheduleThumbnailPass()
@@ -694,11 +697,12 @@ struct CoverFlowView: View {
                     continue
                 }
                 guard let entry = state.ledger.entry(for: url), !entry.isFinal, entry.pixelSize > maxSize else { continue }
-                let version = items[index].contentVersion
-                if let smaller = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: maxSize) {
+                let item = items[index]
+                let version = item.contentVersion
+                if let smaller = thumbnailCache.cachedThumbnail(for: item, maxPixelSize: maxSize) {
                     updates[url] = smaller
                     state.ledger.replace(url, version: version, pixelSize: maxSize)
-                } else if maxSize > sizes.low, let low = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: sizes.low) {
+                } else if maxSize > sizes.low, let low = thumbnailCache.cachedThumbnail(for: item, maxPixelSize: sizes.low) {
                     updates[url] = low
                     state.ledger.replace(url, version: version, pixelSize: sizes.low)
                 } else if distance > policy.highRadius {
@@ -743,23 +747,16 @@ struct CoverFlowView: View {
                     continue
                 }
 
-                if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: required) {
+                // Memory cache only; disk-cache hits arrive through the request below
+                if let cached = thumbnailCache.cachedThumbnail(for: item, maxPixelSize: required) {
                     updates[url] = cached
                     state.ledger.markSettled(url, version: version, pixelSize: required)
                     continue
                 }
 
-                if thumbnailCache.hasFailed(url: url) {
-                    if !hasImage {
-                        updates[url] = item.placeholderIcon
-                    }
-                    state.ledger.markFinal(url, version: version)
-                    continue
-                }
-
                 // Show a cheap low-resolution copy while the full one loads
                 if !hasImage, required > sizes.low,
-                   let low = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: sizes.low) {
+                   let low = thumbnailCache.cachedThumbnail(for: item, maxPixelSize: sizes.low) {
                     updates[url] = low
                     state.ledger.markSettled(url, version: version, pixelSize: sizes.low)
                 }
@@ -793,8 +790,8 @@ struct CoverFlowView: View {
             requestThumbnail(for: request.item, pixelSize: request.pixelSize)
         }
 
-        // Completions schedule the next pass; if every slot is taken by requests that may never
-        // complete (dropped by the cache), look again once they go stale.
+        // Completions schedule the next pass; if every slot is taken, look again shortly
+        // (requests that never complete go stale in the ledger and are retried).
         state.hasMoreWork = hasMore
         if hasMore && requests.isEmpty {
             scheduleRetryPass(after: 0.5)
@@ -805,8 +802,11 @@ struct CoverFlowView: View {
         let state = thumbState
         let generation = state.generation
         let version = item.contentVersion
+        let url = item.url
 
-        thumbnailCache.generateThumbnail(for: item, maxPixelSize: pixelSize) { url, image in
+        // The completion can run synchronously (memory hit, known failure); always handle it on
+        // the next turn so it never mutates state in the middle of a pass.
+        thumbnailCache.requestThumbnail(for: item, maxPixelSize: pixelSize, owner: state.requestOwner) { result in
             DispatchQueue.main.async {
                 guard generation == state.generation, state.isActive else { return }
                 state.ledger.finishRequest(url, pixelSize: pixelSize)
@@ -818,22 +818,27 @@ struct CoverFlowView: View {
                     return
                 }
 
-                let failed = image == nil || thumbnailCache.hasFailed(url: url)
                 let hasImage = thumbnails[url] != nil || state.pendingUpdates[url] != nil
-                if let existing = state.ledger.entry(for: url),
-                   CoverFlowThumbnailLedger.isSameContent(existing.version, version),
-                   existing.isFinal || existing.pixelSize > pixelSize {
-                    // Something better arrived first
-                } else if failed && hasImage {
-                    // Keep the image we have rather than replacing it with a generic icon
-                    state.ledger.markFinal(url, version: version)
-                } else {
-                    state.pendingUpdates[url] = image ?? item.placeholderIcon
-                    if failed {
-                        state.ledger.markFinal(url, version: version)
-                    } else {
-                        state.ledger.markSettled(url, version: version, pixelSize: pixelSize)
+                switch result {
+                case .cancelled:
+                    // Not settled: the next pass asks again if the cover still needs it
+                    break
+                case .failed:
+                    // Keep any image we have rather than replacing it with a generic icon
+                    if !hasImage {
+                        state.pendingUpdates[url] = item.placeholderIcon
+                        scheduleThumbnailBatch()
                     }
+                    state.ledger.markFinal(url, version: version)
+                case .loaded(let image):
+                    if let existing = state.ledger.entry(for: url),
+                       CoverFlowThumbnailLedger.isSameContent(existing.version, version),
+                       existing.isFinal || existing.pixelSize > pixelSize {
+                        // Something better arrived first
+                        break
+                    }
+                    state.pendingUpdates[url] = image
+                    state.ledger.markSettled(url, version: version, pixelSize: pixelSize)
                     scheduleThumbnailBatch()
                 }
 
@@ -1125,6 +1130,10 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
     /// True while SwiftUI is pushing new state into the view (updateNSView)
     private var isApplyingSwiftUIUpdate = false
+
+    private var emptyRebuildWorkItem: DispatchWorkItem?
+    /// How long the list must stay empty before the covers are cleared
+    let emptyRebuildDelay: TimeInterval = 0.3
 
     private func setupView() {
         wantsLayer = true
@@ -1467,11 +1476,24 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         }
 
         if itemsChanged {
-            // Rebuild even when empty, so no ghost covers stay behind
+            emptyRebuildWorkItem?.cancel()
+            emptyRebuildWorkItem = nil
             accessibilityElementsByIndex.removeAll()
-            rebuildCovers()
-            layer?.setNeedsLayout()
-            layer?.layoutIfNeeded()
+            if items.isEmpty && !coverLayers.isEmpty {
+                // A reload empties the list for a moment; clear the covers only if it stays
+                // empty, so a refresh doesn't flash but no ghost covers stay behind
+                let workItem = DispatchWorkItem { [weak self] in
+                    guard let self, self.items.isEmpty else { return }
+                    self.emptyRebuildWorkItem = nil
+                    self.rebuildCovers()
+                }
+                emptyRebuildWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + emptyRebuildDelay, execute: workItem)
+            } else {
+                rebuildCovers()
+                layer?.setNeedsLayout()
+                layer?.layoutIfNeeded()
+            }
             if shouldSyncSelection && indexChanged {
                 centredIndexDidChange()
             }
