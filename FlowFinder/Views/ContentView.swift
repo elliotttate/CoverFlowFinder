@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 
 @MainActor
 final class AuxiliaryPaneStore: ObservableObject {
@@ -48,6 +49,13 @@ final class AuxiliaryPaneStore: ObservableObject {
     }
 }
 
+/// The window a `ContentView` lives in. Deliberately not published: knowing the window never
+/// needs to re-render anything.
+@MainActor
+final class HostWindowBox: ObservableObject {
+    weak var window: NSWindow?
+}
+
 private struct ViewModelActivitySyncView: View {
     let selectedTabId: UUID
     let currentViewMode: ViewMode
@@ -66,55 +74,78 @@ private struct ViewModelActivitySyncView: View {
         Color.clear
             .frame(width: 0, height: 0)
             .onAppear(perform: onAppearAction)
-            .onChange(of: selectedTabId) { _ in
+            .onChange(of: selectedTabId) { _, _ in
                 onSelectedTabChange()
             }
-            .onChange(of: currentViewMode) { _ in
+            .onChange(of: currentViewMode) { _, _ in
                 onUpdateActivity()
             }
-            .onChange(of: activePane) { _ in
+            .onChange(of: activePane) { _, _ in
                 onUpdateActivity()
             }
-            .onChange(of: activeQuadPane) { _ in
+            .onChange(of: activeQuadPane) { _, _ in
                 onUpdateActivity()
             }
-            .onChange(of: scenePhase) { _ in
+            .onChange(of: scenePhase) { _, _ in
                 onUpdateActivity()
             }
-            .onChange(of: tabIDs) { _ in
+            .onChange(of: tabIDs) { _, _ in
                 onTabsChange()
             }
-            .onChange(of: showHiddenFiles) { _ in
+            .onChange(of: showHiddenFiles) { _, _ in
                 onRefreshAll()
             }
     }
 }
 
-private struct NotificationReceivers: ViewModifier {
-    @Binding var showingInfoItem: FileItem?
+/// Window-scoped commands: menu commands post these with the target window as `object`, and only
+/// the `ContentView` of that window reacts.
+private struct BrowserWindowNotifications: ViewModifier {
+    let isTargetWindow: (Any?) -> Bool
     let onNewTab: () -> Void
     let onCloseTab: () -> Void
     let onNextTab: () -> Void
     let onPreviousTab: () -> Void
+    let onSetViewMode: (ViewMode) -> Void
+    let onShowInfo: (FileItem) -> Void
+    let onVolumeUnmount: (URL) -> Void
 
     func body(content: Content) -> some View {
         content
             .onReceive(NotificationCenter.default.publisher(for: .showGetInfo)) { notification in
+                // Posted by the view model with the item; the window owning that view model shows it.
                 if let item = notification.object as? FileItem {
-                    showingInfoItem = item
+                    onShowInfo(item)
                 }
             }
-            .onReceive(NotificationCenter.default.publisher(for: .newTab)) { _ in
-                onNewTab()
+            .onReceive(NotificationCenter.default.publisher(for: .newTab)) { notification in
+                if isTargetWindow(notification.object) { onNewTab() }
             }
-            .onReceive(NotificationCenter.default.publisher(for: .closeTab)) { _ in
-                onCloseTab()
+            .onReceive(NotificationCenter.default.publisher(for: .closeTab)) { notification in
+                if isTargetWindow(notification.object) { onCloseTab() }
             }
-            .onReceive(NotificationCenter.default.publisher(for: .nextTab)) { _ in
-                onNextTab()
+            .onReceive(NotificationCenter.default.publisher(for: .nextTab)) { notification in
+                if isTargetWindow(notification.object) { onNextTab() }
             }
-            .onReceive(NotificationCenter.default.publisher(for: .previousTab)) { _ in
-                onPreviousTab()
+            .onReceive(NotificationCenter.default.publisher(for: .previousTab)) { notification in
+                if isTargetWindow(notification.object) { onPreviousTab() }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .browserSetViewMode)) { notification in
+                guard isTargetWindow(notification.object),
+                      let rawValue = notification.userInfo?[BrowserWindowCommand.viewModeKey] as? String,
+                      let mode = ViewMode(rawValue: rawValue) else { return }
+                onSetViewMode(mode)
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willUnmountNotification)) { notification in
+                // Leave the volume before it goes away so open folders don't block the unmount.
+                if let volumeURL = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL {
+                    onVolumeUnmount(volumeURL)
+                }
+            }
+            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { notification in
+                if let volumeURL = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL {
+                    onVolumeUnmount(volumeURL)
+                }
             }
     }
 }
@@ -124,22 +155,31 @@ struct ContentView: View {
     @EnvironmentObject private var settings: AppSettings
     @Environment(\.undoManager) private var undoManager
     @Environment(\.scenePhase) private var scenePhase
-    @State private var tabs: [BrowserTab] = [BrowserTab()]
-    @State private var selectedTabId: UUID = UUID()
+    // @StateObject evaluates its initializer once per window, so the initial tab's view model is
+    // created exactly once (a @State initial value would be rebuilt on every ContentView init).
+    @StateObject private var tabStore = BrowserTabStore()
     @StateObject private var auxiliaryPaneStore = AuxiliaryPaneStore()
+    @StateObject private var hostWindow = HostWindowBox()
 
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var activePane: DualPaneView.Pane = .left
     @State private var activeQuadPane: QuadPaneView.Pane = .topLeft
+    @State private var dualPaneModes = DualPaneView.PaneModes()
+    @State private var quadPaneModes = QuadPaneView.PaneModes()
     @State private var currentViewMode: ViewMode = .coverFlow
     @State private var showingInfoItem: FileItem?
-    @FocusState private var isSearchFocused: Bool
-    @State private var navHistoryIndex: Int = 0
-    @State private var navHistoryCount: Int = 1
-    @ObservedObject private var columnConfig = ListColumnConfigManager.shared
+    @State private var windowTitle: String = ""
+
+    private var tabs: [BrowserTab] {
+        tabStore.tabs
+    }
+
+    private var selectedTabId: UUID {
+        tabStore.selectedTabId
+    }
 
     private var viewModel: FileBrowserViewModel {
-        tabs.first(where: { $0.id == selectedTabId })?.viewModel ?? tabs[0].viewModel
+        tabStore.selectedTab.viewModel
     }
 
     private var rightPaneViewModel: FileBrowserViewModel {
@@ -156,42 +196,26 @@ struct ContentView: View {
 
     private var viewModeBinding: Binding<ViewMode> {
         Binding(
-            get: { viewModel.viewMode },
-            set: { newValue in
-                DispatchQueue.main.async {
-                    viewModel.viewMode = newValue
-                    currentViewMode = newValue
-                }
-            }
+            get: { currentViewMode },
+            set: { setViewMode($0) }
         )
     }
 
-    private var searchTextBinding: Binding<String> {
-        Binding(
-            get: { viewModel.searchText },
-            set: { viewModel.searchText = $0 }
-        )
-    }
-
-    private var searchModeBinding: Binding<SearchMode> {
-        Binding(
-            get: { viewModel.searchMode },
-            set: { viewModel.searchMode = $0 }
-        )
-    }
-
+    /// The view model menus, the toolbar and the sidebar act on: the active pane in dual/quad mode.
     private var activeViewModel: FileBrowserViewModel {
-        if viewModel.viewMode == .dualPane && activePane == .right {
-            return rightPaneViewModel
-        } else if viewModel.viewMode == .quadPane {
+        switch currentViewMode {
+        case .dualPane:
+            return activePane == .right ? rightPaneViewModel : viewModel
+        case .quadPane:
             switch activeQuadPane {
             case .topLeft: return viewModel
             case .topRight: return rightPaneViewModel
             case .bottomLeft: return bottomLeftPaneViewModel
             case .bottomRight: return bottomRightPaneViewModel
             }
+        default:
+            return viewModel
         }
-        return viewModel
     }
 
     private var visibleViewModels: [FileBrowserViewModel] {
@@ -214,57 +238,50 @@ struct ContentView: View {
         return min(380, max(220, count * 40))
     }
 
-    init() {
-        let initialTab = BrowserTab()
-        _tabs = State(initialValue: [initialTab])
-        _selectedTabId = State(initialValue: initialTab.id)
-    }
-
     var body: some View {
         splitView
             .toolbar { toolbarItems }
-            .navigationTitle(viewModel.currentPath.lastPathComponent)
-            .focusedSceneValue(\.viewModel, viewModel)
+            .navigationTitle(windowTitle)
+            .focusedSceneObject(activeViewModel)
             .sheet(item: $showingInfoItem) { item in
                 FileInfoView(item: item)
             }
-            .modifier(NotificationReceivers(
-                showingInfoItem: $showingInfoItem,
+            .modifier(BrowserWindowNotifications(
+                isTargetWindow: isTargetWindow,
                 onNewTab: addNewTab,
-                onCloseTab: { closeTab(selectedTabId) },
-                onNextTab: selectNextTab,
-                onPreviousTab: selectPreviousTab
+                onCloseTab: closeTabOrWindow,
+                onNextTab: { tabStore.selectNextTab() },
+                onPreviousTab: { tabStore.selectPreviousTab() },
+                onSetViewMode: setViewMode,
+                onShowInfo: showInfoIfOwned,
+                onVolumeUnmount: leaveUnmountedVolume
             ))
-            .onReceive(viewModel.$historyIndex) { newIndex in
-                navHistoryIndex = newIndex
+            .onReceive(activeViewModel.$currentPath) { path in
+                windowTitle = path.lastPathComponent
             }
-            .onReceive(viewModel.$navigationHistory) { newHistory in
-                navHistoryCount = newHistory.count
+            .onReceive(viewModel.$viewMode) { mode in
+                // Keep the layout in sync when something else changes the mode (e.g. the sidebar's
+                // Photos Library switches to Masonry).
+                if mode != currentViewMode {
+                    currentViewMode = mode
+                }
             }
             .background(activitySyncView)
             .background(QuickLookWindowController())
-            .background(WindowRepresentedURL(url: viewModel.isInsideArchive ? nil : viewModel.currentPath) { url in
-                viewModel.navigateToAndSelectCurrent(url)
+            .background(HostingWindowReader { window in
+                attachHostWindow(window)
             })
-            .background(LiquidGlassWindowConfigurator())
+            .background(RepresentedURLSync(viewModel: activeViewModel))
     }
 
     @ToolbarContentBuilder
     private var toolbarItems: some ToolbarContent {
         ToolbarItem(placement: .navigation) {
-            Button(action: { viewModel.goBack() }) {
-                Image(systemName: "chevron.left")
-            }
-            .disabled(navHistoryIndex <= 0)
-            .help("Back")
+            ToolbarHistoryButton(viewModel: activeViewModel, direction: .back)
         }
 
         ToolbarItem(placement: .navigation) {
-            Button(action: { viewModel.goForward() }) {
-                Image(systemName: "chevron.right")
-            }
-            .disabled(navHistoryIndex >= navHistoryCount - 1)
-            .help("Forward")
+            ToolbarHistoryButton(viewModel: activeViewModel, direction: .forward)
         }
 
         ToolbarItem(placement: .principal) {
@@ -282,7 +299,9 @@ struct ContentView: View {
         }
 
         ToolbarItemGroup(placement: .primaryAction) {
-            toolbarActions
+            ToolbarSortMenu()
+            ToolbarActionsMenu(viewModel: activeViewModel)
+            ToolbarSearchControls(viewModel: activeViewModel)
         }
     }
 
@@ -297,28 +316,26 @@ struct ContentView: View {
             showHiddenFiles: settings.showHiddenFiles,
             onAppearAction: {
                 currentViewMode = viewModel.viewMode
-                syncNavigationState()
-                assignUndoManager()
+                syncWindowTitle()
                 updateViewModelActivity()
             },
             onSelectedTabChange: {
                 currentViewMode = viewModel.viewMode
-                syncNavigationState()
-                assignUndoManager()
+                syncWindowTitle()
                 updateViewModelActivity()
             },
             onRefreshAll: refreshAllViewModels,
-            onUpdateActivity: updateViewModelActivity,
-            onTabsChange: {
-                assignUndoManager()
+            onUpdateActivity: {
+                syncWindowTitle()
                 updateViewModelActivity()
-            }
+            },
+            onTabsChange: updateViewModelActivity
         )
     }
 
     private var splitView: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(viewModel: activeViewModel, isDualPane: currentViewMode == .dualPane || currentViewMode == .quadPane)
+            SidebarView(viewModel: activeViewModel)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 300)
         } detail: {
             detailContent
@@ -330,30 +347,38 @@ struct ContentView: View {
         VStack(spacing: 0) {
             if tabs.count > 1 {
                 TabBarView(
-                    tabs: $tabs,
-                    selectedTabId: $selectedTabId,
+                    tabs: $tabStore.tabs,
+                    selectedTabId: $tabStore.selectedTabId,
                     onNewTab: addNewTab,
                     onCloseTab: closeTab
                 )
                 Divider()
             }
 
+            // Keyed by tab only: navigating a pane must not rebuild the split view (that reset the
+            // other panes' scroll positions and path editing).
             if currentViewMode == .dualPane {
-                DualPaneView(leftViewModel: viewModel, rightViewModel: rightPaneViewModel, activePane: $activePane)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    .frame(minWidth: 700, minHeight: 400)
-                    .id("dualpane-\(viewModel.currentPath.path)-\(selectedTabId)")
+                DualPaneView(
+                    leftViewModel: viewModel,
+                    rightViewModel: rightPaneViewModel,
+                    activePane: $activePane,
+                    paneModes: $dualPaneModes
+                )
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .frame(minWidth: 700, minHeight: 400)
+                .id("dualpane-\(selectedTabId)")
             } else if currentViewMode == .quadPane {
                 QuadPaneView(
                     topLeftViewModel: viewModel,
                     topRightViewModel: rightPaneViewModel,
                     bottomLeftViewModel: bottomLeftPaneViewModel,
                     bottomRightViewModel: bottomRightPaneViewModel,
-                    activePane: $activeQuadPane
+                    activePane: $activeQuadPane,
+                    paneModes: $quadPaneModes
                 )
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .frame(minWidth: 800, minHeight: 600)
-                .id("quadpane-\(viewModel.currentPath.path)-\(selectedTabId)")
+                .id("quadpane-\(selectedTabId)")
             } else {
                 TabContentWrapper(viewModel: viewModel, selectedTabId: selectedTabId)
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -361,76 +386,51 @@ struct ContentView: View {
         }
     }
 
-    @ViewBuilder
-    private var toolbarActions: some View {
-        Menu {
-            ForEach(ListColumn.allCases) { column in
-                Button(action: {
-                    columnConfig.setSortColumn(column)
-                }) {
-                    HStack {
-                        Text(column.rawValue)
-                        if columnConfig.sortColumn == column {
-                            Image(systemName: columnConfig.sortDirection == .ascending ? "chevron.up" : "chevron.down")
-                        }
-                    }
-                }
-            }
-        } label: {
-            Image(systemName: "arrow.up.arrow.down")
+    // MARK: - Window
+
+    private func attachHostWindow(_ window: NSWindow?) {
+        hostWindow.window = window
+        if let window {
+            KeyboardManager.shared.registerBrowserWindow(window)
         }
-        .help("Sort by")
+    }
 
-        Menu {
-            Button("New Folder") {
-                viewModel.createNewFolder()
-            }
-            .keyboardShortcut("n", modifiers: [.command, .shift])
+    private func isTargetWindow(_ object: Any?) -> Bool {
+        guard let target = object as? NSWindow, let window = hostWindow.window else { return false }
+        return target === window
+    }
 
-            Divider()
+    private func syncWindowTitle() {
+        windowTitle = activeViewModel.currentPath.lastPathComponent
+    }
 
-            Button("Get Info") {
-                viewModel.getInfo()
-            }
-            .keyboardShortcut("i", modifiers: .command)
-            .disabled(viewModel.selectedItems.isEmpty)
-
-            Divider()
-
-            Button("Show in Finder") {
-                viewModel.showInFinder()
-            }
-        } label: {
-            Image(systemName: "ellipsis.circle")
+    private func setViewMode(_ mode: ViewMode) {
+        // Deferred: switching modes replaces the content view, which must not happen inside the
+        // picker's own update.
+        DispatchQueue.main.async {
+            viewModel.viewMode = mode
+            currentViewMode = mode
         }
-        .help("Actions")
+    }
 
-        HStack(spacing: 2) {
-            Menu {
-                ForEach(SearchMode.allCases, id: \.self) { mode in
-                    Button {
-                        viewModel.searchMode = mode
-                    } label: {
-                        Label(mode.rawValue, systemImage: mode.systemImage)
-                    }
-                }
-            } label: {
-                Label(viewModel.searchMode.rawValue, systemImage: viewModel.searchMode.systemImage)
-                    .labelStyle(.titleAndIcon)
+    private func showInfoIfOwned(_ item: FileItem) {
+        guard let owner = managedViewModels.first(where: { $0.infoItem == item }) else { return }
+        owner.infoItem = nil
+        showingInfoItem = item
+    }
+
+    /// Sends every pane showing a folder on an unmounting volume back to the home folder.
+    private func leaveUnmountedVolume(_ volumeURL: URL) {
+        let home = FileManager.default.homeDirectoryForCurrentUser
+        for viewModel in managedViewModels {
+            let showsVolume = VolumePaths.isURL(viewModel.currentPath, onVolumeAt: volumeURL)
+                || (viewModel.currentArchiveURL.map { VolumePaths.isURL($0, onVolumeAt: volumeURL) } ?? false)
+            guard showsVolume else { continue }
+            PendingSelection.cancel(for: viewModel)
+            if viewModel.isInsideArchive {
+                viewModel.exitArchive()
             }
-            .id("search-mode-\(viewModel.searchMode.rawValue)")
-            .fixedSize()
-            .help("Search mode: \(viewModel.searchMode.rawValue)")
-
-            SearchField(text: searchTextBinding, placeholder: viewModel.searchMode.placeholder)
-                .frame(width: 180)
-                .id("main-search-field")
-
-            if viewModel.isSearching {
-                ProgressView()
-                    .scaleEffect(0.6)
-                    .frame(width: 16, height: 16)
-            }
+            viewModel.navigateTo(home)
         }
     }
 
@@ -439,43 +439,33 @@ struct ContentView: View {
     private func addNewTab() {
         let newTab = BrowserTab(initialPath: viewModel.currentPath)
         newTab.viewModel.setUndoManager(undoManager)
-        tabs.append(newTab)
-        selectedTabId = newTab.id
+        tabStore.addTab(newTab)
     }
 
     private func closeTab(_ tabId: UUID) {
-        guard tabs.count > 1 else { return }
+        guard let closed = tabStore.closeTab(tabId) else { return }
+        shutDown(closed.viewModel)
+    }
 
-        if let index = tabs.firstIndex(where: { $0.id == tabId }) {
-            tabs.remove(at: index)
-
-            // If we closed the selected tab, select an adjacent one
-            if selectedTabId == tabId {
-                let newIndex = min(index, tabs.count - 1)
-                selectedTabId = tabs[newIndex].id
-            }
+    /// ⌘W: close the current tab, or the window when it is the last tab.
+    private func closeTabOrWindow() {
+        if tabs.count > 1 {
+            closeTab(selectedTabId)
+        } else {
+            hostWindow.window?.performClose(nil)
         }
     }
 
-    private func selectNextTab() {
-        guard let currentIndex = tabs.firstIndex(where: { $0.id == selectedTabId }) else { return }
-        let nextIndex = (currentIndex + 1) % tabs.count
-        selectedTabId = tabs[nextIndex].id
-    }
-
-    private func selectPreviousTab() {
-        guard let currentIndex = tabs.firstIndex(where: { $0.id == selectedTabId }) else { return }
-        let prevIndex = currentIndex == 0 ? tabs.count - 1 : currentIndex - 1
-        selectedTabId = tabs[prevIndex].id
-    }
-
-    private func syncNavigationState() {
-        navHistoryIndex = viewModel.historyIndex
-        navHistoryCount = viewModel.navigationHistory.count
+    private func shutDown(_ viewModel: FileBrowserViewModel) {
+        InlinePreviews.stopAll()
+        PendingSelection.cancel(for: viewModel)
+        // Stops the closed tab's folder watcher, network browsing and searches.
+        viewModel.setBackgroundWorkActive(false)
     }
 
     private func refreshAllViewModels() {
-        for viewModel in visibleViewModels {
+        // Every tab and pane of this window, not only the visible ones (hidden files toggle).
+        for viewModel in managedViewModels {
             viewModel.refresh()
         }
     }
@@ -511,7 +501,140 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Toolbar
+
+/// Toolbar items observe the active view model themselves; `ContentView` doesn't re-render on its changes.
+private struct ToolbarHistoryButton: View {
+    enum Direction {
+        case back, forward
+    }
+
+    @ObservedObject var viewModel: FileBrowserViewModel
+    let direction: Direction
+
+    var body: some View {
+        Button(action: {
+            if direction == .back {
+                viewModel.goBack()
+            } else {
+                viewModel.goForward()
+            }
+        }) {
+            Image(systemName: direction == .back ? "chevron.left" : "chevron.right")
+        }
+        .disabled(direction == .back ? !viewModel.canGoBack : !viewModel.canGoForward)
+        .help(direction == .back ? "Back" : "Forward")
+    }
+}
+
+private struct ToolbarSortMenu: View {
+    @ObservedObject private var columnConfig = ListColumnConfigManager.shared
+
+    var body: some View {
+        Menu {
+            ForEach(ListColumn.allCases) { column in
+                Button(action: {
+                    columnConfig.setSortColumn(column)
+                }) {
+                    HStack {
+                        Text(column.rawValue)
+                        if columnConfig.sortColumn == column {
+                            Image(systemName: columnConfig.sortDirection == .ascending ? "chevron.up" : "chevron.down")
+                        }
+                    }
+                }
+            }
+        } label: {
+            Image(systemName: "arrow.up.arrow.down")
+        }
+        .help("Sort by")
+    }
+}
+
+private struct ToolbarActionsMenu: View {
+    @ObservedObject var viewModel: FileBrowserViewModel
+
+    var body: some View {
+        // Shortcuts (⇧⌘N, ⌘I) live in the menu bar.
+        Menu {
+            Button("New Folder") {
+                viewModel.createNewFolder()
+            }
+
+            Divider()
+
+            Button("Get Info") {
+                viewModel.presentInfo(for: viewModel.primarySelectedItem)
+            }
+            .disabled(viewModel.selectedItems.isEmpty)
+
+            Divider()
+
+            Button("Show in Finder") {
+                viewModel.showInFinder()
+            }
+        } label: {
+            Image(systemName: "ellipsis.circle")
+        }
+        .help("Actions")
+    }
+}
+
+private struct ToolbarSearchControls: View {
+    @ObservedObject var viewModel: FileBrowserViewModel
+
+    var body: some View {
+        HStack(spacing: 2) {
+            Menu {
+                ForEach(SearchMode.allCases, id: \.self) { mode in
+                    Button {
+                        viewModel.searchMode = mode
+                    } label: {
+                        Label(mode.rawValue, systemImage: mode.systemImage)
+                    }
+                }
+            } label: {
+                Label(viewModel.searchMode.rawValue, systemImage: viewModel.searchMode.systemImage)
+                    .labelStyle(.titleAndIcon)
+            }
+            .id("search-mode-\(viewModel.searchMode.rawValue)")
+            .fixedSize()
+            .help("Search mode: \(viewModel.searchMode.rawValue)")
+
+            SearchField(text: $viewModel.searchText, placeholder: viewModel.searchMode.placeholder)
+                .frame(width: 180)
+                .id("main-search-field")
+
+            if viewModel.isSearching {
+                ProgressView()
+                    .scaleEffect(0.6)
+                    .frame(width: 16, height: 16)
+            }
+        }
+    }
+}
+
+/// Keeps the window's represented URL (title-bar path menu) on the active pane's folder.
+private struct RepresentedURLSync: View {
+    @ObservedObject var viewModel: FileBrowserViewModel
+
+    var body: some View {
+        WindowRepresentedURL(url: viewModel.isInsideArchive ? nil : viewModel.currentPath) { url in
+            viewModel.navigateToAndSelectCurrent(url)
+        }
+    }
+}
+
 // MARK: - Context Menu for File Items
+
+/// Which items a context-menu command acts on (Finder semantics).
+enum ContextMenuTarget {
+    /// Right-clicking an item that is part of the selection acts on the whole selection;
+    /// right-clicking any other item first makes it the selection.
+    static func shouldReselect<Item: Hashable>(clicked: Item, selection: Set<Item>) -> Bool {
+        !selection.contains(clicked)
+    }
+}
 
 struct FileItemContextMenu: View {
     let item: FileItem
@@ -519,6 +642,8 @@ struct FileItemContextMenu: View {
     var onRename: (FileItem) -> Void
 
     private var isPackage: Bool {
+        // Archive entries have no real path to browse.
+        guard !item.isFromArchive, item.url.isFileURL else { return false }
         let packageExtensions = ["app", "bundle", "framework", "plugin", "kext", "prefPane", "qlgenerator", "saver", "wdgt", "xpc"]
         let ext = item.url.pathExtension.lowercased()
         return packageExtensions.contains(ext) || NSWorkspace.shared.isFilePackage(atPath: item.url.path)
@@ -533,7 +658,7 @@ struct FileItemContextMenu: View {
             // Show Package Contents option for bundles like .app
             if isPackage {
                 Button("Show Package Contents") {
-                    viewModel.navigateTo(item.url)
+                    viewModel.showPackageContents(item)
                 }
             }
 
@@ -543,16 +668,14 @@ struct FileItemContextMenu: View {
 
             Divider()
 
-            Button("Get Info") {
-                viewModel.selectItem(item)
-                viewModel.getInfo()
-            }
-            .disabled(item.isFromArchive)
-
-            Divider()
-
-            // Tags submenu
             if !item.isFromArchive {
+                Button("Get Info") {
+                    viewModel.presentInfo(for: item)
+                }
+
+                Divider()
+
+                // Tags submenu
                 Menu("Tags") {
                     ForEach(FinderTag.allTags) { tag in
                         Button {
@@ -606,39 +729,210 @@ struct FileItemContextMenu: View {
             }
 
             Button("Copy") {
-                viewModel.selectItem(item)
+                targetSelection()
                 viewModel.copySelectedItems()
             }
 
             Button("Cut") {
-                viewModel.selectItem(item)
+                targetSelection()
                 viewModel.cutSelectedItems()
             }
 
-            Button("Duplicate") {
-                viewModel.selectItem(item)
-                viewModel.duplicateSelectedItems()
-            }
-            .disabled(item.isFromArchive)
+            // Duplicate, rename and trash can't work on entries inside an archive.
+            if !item.isFromArchive {
+                Button("Duplicate") {
+                    targetSelection()
+                    viewModel.duplicateSelectedItems()
+                }
 
-            Divider()
+                Divider()
 
-            Button("Rename") {
-                onRename(item)
-            }
-            .disabled(item.isFromArchive)
+                Button("Rename") {
+                    onRename(item)
+                }
 
-            Button("Move to Trash") {
-                viewModel.selectItem(item)
-                viewModel.deleteSelectedItems()
+                Button("Move to Trash") {
+                    targetSelection()
+                    viewModel.deleteSelectedItems()
+                }
             }
-            .disabled(item.isFromArchive)
 
             Divider()
 
             Button("Show in Finder") {
-                viewModel.selectItem(item)
+                targetSelection()
                 viewModel.showInFinder()
+            }
+        }
+    }
+
+    /// Keeps a multi-selection that contains the clicked item; otherwise selects the clicked item.
+    private func targetSelection() {
+        guard ContextMenuTarget.shouldReselect(clicked: item, selection: viewModel.selectedItems) else { return }
+        viewModel.selectItem(item)
+        if let index = viewModel.filteredItems.firstIndex(of: item) {
+            viewModel.lastSelectedIndex = index
+            viewModel.selectionAnchorIndex = index
+        }
+    }
+}
+
+extension FileBrowserViewModel {
+    /// Shows Get Info for a specific item (the clicked or lead item, not an arbitrary member of the
+    /// selection). The window that owns this view model presents the sheet.
+    func presentInfo(for item: FileItem?) {
+        guard let item, !item.isFromArchive else {
+            NSSound.beep()
+            return
+        }
+        infoItem = item
+        NotificationCenter.default.post(name: .showGetInfo, object: item)
+    }
+}
+
+// MARK: - Path Entry
+
+/// Turns a typed path (path bar, pane path fields, Go to Folder) into a location.
+enum PathEntryResolver {
+    enum Resolution: Equatable {
+        case directory(URL)
+        /// A file: navigate to `parent` and select the file.
+        case file(URL, parent: URL)
+        case notFound
+    }
+
+    /// Trims whitespace/newlines and surrounding quotes, accepts `file://` URLs, expands `~` and
+    /// `~user`, resolves relative paths against `base`, and standardizes `.`/`..`.
+    static func expandedURL(for input: String, relativeTo base: URL?) -> URL? {
+        var text = input.trimmingCharacters(in: .whitespacesAndNewlines)
+        if text.count >= 2, let first = text.first, first == text.last, first == "\"" || first == "'" {
+            text = String(text.dropFirst().dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard !text.isEmpty else { return nil }
+
+        if text.lowercased().hasPrefix("file://") {
+            guard let url = URL(string: text), url.isFileURL else { return nil }
+            return url.standardizedFileURL
+        }
+
+        let expanded = (text as NSString).expandingTildeInPath
+        if expanded.hasPrefix("/") {
+            return URL(fileURLWithPath: expanded).standardizedFileURL
+        }
+        // "~name" for a user that doesn't exist stays unexpanded.
+        if expanded.hasPrefix("~") {
+            return nil
+        }
+        guard let base else { return nil }
+        return base.appendingPathComponent(expanded).standardizedFileURL
+    }
+
+    static func resolve(_ input: String, relativeTo base: URL?, fileManager: FileManager = .default) -> Resolution {
+        guard let url = expandedURL(for: input, relativeTo: base) else { return .notFound }
+        var isDirectory: ObjCBool = false
+        guard fileManager.fileExists(atPath: url.path, isDirectory: &isDirectory) else { return .notFound }
+        if isDirectory.boolValue {
+            return .directory(url)
+        }
+        return .file(url, parent: url.deletingLastPathComponent())
+    }
+
+    /// Navigates `viewModel` to the typed location; a file opens its folder with the file selected.
+    /// Returns false (caller beeps) when nothing exists there.
+    @MainActor
+    @discardableResult
+    static func navigate(_ viewModel: FileBrowserViewModel, to input: String) -> Bool {
+        let base = viewModel.isInsideArchive ? nil : viewModel.currentPath
+        switch resolve(input, relativeTo: base) {
+        case .notFound:
+            return false
+        case .directory(let url):
+            PendingSelection.cancel(for: viewModel)
+            if viewModel.isInsideArchive {
+                viewModel.exitArchive()
+            }
+            viewModel.navigateTo(url)
+        case .file(let url, let parent):
+            if viewModel.isInsideArchive {
+                viewModel.exitArchive()
+            }
+            PendingSelection.select(url, in: viewModel, navigatingTo: parent)
+        }
+        return true
+    }
+}
+
+/// Selects a file once its folder has loaded.
+@MainActor
+enum PendingSelection {
+    private static var subscriptions: [ObjectIdentifier: AnyCancellable] = [:]
+
+    static func select(_ fileURL: URL, in viewModel: FileBrowserViewModel, navigatingTo parent: URL, timeout: TimeInterval = 10) {
+        cancel(for: viewModel)
+        let targetPath = fileURL.standardizedFileURL.path
+        let parentPath = parent.standardizedFileURL.path
+        if viewModel.currentPath.standardizedFileURL.path != parentPath {
+            viewModel.navigateTo(parent)
+        }
+        if trySelect(targetPath, in: viewModel) {
+            return
+        }
+
+        let key = ObjectIdentifier(viewModel)
+        let deadline = Date().addingTimeInterval(timeout)
+        subscriptions[key] = viewModel.$items
+            .receive(on: RunLoop.main)
+            .sink { [weak viewModel] _ in
+                MainActor.assumeIsolated {
+                    guard let viewModel else {
+                        subscriptions[key] = nil
+                        return
+                    }
+                    if viewModel.currentPath.standardizedFileURL.path != parentPath
+                        || trySelect(targetPath, in: viewModel)
+                        || Date() > deadline {
+                        subscriptions[key] = nil
+                    }
+                }
+            }
+    }
+
+    static func cancel(for viewModel: FileBrowserViewModel) {
+        subscriptions[ObjectIdentifier(viewModel)] = nil
+    }
+
+    private static func trySelect(_ path: String, in viewModel: FileBrowserViewModel) -> Bool {
+        let items = viewModel.filteredItems
+        guard let index = items.firstIndex(where: { $0.url.standardizedFileURL.path == path }) else { return false }
+        viewModel.selectItem(items[index])
+        viewModel.lastSelectedIndex = index
+        viewModel.selectionAnchorIndex = index
+        return true
+    }
+}
+
+/// Go ▸ Go to Folder… (⇧⌘G).
+@MainActor
+enum GoToFolderPrompt {
+    static func present(for viewModel: FileBrowserViewModel, in window: NSWindow) {
+        guard window.attachedSheet == nil else { return }
+
+        let alert = NSAlert()
+        alert.messageText = "Go to Folder"
+        alert.informativeText = "Enter a path. Use ~ for your home folder."
+        alert.addButton(withTitle: "Go")
+        alert.addButton(withTitle: "Cancel")
+
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 340, height: 24))
+        field.stringValue = viewModel.isInsideArchive ? "" : viewModel.currentPath.path
+        field.placeholderString = "~/Documents"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+
+        alert.beginSheetModal(for: window) { response in
+            guard response == .alertFirstButtonReturn else { return }
+            if !PathEntryResolver.navigate(viewModel, to: field.stringValue) {
+                NSSound.beep()
             }
         }
     }
@@ -753,31 +1047,98 @@ struct PathBarView: View {
     }
 
     private func navigateToPath(_ path: String) {
-        var expandedPath = path.trimmingCharacters(in: .whitespaces)
-
-        // Expand ~ to home directory
-        if expandedPath.hasPrefix("~") {
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            expandedPath = home + expandedPath.dropFirst()
-        }
-
-        let url = URL(fileURLWithPath: expandedPath)
-
-        // Validate path exists and is a directory
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
-            if isDirectory.boolValue {
-                viewModel.navigateTo(url)
-                isEditing = false
-                isTextFieldFocused = false
-            } else {
-                let parentURL = url.deletingLastPathComponent()
-                viewModel.navigateTo(parentURL)
-                isEditing = false
-                isTextFieldFocused = false
-            }
+        if PathEntryResolver.navigate(viewModel, to: path) {
+            cancelEditing()
         } else {
             NSSound.beep()
+        }
+    }
+}
+
+// MARK: - Status Bar
+
+/// Free space per volume, read off the main thread and cached briefly.
+enum VolumeSpaceCache {
+    private static var cache: [String: (bytes: Int64?, date: Date)] = [:]
+    private static let lifetime: TimeInterval = 10
+    private static let queue = DispatchQueue(label: "com.coverflowfinder.volumespace", qos: .utility)
+
+    @MainActor
+    static func availableCapacity(for url: URL, completion: @escaping (Int64?) -> Void) {
+        let key = url.standardizedFileURL.path
+        if let entry = cache[key], Date().timeIntervalSince(entry.date) < lifetime {
+            completion(entry.bytes)
+            return
+        }
+        queue.async {
+            let values = try? url.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey, .volumeAvailableCapacityKey])
+            let bytes = values?.volumeAvailableCapacityForImportantUsage ?? values?.volumeAvailableCapacity.map { Int64($0) }
+            DispatchQueue.main.async {
+                cache[key] = (bytes, Date())
+                completion(bytes)
+            }
+        }
+    }
+}
+
+/// Status bar figures, recomputed only when the listing changes (not on every render).
+@MainActor
+final class StatusBarModel: ObservableObject {
+    @Published private(set) var totalSizeText: String?
+    @Published private(set) var availableText: String?
+
+    private weak var viewModel: FileBrowserViewModel?
+    private var cancellables = Set<AnyCancellable>()
+    private var availabilityRequest = UUID()
+
+    func bind(to viewModel: FileBrowserViewModel) {
+        guard self.viewModel !== viewModel else { return }
+        self.viewModel = viewModel
+        cancellables.removeAll()
+
+        Publishers.Merge5(
+            viewModel.$items.map { _ in () },
+            viewModel.$searchResults.map { _ in () },
+            viewModel.$searchText.map { _ in () },
+            viewModel.$filterTag.map { _ in () },
+            viewModel.$searchMode.map { _ in () }
+        )
+        .debounce(for: .milliseconds(150), scheduler: RunLoop.main)
+        .sink { [weak self] in
+            MainActor.assumeIsolated {
+                self?.recompute()
+            }
+        }
+        .store(in: &cancellables)
+
+        recompute()
+    }
+
+    private func recompute() {
+        guard let viewModel else { return }
+
+        if viewModel.isPhotosLibraryActive {
+            totalSizeText = nil
+        } else {
+            var total: Int64 = 0
+            var hasFiles = false
+            for item in viewModel.filteredItems where !item.isDirectory {
+                total += item.size
+                hasFiles = true
+            }
+            totalSizeText = hasFiles ? ByteCountFormatter.string(fromByteCount: total, countStyle: .file) : nil
+        }
+
+        let path = viewModel.currentPath
+        guard path.isFileURL, !viewModel.isPhotosLibraryActive, path.path != "/Network" else {
+            availableText = nil
+            return
+        }
+        let request = UUID()
+        availabilityRequest = request
+        VolumeSpaceCache.availableCapacity(for: path) { [weak self] bytes in
+            guard let self, self.availabilityRequest == request else { return }
+            self.availableText = bytes.map { "\(ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)) available" }
         }
     }
 }
@@ -785,6 +1146,7 @@ struct PathBarView: View {
 struct StatusBarView: View {
     @EnvironmentObject private var settings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
+    @StateObject private var model = StatusBarModel()
 
     var body: some View {
         HStack {
@@ -800,8 +1162,14 @@ struct StatusBarView: View {
 
             Spacer()
 
-            if let totalSize = calculateTotalSize() {
+            if let totalSize = model.totalSizeText {
                 Text(totalSize)
+                    .font(settings.listDetailFont)
+                    .foregroundColor(.secondary)
+            }
+
+            if let available = model.availableText {
+                Text(model.totalSizeText == nil ? available : "• \(available)")
                     .font(settings.listDetailFont)
                     .foregroundColor(.secondary)
             }
@@ -809,24 +1177,18 @@ struct StatusBarView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 4)
         .background(Color(nsColor: .windowBackgroundColor))
-    }
-
-    private func calculateTotalSize() -> String? {
-        if viewModel.isPhotosLibraryActive {
-            return nil
+        .onAppear {
+            model.bind(to: viewModel)
         }
-        let files = viewModel.filteredItems.filter { !$0.isDirectory }
-        guard !files.isEmpty else { return nil }
-
-        let total = files.reduce(0) { $0 + $1.size }
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: total)
+        .onChange(of: ObjectIdentifier(viewModel)) { _, _ in
+            model.bind(to: viewModel)
+        }
     }
 }
 
 struct EmptyFolderView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
+    @State private var isDropTargeted = false
 
     private var hasSearchText: Bool {
         !viewModel.searchText.isEmpty
@@ -913,6 +1275,15 @@ struct EmptyFolderView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .background(Color(nsColor: .controlBackgroundColor))
+        // Dropping into an empty folder works like dropping on any folder background.
+        .onDrop(of: DropHelper.acceptedDropTypes, delegate: ContainerDropDelegate(
+            viewModel: viewModel,
+            isDropTargeted: $isDropTargeted,
+            containerHeight: 0,
+            items: [],
+            autoScroll: false
+        ))
+        .dropTargetOverlay(isTargeted: isDropTargeted, padding: UI.Spacing.standard)
         .contextMenu {
             Button("New Folder") {
                 viewModel.createNewFolder()
@@ -930,6 +1301,16 @@ struct EmptyFolderView: View {
                 NSWorkspace.shared.activateFileViewerSelecting([viewModel.currentPath])
             }
         }
+    }
+}
+
+/// When the content area shows a spinner instead of the listing.
+enum ContentLoadingPolicy {
+    /// Only while there is nothing to show yet: an in-place reload or a Spotlight search that
+    /// already has results keeps the current content on screen.
+    static func showsSpinner(isLoading: Bool, isSpotlightSearchRunning: Bool, hasItems: Bool) -> Bool {
+        guard !hasItems else { return false }
+        return isLoading || isSpotlightSearchRunning
     }
 }
 
@@ -968,22 +1349,19 @@ struct TabContentWrapper: View {
     }
 
     private var shouldShowProgressView: Bool {
-        viewModel.isLoading ||
-        (viewModel.isSearching && viewModel.searchMode == .finder && !viewModel.searchText.isEmpty)
+        ContentLoadingPolicy.showsSpinner(
+            isLoading: viewModel.isLoading,
+            isSpotlightSearchRunning: viewModel.isSearching && viewModel.searchMode == .finder && !viewModel.searchText.isEmpty,
+            hasItems: !viewModel.filteredItems.isEmpty
+        )
     }
 
-    // Generate a unique ID for view refresh that includes archive state and search results
-    // Note: Don't include navigationGeneration for scroll-preserving views (CoverFlow, Masonry)
-    // to prevent scroll position reset during refresh
+    // Identity of the content view: a new folder, tab, archive location or search mode gets a fresh
+    // view. Search results streaming in must NOT change it (that rebuilt Cover Flow per batch,
+    // dropping thumbnails and stealing focus); the views update from the published items instead.
     private var contentViewId: String {
         let archiveId = viewModel.isInsideArchive ? "-archive-\(viewModel.currentArchivePath)" : ""
-        let searchId = "-\(viewModel.searchMode.rawValue)-\(viewModel.searchResults.count)"
-        return "\(viewModel.currentPath.path)-\(selectedTabId)\(archiveId)\(searchId)"
-    }
-
-    // Full content view ID including navigation generation - use for views that should reset on navigation
-    private var fullContentViewId: String {
-        return "\(contentViewId)-\(viewModel.navigationGeneration)"
+        return "\(viewModel.currentPath.path)-\(selectedTabId)\(archiveId)-\(viewModel.searchMode.rawValue)"
     }
 
     @ViewBuilder
@@ -1015,19 +1393,22 @@ struct TabContentWrapper: View {
     }
 }
 
-// Focus value for keyboard shortcuts
-struct ViewModelKey: FocusedValueKey {
-    typealias Value = FileBrowserViewModel
-}
+// Tab notification names are defined in UIConstants.swift
 
-extension FocusedValues {
-    var viewModel: FileBrowserViewModel? {
-        get { self[ViewModelKey.self] }
-        set { self[ViewModelKey.self] = newValue }
+// MARK: - Volumes
+
+enum VolumePaths {
+    /// Whether `url` is on the volume mounted at `volumeURL` (never true for the root volume).
+    static func isURL(_ url: URL, onVolumeAt volumeURL: URL) -> Bool {
+        var volumePath = volumeURL.standardizedFileURL.path
+        while volumePath.count > 1 && volumePath.hasSuffix("/") {
+            volumePath.removeLast()
+        }
+        guard volumePath != "/" else { return false }
+        let path = url.standardizedFileURL.path
+        return path == volumePath || path.hasPrefix(volumePath + "/")
     }
 }
-
-// Tab notification names are defined in UIConstants.swift
 
 // Native macOS search field
 struct SearchField: NSViewRepresentable {
@@ -1046,10 +1427,10 @@ struct SearchField: NSViewRepresentable {
         // Store reference for focus handling
         context.coordinator.searchField = searchField
 
-        // Listen for focus notification
+        // Listen for focus notification (⌘F); the coordinator ignores other windows' requests.
         NotificationCenter.default.addObserver(
             context.coordinator,
-            selector: #selector(Coordinator.focusSearchField),
+            selector: #selector(Coordinator.focusSearchField(_:)),
             name: .focusSearch,
             object: nil
         )
@@ -1058,6 +1439,9 @@ struct SearchField: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: NSSearchField, context: Context) {
+        // The binding changes when the active pane or tab changes.
+        context.coordinator.parent = self
+
         // Only update text if different AND the field is not being actively edited
         // This prevents interference with user typing
         let isFirstResponder = nsView.window?.firstResponder == nsView.currentEditor()
@@ -1086,18 +1470,22 @@ struct SearchField: NSViewRepresentable {
             NotificationCenter.default.removeObserver(self)
         }
 
-        @objc func focusSearchField() {
+        @objc func focusSearchField(_ notification: Notification) {
             guard let searchField = searchField,
                   let window = searchField.window else { return }
+            if let target = notification.object as? NSWindow {
+                guard target === window else { return }
+            } else if !window.isKeyWindow {
+                return
+            }
             window.makeFirstResponder(searchField)
         }
 
         // Handle Escape key to unfocus the search field and return focus to file list
         func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
             if commandSelector == #selector(NSResponder.cancelOperation(_:)) {
-                // Escape pressed - return focus to file list
-                // Post notification for FileTableView to handle (it will make itself first responder)
-                NotificationCenter.default.post(name: .focusFileList, object: nil)
+                // Escape pressed - return focus to the file list of this window
+                NotificationCenter.default.post(name: .focusFileList, object: control.window)
 
                 // Fallback: if no view took focus (still on search field), focus content view
                 // This allows KeyboardManager to handle keyboard for SwiftUI views
@@ -1173,44 +1561,65 @@ struct WindowRepresentedURL: NSViewRepresentable {
 }
 
 /// Custom NSView that applies representedURL when it is attached to a window.
-/// Intercepts the title bar path popup menu by swizzling into the window delegate
-/// chain, redirecting navigation to the app instead of Finder.
+///
+/// Customizing the title-bar path menu needs `window(_:shouldPopUpDocumentPathMenu:)`, a delegate
+/// method with no notification equivalent, so a proxy is put in front of SwiftUI's window delegate.
+/// The proxy forwards every other delegate method, lives as long as the window, never wraps a nil
+/// delegate, and is removed again when this view leaves the window.
 final class WindowRepresentedURLView: NSView {
     var representedURL: URL?
     var onNavigate: ((URL) -> Void)?
     private var delegateProxy: PathMenuWindowDelegateProxy?
 
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if let window, newWindow !== window {
+            uninstallProxy(from: window)
+        }
+        super.viewWillMove(toWindow: newWindow)
+    }
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         applyRepresentedURL()
-        installProxy()
     }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
 
     func applyRepresentedURL() {
         guard let window else { return }
         if window.representedURL != representedURL {
             window.representedURL = representedURL
         }
-        delegateProxy?.parentView = self
-        // Re-install proxy if SwiftUI replaced the window delegate
-        if let proxy = delegateProxy, window.delegate !== proxy {
-            proxy.originalDelegate = window.delegate
-            window.delegate = proxy
-        }
+        installProxyIfNeeded(on: window)
     }
 
-    private func installProxy() {
-        guard let window else { return }
-        // If we already have a proxy installed on this window, just update it
-        if let existing = delegateProxy, window.delegate === existing {
-            existing.parentView = self
+    private func installProxyIfNeeded(on window: NSWindow) {
+        if let proxy = window.delegate as? PathMenuWindowDelegateProxy {
+            // Already in place (possibly installed by an earlier instance of this view): take it over.
+            proxy.parentView = self
+            delegateProxy = proxy
             return
         }
-        let proxy = PathMenuWindowDelegateProxy()
+        // Re-wrap when SwiftUI replaced the delegate, but never wrap nil: that would drop
+        // SwiftUI's delegate (close handling, state restoration) for good.
+        guard let original = window.delegate else { return }
+        let proxy = delegateProxy ?? PathMenuWindowDelegateProxy()
         proxy.parentView = self
-        proxy.originalDelegate = window.delegate
+        proxy.originalDelegate = original
         delegateProxy = proxy
+        PathMenuWindowDelegateProxy.retain(proxy, for: window)
         window.delegate = proxy
+    }
+
+    private func uninstallProxy(from window: NSWindow) {
+        guard let proxy = delegateProxy else { return }
+        delegateProxy = nil
+        // Another instance may have taken the proxy over; only the current owner restores.
+        guard proxy.parentView === self || proxy.parentView == nil else { return }
+        proxy.parentView = nil
+        if window.delegate === proxy, let original = proxy.originalDelegate {
+            window.delegate = original
+        }
     }
 }
 
@@ -1220,6 +1629,13 @@ final class WindowRepresentedURLView: NSView {
 final class PathMenuWindowDelegateProxy: NSObject, NSWindowDelegate {
     weak var parentView: WindowRepresentedURLView?
     weak var originalDelegate: (any NSWindowDelegate)?
+
+    private static var associationKey: UInt8 = 0
+
+    /// `NSWindow.delegate` is weak: tie the proxy's lifetime to the window, not to the view.
+    static func retain(_ proxy: PathMenuWindowDelegateProxy, for window: NSWindow) {
+        objc_setAssociatedObject(window, &associationKey, proxy, .OBJC_ASSOCIATION_RETAIN_NONATOMIC)
+    }
 
     func window(_ window: NSWindow, shouldPopUpDocumentPathMenu menu: NSMenu) -> Bool {
         // Replace each menu item's action so clicking navigates within the app
@@ -1292,16 +1708,6 @@ final class PathMenuWindowDelegateProxy: NSObject, NSWindowDelegate {
         }
         return super.forwardingTarget(for: aSelector)
     }
-}
-
-// MARK: - Liquid Glass Window Configurator
-
-/// Placeholder - Liquid Glass effect is now applied via FeatheredBlurOverlay in scroll views
-struct LiquidGlassWindowConfigurator: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        NSView()
-    }
-    func updateNSView(_ nsView: NSView, context: Context) {}
 }
 
 // MARK: - Feathered Blur Overlay

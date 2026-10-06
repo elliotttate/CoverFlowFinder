@@ -8,13 +8,10 @@ struct QuadPaneView: View {
     @ObservedObject var topRightViewModel: FileBrowserViewModel
     @ObservedObject var bottomLeftViewModel: FileBrowserViewModel
     @ObservedObject var bottomRightViewModel: FileBrowserViewModel
-    @ObservedObject private var internalDragState = InternalDragState.shared
     @Binding var activePane: Pane
+    /// Owned by ContentView so the pane modes survive navigation and leaving quad mode.
+    @Binding var paneModes: PaneModes
 
-    @State private var topLeftViewMode: PaneViewMode = .list
-    @State private var topRightViewMode: PaneViewMode = .list
-    @State private var bottomLeftViewMode: PaneViewMode = .list
-    @State private var bottomRightViewMode: PaneViewMode = .list
     @State private var topLeftColumns: Int = 1
     @State private var topRightColumns: Int = 1
     @State private var bottomLeftColumns: Int = 1
@@ -36,6 +33,13 @@ struct QuadPaneView: View {
         }
     }
 
+    struct PaneModes: Equatable {
+        var topLeft: PaneViewMode = .list
+        var topRight: PaneViewMode = .list
+        var bottomLeft: PaneViewMode = .list
+        var bottomRight: PaneViewMode = .list
+    }
+
     private var activeViewModel: FileBrowserViewModel {
         switch activePane {
         case .topLeft: return topLeftViewModel
@@ -43,6 +47,28 @@ struct QuadPaneView: View {
         case .bottomLeft: return bottomLeftViewModel
         case .bottomRight: return bottomRightViewModel
         }
+    }
+
+    private var activeMode: PaneViewMode {
+        switch activePane {
+        case .topLeft: return paneModes.topLeft
+        case .topRight: return paneModes.topRight
+        case .bottomLeft: return paneModes.bottomLeft
+        case .bottomRight: return paneModes.bottomRight
+        }
+    }
+
+    /// Items per row in the active pane (1 in list mode).
+    private var activeColumnsCount: Int {
+        guard activeMode == .icons else { return 1 }
+        let columns: Int
+        switch activePane {
+        case .topLeft: columns = topLeftColumns
+        case .topRight: columns = topRightColumns
+        case .bottomLeft: columns = bottomLeftColumns
+        case .bottomRight: columns = bottomRightColumns
+        }
+        return max(1, columns)
     }
 
     private func otherViewModels(for pane: Pane) -> [FileBrowserViewModel] {
@@ -65,7 +91,7 @@ struct QuadPaneView: View {
                         viewModel: topLeftViewModel,
                         otherViewModels: otherViewModels(for: .topLeft),
                         isActive: activePane == .topLeft,
-                        paneViewMode: $topLeftViewMode,
+                        paneViewMode: $paneModes.topLeft,
                         onActivate: { activePane = .topLeft },
                         onColumnsCalculated: { topLeftColumns = $0 }
                     )
@@ -74,7 +100,7 @@ struct QuadPaneView: View {
                         viewModel: topRightViewModel,
                         otherViewModels: otherViewModels(for: .topRight),
                         isActive: activePane == .topRight,
-                        paneViewMode: $topRightViewMode,
+                        paneViewMode: $paneModes.topRight,
                         onActivate: { activePane = .topRight },
                         onColumnsCalculated: { topRightColumns = $0 }
                     )
@@ -85,7 +111,7 @@ struct QuadPaneView: View {
                         viewModel: bottomLeftViewModel,
                         otherViewModels: otherViewModels(for: .bottomLeft),
                         isActive: activePane == .bottomLeft,
-                        paneViewMode: $bottomLeftViewMode,
+                        paneViewMode: $paneModes.bottomLeft,
                         onActivate: { activePane = .bottomLeft },
                         onColumnsCalculated: { bottomLeftColumns = $0 }
                     )
@@ -94,7 +120,7 @@ struct QuadPaneView: View {
                         viewModel: bottomRightViewModel,
                         otherViewModels: otherViewModels(for: .bottomRight),
                         isActive: activePane == .bottomRight,
-                        paneViewMode: $bottomRightViewMode,
+                        paneViewMode: $paneModes.bottomRight,
                         onActivate: { activePane = .bottomRight },
                         onColumnsCalculated: { bottomRightColumns = $0 }
                     )
@@ -102,156 +128,33 @@ struct QuadPaneView: View {
             }
         }
         .onAppear {
-            if topLeftViewModel.selectedItems.isEmpty && !topLeftViewModel.filteredItems.isEmpty {
-                topLeftViewModel.selectItem(topLeftViewModel.filteredItems[0])
-            }
-            registerKeyboardHandler()
-        }
-        .onChange(of: activePane) { _ in
-            registerKeyboardHandler()
-        }
-        .onChange(of: topLeftViewMode) { _ in
-            registerKeyboardHandler()
-        }
-        .onChange(of: topRightViewMode) { _ in
-            registerKeyboardHandler()
-        }
-        .onChange(of: bottomLeftViewMode) { _ in
-            registerKeyboardHandler()
-        }
-        .onChange(of: bottomRightViewMode) { _ in
-            registerKeyboardHandler()
-        }
-        .onChange(of: topLeftColumns) { _ in
-            registerKeyboardHandler()
-        }
-        .onChange(of: topRightColumns) { _ in
-            registerKeyboardHandler()
-        }
-        .onChange(of: bottomLeftColumns) { _ in
-            registerKeyboardHandler()
-        }
-        .onChange(of: bottomRightColumns) { _ in
-            registerKeyboardHandler()
-        }
-    }
-
-    private func registerKeyboardHandler() {
-        let pane = activePane
-        let vm = activeViewModel
-        let mode: PaneViewMode
-        let columnsCount: Int
-        switch pane {
-        case .topLeft:
-            mode = topLeftViewMode
-            columnsCount = topLeftColumns
-        case .topRight:
-            mode = topRightViewMode
-            columnsCount = topRightColumns
-        case .bottomLeft:
-            mode = bottomLeftViewMode
-            columnsCount = bottomLeftColumns
-        case .bottomRight:
-            mode = bottomRightViewMode
-            columnsCount = bottomRightColumns
-        }
-        let safeColumns = max(1, columnsCount)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            KeyboardManager.shared.setHandler {
-                guard let event = NSApp.currentEvent else { return false }
-                let modifiers = event.modifierFlags
-                let hasShift = modifiers.contains(.shift)
-
-                switch event.keyCode {
-                case 126: // Up arrow
-                    let offset = mode == .icons ? -safeColumns : -1
-                    navigateInViewModel(vm, by: offset, extend: hasShift)
-                    return true
-                case 125: // Down arrow
-                    let offset = mode == .icons ? safeColumns : 1
-                    navigateInViewModel(vm, by: offset, extend: hasShift)
-                    return true
-                case 123: // Left arrow
-                    navigateInViewModel(vm, by: -1, extend: hasShift)
-                    return true
-                case 124: // Right arrow
-                    navigateInViewModel(vm, by: 1, extend: hasShift)
-                    return true
-                case 36: // Return
-                    if let item = vm.selectedItems.first {
-                        vm.openItem(item)
-                    }
-                    return true
-                case 49: // Space
-                    vm.toggleQuickLookForSelection { offset in
-                        self.navigateInViewModel(vm, by: offset)
-                    }
-                    return true
-                case 51: // Backspace/Delete
-                    if modifiers.contains(.command) {
-                        vm.deleteSelectedItems()
-                        return true
-                    }
-                    return false
-                case 8: // C key
-                    if modifiers.contains(.command) && !modifiers.contains(.shift) {
-                        vm.copySelectedItems()
-                        return true
-                    }
-                    return false
-                case 7: // X key
-                    if modifiers.contains(.command) && !modifiers.contains(.shift) {
-                        vm.cutSelectedItems()
-                        return true
-                    }
-                    return false
-                case 9: // V key
-                    if modifiers.contains(.command) && !modifiers.contains(.shift) {
-                        vm.paste()
-                        return true
-                    }
-                    return false
-                default:
-                    return false
-                }
+            // Give keyboard navigation a starting point in the active pane only.
+            let viewModel = activeViewModel
+            if viewModel.selectedItems.isEmpty, let first = viewModel.filteredItems.first {
+                viewModel.selectItem(first)
             }
         }
-    }
-
-    private func navigateInViewModel(_ vm: FileBrowserViewModel, by offset: Int, extend: Bool = false) {
-        let items = vm.filteredItems
-        guard !items.isEmpty else { return }
-
-        // Derive current index from actual selection to avoid stale lastSelectedIndex
-        let currentIndex: Int
-        if let selected = vm.selectedItems.first,
-           let idx = items.firstIndex(of: selected) {
-            currentIndex = idx
-        } else {
-            currentIndex = vm.lastSelectedIndex
-        }
-        let clampedCurrentIndex = max(0, min(items.count - 1, currentIndex))
-        let newIndex = max(0, min(items.count - 1, clampedCurrentIndex + offset))
-        guard newIndex != clampedCurrentIndex || vm.selectedItems.isEmpty else { return }
-
-        if extend {
-            vm.selectRange(to: newIndex, in: items)
-        } else {
-            let newItem = items[newIndex]
-            vm.selectItem(newItem)
-            vm.lastSelectedIndex = newIndex
-            vm.selectionAnchorIndex = newIndex
-        }
-
-        vm.updateQuickLookPreview(for: items[newIndex])
+        // Same guarded, per-window handling as the single-pane views; keys go to the active pane.
+        // The closures read the active pane, its mode and column count when the key is pressed.
+        .keyboardNavigable(
+            onUpArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: -activeColumnsCount, extend: shift) },
+            onDownArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: activeColumnsCount, extend: shift) },
+            onLeftArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: -1, extend: shift) },
+            onRightArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: 1, extend: shift) },
+            onReturn: { PaneKeyboardNavigation.openSelection(in: activeViewModel) },
+            onSpace: { PaneKeyboardNavigation.toggleQuickLook(in: activeViewModel) },
+            onDelete: { activeViewModel.deleteSelectedItems() },
+            onCopy: { activeViewModel.copySelectedItems() },
+            onCut: { activeViewModel.cutSelectedItems() },
+            onPaste: { activeViewModel.paste() },
+            onTypeAhead: { prefix in PaneKeyboardNavigation.jumpToMatch(prefix, in: activeViewModel) }
+        )
     }
 }
 
 struct QuadPaneCell: View {
     @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
-    @ObservedObject private var internalDragState = InternalDragState.shared
     let otherViewModels: [FileBrowserViewModel]
     let isActive: Bool
     @Binding var paneViewMode: QuadPaneView.PaneViewMode
@@ -387,11 +290,17 @@ struct QuadPaneCell: View {
                     QuadPaneIconView(viewModel: viewModel, onActivate: onActivate, onColumnsCalculated: onColumnsCalculated)
                 }
             }
-            .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-                handleDrop(providers: providers)
-                return true
-            }
-            .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging, cornerRadius: UI.CornerRadius.medium, lineWidth: UI.LineWidth.standard, padding: UI.Spacing.tiny)
+            // A delegate (not a perform closure) so the cursor shows move vs. copy correctly and
+            // drags from other panes are accepted while drags within this pane are refused.
+            .onDrop(of: DropHelper.acceptedDropTypes, delegate: ContainerDropDelegate(
+                viewModel: viewModel,
+                isDropTargeted: $isDropTargeted,
+                containerHeight: 0,
+                items: [],
+                autoScroll: false,
+                onComplete: { otherViewModels.forEach { $0.refresh() } }
+            ))
+            .dropTargetOverlay(isTargeted: isDropTargeted, cornerRadius: UI.CornerRadius.medium, lineWidth: UI.LineWidth.standard, padding: UI.Spacing.tiny)
 
             Divider()
 
@@ -425,14 +334,6 @@ struct QuadPaneCell: View {
         }
     }
 
-    private func handleDrop(providers: [NSItemProvider]) {
-        DropHelper.handleDrop(providers: providers, viewModel: viewModel) {
-            for other in otherViewModels {
-                other.refresh()
-            }
-        }
-    }
-
     private func startPathEditing() {
         editPathText = viewModel.currentPath.path
         isEditingPath = true
@@ -444,22 +345,9 @@ struct QuadPaneCell: View {
     }
 
     private func navigateToEditedPath() {
-        var expandedPath = editPathText.trimmingCharacters(in: .whitespaces)
-        if expandedPath.hasPrefix("~") {
-            let home = FileManager.default.homeDirectoryForCurrentUser.path
-            expandedPath = home + expandedPath.dropFirst()
-        }
-
-        let url = URL(fileURLWithPath: expandedPath)
-        var isDirectory: ObjCBool = false
-        if FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) {
-            if isDirectory.boolValue {
-                viewModel.navigateTo(url)
-            } else {
-                viewModel.navigateTo(url.deletingLastPathComponent())
-            }
-            isEditingPath = false
-            isPathFieldFocused = false
+        if PathEntryResolver.navigate(viewModel, to: editPathText) {
+            cancelPathEditing()
+            onActivate()
         } else {
             NSSound.beep()
         }
@@ -481,16 +369,16 @@ struct QuadPaneListView: View {
                 }
             }
             .onAppear {
-                if let firstSelected = viewModel.selectedItems.first {
+                if let lead = viewModel.primarySelectedItem {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                        scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                        scrollProxy.scrollTo(lead.id, anchor: .center)
                     }
                 }
             }
-            .onChange(of: viewModel.selectedItems) { newSelection in
-                if let firstSelected = newSelection.first {
+            .onChange(of: viewModel.selectedItems) { _, _ in
+                if let lead = viewModel.primarySelectedItem {
                     withAnimation {
-                        scrollProxy.scrollTo(firstSelected.id)
+                        scrollProxy.scrollTo(lead.id)
                     }
                 }
             }
@@ -541,7 +429,7 @@ struct QuadPaneListRow: View {
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
         .internalDrag(url: item.url)
-        .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
+        .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
             dropTargetedItemID: $dropTargetedItemID
@@ -584,9 +472,12 @@ struct QuadPaneIconView: View {
     let onActivate: () -> Void
     let onColumnsCalculated: (Int) -> Void
 
+    // Display copies of on-screen thumbnails; ThumbnailCacheManager holds the real cache.
     @State private var thumbnails: [URL: NSImage] = [:]
+    @State private var visibleItems = VisibleItemTracker()
     @State private var dropTargetedItemID: UUID?
     private let thumbnailCache = ThumbnailCacheManager.shared
+    private static let maxDisplayedThumbnails = 300
 
     private var cellWidth: CGFloat {
         appSettings.quadPaneIconSize + 32
@@ -621,26 +512,36 @@ struct QuadPaneIconView: View {
         if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) { return }
 
         if thumbnailCache.hasFailed(url: url) {
-            DispatchQueue.main.async { thumbnails[url] = item.icon }
+            DispatchQueue.main.async { storeThumbnail(item.icon, for: url) }
             return
         }
 
         if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
-            DispatchQueue.main.async { thumbnails[url] = cached }
+            DispatchQueue.main.async { storeThumbnail(cached, for: url) }
             return
         }
 
         thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { url, image in
             DispatchQueue.main.async {
-                thumbnails[url] = image ?? item.icon
+                storeThumbnail(image ?? item.icon, for: url)
             }
+        }
+    }
+
+    /// Keeps the display dictionary bounded: past the limit only the cells on screen are kept
+    /// (the rest come back from ThumbnailCacheManager's memory cache when they reappear).
+    private func storeThumbnail(_ image: NSImage, for url: URL) {
+        thumbnails[url] = image
+        if thumbnails.count > Self.maxDisplayedThumbnails {
+            let visible = visibleItems.urls
+            thumbnails = thumbnails.filter { visible.contains($0.key) }
         }
     }
 
     private func refreshThumbnails() {
         let targetPixelSize = thumbnailPixelSize
         DispatchQueue.main.async {
-            for item in viewModel.filteredItems {
+            for item in viewModel.filteredItems where visibleItems.urls.contains(item.url) {
                 if let existing = thumbnails[item.url],
                    imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
                     continue
@@ -662,7 +563,13 @@ struct QuadPaneIconView: View {
                     LazyVGrid(columns: columns, spacing: appSettings.quadPaneGridSpacing) {
                         ForEach(viewModel.filteredItems) { item in
                             QuadPaneIconCell(item: item, viewModel: viewModel, onActivate: onActivate, thumbnail: thumbnails[item.url], dropTargetedItemID: $dropTargetedItemID)
-                                .onAppear { loadThumbnail(for: item) }
+                                .onAppear {
+                                    visibleItems.urls.insert(item.url)
+                                    loadThumbnail(for: item)
+                                }
+                                .onDisappear {
+                                    visibleItems.urls.remove(item.url)
+                                }
                         }
                     }
                     .padding(8)
@@ -670,29 +577,33 @@ struct QuadPaneIconView: View {
                 .onAppear {
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
                     // Scroll to selected item when view appears (e.g., when switching view modes)
-                    if let firstSelected = viewModel.selectedItems.first {
+                    if let lead = viewModel.primarySelectedItem {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                            scrollProxy.scrollTo(lead.id, anchor: .center)
                         }
                     }
                 }
-                .onChange(of: geometry.size.width) { newWidth in
+                .onChange(of: geometry.size.width) { _, newWidth in
                     onColumnsCalculated(calculateColumns(width: newWidth))
                 }
-                .onChange(of: appSettings.iconGridIconSize) { _ in
+                .onChange(of: appSettings.iconGridIconSize) { _, _ in
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
                     refreshThumbnails()
                 }
-                .onChange(of: appSettings.iconGridSpacing) { _ in
+                .onChange(of: appSettings.iconGridSpacing) { _, _ in
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
                 }
-                .onChange(of: appSettings.thumbnailQuality) { _ in
+                .onChange(of: appSettings.thumbnailQuality) { _, _ in
                     refreshThumbnails()
                 }
-                .onChange(of: viewModel.selectedItems) { newSelection in
-                    if let firstSelected = newSelection.first {
+                .onChange(of: viewModel.currentPath) { _, _ in
+                    // A new folder: drop the previous folder's thumbnails.
+                    thumbnails.removeAll()
+                }
+                .onChange(of: viewModel.selectedItems) { _, _ in
+                    if let lead = viewModel.primarySelectedItem {
                         withAnimation {
-                            scrollProxy.scrollTo(firstSelected.id)
+                            scrollProxy.scrollTo(lead.id)
                         }
                     }
                 }
@@ -743,7 +654,7 @@ struct QuadPaneIconCell: View {
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
         .internalDrag(url: item.url)
-        .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
+        .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
             dropTargetedItemID: $dropTargetedItemID

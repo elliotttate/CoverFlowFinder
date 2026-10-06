@@ -47,174 +47,44 @@ extension View {
     }
 }
 
-// MARK: - Selection Background Modifier
-// Reusable background for selected/drop-targeted items
-
-struct SelectionBackground: ViewModifier {
-    let isSelected: Bool
-    let isDropTarget: Bool
-    let cornerRadius: CGFloat
-
-    init(
-        isSelected: Bool,
-        isDropTarget: Bool = false,
-        cornerRadius: CGFloat = UI.CornerRadius.large
-    ) {
-        self.isSelected = isSelected
-        self.isDropTarget = isDropTarget
-        self.cornerRadius = cornerRadius
-    }
-
-    func body(content: Content) -> some View {
-        content.background(
-            RoundedRectangle(cornerRadius: cornerRadius)
-                .fill(backgroundColor)
-        )
-    }
-
-    private var backgroundColor: Color {
-        if isDropTarget {
-            return Color.accentColor.opacity(UI.Opacity.dropTarget)
-        } else if isSelected {
-            return Color.accentColor.opacity(UI.Opacity.selectedItem)
-        } else {
-            return Color.clear
-        }
-    }
-}
-
-extension View {
-    func selectionBackground(
-        isSelected: Bool,
-        isDropTarget: Bool = false,
-        cornerRadius: CGFloat = UI.CornerRadius.large
-    ) -> some View {
-        modifier(SelectionBackground(
-            isSelected: isSelected,
-            isDropTarget: isDropTarget,
-            cornerRadius: cornerRadius
-        ))
-    }
-}
-
-// MARK: - Item Drop Target Overlay
-// Combined selection background and drop stroke for list/grid items
-
-struct ItemDropTargetStyle: ViewModifier {
-    let isSelected: Bool
-    let isDropTarget: Bool
-    let cornerRadius: CGFloat
-    let strokeWidth: CGFloat
-
-    init(
-        isSelected: Bool,
-        isDropTarget: Bool,
-        cornerRadius: CGFloat = UI.CornerRadius.large,
-        strokeWidth: CGFloat = UI.LineWidth.standard
-    ) {
-        self.isSelected = isSelected
-        self.isDropTarget = isDropTarget
-        self.cornerRadius = cornerRadius
-        self.strokeWidth = strokeWidth
-    }
-
-    func body(content: Content) -> some View {
-        content
-            .background(
-                isDropTarget
-                    ? Color.accentColor.opacity(UI.Opacity.dropTarget)
-                    : (isSelected ? Color.accentColor.opacity(UI.Opacity.selectedItemStrong) : Color.clear)
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: cornerRadius)
-                    .stroke(Color.accentColor, lineWidth: strokeWidth)
-                    .opacity(isDropTarget ? 1 : 0)
-            )
-    }
-}
-
-extension View {
-    func itemDropTargetStyle(
-        isSelected: Bool,
-        isDropTarget: Bool,
-        cornerRadius: CGFloat = UI.CornerRadius.large,
-        strokeWidth: CGFloat = UI.LineWidth.standard
-    ) -> some View {
-        modifier(ItemDropTargetStyle(
-            isSelected: isSelected,
-            isDropTarget: isDropTarget,
-            cornerRadius: cornerRadius,
-            strokeWidth: strokeWidth
-        ))
-    }
-}
-
-// MARK: - Active Pane Border
-// Highlights the active pane in multi-pane views
-
-struct ActivePaneBorder: ViewModifier {
-    let isActive: Bool
-    let lineWidth: CGFloat
-
-    init(isActive: Bool, lineWidth: CGFloat = UI.LineWidth.standard) {
-        self.isActive = isActive
-        self.lineWidth = lineWidth
-    }
-
-    func body(content: Content) -> some View {
-        content.overlay(
-            RoundedRectangle(cornerRadius: 0)
-                .stroke(isActive ? Color.accentColor : Color.clear, lineWidth: lineWidth)
-        )
-    }
-}
-
-extension View {
-    func activePaneBorder(isActive: Bool, lineWidth: CGFloat = UI.LineWidth.standard) -> some View {
-        modifier(ActivePaneBorder(isActive: isActive, lineWidth: lineWidth))
-    }
-}
-
-// MARK: - Cut Item Opacity
-// Applies reduced opacity to items that are cut
-
-extension View {
-    func cutItemOpacity(isCut: Bool) -> some View {
-        opacity(isCut ? UI.Opacity.cutItem : 1.0)
-    }
-}
-
 // MARK: - Internal Drag State Tracking
 // Tracks when a drag originates from within the app to suppress drop overlays
 
 class InternalDragState: ObservableObject {
     static let shared = InternalDragState()
-    @Published var isDragging = false
-    var mouseScreenLocation: NSPoint = .zero
-    private var dragMonitor: Any?
-    private var mouseDraggedMonitor: Any?
 
-    private init() {
-        setupDragMonitor()
+    /// True while a drag that started in this app is in progress.
+    @Published var isDragging = false {
+        didSet {
+            guard isDragging != oldValue else { return }
+            if isDragging {
+                startWatchdog()
+            } else {
+                draggedURLs = []
+                stopWatchdog()
+            }
+        }
     }
 
-    private func setupDragMonitor() {
-        // Monitor for drag session end at the app level
-        dragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] event in
-            // Clear drag state on mouse up (drag end)
-            if self?.isDragging == true {
-                DispatchQueue.main.async {
-                    self?.isDragging = false
-                }
-            }
-            return event
-        }
+    /// The URLs of a SwiftUI drag started in this app (empty when unknown, e.g. list / Cover Flow drags).
+    private(set) var draggedURLs: [URL] = []
 
-        // Monitor mouse position during drag
-        mouseDraggedMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDragged]) { [weak self] event in
+    private var dragMonitor: Any?
+    private var watchdog: Timer?
+    private var dragStartedAt = Date.distantPast
+    private var buttonReleasedAt: Date?
+
+    /// A drag session swallows its mouse-up, so the flag is also cleared once the mouse button has
+    /// been up for a moment, and after a hard timeout.
+    private let releaseGrace: TimeInterval = 0.75
+    private let maximumDragDuration: TimeInterval = 120
+
+    private init() {
+        // Clear drag state on a mouse-up the app does see (drags that never left the source view).
+        dragMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseUp]) { [weak self] event in
             if self?.isDragging == true {
                 DispatchQueue.main.async {
-                    self?.mouseScreenLocation = NSEvent.mouseLocation
+                    self?.endDrag()
                 }
             }
             return event
@@ -225,8 +95,68 @@ class InternalDragState: ObservableObject {
         if let monitor = dragMonitor {
             NSEvent.removeMonitor(monitor)
         }
-        if let monitor = mouseDraggedMonitor {
-            NSEvent.removeMonitor(monitor)
+        watchdog?.invalidate()
+    }
+
+    /// Marks the start of an internal drag of `urls`. The URLs are available immediately (drop
+    /// targets validate against them); the published flag updates on the next runloop turn, since
+    /// drag callbacks can run inside a SwiftUI update.
+    func beginDrag(urls: [URL]) {
+        draggedURLs = urls
+        dragStartedAt = Date()
+        buttonReleasedAt = nil
+        DispatchQueue.main.async { [weak self] in
+            guard let self, !self.isDragging else { return }
+            self.isDragging = true
+        }
+    }
+
+    /// Ends the current internal drag (drop performed, drag cancelled, or mouse released).
+    func endDrag() {
+        if isDragging {
+            isDragging = false
+        } else {
+            draggedURLs = []
+        }
+    }
+
+    private func startWatchdog() {
+        if Date().timeIntervalSince(dragStartedAt) > 1 {
+            // Started by a caller that set `isDragging` directly (list view, Cover Flow).
+            dragStartedAt = Date()
+        }
+        buttonReleasedAt = nil
+        watchdog?.invalidate()
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.checkDragStillActive()
+        }
+        // Common modes: the timer must fire while the drag session tracks the mouse.
+        RunLoop.main.add(timer, forMode: .common)
+        watchdog = timer
+    }
+
+    private func stopWatchdog() {
+        watchdog?.invalidate()
+        watchdog = nil
+        buttonReleasedAt = nil
+    }
+
+    private func checkDragStillActive() {
+        let now = Date()
+        if now.timeIntervalSince(dragStartedAt) > maximumDragDuration {
+            endDrag()
+            return
+        }
+        if NSEvent.pressedMouseButtons & 1 != 0 {
+            buttonReleasedAt = nil
+            return
+        }
+        if let releasedAt = buttonReleasedAt {
+            if now.timeIntervalSince(releasedAt) >= releaseGrace {
+                endDrag()
+            }
+        } else {
+            buttonReleasedAt = now
         }
     }
 }
@@ -239,10 +169,7 @@ struct InternalDragModifier: ViewModifier {
 
     func body(content: Content) -> some View {
         content.onDrag {
-            // Mark as internal drag when drag starts
-            DispatchQueue.main.async {
-                InternalDragState.shared.isDragging = true
-            }
+            InternalDragState.shared.beginDrag(urls: [url])
             return NSItemProvider(object: url as NSURL)
         }
     }
@@ -252,218 +179,5 @@ extension View {
     /// Adds drag support that marks the drag as internal (from within the app)
     func internalDrag(url: URL) -> some View {
         modifier(InternalDragModifier(url: url))
-    }
-}
-
-// MARK: - Multi-File Drag Support
-// Custom drag modifier that supports dragging multiple selected files
-
-struct MultiFileDragModifier: ViewModifier {
-    let item: FileItem
-    let selectedItems: Set<FileItem>
-    let icon: NSImage
-
-    func body(content: Content) -> some View {
-        content.overlay(
-            MultiFileDragView(
-                item: item,
-                selectedItems: selectedItems,
-                icon: icon
-            )
-        )
-    }
-}
-
-/// NSViewRepresentable that handles multi-file drag using AppKit
-struct MultiFileDragView: NSViewRepresentable {
-    let item: FileItem
-    let selectedItems: Set<FileItem>
-    let icon: NSImage
-
-    func makeNSView(context: Context) -> MultiFileDragNSView {
-        let view = MultiFileDragNSView()
-        view.item = item
-        view.selectedItems = selectedItems
-        view.icon = icon
-        return view
-    }
-
-    func updateNSView(_ nsView: MultiFileDragNSView, context: Context) {
-        nsView.item = item
-        nsView.selectedItems = selectedItems
-        nsView.icon = icon
-    }
-}
-
-/// Custom NSView that initiates multi-file drag sessions using Finder-style approach
-/// This view passes through all events to SwiftUI but monitors for drag gestures
-class MultiFileDragNSView: NSView, NSDraggingSource {
-    var item: FileItem?
-    var selectedItems: Set<FileItem> = []
-    var icon: NSImage?
-
-    private var dragStartLocation: NSPoint?
-    private var mouseDownEvent: NSEvent?
-    private let dragThreshold: CGFloat = 4
-    private var isDragging = false
-    private var eventMonitor: Any?
-
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
-        setupEventMonitor()
-    }
-
-    required init?(coder: NSCoder) {
-        super.init(coder: coder)
-        setupEventMonitor()
-    }
-
-    deinit {
-        if let monitor = eventMonitor {
-            NSEvent.removeMonitor(monitor)
-        }
-    }
-
-    private func setupEventMonitor() {
-        // Monitor mouse events globally within the app
-        eventMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .leftMouseDragged, .leftMouseUp]) { [weak self] event in
-            self?.handleMouseEvent(event)
-            return event // Always pass the event through
-        }
-    }
-
-    private func handleMouseEvent(_ event: NSEvent) {
-        guard let window = self.window,
-              event.window == window else { return }
-
-        let windowPoint = event.locationInWindow
-        let viewPoint = convert(windowPoint, from: nil)
-
-        // Only handle events within our bounds
-        guard bounds.contains(viewPoint) else {
-            if event.type == .leftMouseUp {
-                dragStartLocation = nil
-                mouseDownEvent = nil
-                isDragging = false
-            }
-            return
-        }
-
-        switch event.type {
-        case .leftMouseDown:
-            dragStartLocation = viewPoint
-            mouseDownEvent = event
-            isDragging = false
-
-        case .leftMouseDragged:
-            handleDrag(at: viewPoint, event: event)
-
-        case .leftMouseUp:
-            dragStartLocation = nil
-            mouseDownEvent = nil
-            isDragging = false
-
-        default:
-            break
-        }
-    }
-
-    private func handleDrag(at viewPoint: NSPoint, event: NSEvent) {
-        guard let startLocation = dragStartLocation,
-              let item = item,
-              !item.isFromArchive,
-              !isDragging else { return }
-
-        let distance = hypot(viewPoint.x - startLocation.x, viewPoint.y - startLocation.y)
-
-        // Start drag if moved enough
-        if distance > dragThreshold {
-            isDragging = true
-
-            // Determine items to drag
-            let itemsToDrag: [FileItem]
-            if selectedItems.contains(item) && selectedItems.count > 1 {
-                itemsToDrag = Array(selectedItems).filter { !$0.isFromArchive }
-            } else {
-                itemsToDrag = [item]
-            }
-
-            guard !itemsToDrag.isEmpty else { return }
-
-            // Create dragging items for each file (Finder-style)
-            let iconSize = NSSize(width: 48, height: 48)
-            var draggingItems: [NSDraggingItem] = []
-
-            for (offset, dragItem) in itemsToDrag.enumerated() {
-                let pasteboardItem = NSPasteboardItem()
-                pasteboardItem.setString(dragItem.url.absoluteString, forType: .fileURL)
-
-                let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
-
-                // Offset each subsequent item for stacked appearance (like Finder)
-                let itemLocation = NSPoint(
-                    x: startLocation.x + CGFloat(offset * 6),
-                    y: startLocation.y - CGFloat(offset * 6)
-                )
-
-                // Use imageComponentsProvider for lazy image generation (Finder approach)
-                draggingItem.imageComponentsProvider = {
-                    let dragIcon = dragItem.icon
-                    dragIcon.size = iconSize
-
-                    // Create icon component
-                    let iconComponent = NSDraggingImageComponent(key: .icon)
-                    iconComponent.contents = dragIcon
-                    iconComponent.frame = NSRect(origin: .zero, size: iconSize)
-
-                    return [iconComponent]
-                }
-
-                draggingItem.setDraggingFrame(NSRect(origin: itemLocation, size: iconSize), contents: dragItem.icon)
-                draggingItems.append(draggingItem)
-            }
-
-            // Mark internal drag as active to suppress drop overlays
-            DispatchQueue.main.async {
-                InternalDragState.shared.isDragging = true
-            }
-
-            // Start the drag session using the original mouseDown event
-            let dragEvent = mouseDownEvent ?? event
-            _ = beginDraggingSession(with: draggingItems, event: dragEvent, source: self)
-
-            // Use stack formation for multiple items (like Finder)
-            // Note: formation is set after session starts
-
-            dragStartLocation = nil
-            mouseDownEvent = nil
-        }
-    }
-
-    // Make this view completely transparent to hit testing
-    // All events pass through to SwiftUI, we just monitor them
-    override func hitTest(_ point: NSPoint) -> NSView? {
-        return nil
-    }
-
-    // MARK: - NSDraggingSource
-
-    func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        return context == .withinApplication ? [.copy, .move] : .copy
-    }
-
-    func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
-        isDragging = false
-        // Clear internal drag state
-        DispatchQueue.main.async {
-            InternalDragState.shared.isDragging = false
-        }
-    }
-}
-
-extension View {
-    /// Adds multi-file drag support that works with Finder and other apps
-    func multiFileDrag(item: FileItem, selectedItems: Set<FileItem>, icon: NSImage) -> some View {
-        modifier(MultiFileDragModifier(item: item, selectedItems: selectedItems, icon: icon))
     }
 }
