@@ -2188,6 +2188,13 @@ class FileBrowserViewModel: ObservableObject {
         let folderKey = currentPath.standardizedPathKey
         let watchPath = url.standardizedPathKey
         if watchedFolderKey == folderKey, directoryWatcher?.watchedPath == watchPath { return }
+        if watchedFolderKey != folderKey {
+            // Events still queued for the previous folder must never be applied to this one
+            directoryEventWorkItem?.cancel()
+            directoryEventWorkItem = nil
+            pendingDirectoryEventPaths.removeAll()
+            pendingDirectoryRescan = false
+        }
         if directoryWatcher == nil {
             directoryWatcher = DirectoryWatcher { [weak self] paths, needsRescan, watchedPath in
                 self?.queueDirectoryEvents(paths, needsRescan: needsRescan, watchedPath: watchedPath)
@@ -2238,7 +2245,9 @@ class FileBrowserViewModel: ObservableObject {
             scheduleDirectoryEventProcessing()
             return
         }
-        let paths = pendingDirectoryEventPaths
+        // Only direct children of the folder being shown
+        let folderKey = currentPath.standardizedPathKey
+        let paths = pendingDirectoryEventPaths.filter { ($0 as NSString).deletingLastPathComponent == folderKey }
         let needsRescan = pendingDirectoryRescan
         pendingDirectoryEventPaths.removeAll()
         pendingDirectoryRescan = false
