@@ -485,8 +485,8 @@ struct ContentView: View {
     private func shutDown(_ viewModel: FileBrowserViewModel) {
         InlinePreviews.stopAll()
         PendingSelection.cancel(for: viewModel)
-        // Stops the closed tab's folder watcher, network browsing and searches.
-        viewModel.setBackgroundWorkActive(false)
+        // Stops the closed tab's folder watcher, loads, network browsing and searches for good.
+        viewModel.tearDown()
     }
 
     private func refreshAllViewModels() {
@@ -873,15 +873,10 @@ enum PathEntryResolver {
         case .notFound:
             return false
         case .directory(let url):
+            // navigateTo also leaves archive / Photos browsing.
             PendingSelection.cancel(for: viewModel)
-            if viewModel.isInsideArchive {
-                viewModel.exitArchive()
-            }
             viewModel.navigateTo(url)
         case .file(let url, let parent):
-            if viewModel.isInsideArchive {
-                viewModel.exitArchive()
-            }
             PendingSelection.select(url, in: viewModel, navigatingTo: parent)
         }
         return true
@@ -1051,10 +1046,7 @@ struct PathBarView: View {
         let component = viewModel.pathComponents[index]
 
         if let url = component.url {
-            // Regular filesystem navigation
-            if viewModel.isInsideArchive {
-                viewModel.exitArchive()
-            }
+            // Regular filesystem navigation (also leaves an archive, in one history step)
             viewModel.navigateToAndSelectCurrent(url)
         } else if let archivePath = component.archivePath {
             // Navigate within archive
@@ -1444,12 +1436,9 @@ enum VolumePaths {
             || (viewModel.currentArchiveURL.map { isURL($0, onVolumeAt: volumeURL) } ?? false)
         guard showsVolume else { return false }
         PendingSelection.cancel(for: viewModel)
-        // Suspending stops the watcher now; the loads below are deferred until work resumes, so
-        // nothing on the volume is listed again (leaving a ZIP would otherwise list its folder).
+        // Suspending stops the watcher now; the load below is deferred until work resumes, so
+        // nothing on the volume is listed again. navigateTo also leaves archive browsing.
         viewModel.setBackgroundWorkActive(false)
-        if viewModel.isInsideArchive {
-            viewModel.exitArchive()
-        }
         viewModel.navigateTo(FileManager.default.homeDirectoryForCurrentUser)
         return true
     }
