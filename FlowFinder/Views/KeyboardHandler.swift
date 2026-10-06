@@ -392,7 +392,9 @@ final class KeyboardManager {
 
     // MARK: Event handling
 
-    private func handle(_ event: NSEvent) -> Bool {
+    /// Returns true when the event was dispatched to a file view and must be consumed.
+    /// Internal (not private) so tests can drive it without depending on monitor order.
+    func handle(_ event: NSEvent) -> Bool {
         guard let window = event.window else { return false }
         if event.keyCode == KeyboardRouting.KeyCode.tab {
             noteFocusMovedByKeyboard(in: window)

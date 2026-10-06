@@ -3209,14 +3209,14 @@ struct FileListSection: View {
             tagRefreshToken: viewModel.tagRefreshToken,
             onEmptySpaceClick: onEmptySpaceClick
         )
-        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+        .onDrop(of: DropHelper.acceptedDropTypes, isTargeted: $isDropTargeted) { providers in
             // Resolve copy/move now, while the drop's modifier keys are still down
-            let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
-            DropHelper.processDroppedItems(providers) { urls in
-                guard !urls.isEmpty else { return }
-                viewModel.handleDrop(urls: urls, operation: operation)
-            }
-            return true
+            DropHelper.performDrop(
+                providers: providers,
+                into: viewModel.currentPath,
+                viewModel: viewModel,
+                operation: FileDropOperation(modifierFlags: NSEvent.modifierFlags)
+            )
         }
         .overlay(
             RoundedRectangle(cornerRadius: 4)
