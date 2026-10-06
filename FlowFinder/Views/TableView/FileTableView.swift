@@ -305,8 +305,6 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     var lastTagRefreshToken: Int = 0  // Track tag changes for UI refresh
 
     // Cut dimming
-    private var lastClipboardItems: [URL] = []
-    private var lastClipboardOperation: ClipboardOperation = .copy
     private(set) var cutURLs: Set<URL> = []
 
     // Lazy loading state
@@ -455,7 +453,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         reconcileEditingState()
         applyDisplaySettingsIfNeeded()
 
-        let changedCutURLs = refreshCutURLs()
+        let cutChanged = refreshCutURLs()
 
         // Most updates (selection, clipboard…) pass the very same array and the view model's items
         // haven't changed: nothing to do for the rows.
@@ -476,7 +474,9 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             lastTagRefreshToken = tagRefreshToken
             reloadRows(loadedRows())
         }
-        applyCutDimming(to: changedCutURLs)
+        if cutChanged {
+            applyCutDimmingToLoadedRows()
+        }
 
         syncColumnsIfNeeded()
 
@@ -716,24 +716,20 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     // MARK: - Cut Dimming
 
-    /// Updates the set of cut URLs; returns the URLs whose dimming changed.
-    private func refreshCutURLs() -> Set<URL> {
-        let clipboardItems = viewModel.clipboardItems
-        let operation = viewModel.clipboardOperation
-        guard clipboardItems != lastClipboardItems || operation != lastClipboardOperation else { return [] }
-        lastClipboardItems = clipboardItems
-        lastClipboardOperation = operation
-        let newCutURLs: Set<URL> = operation == .cut ? Set(clipboardItems) : []
-        let changed = newCutURLs.symmetricDifference(cutURLs)
-        cutURLs = newCutURLs
-        return changed
+    /// Picks up the app-wide cut set (compared as a set, so cutting A then B is a change).
+    /// Returns whether it changed.
+    private func refreshCutURLs() -> Bool {
+        let current = viewModel.cutItemURLs
+        guard current != cutURLs else { return false }
+        cutURLs = current
+        return true
     }
 
-    private func applyCutDimming(to urls: Set<URL>) {
-        guard let tableView, !urls.isEmpty else { return }
-        for url in urls {
-            guard let row = rowIndex[url] else { continue }
-            let alpha: CGFloat = cutURLs.contains(url) ? 0.5 : 1.0
+    /// Re-dims the rows that have cells; other rows get their dimming when they're shown.
+    private func applyCutDimmingToLoadedRows() {
+        guard let tableView else { return }
+        for row in loadedRows() {
+            let alpha: CGFloat = viewModel.isItemCut(items[row]) ? 0.5 : 1.0
             for column in 0..<tableView.numberOfColumns {
                 tableView.view(atColumn: column, row: row, makeIfNecessary: false)?.alphaValue = alpha
             }
@@ -1224,7 +1220,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         }
 
         // Dim cut items (Finder-style visual feedback)
-        cellView.alphaValue = cutURLs.contains(item.url) ? 0.5 : 1.0
+        cellView.alphaValue = viewModel.isItemCut(item) ? 0.5 : 1.0
 
         return cellView
     }

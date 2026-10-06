@@ -114,7 +114,7 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
 
         // Only update text if not currently editing
         if !isEditing {
-            nameTextField.stringValue = item.displayName(showFileExtensions: appSettings.showFileExtensions)
+            nameTextField.stringValue = Self.displayText(for: item, showFileExtensions: appSettings.showFileExtensions)
         }
         nameTextField.font = NSFont.systemFont(ofSize: appSettings.listFontSize)
         nameTextField.textColor = .labelColor
@@ -170,6 +170,46 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         }
     }
 
+    // MARK: - Names
+
+    /// The name as listed: Finder shows ":" on disk as "/".
+    static func displayText(for item: FileItem, showFileExtensions: Bool) -> String {
+        item.displayName(showFileExtensions: showFileExtensions).replacingOccurrences(of: ":", with: "/")
+    }
+
+    /// The rename field's text: files without their extension (it's kept), folders and packages
+    /// with their full name; ":" shown as "/" (the view model stores "/" back as ":").
+    static func editingText(for item: FileItem) -> String {
+        let name = item.isDirectory ? item.name : item.url.deletingPathExtension().lastPathComponent
+        return name.replacingOccurrences(of: ":", with: "/")
+    }
+
+    /// The extension hidden from the rename field ("" for folders and packages).
+    static func hiddenExtension(for item: FileItem) -> String {
+        item.isDirectory ? "" : item.url.pathExtension
+    }
+
+    /// The new full name: the hidden extension is put back unless the user typed it.
+    static func fullName(fromEditedText text: String, hiddenExtension ext: String) -> String {
+        guard !ext.isEmpty, !text.lowercased().hasSuffix("." + ext.lowercased()) else { return text }
+        return "\(text).\(ext)"
+    }
+
+    /// The edited name without the hidden extension (the view model re-appends it on Tab/⇧Tab).
+    static func baseName(fromEditedText text: String, hiddenExtension ext: String) -> String {
+        guard !ext.isEmpty, text.lowercased().hasSuffix("." + ext.lowercased()) else { return text }
+        return String(text.dropLast(ext.count + 1))
+    }
+
+    /// The field text, or nil when it's blank or unchanged (nothing to rename). Not trimmed:
+    /// leading and trailing spaces are part of the name, as in Finder.
+    private func editedTextIfChanged(for item: FileItem) -> String? {
+        let text = nameTextField.stringValue
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              text != Self.editingText(for: item) else { return nil }
+        return text
+    }
+
     // MARK: - Inline Editing
 
     func startEditing() {
@@ -179,8 +219,7 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         editingStartedAt = Date()
 
         // Set up for editing
-        let nameWithoutExt = item.isDirectory ? item.name : item.url.deletingPathExtension().lastPathComponent
-        nameTextField.stringValue = nameWithoutExt
+        nameTextField.stringValue = Self.editingText(for: item)
         nameTextField.isEditable = true
         nameTextField.isSelectable = true
         nameTextField.isBordered = true
@@ -229,7 +268,7 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
     }
 
     private func displayedName(for item: FileItem) -> String {
-        item.displayName(showFileExtensions: AppSettings.shared.showFileExtensions)
+        Self.displayText(for: item, showFileExtensions: AppSettings.shared.showFileExtensions)
     }
 
     private func resetEditingState() {
@@ -272,16 +311,13 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
     private func commitEditing(refocusTable: Bool) {
         guard isEditing, let item = currentItem else { return }
 
-        let trimmedName = nameTextField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
-        let originalNameWithoutExt = item.isDirectory ? item.name : item.url.deletingPathExtension().lastPathComponent
+        let editedText = editedTextIfChanged(for: item)
 
         endEditingMode(refocusTable: refocusTable)
 
         // Only rename if name actually changed and is not empty
-        if !trimmedName.isEmpty && trimmedName != originalNameWithoutExt {
-            // Reconstruct full name with extension (folders are edited with their full name)
-            let ext = item.url.pathExtension
-            let newName = ext.isEmpty || item.isDirectory ? trimmedName : "\(trimmedName).\(ext)"
+        if let editedText {
+            let newName = Self.fullName(fromEditedText: editedText, hiddenExtension: Self.hiddenExtension(for: item))
             delegate?.fileNameCellView(self, didRenameItem: item, to: newName)
         } else {
             // Restore original name
@@ -321,20 +357,26 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         return false
     }
 
+    /// The base name to hand to the view model's rename-and-advance ("" = don't rename).
+    private func editedBaseName(for item: FileItem) -> String {
+        guard let editedText = editedTextIfChanged(for: item) else { return "" }
+        return Self.baseName(fromEditedText: editedText, hiddenExtension: Self.hiddenExtension(for: item))
+    }
+
     private func commitRenameAndMoveNext() {
         guard isEditing, let item = currentItem else { return }
 
-        let trimmedName = nameTextField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newName = editedBaseName(for: item)
         endEditingMode(refocusTable: true)
-        delegate?.fileNameCellView(self, commitRenameAndMoveNext: item, newName: trimmedName)
+        delegate?.fileNameCellView(self, commitRenameAndMoveNext: item, newName: newName)
     }
 
     private func commitRenameAndMovePrevious() {
         guard isEditing, let item = currentItem else { return }
 
-        let trimmedName = nameTextField.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newName = editedBaseName(for: item)
         endEditingMode(refocusTable: true)
-        delegate?.fileNameCellView(self, commitRenameAndMovePrevious: item, newName: trimmedName)
+        delegate?.fileNameCellView(self, commitRenameAndMovePrevious: item, newName: newName)
     }
 }
 
