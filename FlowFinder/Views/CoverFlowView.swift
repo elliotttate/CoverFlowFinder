@@ -162,7 +162,7 @@ struct CoverFlowView: View {
                     thumbnailCount: thumbnails.count,
                     navigationGeneration: viewModel.navigationGeneration,
                     selectedItems: viewModel.selectedItems,
-                    cutItemURLs: Set(viewModel.clipboardOperation == .cut ? viewModel.clipboardItems : []),
+                    cutItemURLs: viewModel.cutItemURLs,
                     coverScale: settings.coverFlowScaleValue,
                     scrollSensitivity: settings.coverFlowSwipeSpeedValue,
                     currentFolderURL: viewModel.isInsideArchive ? nil : viewModel.currentPath,
