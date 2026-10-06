@@ -241,11 +241,6 @@ struct ContentView: View {
         deduplicatedViewModels(tabs.map(\.viewModel) + auxiliaryPaneStore.loadedViewModels)
     }
 
-    private var viewModePickerWidth: CGFloat {
-        let count = CGFloat(ViewMode.allCases.count)
-        return min(380, max(220, count * 40))
-    }
-
     var body: some View {
         splitView
             .toolbar { toolbarItems }
@@ -303,7 +298,10 @@ struct ContentView: View {
                 }
             }
             .pickerStyle(.segmented)
-            .frame(width: viewModePickerWidth)
+            // Always the control's natural width: a fixed frame narrower than the segments need was
+            // honoured on some toolbar layouts and not others, so the icons were sometimes crammed
+            // against the capsule's edges.
+            .fixedSize()
             .help("Change view mode")
         }
 
