@@ -1053,7 +1053,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     /// collapses it to that item on mouse-up if no drag started
     private var pendingCollapseIndex: Int?
     /// Identity of the last mouse-down handled, to drop a re-delivery of the same click
-    private var lastMouseDownIdentity: (timestamp: TimeInterval, eventNumber: Int)?
+    private var lastMouseDownIdentity: (timestamp: TimeInterval, eventNumber: Int, clickCount: Int)?
 
     // Scrolling
     private var isScrolling = false
@@ -2028,10 +2028,11 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     override func mouseDown(with event: NSEvent) {
         // AppKit can re-deliver an already-handled mouse-down (delayed gesture-recognizer event).
         // A second copy would read as a double-click and open the item, or as a click on empty space.
-        if let last = lastMouseDownIdentity, last.timestamp == event.timestamp, last.eventNumber == event.eventNumber {
+        if let last = lastMouseDownIdentity, last.timestamp == event.timestamp, last.eventNumber == event.eventNumber,
+           last.clickCount == event.clickCount {
             return
         }
-        lastMouseDownIdentity = (event.timestamp, event.eventNumber)
+        lastMouseDownIdentity = (event.timestamp, event.eventNumber, event.clickCount)
 
         window?.makeFirstResponder(self)
         pendingCollapseIndex = nil

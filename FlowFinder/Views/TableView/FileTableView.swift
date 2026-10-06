@@ -88,16 +88,17 @@ final class KeyboardTableView: NSTableView {
     }
 
     /// Identity of the last mouse-down handled, to drop a re-delivery of the same click.
-    private var lastMouseDown: (timestamp: TimeInterval, eventNumber: Int)?
+    private var lastMouseDown: (timestamp: TimeInterval, eventNumber: Int, clickCount: Int)?
 
     override func mouseDown(with event: NSEvent) {
         // AppKit's gesture-recognizer machinery can deliver the same mouse-down a second time
         // ("delayed event") after it was already handled. Handling it twice turned a row click
         // into a row click followed by an empty-space click, which cleared the selection.
-        if let last = lastMouseDown, last.timestamp == event.timestamp, last.eventNumber == event.eventNumber {
+        if let last = lastMouseDown, last.timestamp == event.timestamp, last.eventNumber == event.eventNumber,
+           last.clickCount == event.clickCount {
             return
         }
-        lastMouseDown = (event.timestamp, event.eventNumber)
+        lastMouseDown = (event.timestamp, event.eventNumber, event.clickCount)
 
         let point = convert(event.locationInWindow, from: nil)
         var clickedRow = row(at: point)
