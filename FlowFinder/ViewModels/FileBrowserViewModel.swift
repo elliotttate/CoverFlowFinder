@@ -69,6 +69,730 @@ enum ClipboardOperation {
     case cut
 }
 
+// MARK: - App-wide File Clipboard
+
+/// The file clipboard shared by every window, tab and pane.
+///
+/// The internal list is trusted only while the pasteboard still holds what FlowFinder wrote
+/// (same `changeCount`). Once anything else is copied — in Finder or any other app — the system
+/// pasteboard wins and a pending cut is dropped.
+@MainActor
+final class FileClipboard {
+    static let shared = FileClipboard()
+
+    /// The pasteboard in use. Tests swap in a private one so they don't touch the user's clipboard.
+    var pasteboard: NSPasteboard = .general
+
+    private(set) var items: [URL] = []
+    private(set) var operation: ClipboardOperation = .copy
+    /// The cut URLs exactly as they were selected. Views dim these.
+    private(set) var cutURLs: Set<URL> = []
+    /// Bumped on every change, for cheap change detection.
+    private(set) var revision = 0
+
+    private var cutPaths: Set<String> = []
+    private var ownedChangeCount: Int?
+    private var writeToken = 0
+    private let observers = NSHashTable<FileBrowserViewModel>.weakObjects()
+
+    private init() {
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            MainActor.assumeIsolated {
+                FileClipboard.shared.discardIfPasteboardChanged()
+            }
+        }
+    }
+
+    /// `viewModel` gets `objectWillChange` whenever the clipboard changes, so its views re-dim.
+    func addObserver(_ viewModel: FileBrowserViewModel) {
+        observers.add(viewModel)
+    }
+
+    private var ownsPasteboard: Bool {
+        ownedChangeCount == pasteboard.changeCount
+    }
+
+    var canPaste: Bool {
+        if !items.isEmpty && ownsPasteboard { return true }
+        return pasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+    }
+
+    func isCut(_ url: URL) -> Bool {
+        guard !cutPaths.isEmpty else { return false }
+        return cutURLs.contains(url) || cutPaths.contains(Self.key(for: url))
+    }
+
+    /// Writes `urls` to the pasteboard now and makes them the clipboard contents.
+    func write(_ urls: [URL], operation: ClipboardOperation) {
+        writeToken &+= 1
+        pasteboard.clearContents()
+        pasteboard.writeObjects(urls as [NSURL])
+        if operation == .cut {
+            pasteboard.setData(Data([1]), forType: cutOperationPasteboardType)
+        }
+        ownedChangeCount = pasteboard.changeCount
+        setContents(urls, operation: operation)
+    }
+
+    /// Starts a copy whose URLs are produced later (archive extraction).
+    func beginDeferredWrite() -> (token: Int, changeCount: Int) {
+        writeToken &+= 1
+        return (writeToken, pasteboard.changeCount)
+    }
+
+    /// Finishes a deferred copy unless something else was copied in the meantime.
+    @discardableResult
+    func finishDeferredWrite(_ start: (token: Int, changeCount: Int), urls: [URL]) -> Bool {
+        guard start.token == writeToken, start.changeCount == pasteboard.changeCount else { return false }
+        write(urls, operation: .copy)
+        return true
+    }
+
+    /// What a paste should use right now: our list while we still own the pasteboard, otherwise
+    /// the file URLs on the pasteboard (always as a copy).
+    func contentsForPaste() -> (urls: [URL], isCut: Bool) {
+        if !items.isEmpty && ownsPasteboard {
+            return (items, operation == .cut)
+        }
+        discardIfPasteboardChanged()
+        let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] ?? []
+        return (urls, false)
+    }
+
+    /// Drops our contents (and any cut) if another app has replaced the pasteboard.
+    func discardIfPasteboardChanged() {
+        guard ownedChangeCount != nil, !ownsPasteboard else { return }
+        ownedChangeCount = nil
+        setContents([], operation: .copy)
+    }
+
+    /// Called after a cut-paste moved `sources`. Once everything is moved, the cut is cleared
+    /// everywhere, along with the pasteboard (which still lists the old locations).
+    func didMoveCutItems(_ sources: [URL]) {
+        guard operation == .cut, !sources.isEmpty else { return }
+        let movedPaths = Set(sources.map(Self.key(for:)))
+        let remaining = items.filter { !movedPaths.contains(Self.key(for: $0)) }
+        guard remaining.count != items.count else { return }
+        if remaining.isEmpty {
+            if ownsPasteboard {
+                pasteboard.clearContents()
+            }
+            ownedChangeCount = nil
+            setContents([], operation: .copy)
+        } else {
+            setContents(remaining, operation: .cut)
+        }
+    }
+
+    /// Keeps the clipboard pointing at an item that was renamed.
+    func itemDidMove(from oldURL: URL, to newURL: URL) {
+        let oldKey = Self.key(for: oldURL)
+        guard ownsPasteboard, items.contains(where: { Self.key(for: $0) == oldKey }) else { return }
+        write(items.map { Self.key(for: $0) == oldKey ? newURL : $0 }, operation: operation)
+    }
+
+    private func setContents(_ urls: [URL], operation: ClipboardOperation) {
+        for viewModel in observers.allObjects {
+            viewModel.objectWillChange.send()
+        }
+        items = urls
+        self.operation = operation
+        cutURLs = operation == .cut ? Set(urls) : []
+        cutPaths = operation == .cut ? Set(urls.map(Self.key(for:))) : []
+        revision &+= 1
+    }
+
+    private static func key(for url: URL) -> String {
+        url.standardizedFileURL.path
+    }
+}
+
+// MARK: - File Operation Alerts
+
+struct FileOperationFailure {
+    let url: URL
+    let error: Error
+}
+
+/// Presents file-operation alerts one at a time — as a sheet on the key window when there is one,
+/// otherwise app-modal.
+@MainActor
+enum FileOperationAlerts {
+    /// Shows `alert` and reports the button pressed. Tests replace this to record and answer alerts.
+    static var presentAlert: (NSAlert, @escaping (NSApplication.ModalResponse) -> Void) -> Void = { alert, completion in
+        var window = NSApp.mainWindow ?? NSApp.keyWindow
+        while let parent = window?.sheetParent {
+            window = parent
+        }
+        if let window, window.isVisible {
+            // AppKit queues this behind any sheet already on the window.
+            alert.beginSheetModal(for: window, completionHandler: completion)
+        } else {
+            completion(alert.runModal())
+        }
+    }
+
+    private static var pending: [(alert: NSAlert, completion: (NSApplication.ModalResponse) -> Void)] = []
+    private static var isPresenting = false
+
+    static func show(_ alert: NSAlert, completion: @escaping (NSApplication.ModalResponse) -> Void = { _ in }) {
+        pending.append((alert, completion))
+        presentNext()
+    }
+
+    private static func presentNext() {
+        guard !isPresenting, !pending.isEmpty else { return }
+        isPresenting = true
+        let next = pending.removeFirst()
+        presentAlert(next.alert) { response in
+            next.completion(response)
+            // Next turn, so the finished sheet is fully detached first. Alerts shown from the
+            // completion wait until then.
+            DispatchQueue.main.async {
+                isPresenting = false
+                presentNext()
+            }
+        }
+    }
+
+    /// One alert summarizing everything that failed in a batch. `verb` completes
+    /// "“name” couldn’t be …", e.g. "copied".
+    static func reportFailures(_ failures: [FileOperationFailure], verb: String) {
+        guard !failures.isEmpty else { return }
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        if failures.count == 1, let failure = failures.first {
+            alert.messageText = "“\(displayName(failure.url))” couldn’t be \(verb)."
+            alert.informativeText = reason(for: failure.error)
+        } else {
+            alert.messageText = "\(failures.count) items couldn’t be \(verb)."
+            var lines = failures.prefix(5).map { "“\(displayName($0.url))”: \(reason(for: $0.error))" }
+            if failures.count > 5 {
+                lines.append("…and \(failures.count - 5) more.")
+            }
+            alert.informativeText = lines.joined(separator: "\n")
+        }
+        alert.addButton(withTitle: "OK")
+        show(alert)
+    }
+
+    static func showMessage(_ message: String, information: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = message
+        alert.informativeText = information
+        alert.addButton(withTitle: "OK")
+        show(alert)
+    }
+
+    static func displayName(_ url: URL) -> String {
+        FileOperationEngine.displayName(url)
+    }
+
+    private static func reason(for error: Error) -> String {
+        let nsError = error as NSError
+        return nsError.localizedFailureReason ?? nsError.localizedDescription
+    }
+}
+
+// MARK: - File Operation Engine
+
+/// A change to the file system, recorded so it can be reversed.
+enum FileOperationStep {
+    case moved(from: URL, to: URL)
+    case copied(from: URL, to: URL)
+    case trashed(original: URL, trashedAs: URL)
+    case restored(from: URL, to: URL)
+    case created(URL)
+}
+
+/// What one operation did. Filled in on the file-operation queue; undo and redo are queued after
+/// the operation they reverse, so they read it once it is complete, and the main thread reads it
+/// only after the work hops back. Hence unchecked.
+final class FileOperationJournal: @unchecked Sendable {
+    var steps: [FileOperationStep] = []
+
+    /// Where moved and copied items ended up.
+    var placedURLs: [URL] {
+        steps.compactMap {
+            switch $0 {
+            case .moved(_, let to), .copied(_, let to): return to
+            default: return nil
+            }
+        }
+    }
+
+    /// Sources that were moved away (not copies whose original stayed behind).
+    var movedSources: [URL] {
+        steps.compactMap {
+            if case .moved(let from, _) = $0 { return from }
+            return nil
+        }
+    }
+
+    var trashedOriginals: [URL] {
+        steps.compactMap {
+            if case .trashed(let original, _) = $0 { return original }
+            return nil
+        }
+    }
+}
+
+/// One item of a copy/move batch, planned on the main actor and run on the file-operation queue.
+struct FileTransferItem {
+    enum Kind {
+        case copy
+        case move
+    }
+
+    enum Placement {
+        /// No conflict when planned. Still never overwrites: a late conflict keeps both.
+        case exact
+        /// An item with this name exists; ask the user.
+        case ask
+        case keepBoth
+        /// Move the existing item to the Trash first, so it can be undone.
+        case replace
+        /// "name copy" next to the original.
+        case duplicate
+        case skip
+    }
+
+    let source: URL
+    let destination: URL
+    let kind: Kind
+    var placement: Placement
+}
+
+struct FileOperationResult {
+    var failures: [FileOperationFailure] = []
+    /// Items that weren't trashed because their volume has no Trash.
+    var trashUnsupported: [URL] = []
+}
+
+enum FileOperationEngine {
+    /// All copy/move/trash work runs here, app-wide and in order, so undo and redo always run after
+    /// the operation they reverse. Quick operations (pasteboard writes, New Folder, rename) don't
+    /// use it.
+    static let queue = DispatchQueue(label: "com.coverflowfinder.fileops", qos: .userInitiated)
+
+    /// Moves an item to the Trash and returns where it went. Replaceable for tests.
+    static var trashItem: (URL) throws -> URL? = { url in
+        var resultingURL: NSURL?
+        try FileManager.default.trashItem(at: url, resultingItemURL: &resultingURL)
+        return resultingURL as URL?
+    }
+
+    // MARK: Operations (file-operation queue)
+
+    static func transfer(_ items: [FileTransferItem], journal: FileOperationJournal) -> FileOperationResult {
+        var result = FileOperationResult()
+        for item in items where item.placement != .skip {
+            let source = item.source
+            guard itemExists(at: source) else {
+                result.failures.append(FileOperationFailure(url: source, error: notFoundError(source)))
+                continue
+            }
+
+            var destination = item.destination
+            var replaced: (original: URL, trashedAs: URL)?
+            switch item.placement {
+            case .duplicate:
+                destination = duplicateDestinationURL(for: source, in: destination.deletingLastPathComponent())
+            case .replace where itemExists(at: destination):
+                if isPath(canonicalItemPath(source), sameAsOrInside: canonicalItemPath(destination))
+                    || isSameItem(source, destination) {
+                    let error = makeError("“\(displayName(destination))” can’t be replaced because it contains the item you’re \(item.kind == .move ? "moving" : "copying").")
+                    result.failures.append(FileOperationFailure(url: source, error: error))
+                    continue
+                }
+                do {
+                    guard let trashedURL = try trashItem(destination) else {
+                        throw makeError("The existing item couldn’t be moved to the Trash.")
+                    }
+                    replaced = (destination, trashedURL)
+                } catch {
+                    result.failures.append(FileOperationFailure(url: destination, error: error))
+                    continue
+                }
+            default:
+                if itemExists(at: destination) {
+                    destination = uniqueDestinationURL(for: destination)
+                }
+            }
+
+            do {
+                let step: FileOperationStep
+                switch item.kind {
+                case .copy:
+                    try copyItem(at: source, to: destination)
+                    step = .copied(from: source, to: destination)
+                case .move:
+                    step = try moveItem(at: source, to: destination, failures: &result.failures)
+                }
+                if let replaced {
+                    journal.steps.append(.trashed(original: replaced.original, trashedAs: replaced.trashedAs))
+                }
+                journal.steps.append(step)
+            } catch {
+                result.failures.append(FileOperationFailure(url: source, error: error))
+                // Nothing took its place: put the replaced item back (or leave it undoable).
+                if let replaced, (try? FileManager.default.moveItem(at: replaced.trashedAs, to: replaced.original)) == nil {
+                    journal.steps.append(.trashed(original: replaced.original, trashedAs: replaced.trashedAs))
+                }
+            }
+        }
+        return result
+    }
+
+    static func trash(_ urls: [URL], journal: FileOperationJournal) -> FileOperationResult {
+        var result = FileOperationResult()
+        for url in urls {
+            do {
+                if let trashedURL = try trashItem(url) {
+                    journal.steps.append(.trashed(original: url, trashedAs: trashedURL))
+                }
+            } catch let error where isTrashUnsupported(error) {
+                result.trashUnsupported.append(url)
+            } catch {
+                result.failures.append(FileOperationFailure(url: url, error: error))
+            }
+        }
+        return result
+    }
+
+    /// Permanent delete. Only after the user confirmed it; not undoable.
+    static func deleteImmediately(_ urls: [URL]) -> FileOperationResult {
+        var result = FileOperationResult()
+        for url in urls {
+            do {
+                try FileManager.default.removeItem(at: url)
+            } catch {
+                result.failures.append(FileOperationFailure(url: url, error: error))
+            }
+        }
+        return result
+    }
+
+    /// Reverses `steps` (last first), recording what it did in `journal` so that can be reversed too.
+    static func reverse(_ steps: [FileOperationStep], journal: FileOperationJournal) -> FileOperationResult {
+        var result = FileOperationResult()
+        for step in steps.reversed() {
+            switch step {
+            case let .moved(from, to):
+                guard itemExists(at: to) else {
+                    result.failures.append(FileOperationFailure(url: to, error: notFoundError(to)))
+                    continue
+                }
+                do {
+                    if isSameItem(from, to) {
+                        // A case-only rename.
+                        try renameItem(at: to, to: from, caseOnly: true)
+                        journal.steps.append(.moved(from: to, to: from))
+                    } else {
+                        let destination = itemExists(at: from) ? uniqueDestinationURL(for: from) : from
+                        journal.steps.append(try moveItem(at: to, to: destination, failures: &result.failures))
+                    }
+                } catch {
+                    result.failures.append(FileOperationFailure(url: to, error: error))
+                }
+            case let .copied(_, url), let .restored(_, url), let .created(url):
+                guard itemExists(at: url) else {
+                    result.failures.append(FileOperationFailure(url: url, error: notFoundError(url)))
+                    continue
+                }
+                do {
+                    if let trashedURL = try trashItem(url) {
+                        journal.steps.append(.trashed(original: url, trashedAs: trashedURL))
+                    }
+                } catch {
+                    result.failures.append(FileOperationFailure(url: url, error: error))
+                }
+            case let .trashed(original, trashedAs):
+                guard itemExists(at: trashedAs) else {
+                    result.failures.append(FileOperationFailure(url: original, error: notFoundError(trashedAs)))
+                    continue
+                }
+                let destination = itemExists(at: original) ? uniqueDestinationURL(for: original) : original
+                do {
+                    _ = try moveItem(at: trashedAs, to: destination, failures: &result.failures)
+                    journal.steps.append(.restored(from: trashedAs, to: destination))
+                } catch {
+                    result.failures.append(FileOperationFailure(url: original, error: error))
+                }
+            }
+        }
+        return result
+    }
+
+    // MARK: Primitives
+
+    /// Copies an item. A failed copy leaves nothing behind.
+    static func copyItem(at source: URL, to destination: URL) throws {
+        guard !itemExists(at: destination) else {
+            throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: destination.path])
+        }
+        do {
+            try FileManager.default.copyItem(at: source, to: destination)
+        } catch {
+            try? FileManager.default.removeItem(at: destination)
+            throw error
+        }
+    }
+
+    /// Moves an item. Within a volume this is a rename. Across volumes the item is copied, the
+    /// copy checked, and only then is the original removed. If the original can't be removed the
+    /// result is a copy (reported in `failures`).
+    static func moveItem(at source: URL, to destination: URL, failures: inout [FileOperationFailure]) throws -> FileOperationStep {
+        let fileManager = FileManager.default
+        guard !itemExists(at: destination) else {
+            throw CocoaError(.fileWriteFileExists, userInfo: [NSFilePathErrorKey: destination.path])
+        }
+        // FileManager.moveItem silently copies + deletes across volumes, so only use it within one.
+        if isSameVolume(source, destination.deletingLastPathComponent()) != false {
+            do {
+                try fileManager.moveItem(at: source, to: destination)
+                return .moved(from: source, to: destination)
+            } catch let error where isCrossDeviceError(error) {
+                // Fall through to copy + remove.
+            }
+        }
+
+        try copyItem(at: source, to: destination)
+        guard copyMatchesOriginal(source, destination) else {
+            try? fileManager.removeItem(at: destination)
+            throw makeError("The copy of “\(displayName(source))” didn’t match the original, so the original was kept.")
+        }
+        do {
+            try fileManager.removeItem(at: source)
+        } catch {
+            let message = "“\(displayName(source))” was copied, but the original couldn’t be removed: \((error as NSError).localizedDescription)"
+            failures.append(FileOperationFailure(url: source, error: makeError(message)))
+            return .copied(from: source, to: destination)
+        }
+        return .moved(from: source, to: destination)
+    }
+
+    /// Renames within a folder, refusing to replace an existing item. A case-only change on a
+    /// case-insensitive volume goes through a temporary name.
+    static func renameItem(at source: URL, to destination: URL, caseOnly: Bool) throws {
+        let fileManager = FileManager.default
+        guard caseOnly else {
+            try fileManager.moveItem(at: source, to: destination)
+            return
+        }
+        let temporary = source.deletingLastPathComponent()
+            .appendingPathComponent(".\(UUID().uuidString).flowfinder-rename")
+        try fileManager.moveItem(at: source, to: temporary)
+        do {
+            try fileManager.moveItem(at: temporary, to: destination)
+        } catch {
+            try? fileManager.moveItem(at: temporary, to: source)
+            throw error
+        }
+    }
+
+    // MARK: Helpers
+
+    /// Whether anything (including a dangling symlink) is at `url`.
+    static func itemExists(at url: URL) -> Bool {
+        var info = stat()
+        return lstat(url.path, &info) == 0
+    }
+
+    /// Whether two URLs name the same file-system object (e.g. a case-only rename).
+    static func isSameItem(_ lhs: URL, _ rhs: URL) -> Bool {
+        let key: Set<URLResourceKey> = [.fileResourceIdentifierKey]
+        guard itemExists(at: lhs), itemExists(at: rhs),
+              let left = try? URL(fileURLWithPath: lhs.path).resourceValues(forKeys: key).fileResourceIdentifier as? NSObject,
+              let right = try? URL(fileURLWithPath: rhs.path).resourceValues(forKeys: key).fileResourceIdentifier else {
+            return false
+        }
+        return left.isEqual(right)
+    }
+
+    /// `nil` when either volume is unknown.
+    static func isSameVolume(_ lhs: URL, _ rhs: URL) -> Bool? {
+        let key: Set<URLResourceKey> = [.volumeIdentifierKey]
+        guard let left = try? URL(fileURLWithPath: lhs.path).resourceValues(forKeys: key).volumeIdentifier as? NSObject,
+              let right = try? URL(fileURLWithPath: rhs.path).resourceValues(forKeys: key).volumeIdentifier else {
+            return nil
+        }
+        return left.isEqual(right)
+    }
+
+    static func isVolumeRoot(_ url: URL) -> Bool {
+        (try? URL(fileURLWithPath: url.path).resourceValues(forKeys: [.isVolumeKey]))?.isVolume == true
+    }
+
+    /// The real path: symlinks (including /var → /private/var) resolved and case canonicalized.
+    /// For a path that doesn't exist, the existing part is resolved.
+    static func canonicalPath(_ url: URL) -> String {
+        let path = url.standardizedFileURL.path
+        if let resolved = realpath(path, nil) {
+            defer { free(resolved) }
+            return String(cString: resolved)
+        }
+        let parent = (path as NSString).deletingLastPathComponent
+        guard !parent.isEmpty, parent != path else { return path }
+        return (canonicalPath(URL(fileURLWithPath: parent)) as NSString)
+            .appendingPathComponent((path as NSString).lastPathComponent)
+    }
+
+    /// Like `canonicalPath`, but a symlink itself isn't followed — copying a link copies the link.
+    static func canonicalItemPath(_ url: URL) -> String {
+        let standardized = url.standardizedFileURL
+        var info = stat()
+        let isSymlink = lstat(standardized.path, &info) == 0 && (info.st_mode & S_IFMT) == S_IFLNK
+        guard isSymlink else { return canonicalPath(standardized) }
+        return (canonicalPath(standardized.deletingLastPathComponent()) as NSString)
+            .appendingPathComponent(standardized.lastPathComponent)
+    }
+
+    static func isPath(_ path: String, sameAsOrInside ancestor: String) -> Bool {
+        if path == ancestor { return true }
+        let prefix = ancestor.hasSuffix("/") ? ancestor : ancestor + "/"
+        return path.hasPrefix(prefix)
+    }
+
+    /// Volumes without a Trash (many SMB shares, some USB drives) fail `trashItem` this way.
+    static func isTrashUnsupported(_ error: Error) -> Bool {
+        var current: NSError? = error as NSError
+        while let nsError = current {
+            if nsError.domain == NSCocoaErrorDomain && nsError.code == NSFeatureUnsupportedError {
+                return true
+            }
+            if nsError.domain == NSPOSIXErrorDomain && (nsError.code == Int(ENOTSUP) || nsError.code == Int(EOPNOTSUPP)) {
+                return true
+            }
+            let description = nsError.localizedDescription.lowercased()
+            if description.contains("trash") && description.contains("support") {
+                return true
+            }
+            current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return false
+    }
+
+    /// "name 2.ext", "name 3.ext", … — the first free name next to `url`.
+    static func uniqueDestinationURL(for url: URL) -> URL {
+        guard itemExists(at: url) else { return url }
+        let (baseName, ext) = nameParts(of: url)
+        let directory = url.deletingLastPathComponent()
+        var counter = 2
+        var candidate: URL
+        repeat {
+            let name = ext.isEmpty ? "\(baseName) \(counter)" : "\(baseName) \(counter).\(ext)"
+            candidate = directory.appendingPathComponent(name)
+            counter += 1
+        } while itemExists(at: candidate)
+        return candidate
+    }
+
+    /// "name copy.ext", "name copy 2.ext", … in `directory`, as Finder's Duplicate names them.
+    static func duplicateDestinationURL(for source: URL, in directory: URL) -> URL {
+        let (baseName, ext) = nameParts(of: source)
+        func candidate(_ suffix: String) -> URL {
+            directory.appendingPathComponent(ext.isEmpty ? "\(baseName) \(suffix)" : "\(baseName) \(suffix).\(ext)")
+        }
+        var url = candidate("copy")
+        var counter = 2
+        while itemExists(at: url) {
+            url = candidate("copy \(counter)")
+            counter += 1
+        }
+        return url
+    }
+
+    /// Folders (other than packages) have no extension, whatever their name contains.
+    private static func nameParts(of url: URL) -> (baseName: String, ext: String) {
+        let values = try? URL(fileURLWithPath: url.path).resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+        if values?.isDirectory == true && values?.isPackage != true {
+            return (url.lastPathComponent, "")
+        }
+        return (url.deletingPathExtension().lastPathComponent, url.pathExtension)
+    }
+
+    /// The name as Finder shows it (":" on disk is displayed as "/").
+    static func displayName(_ url: URL) -> String {
+        url.lastPathComponent.replacingOccurrences(of: ":", with: "/")
+    }
+
+    /// The on-disk name for a name typed by the user: Finder stores "/" as ":".
+    static func fileSystemName(forDisplayName name: String) -> String {
+        name.replacingOccurrences(of: "/", with: ":")
+    }
+
+    /// Why `name` can't be used as a file name, or `nil` if it can.
+    static func problemWithFileName(_ name: String) -> String? {
+        if name.isEmpty || name == "." || name == ".." || name.contains("\0") {
+            return "The name “\(name)” can’t be used."
+        }
+        if name.utf8.count > 255 {
+            return "The name is too long."
+        }
+        return nil
+    }
+
+    /// Item count and total file size match. Catches truncated or partial copies.
+    private static func copyMatchesOriginal(_ source: URL, _ copy: URL) -> Bool {
+        guard let original = treeSummary(source), let copied = treeSummary(copy) else { return false }
+        return original == copied
+    }
+
+    private static func treeSummary(_ url: URL) -> [Int64]? {
+        let keys: [URLResourceKey] = [.isDirectoryKey, .isSymbolicLinkKey, .isRegularFileKey, .fileSizeKey]
+        let root = URL(fileURLWithPath: url.path)
+        guard let values = try? root.resourceValues(forKeys: Set(keys)) else { return nil }
+        if values.isSymbolicLink == true || values.isDirectory != true {
+            return [1, Int64(values.fileSize ?? 0)]
+        }
+        var enumerationFailed = false
+        guard let enumerator = FileManager.default.enumerator(
+            at: root,
+            includingPropertiesForKeys: keys,
+            options: [],
+            errorHandler: { _, _ in
+                enumerationFailed = true
+                return false
+            }
+        ) else { return nil }
+        var count: Int64 = 1
+        var bytes: Int64 = 0
+        for case let child as URL in enumerator {
+            count += 1
+            if let childValues = try? child.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]),
+               childValues.isRegularFile == true {
+                bytes += Int64(childValues.fileSize ?? 0)
+            }
+        }
+        return enumerationFailed ? nil : [count, bytes]
+    }
+
+    private static func isCrossDeviceError(_ error: Error) -> Bool {
+        var current: NSError? = error as NSError
+        while let nsError = current {
+            if nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(EXDEV) {
+                return true
+            }
+            current = nsError.userInfo[NSUnderlyingErrorKey] as? NSError
+        }
+        return false
+    }
+
+    static func notFoundError(_ url: URL) -> Error {
+        CocoaError(.fileNoSuchFile, userInfo: [NSFilePathErrorKey: url.path])
+    }
+
+    static func makeError(_ description: String) -> Error {
+        NSError(domain: NSCocoaErrorDomain, code: NSFileWriteUnknownError, userInfo: [NSLocalizedDescriptionKey: description])
+    }
+}
+
 // Custom pasteboard type to track cut operations
 private let cutOperationPasteboardType = NSPasteboard.PasteboardType("com.coverflowfinder.cut-operation")
 
@@ -204,7 +928,8 @@ class FileBrowserViewModel: ObservableObject {
     private var lastClickedURL: URL?
     private var lastClickTime: Date = .distantPast
     private var pendingRenameWorkItem: DispatchWorkItem?
-    private let renameDelay: TimeInterval = 0.2
+    /// Watches for another click while a click-to-rename is pending (e.g. the second half of a slow double-click).
+    private var pendingRenameClickMonitor: Any?
 
     // Track the folder we entered so we can select it when going back
     private var enteredFolderURL: URL?
@@ -215,27 +940,36 @@ class FileBrowserViewModel: ObservableObject {
     // URL to select and immediately start renaming (used for new folder creation)
     private var pendingNewFolderRenameURL: URL?
 
-    private let fileOperationQueue = DispatchQueue(label: "com.coverflowfinder.fileops", qos: .userInitiated)
-    private struct MoveRecord {
-        let from: URL
-        let to: URL
-    }
-    private struct CopyRecord {
-        let from: URL
-        let to: URL
-    }
-    private struct TrashRecord {
-        let original: URL
-        let trashed: URL
+    // Clipboard state lives in the app-wide FileClipboard; these forward to it.
+    private var isObservingClipboard = false
+
+    var clipboardItems: [URL] {
+        observeClipboard()
+        return FileClipboard.shared.items
     }
 
-    // Clipboard state
-    @Published var clipboardItems: [URL] = []
-    @Published var clipboardOperation: ClipboardOperation = .copy
+    var clipboardOperation: ClipboardOperation {
+        observeClipboard()
+        return FileClipboard.shared.operation
+    }
+
+    /// The cut items (app-wide), as they were selected. Views dim these; compare sets to detect changes.
+    var cutItemURLs: Set<URL> {
+        observeClipboard()
+        return FileClipboard.shared.cutURLs
+    }
 
     /// Check if a file is marked for cut (should appear dimmed)
     func isItemCut(_ item: FileItem) -> Bool {
-        clipboardOperation == .cut && clipboardItems.contains(item.url)
+        observeClipboard()
+        return FileClipboard.shared.isCut(item.url)
+    }
+
+    /// Re-render this view model's views when the clipboard changes in any window or pane.
+    private func observeClipboard() {
+        guard !isObservingClipboard else { return }
+        isObservingClipboard = true
+        FileClipboard.shared.addObserver(self)
     }
 
     @Published var infoItem: FileItem?
@@ -2652,22 +3386,35 @@ class FileBrowserViewModel: ObservableObject {
         lastClickTime = now
     }
 
+    /// Starts renaming after the double-click interval, unless another click comes first — so the
+    /// second click of a slow double-click opens the item instead of also starting a rename.
     private func scheduleRename(for item: FileItem) {
         cancelPendingRename()
         let workItem = DispatchWorkItem { [weak self] in
             guard let self else { return }
+            self.cancelPendingRename()
             guard self.renamingURL == nil else { return }
             guard self.selectedItems.count == 1, self.selectedItems.contains(item) else { return }
             self.renamingURL = item.url
         }
         pendingRenameWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + renameDelay, execute: workItem)
+        pendingRenameClickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] event in
+            MainActor.assumeIsolated {
+                self?.cancelPendingRename()
+            }
+            return event
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + NSEvent.doubleClickInterval, execute: workItem)
     }
 
     /// Cancel any pending rename operation (e.g., when drag starts)
     func cancelPendingRename() {
         pendingRenameWorkItem?.cancel()
         pendingRenameWorkItem = nil
+        if let monitor = pendingRenameClickMonitor {
+            NSEvent.removeMonitor(monitor)
+            pendingRenameClickMonitor = nil
+        }
     }
 
     /// Trigger rename for a newly created folder after it appears in the loaded items.
@@ -2723,192 +3470,260 @@ class FileBrowserViewModel: ObservableObject {
         self.undoManager = undoManager
     }
 
-    // MARK: - Undo Support
+    // MARK: - File Operations & Undo
 
-    private func performMoves(
-        _ moves: [MoveRecord],
-        actionName: String,
-        registerUndo: Bool,
-        resolveCollisions: Bool,
-        refreshAfter: Bool = true,
-        completion: (([MoveRecord]) -> Void)? = nil
+    /// Runs `work` on the file-operation queue and reports failures in one alert.
+    ///
+    /// With an `actionName`, the undo action is registered right away — in the same event as the
+    /// user's command, so the undo stack keeps the order of commands — and reads the journal when
+    /// it runs, which is after `work` because the queue is serial.
+    private func runFileOperation(
+        actionName: String?,
+        failureVerb: String,
+        initialFailures: [FileOperationFailure] = [],
+        work: @escaping (FileOperationJournal) -> FileOperationResult,
+        completion: ((FileOperationJournal, FileOperationResult) -> Void)? = nil
     ) {
-        guard !moves.isEmpty else { return }
-        fileOperationQueue.async { [weak self, moves] in
-            guard let self else { return }
-            let fileManager = FileManager.default
-            var completed: [MoveRecord] = []
-            completed.reserveCapacity(moves.count)
-
-            for move in moves {
-                let destination = resolveCollisions ? self.uniqueDestinationURL(for: move.to) : move.to
-                do {
-                    try self.moveItemWithFallback(fileManager, from: move.from, to: destination)
-                    completed.append(MoveRecord(from: move.from, to: destination))
-                } catch {
-                    print("Failed to move \(move.from.lastPathComponent): \(error.localizedDescription)")
+        let journal = FileOperationJournal()
+        let undoManager = self.undoManager
+        if let actionName {
+            FileBrowserViewModel.registerUndo(reversing: journal, actionName: actionName, undoManager: undoManager, viewModel: self)
+        }
+        FileOperationEngine.queue.async { [weak undoManager] in
+            var result = work(journal)
+            result.failures.insert(contentsOf: initialFailures, at: 0)
+            DispatchQueue.main.async {
+                if actionName != nil, journal.steps.isEmpty {
+                    // Nothing happened, so there's nothing to undo.
+                    undoManager?.removeAllActions(withTarget: journal)
                 }
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                if registerUndo, !completed.isEmpty {
-                    let inverse = completed.map { MoveRecord(from: $0.to, to: $0.from) }
-                    self.undoManager?.registerUndo(withTarget: self) { target in
-                        target.performMoves(
-                            inverse,
-                            actionName: actionName,
-                            registerUndo: true,
-                            resolveCollisions: true
-                        )
-                    }
-                    self.undoManager?.setActionName(actionName)
-                }
-                completion?(completed)
-                if refreshAfter {
-                    self.refresh()
-                }
+                completion?(journal, result)
+                FileOperationAlerts.reportFailures(result.failures, verb: failureVerb)
             }
         }
     }
 
-    private func performCopies(
-        _ copies: [CopyRecord],
+    /// Registers an undo action that reverses whatever `journal` records. When it runs (inside
+    /// undo or redo) it registers its own reversal immediately, so it lands on the opposite stack,
+    /// and then does the file work on the queue.
+    private static func registerUndo(
+        reversing journal: FileOperationJournal,
         actionName: String,
-        registerUndo: Bool,
-        resolveCollisions: Bool = true,
-        refreshAfter: Bool = true,
-        completion: (([CopyRecord]) -> Void)? = nil
+        undoManager: UndoManager?,
+        viewModel: FileBrowserViewModel?
     ) {
-        guard !copies.isEmpty else { return }
-        fileOperationQueue.async { [weak self, copies] in
-            guard let self else { return }
-            let fileManager = FileManager.default
-            var completed: [CopyRecord] = []
-            completed.reserveCapacity(copies.count)
-
-            for copy in copies {
-                let destination = resolveCollisions ? self.uniqueDestinationURL(for: copy.to) : copy.to
-                do {
-                    try fileManager.copyItem(at: copy.from, to: destination)
-                    completed.append(CopyRecord(from: copy.from, to: destination))
-                } catch {
-                    print("Failed to copy \(copy.from.lastPathComponent): \(error.localizedDescription)")
-                }
-            }
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                if registerUndo, !completed.isEmpty {
-                    let copiedURLs = completed.map { $0.to }
-                    self.undoManager?.registerUndo(withTarget: self) { target in
-                        target.performTrash(
-                            copiedURLs,
-                            actionName: actionName,
-                            registerUndo: true,
-                            playSound: false
-                        )
-                    }
-                    self.undoManager?.setActionName(actionName)
-                }
-                completion?(completed)
-                if refreshAfter {
-                    self.refresh()
+        guard let undoManager else { return }
+        // The handler keeps the journal alive; the undo manager holds its target unowned.
+        undoManager.registerUndo(withTarget: journal) { [journal, weak undoManager, weak viewModel] _ in
+            let reversal = FileOperationJournal()
+            registerUndo(reversing: reversal, actionName: actionName, undoManager: undoManager, viewModel: viewModel)
+            FileOperationEngine.queue.async {
+                let result = FileOperationEngine.reverse(journal.steps, journal: reversal)
+                DispatchQueue.main.async {
+                    viewModel?.refresh()
+                    FileOperationAlerts.reportFailures(result.failures, verb: "restored")
                 }
             }
         }
+        undoManager.setActionName(actionName)
     }
 
-    private func performTrash(
-        _ urls: [URL],
-        actionName: String,
-        registerUndo: Bool,
-        refreshAfter: Bool = true,
-        playSound: Bool = false,
-        completion: (([TrashRecord]) -> Void)? = nil
+    private enum TransferOrigin {
+        case paste
+        case drop
+        case duplicate
+    }
+
+    /// The one copy/move pipeline behind paste, drop and duplicate: resolves the operation per
+    /// item, refuses copying a folder into itself, skips same-folder moves, asks about name
+    /// conflicts, then runs everything as one undoable operation. `completion` gets the journal,
+    /// or `nil` if nothing was started.
+    private func transferItems(
+        _ requests: [(source: URL, directory: URL)],
+        operation: FileDropOperation,
+        origin: TransferOrigin,
+        completion: @escaping (FileOperationJournal?) -> Void
     ) {
-        guard !urls.isEmpty else { return }
-        fileOperationQueue.async { [weak self, urls] in
-            guard let self else { return }
-            let fileManager = FileManager.default
-            var completed: [TrashRecord] = []
-            completed.reserveCapacity(urls.count)
-
-            for url in urls {
-                var trashedURL: NSURL?
-                do {
-                    try fileManager.trashItem(at: url, resultingItemURL: &trashedURL)
-                    if let trashedURL = trashedURL as URL? {
-                        completed.append(TrashRecord(original: url, trashed: trashedURL))
-                    }
-                } catch {
-                    print("Failed to move \(url.lastPathComponent) to Trash: \(error.localizedDescription)")
-                }
+        guard let plan = planTransfer(requests, operation: operation, origin: origin) else {
+            completion(nil)
+            return
+        }
+        resolveConflicts(in: plan.items) { [weak self] resolved in
+            guard let self, let resolved else {
+                completion(nil)
+                return
             }
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                if registerUndo, !completed.isEmpty {
-                    self.undoManager?.registerUndo(withTarget: self) { target in
-                        target.performRestoreFromTrash(
-                            completed,
-                            actionName: actionName,
-                            registerUndo: true
-                        )
-                    }
-                    self.undoManager?.setActionName(actionName)
-                }
-                completion?(completed)
-                if refreshAfter {
-                    self.refresh()
-                }
-                if playSound, !completed.isEmpty {
-                    FinderSoundEffects.shared.play(.moveToTrash)
-                }
+            let items = resolved.filter { $0.placement != .skip }
+            guard !items.isEmpty || !plan.failures.isEmpty else {
+                completion(nil)
+                return
             }
+            let allCopies = items.allSatisfy { $0.kind == .copy }
+            let actionName = origin == .duplicate ? "Duplicate" : (allCopies ? "Copy" : "Move")
+            let verb = origin == .duplicate ? "duplicated" : (allCopies ? "copied" : "moved")
+            self.runFileOperation(
+                actionName: actionName,
+                failureVerb: verb,
+                initialFailures: plan.failures,
+                work: { journal in FileOperationEngine.transfer(items, journal: journal) },
+                completion: { journal, _ in completion(journal) }
+            )
         }
     }
 
-    private func performRestoreFromTrash(
-        _ records: [TrashRecord],
-        actionName: String,
-        registerUndo: Bool,
-        refreshAfter: Bool = true
-    ) {
-        guard !records.isEmpty else { return }
-        fileOperationQueue.async { [weak self, records] in
-            guard let self else { return }
-            let fileManager = FileManager.default
-            var restoredURLs: [URL] = []
-            restoredURLs.reserveCapacity(records.count)
+    private func planTransfer(
+        _ requests: [(source: URL, directory: URL)],
+        operation: FileDropOperation,
+        origin: TransferOrigin
+    ) -> (items: [FileTransferItem], failures: [FileOperationFailure])? {
+        var items: [FileTransferItem] = []
+        var failures: [FileOperationFailure] = []
+        var seenSources = Set<String>()
+        var checkedDirectories = Set<String>()
 
-            for record in records {
-                let destination = self.uniqueDestinationURL(for: record.original)
-                do {
-                    try self.moveItemWithFallback(fileManager, from: record.trashed, to: destination)
-                    restoredURLs.append(destination)
-                } catch {
-                    print("Failed to restore \(record.original.lastPathComponent): \(error.localizedDescription)")
+        for (source, directory) in requests {
+            let directoryPath = FileOperationEngine.canonicalPath(directory)
+            if checkedDirectories.insert(directoryPath).inserted {
+                var isDirectory: ObjCBool = false
+                guard FileManager.default.fileExists(atPath: directoryPath, isDirectory: &isDirectory),
+                      isDirectory.boolValue else {
+                    NSSound.beep()
+                    return nil
                 }
             }
 
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                if registerUndo, !restoredURLs.isEmpty {
-                    self.undoManager?.registerUndo(withTarget: self) { target in
-                        target.performTrash(
-                            restoredURLs,
-                            actionName: actionName,
-                            registerUndo: true,
-                            playSound: false
-                        )
-                    }
-                    self.undoManager?.setActionName(actionName)
-                }
-                if refreshAfter {
-                    self.refresh()
-                }
+            let sourcePath = FileOperationEngine.canonicalItemPath(source)
+            guard seenSources.insert(sourcePath).inserted else { continue }
+            guard FileOperationEngine.itemExists(at: source) else {
+                failures.append(FileOperationFailure(url: source, error: FileOperationEngine.notFoundError(source)))
+                continue
             }
+
+            var kind: FileTransferItem.Kind
+            switch operation {
+            case .copy:
+                kind = .copy
+            case .move:
+                kind = .move
+            case .automatic:
+                // Finder: move within a volume, copy across volumes.
+                kind = FileOperationEngine.isSameVolume(source, directory) == true ? .move : .copy
+            }
+            if kind == .move && FileOperationEngine.isVolumeRoot(source) {
+                // "Moving" a volume would erase it after copying; Finder only copies.
+                kind = .copy
+            }
+
+            if FileOperationEngine.isPath(directoryPath, sameAsOrInside: sourcePath) {
+                // Dropping an item onto itself does nothing; anything else into itself is refused.
+                if origin == .drop && directoryPath == sourcePath { continue }
+                refuseTransferIntoItself(source, kind: kind)
+                return nil
+            }
+
+            let destination = directory.appendingPathComponent(source.lastPathComponent)
+            let destinationExists = FileOperationEngine.itemExists(at: destination)
+            // Also catches the same folder reached by another path (e.g. through a firmlink).
+            let inSameFolder = (sourcePath as NSString).deletingLastPathComponent == directoryPath
+                || (destinationExists && FileOperationEngine.isSameItem(source, destination))
+            var placement = FileTransferItem.Placement.exact
+            if origin == .duplicate {
+                placement = .duplicate
+            } else if inSameFolder {
+                // Moving (or dropping) into the folder it's already in does nothing, as in Finder;
+                // pasting a copy there makes "name copy".
+                if kind == .move || origin == .drop { continue }
+                placement = .duplicate
+            } else if destinationExists {
+                placement = .ask
+            }
+            items.append(FileTransferItem(source: source, destination: destination, kind: kind, placement: placement))
+        }
+        return (items, failures)
+    }
+
+    private func refuseTransferIntoItself(_ source: URL, kind: FileTransferItem.Kind) {
+        NSSound.beep()
+        let name = FileOperationAlerts.displayName(source)
+        let verb = kind == .move ? "moved" : "copied"
+        FileOperationAlerts.showMessage(
+            "“\(name)” can’t be \(verb) into itself.",
+            information: "The destination is inside the item you’re \(kind == .move ? "moving" : "copying")."
+        )
+    }
+
+    /// Finder-style Replace / Keep Both / Skip / Stop for each name conflict, with "Apply to All".
+    /// `completion` gets the items with their placements decided, or `nil` for Stop.
+    private func resolveConflicts(in items: [FileTransferItem], completion: @escaping ([FileTransferItem]?) -> Void) {
+        let conflictIndices = items.indices.filter { items[$0].placement == .ask }
+        guard !conflictIndices.isEmpty else {
+            completion(items)
+            return
+        }
+        var resolved = items
+        var choiceForAll: FileTransferItem.Placement?
+        let allowSkip = items.count > 1
+
+        func resolve(from start: Int) {
+            var position = start
+            while position < conflictIndices.count, let choice = choiceForAll {
+                resolved[conflictIndices[position]].placement = choice
+                position += 1
+            }
+            guard position < conflictIndices.count else {
+                completion(resolved)
+                return
+            }
+            let index = conflictIndices[position]
+            let alert = FileBrowserViewModel.conflictAlert(
+                for: resolved[index],
+                allowSkip: allowSkip,
+                offerApplyToAll: conflictIndices.count - position > 1
+            )
+            FileOperationAlerts.show(alert) { response in
+                guard let choice = FileBrowserViewModel.conflictChoice(for: response, allowSkip: allowSkip) else {
+                    completion(nil)
+                    return
+                }
+                resolved[index].placement = choice
+                if alert.suppressionButton?.state == .on {
+                    choiceForAll = choice
+                }
+                resolve(from: position + 1)
+            }
+        }
+        resolve(from: 0)
+    }
+
+    private static func conflictAlert(for item: FileTransferItem, allowSkip: Bool, offerApplyToAll: Bool) -> NSAlert {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "An item named “\(FileOperationAlerts.displayName(item.destination))” already exists in this location."
+        alert.informativeText = "Do you want to replace it with the one you’re \(item.kind == .move ? "moving" : "copying")?"
+        alert.addButton(withTitle: "Keep Both")
+        alert.addButton(withTitle: "Replace").hasDestructiveAction = true
+        if allowSkip {
+            alert.addButton(withTitle: "Skip")
+        }
+        alert.addButton(withTitle: "Stop").keyEquivalent = "\u{1b}"
+        if offerApplyToAll {
+            alert.showsSuppressionButton = true
+            alert.suppressionButton?.title = "Apply to All"
+        }
+        return alert
+    }
+
+    /// Button order: Keep Both, Replace, [Skip], Stop. `nil` means Stop.
+    private static func conflictChoice(for response: NSApplication.ModalResponse, allowSkip: Bool) -> FileTransferItem.Placement? {
+        switch response {
+        case .alertFirstButtonReturn:
+            return .keepBoth
+        case .alertSecondButtonReturn:
+            return .replace
+        case .alertThirdButtonReturn where allowSkip:
+            return .skip
+        default:
+            return nil
         }
     }
 
@@ -2984,142 +3799,110 @@ class FileBrowserViewModel: ObservableObject {
 
     var canPaste: Bool {
         if isInsideArchive { return false }
-        if !clipboardItems.isEmpty {
-            return true
-        }
-        // Also check system pasteboard
-        let pasteboard = NSPasteboard.general
-        return pasteboard.canReadObject(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true])
+        return FileClipboard.shared.canPaste
+    }
+
+    /// The selection in display order, followed by any selected items not currently displayed.
+    private var selectedItemsInOrder: [FileItem] {
+        let ordered = orderedSelectedItems
+        guard ordered.count < selectedItems.count else { return ordered }
+        let included = Set(ordered)
+        return ordered + selectedItems.filter { !included.contains($0) }.sorted { $0.url.path < $1.url.path }
     }
 
     func copySelectedItems() {
-        let itemsToCopy = Array(selectedItems)
+        let itemsToCopy = selectedItemsInOrder
         guard !itemsToCopy.isEmpty else { return }
-        let entriesSnapshot = archiveEntries
+        guard itemsToCopy.contains(where: { $0.isFromArchive }) else {
+            // Plain files: the pasteboard is written right away, so an immediate ⌘V sees it.
+            FileClipboard.shared.write(itemsToCopy.map { $0.url }, operation: .copy)
+            return
+        }
 
-        fileOperationQueue.async { [weak self, itemsToCopy, entriesSnapshot] in
+        // Archive entries are extracted to a temp folder first, off the main thread.
+        let entriesSnapshot = archiveEntries
+        let pendingWrite = FileClipboard.shared.beginDeferredWrite()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self, itemsToCopy, entriesSnapshot] in
             guard let self else { return }
             var urlsToCopy: [URL] = []
-            urlsToCopy.reserveCapacity(itemsToCopy.count)
-
+            var failures: [FileOperationFailure] = []
             for item in itemsToCopy {
-                if item.isFromArchive {
-                    // Extract archive item to temp location for copying
-                    if let extractedURL = self.extractArchiveItemForCopy(item, entries: entriesSnapshot) {
-                        urlsToCopy.append(extractedURL)
-                    }
-                } else {
+                if !item.isFromArchive {
                     urlsToCopy.append(item.url)
+                } else if let extractedURL = self.extractArchiveItemForCopy(item, entries: entriesSnapshot) {
+                    urlsToCopy.append(extractedURL)
+                } else {
+                    let error = FileOperationEngine.makeError("It couldn’t be extracted from the archive.")
+                    failures.append(FileOperationFailure(url: item.url, error: error))
                 }
             }
 
-            guard !urlsToCopy.isEmpty else { return }
-
-            DispatchQueue.main.async { [weak self] in
-                guard let self else { return }
-                self.clipboardItems = urlsToCopy
-                self.clipboardOperation = .copy
-
-                // Also copy to system pasteboard
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-                pasteboard.writeObjects(urlsToCopy as [NSURL])
+            DispatchQueue.main.async {
+                if !urlsToCopy.isEmpty {
+                    FileClipboard.shared.finishDeferredWrite(pendingWrite, urls: urlsToCopy)
+                }
+                FileOperationAlerts.reportFailures(failures, verb: "copied")
             }
         }
     }
 
-    /// Extract an archive item to a temp directory for copy/paste operations
+    /// Extract an archive item into a fresh private temp directory for copy/paste operations.
+    /// `entries` is the view's snapshot; ZipArchiveManager re-validates against the archive on disk
+    /// (path containment, size caps, CRC, permissions, quarantine). Problems are shown in a sheet.
     nonisolated private func extractArchiveItemForCopy(_ item: FileItem, entries: [ZipEntry]) -> URL? {
         guard let archiveURL = item.archiveURL,
               let archivePath = item.archivePath else { return nil }
 
-        // Create temp directory for extractions
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("FlowFinder-Extract")
-        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-
-        let destURL = tempDir.appendingPathComponent(item.name)
-
-        // Remove existing file if present
-        try? FileManager.default.removeItem(at: destURL)
-
-        if item.isDirectory {
-            // For directories, we need to extract all contents
-            return extractArchiveDirectory(item, from: archiveURL, to: destURL, entries: entries)
-        } else {
-            // For files, extract single file
-            if let entry = entries.first(where: { $0.path == archivePath || $0.path == archivePath + "/" }) {
-                do {
-                    let extractedURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
-                    // Move from temp extraction location to our desired location
-                    try? FileManager.default.removeItem(at: destURL)
-                    try FileManager.default.copyItem(at: extractedURL, to: destURL)
-                    return destURL
-                } catch {
-                    // Extraction failed
+        func showProblem(_ message: String, _ details: String) {
+            Task { @MainActor in
+                guard let window = NSApp?.keyWindow ?? NSApp?.mainWindow else {
+                    NSSound.beep()
+                    return
                 }
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = message
+                alert.informativeText = details
+                alert.beginSheetModal(for: window)
             }
         }
-        return nil
-    }
 
-    /// Extract an entire directory from archive
-    nonisolated private func extractArchiveDirectory(_ item: FileItem, from archiveURL: URL, to destURL: URL, entries: [ZipEntry]) -> URL? {
-        guard let basePath = item.archivePath else { return nil }
-
-        let normalizedBase = basePath.hasSuffix("/") ? basePath : basePath + "/"
-
+        let result: ZipExtractionResult
         do {
-            try FileManager.default.createDirectory(at: destURL, withIntermediateDirectories: true)
-
-            // Find all entries under this directory
-            for entry in entries {
-                guard entry.path.hasPrefix(normalizedBase) else { continue }
-
-                let relativePath = String(entry.path.dropFirst(normalizedBase.count))
-                guard !relativePath.isEmpty else { continue }
-
-                let itemDestURL = destURL.appendingPathComponent(relativePath)
-
-                if entry.isDirectory {
-                    try FileManager.default.createDirectory(at: itemDestURL, withIntermediateDirectories: true)
-                } else {
-                    // Extract file
-                    let extractedURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
-                    // Ensure parent directory exists
-                    try FileManager.default.createDirectory(at: itemDestURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try? FileManager.default.removeItem(at: itemDestURL)
-                    try FileManager.default.copyItem(at: extractedURL, to: itemDestURL)
-                }
-            }
-            return destURL
+            result = try ZipArchiveManager.shared.extractItemForCopy(archivePath: archivePath, from: archiveURL)
         } catch {
+            zipNavLogger.error("Couldn't extract archive item for copy: \(error.localizedDescription)")
+            showProblem("“\(item.name)” couldn't be copied from “\(archiveURL.lastPathComponent)”.",
+                        error.localizedDescription)
             return nil
         }
+
+        if !result.failures.isEmpty {
+            zipNavLogger.error("Extracted archive folder for copy with \(result.failures.count) failed entries")
+            var details = result.failures.prefix(5)
+                .map { "\($0.path): \($0.error.localizedDescription)" }
+                .joined(separator: "\n")
+            if result.failures.count > 5 {
+                details += "\n…and \(result.failures.count - 5) more."
+            }
+            showProblem("Some items in “\(item.name)” couldn't be extracted. The rest were copied.", details)
+        }
+        return result.url
     }
 
     func cutSelectedItems() {
-        guard !selectedItems.isEmpty else {
+        let itemsToCut = selectedItemsInOrder
+        guard !itemsToCut.isEmpty else {
             return
         }
 
-        // Check if any items are from archive - cut from archive acts as copy
-        let hasArchiveItems = selectedItems.contains { $0.isFromArchive }
-
-        if hasArchiveItems {
-            // Can't cut from archive, just copy instead
+        // Items can't be moved out of an archive - cut from archive acts as copy
+        if itemsToCut.contains(where: { $0.isFromArchive }) {
             copySelectedItems()
             return
         }
 
-        clipboardItems = selectedItems.map { $0.url }
-        clipboardOperation = .cut
-
-        // Also copy to system pasteboard with cut marker
-        let pasteboard = NSPasteboard.general
-        pasteboard.clearContents()
-        pasteboard.writeObjects(clipboardItems as [NSURL])
-        // Add marker to indicate this is a cut operation
-        pasteboard.setData(Data([1]), forType: cutOperationPasteboardType)
+        FileClipboard.shared.write(itemsToCut.map { $0.url }, operation: .cut)
     }
 
     func paste() {
@@ -3132,50 +3915,26 @@ class FileBrowserViewModel: ObservableObject {
             return
         }
 
-        // Use internal clipboard if available, otherwise read from system pasteboard
-        var urlsToPaste = clipboardItems
-        var operationIsCut = clipboardOperation == .cut
+        let contents = FileClipboard.shared.contentsForPaste()
+        guard !contents.urls.isEmpty else { return }
+        let isCut = contents.isCut
 
-        if urlsToPaste.isEmpty {
-            // Fall back to system pasteboard
-            let pasteboard = NSPasteboard.general
-            if let urls = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
-                urlsToPaste = urls
-                // Check if this was a cut operation (our custom marker)
-                operationIsCut = pasteboard.data(forType: cutOperationPasteboardType) != nil
+        transferItems(
+            contents.urls.map { (source: $0, directory: destination) },
+            operation: isCut ? .move : .copy,
+            origin: .paste
+        ) { [weak self] journal in
+            guard let self, let journal else { return }
+            if isCut {
+                FileClipboard.shared.didMoveCutItems(journal.movedSources)
             }
-        }
-
-        guard !urlsToPaste.isEmpty else { return }
-
-        if operationIsCut {
-            let moves = urlsToPaste.map {
-                MoveRecord(from: $0, to: destination.appendingPathComponent($0.lastPathComponent))
+            // Select pasted files after refresh
+            let pastedURLs = journal.placedURLs
+            if !pastedURLs.isEmpty {
+                self.pendingSelectionURLs = Set(pastedURLs)
+                self.pendingSelectionURL = pastedURLs.first
             }
-            performMoves(moves, actionName: "Move", registerUndo: true, resolveCollisions: true) { [weak self] completed in
-                guard let self else { return }
-                guard !completed.isEmpty else { return }
-                // Select pasted files after refresh
-                let pastedURLs = Set(completed.map { $0.to })
-                self.pendingSelectionURLs = pastedURLs
-                self.pendingSelectionURL = completed.first?.to
-                self.clipboardItems.removeAll()
-                // Clear the cut marker from pasteboard to prevent re-pasting moved files
-                let pasteboard = NSPasteboard.general
-                pasteboard.clearContents()
-            }
-        } else {
-            let copies = urlsToPaste.map {
-                CopyRecord(from: $0, to: destination.appendingPathComponent($0.lastPathComponent))
-            }
-            performCopies(copies, actionName: "Copy", registerUndo: true, resolveCollisions: true) { [weak self] completed in
-                guard let self else { return }
-                guard !completed.isEmpty else { return }
-                // Select pasted files after refresh
-                let pastedURLs = Set(completed.map { $0.to })
-                self.pendingSelectionURLs = pastedURLs
-                self.pendingSelectionURL = completed.first?.to
-            }
+            self.refresh()
         }
     }
 
@@ -3184,11 +3943,6 @@ class FileBrowserViewModel: ObservableObject {
         guard !itemsToDelete.isEmpty else {
             NSSound.beep()
             return
-        }
-
-        NSLog("[DELETE] Starting delete of %d items. lastSelectedIndex=%d, items.count=%d, filteredItems.count=%d", itemsToDelete.count, lastSelectedIndex, items.count, filteredItems.count)
-        for item in itemsToDelete {
-            NSLog("[DELETE]   Deleting: %@", item.name)
         }
 
         // Find the URL to select after deletion (next item, or previous if at end)
@@ -3226,48 +3980,77 @@ class FileBrowserViewModel: ObservableObject {
         // Store selection info to use after deletion
         let targetIndex = nextSelectionIndex
         let targetItem = nextSelectionItem
+        let urls = selectedItemsInOrder.filter { !$0.isFromArchive }.map { $0.url }
 
-        performTrash(
-            itemsToDelete.map { $0.url },
+        runFileOperation(
             actionName: "Move to Trash",
-            registerUndo: true,
-            refreshAfter: false,  // Don't do full refresh - we'll update incrementally
-            playSound: true
-        ) { [weak self] records in
+            failureVerb: "moved to the Trash",
+            work: { journal in FileOperationEngine.trash(urls, journal: journal) }
+        ) { [weak self] journal, result in
             guard let self else { return }
-            guard !records.isEmpty else { return }
-
-            // Remove deleted items from the items array directly (incremental update)
-            let trashedURLs = Set(records.map { $0.original })
-            NSLog("[DELETE] Trash completed. Trashed %d items. items.count before removal=%d", trashedURLs.count, self.items.count)
-            self.items.removeAll { trashedURLs.contains($0.url) }
-            NSLog("[DELETE] items.count after removal=%d, targetIndex=%d, targetItem=%@", self.items.count, targetIndex, targetItem?.name ?? "nil")
-
-            // Update selection to the next/previous item
-            let safeTargetIndex = self.items.isEmpty ? 0 : min(targetIndex, self.items.count - 1)
-            self.coverFlowSelectedIndex = safeTargetIndex
-            self.lastSelectedIndex = safeTargetIndex
-            self.selectionAnchorIndex = safeTargetIndex
-            let debugSelectedName = targetItem?.name ?? (safeTargetIndex < self.items.count ? self.items[safeTargetIndex].name : "nil")
-            NSLog("[DELETE] Set lastSelectedIndex=%d, selectedItem=%@", safeTargetIndex, debugSelectedName)
-            if let targetItem = targetItem {
-                self.selectedItems = [targetItem]
-            } else if !self.items.isEmpty {
-                // Select item at the target index if original target was deleted
-                if safeTargetIndex >= 0 {
-                    self.selectedItems = [self.items[safeTargetIndex]]
-                } else {
-                    self.selectedItems.removeAll()
-                }
-            } else {
-                self.selectedItems.removeAll()
+            let trashedURLs = Set(journal.trashedOriginals)
+            if !trashedURLs.isEmpty {
+                // Don't do full refresh - update incrementally
+                self.removeItems(at: trashedURLs, selectingIndex: targetIndex, preferredItem: targetItem)
+                FinderSoundEffects.shared.play(.moveToTrash)
             }
-            NSLog("[DELETE] Final state: selectedItems.count=%d, selectedItems=%@, lastSelectedIndex=%d", self.selectedItems.count, self.selectedItems.map { $0.name }.joined(separator: ", "), self.lastSelectedIndex)
+            if !result.trashUnsupported.isEmpty {
+                self.confirmDeleteImmediately(result.trashUnsupported)
+            }
+        }
+    }
 
-            // Clean up hydration tracking
-            for url in trashedURLs {
-                self.hydratedURLs.remove(url)
-                self.pendingHydrationURLs.remove(url)
+    /// Removes deleted items from the listing and selects the next item.
+    private func removeItems(at removedURLs: Set<URL>, selectingIndex targetIndex: Int, preferredItem targetItem: FileItem?) {
+        // Remove deleted items from the items array directly (incremental update)
+        items.removeAll { removedURLs.contains($0.url) }
+        if searchResults.contains(where: { removedURLs.contains($0.url) }) {
+            searchResults.removeAll { removedURLs.contains($0.url) }
+        }
+
+        // Update selection to the next/previous item
+        let safeTargetIndex = items.isEmpty ? 0 : min(targetIndex, items.count - 1)
+        coverFlowSelectedIndex = safeTargetIndex
+        lastSelectedIndex = safeTargetIndex
+        selectionAnchorIndex = safeTargetIndex
+        if let targetItem = targetItem, !removedURLs.contains(targetItem.url) {
+            selectedItems = [targetItem]
+        } else if !items.isEmpty {
+            // Select item at the target index if original target was deleted
+            selectedItems = [items[safeTargetIndex]]
+        } else {
+            selectedItems.removeAll()
+        }
+
+        // Clean up hydration tracking
+        for url in removedURLs {
+            hydratedURLs.remove(url)
+            pendingHydrationURLs.remove(url)
+        }
+    }
+
+    /// Some volumes (many SMB shares, some USB drives) have no Trash. Like Finder, offer to delete
+    /// those items immediately — only after an explicit confirmation, since it can't be undone.
+    private func confirmDeleteImmediately(_ urls: [URL]) {
+        let alert = NSAlert()
+        alert.alertStyle = .critical
+        if urls.count == 1, let url = urls.first {
+            alert.messageText = "“\(FileOperationAlerts.displayName(url))” can’t be moved to the Trash. Do you want to delete it immediately?"
+        } else {
+            alert.messageText = "\(urls.count) items can’t be moved to the Trash. Do you want to delete them immediately?"
+        }
+        alert.informativeText = "This volume doesn’t have a Trash. You can’t undo this action."
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Delete Immediately").hasDestructiveAction = true
+
+        FileOperationAlerts.show(alert) { [weak self] response in
+            guard response == .alertSecondButtonReturn, let self else { return }
+            self.runFileOperation(
+                actionName: nil,
+                failureVerb: "deleted",
+                work: { _ in FileOperationEngine.deleteImmediately(urls) }
+            ) { [weak self] _, _ in
+                self?.refresh()
             }
         }
     }
@@ -3275,37 +4058,27 @@ class FileBrowserViewModel: ObservableObject {
     /// - Parameter operation: The drop operation resolved by the caller at drop time
     ///   (use `FileDropOperation(modifierFlags:)` with the drop event's modifiers).
     ///   `nil` falls back to the current keyboard modifiers.
+    ///   `.automatic` follows Finder: move within a volume, copy across volumes.
+    /// - Parameter completion: Called once, after the operation finished or was refused.
     func handleDrop(urls: [URL], to destPath: URL? = nil, operation: FileDropOperation? = nil, completion: (() -> Void)? = nil) {
-        guard !isInsideArchive else {
+        guard destPath != nil || !isInsideArchive else {
             NSSound.beep()
+            completion?()
             return
         }
 
         let destination = destPath ?? currentPath
         let resolvedOperation = operation ?? FileDropOperation(modifierFlags: NSEvent.modifierFlags)
-        // Finder behavior: Drag = Move, Option+Drag = Copy
-        let shouldCopy = resolvedOperation == .copy
-        let destinationPath = destination
-        let filteredURLs = urls.filter { $0.deletingLastPathComponent() != destinationPath }
-        guard !filteredURLs.isEmpty else {
+        // All URLs of one drop are one operation with one undo action.
+        transferItems(
+            urls.map { (source: $0, directory: destination) },
+            operation: resolvedOperation,
+            origin: .drop
+        ) { [weak self] journal in
+            if journal != nil {
+                self?.refresh()
+            }
             completion?()
-            return
-        }
-
-        if shouldCopy {
-            let copies = filteredURLs.map {
-                CopyRecord(from: $0, to: destinationPath.appendingPathComponent($0.lastPathComponent))
-            }
-            performCopies(copies, actionName: "Copy", registerUndo: true, resolveCollisions: true) { _ in
-                completion?()
-            }
-        } else {
-            let moves = filteredURLs.map {
-                MoveRecord(from: $0, to: destinationPath.appendingPathComponent($0.lastPathComponent))
-            }
-            performMoves(moves, actionName: "Move", registerUndo: true, resolveCollisions: true) { _ in
-                completion?()
-            }
         }
     }
 
@@ -3315,111 +4088,144 @@ class FileBrowserViewModel: ObservableObject {
             return
         }
 
-        let itemsToDuplicate = selectedItems.filter { !$0.isFromArchive }
+        let itemsToDuplicate = selectedItemsInOrder.filter { !$0.isFromArchive }
         guard !itemsToDuplicate.isEmpty else {
             NSSound.beep()
             return
         }
 
-        let destinationPath = currentPath
-        let fileManager = FileManager.default
-        let copies: [CopyRecord] = itemsToDuplicate.map { item in
-            let baseName = item.url.deletingPathExtension().lastPathComponent
-            let ext = item.url.pathExtension
-            var copyName = ext.isEmpty ? "\(baseName) copy" : "\(baseName) copy.\(ext)"
-            var destinationURL = destinationPath.appendingPathComponent(copyName)
-
-            // Handle existing copies
-            var copyNumber = 2
-            while fileManager.fileExists(atPath: destinationURL.path) {
-                copyName = ext.isEmpty ? "\(baseName) copy \(copyNumber)" : "\(baseName) copy \(copyNumber).\(ext)"
-                destinationURL = destinationPath.appendingPathComponent(copyName)
-                copyNumber += 1
+        // Each copy goes next to its original (in search results they can be anywhere).
+        transferItems(
+            itemsToDuplicate.map { (source: $0.url, directory: $0.url.deletingLastPathComponent()) },
+            operation: .copy,
+            origin: .duplicate
+        ) { [weak self] journal in
+            guard let self, let journal else { return }
+            let copies = journal.placedURLs
+            if !copies.isEmpty {
+                self.pendingSelectionURLs = Set(copies)
+                self.pendingSelectionURL = copies.first
             }
-
-            return CopyRecord(from: item.url, to: destinationURL)
+            self.refresh()
         }
-        performCopies(copies, actionName: "Duplicate", registerUndo: true, resolveCollisions: false)
     }
 
     func renameItem(_ item: FileItem, to newName: String) {
+        performRename(item, to: newName, selectRenamedItem: true)
+    }
+
+    private enum RenameOutcome {
+        case unchanged
+        case renamed(URL)
+        case failed
+    }
+
+    /// Renames with Finder semantics: "/" is stored as ":" on disk, an existing name is refused
+    /// (never replaced), and a case-only change is allowed. Happens immediately — it's one rename.
+    @discardableResult
+    private func performRename(_ item: FileItem, to newName: String, selectRenamedItem: Bool) -> RenameOutcome {
         guard !item.isFromArchive else {
             NSSound.beep()
-            return
+            return .failed
+        }
+        guard !newName.isEmpty else { return .unchanged }
+
+        let source = item.url
+        let fileSystemName = FileOperationEngine.fileSystemName(forDisplayName: newName)
+        guard fileSystemName != source.lastPathComponent else { return .unchanged }
+
+        if let problem = FileOperationEngine.problemWithFileName(fileSystemName) {
+            NSSound.beep()
+            FileOperationAlerts.showMessage(problem, information: "Try using a name with fewer characters, or with no punctuation marks.")
+            return .failed
         }
 
-        let newURL = item.url.deletingLastPathComponent().appendingPathComponent(newName)
+        let destination = source.deletingLastPathComponent().appendingPathComponent(fileSystemName)
+        let isCaseOnlyChange = FileOperationEngine.isSameItem(source, destination)
+        if !isCaseOnlyChange && FileOperationEngine.itemExists(at: destination) {
+            NSSound.beep()
+            FileOperationAlerts.showMessage("The name “\(newName)” is already taken.", information: "Please choose a different name.")
+            return .failed
+        }
 
-        guard newURL != item.url else { return }
+        do {
+            try FileOperationEngine.renameItem(at: source, to: destination, caseOnly: isCaseOnlyChange)
+        } catch {
+            FileOperationAlerts.reportFailures([FileOperationFailure(url: source, error: error)], verb: "renamed")
+            return .failed
+        }
 
-        let move = MoveRecord(from: item.url, to: newURL)
-        performMoves([move], actionName: "Rename", registerUndo: true, resolveCollisions: false)
+        let journal = FileOperationJournal()
+        journal.steps = [.moved(from: source, to: destination)]
+        FileBrowserViewModel.registerUndo(reversing: journal, actionName: "Rename", undoManager: undoManager, viewModel: self)
+        FileClipboard.shared.itemDidMove(from: source, to: destination)
+        if selectRenamedItem {
+            // Keep the renamed item selected once the listing reloads.
+            pendingSelectionURL = destination
+            pendingSelectionURLs = nil
+        }
+        refresh()
+        return .renamed(destination)
     }
 
     /// Commit current rename and start renaming the next item (Tab behavior)
     func commitRenameAndNext(currentItem: FileItem, newName: String) {
-        // Commit the current rename
-        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty && trimmed != currentItem.nameWithoutExtension {
-            let ext = currentItem.url.pathExtension
-            let finalName = ext.isEmpty ? trimmed : "\(trimmed).\(ext)"
-            renameItem(currentItem, to: finalName)
-        }
-
-        // Find next item to rename
-        if let currentIndex = items.firstIndex(where: { $0.url == currentItem.url }) {
-            let nextIndex = currentIndex + 1
-            if nextIndex < items.count {
-                let nextItem = items[nextIndex]
-                if !nextItem.isFromArchive {
-                    selectedItems = [nextItem]
-                    lastSelectedIndex = nextIndex
-                    selectionAnchorIndex = nextIndex
-                    // Small delay to allow the rename to complete before starting new one
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                        self?.renamingURL = nextItem.url
-                    }
-                    return
-                }
-            }
-        }
-        // No next item or it's not renamable - just clear rename state
-        renamingURL = nil
+        commitRenameAndAdvance(currentItem: currentItem, newName: newName, offset: 1)
     }
 
     /// Commit current rename and start renaming the previous item (Shift+Tab behavior)
     func commitRenameAndPrevious(currentItem: FileItem, newName: String) {
-        // Commit the current rename
-        let trimmed = newName.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty && trimmed != currentItem.nameWithoutExtension {
-            let ext = currentItem.url.pathExtension
-            let finalName = ext.isEmpty ? trimmed : "\(trimmed).\(ext)"
-            renameItem(currentItem, to: finalName)
-        }
-
-        // Find previous item to rename
-        if let currentIndex = items.firstIndex(where: { $0.url == currentItem.url }) {
-            let prevIndex = currentIndex - 1
-            if prevIndex >= 0 {
-                let prevItem = items[prevIndex]
-                if !prevItem.isFromArchive {
-                    selectedItems = [prevItem]
-                    lastSelectedIndex = prevIndex
-                    selectionAnchorIndex = prevIndex
-                    // Small delay to allow the rename to complete before starting new one
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                        self?.renamingURL = prevItem.url
-                    }
-                    return
-                }
-            }
-        }
-        // No previous item or it's not renamable - just clear rename state
-        renamingURL = nil
+        commitRenameAndAdvance(currentItem: currentItem, newName: newName, offset: -1)
     }
 
-    func moveSelectedItemsToTrash() {
-        deleteSelectedItems()
+    /// `newName` is the edited name without the extension (for files). Next/previous follow the
+    /// displayed order.
+    private func commitRenameAndAdvance(currentItem: FileItem, newName: String, offset: Int) {
+        // Find the item to rename next before the rename reloads the listing
+        let displayedItems = filteredItems
+        var nextItem: FileItem?
+        var nextIndex = 0
+        if let currentIndex = displayedItems.firstIndex(where: { $0.url == currentItem.url }) {
+            let candidate = currentIndex + offset
+            if displayedItems.indices.contains(candidate), !displayedItems[candidate].isFromArchive {
+                nextItem = displayedItems[candidate]
+                nextIndex = candidate
+            }
+        }
+
+        // Commit the current rename
+        var didRename = false
+        if !newName.isEmpty && newName != currentItem.nameWithoutExtension {
+            let ext = currentItem.isDirectory ? "" : currentItem.url.pathExtension
+            let finalName = ext.isEmpty ? newName : "\(newName).\(ext)"
+            switch performRename(currentItem, to: finalName, selectRenamedItem: false) {
+            case .failed:
+                renamingURL = nil
+                return
+            case .renamed:
+                didRename = true
+            case .unchanged:
+                break
+            }
+        }
+
+        guard let nextItem else {
+            // No next item or it's not renamable - just clear rename state
+            renamingURL = nil
+            return
+        }
+        selectedItems = [nextItem]
+        lastSelectedIndex = nextIndex
+        selectionAnchorIndex = nextIndex
+        if didRename {
+            // The rename reloads the listing; keep the next item selected through it.
+            pendingSelectionURL = nextItem.url
+            pendingSelectionURLs = nil
+        }
+        // Small delay to allow the rename to complete before starting new one
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            self?.renamingURL = nextItem.url
+        }
     }
 
     func getInfo() {
@@ -3457,87 +4263,32 @@ class FileBrowserViewModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
 
+    /// Creates "untitled folder" right away (a single mkdir), then selects it and starts renaming.
     func createNewFolder() {
-        guard !isInsideArchive else {
+        guard !isInsideArchive, !isPhotosLibraryActive else {
             NSSound.beep()
             return
         }
 
-        let destinationPath = currentPath
-
-        fileOperationQueue.async {
-            let fileManager = FileManager.default
-            var folderName = "untitled folder"
-            var folderURL = destinationPath.appendingPathComponent(folderName)
-
-            var counter = 2
-            while fileManager.fileExists(atPath: folderURL.path) {
-                folderName = "untitled folder \(counter)"
-                folderURL = destinationPath.appendingPathComponent(folderName)
-                counter += 1
-            }
-
-            do {
-                try fileManager.createDirectory(at: folderURL, withIntermediateDirectories: false)
-                DispatchQueue.main.async { [weak self] in
-                    guard let self else { return }
-                    NSLog("[NewFolder] Created folder: %@", folderURL.lastPathComponent)
-                    self.undoManager?.registerUndo(withTarget: self) { target in
-                        target.performTrash(
-                            [folderURL],
-                            actionName: "New Folder",
-                            registerUndo: true,
-                            playSound: false
-                        )
-                    }
-                    self.undoManager?.setActionName("New Folder")
-                    NSLog("[NewFolder] Setting pendingSelectionURL and pendingNewFolderRenameURL to: %@", folderURL.absoluteString)
-                    self.pendingSelectionURL = folderURL
-                    self.pendingNewFolderRenameURL = folderURL
-                    self.refresh()
-                }
-            } catch {
-                print("Failed to create folder: \(error.localizedDescription)")
-            }
+        let folderURL = FileOperationEngine.uniqueDestinationURL(for: currentPath.appendingPathComponent("untitled folder"))
+        do {
+            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: false)
+        } catch {
+            FileOperationAlerts.reportFailures([FileOperationFailure(url: folderURL, error: error)], verb: "created")
+            return
         }
+
+        let journal = FileOperationJournal()
+        journal.steps = [.created(folderURL)]
+        FileBrowserViewModel.registerUndo(reversing: journal, actionName: "New Folder", undoManager: undoManager, viewModel: self)
+        pendingSelectionURL = folderURL
+        pendingSelectionURLs = nil
+        pendingNewFolderRenameURL = folderURL
+        refresh()
     }
 
     func selectAll() {
         selectedItems = Set(filteredItems)
-    }
-
-    nonisolated func uniqueDestinationURL(for url: URL) -> URL {
-        let fileManager = FileManager.default
-        var destinationURL = url
-
-        if fileManager.fileExists(atPath: destinationURL.path) {
-            let baseName = url.deletingPathExtension().lastPathComponent
-            let ext = url.pathExtension
-            var counter = 2
-
-            repeat {
-                let newName = ext.isEmpty ? "\(baseName) \(counter)" : "\(baseName) \(counter).\(ext)"
-                destinationURL = url.deletingLastPathComponent().appendingPathComponent(newName)
-                counter += 1
-            } while fileManager.fileExists(atPath: destinationURL.path)
-        }
-
-        return destinationURL
-    }
-
-    nonisolated private func moveItemWithFallback(_ fileManager: FileManager, from sourceURL: URL, to destinationURL: URL) throws {
-        do {
-            try fileManager.moveItem(at: sourceURL, to: destinationURL)
-        } catch {
-            let nsError = error as NSError
-            if nsError.domain == NSPOSIXErrorDomain &&
-                nsError.code == POSIXErrorCode.EXDEV.rawValue {
-                try fileManager.copyItem(at: sourceURL, to: destinationURL)
-                try fileManager.removeItem(at: sourceURL)
-            } else {
-                throw error
-            }
-        }
     }
 
     // MARK: - Search
