@@ -17,25 +17,19 @@ struct MasonryView: View {
     @State private var currentWidth: CGFloat = 800
     @State private var currentHeight: CGFloat = 600
     @State private var autoScrollTimer: Timer?
-
-    @State private var thumbnails: [URL: NSImage] = [:]
-    @State private var aspectRatios: [URL: CGFloat] = [:]
-    @State private var dimensionsFetched: Set<URL> = []  // Track which URLs we've fetched dimensions for
-    private let thumbnailCache = ThumbnailCacheManager.shared
-    @State private var itemsToken: Int = 0
     @State private var pinchStartIconSize: Double?
     @State private var pinchStartSpacing: Double?
     @State private var pinchStartFontSize: Double?
-    @State private var targetThumbnailPixelSize: CGFloat = 256
 
-    // Scroll optimization - defer thumbnail loading during scroll
-    @State private var visibleItemIDs: Set<UUID> = []
-    @State private var hydrationWorkItem: DispatchWorkItem?
-    @State private var lastHydratedRange: Range<Int>?
-    @State private var isScrolling = false
-    @State private var scrollEndTimer: Timer?
-    @State private var needsScrollToSelection = true  // Scroll to selected item when view appears
-    @State private var suppressNextSelectionScroll = false
+    // Thumbnail loading (visible tiles, batching, memory window)
+    @StateObject private var thumbnailLoader = GridThumbnailLoader()
+    // Layout bookkeeping that must not trigger renders
+    @StateObject private var runtime = MasonryRuntime()
+    private let thumbnailCache = ThumbnailCacheManager.shared
+
+    // CACHED LAYOUT - calculated when items, dimensions or settings change, never during scroll.
+    // nil until the first dimensions are known, so the folder doesn't open with estimated sizes.
+    @State private var cachedLayout: MasonryLayout?
 
     private var columnSpacing: CGFloat {
         max(12, settings.iconGridSpacingValue * 0.6)
@@ -77,47 +71,13 @@ struct MasonryView: View {
         return min(1024, max(256, bucket))
     }
 
-    private func aspectRatio(for item: FileItem) -> CGFloat {
-        // First check our cached aspect ratios (from thumbnails)
-        if let ratio = aspectRatios[item.url] {
-            return ratio
-        }
-
-        // Then check the fast dimensions cache (from file metadata)
-        if let dimensions = thumbnailCache.getImageDimensions(for: item.url),
-           dimensions.width > 0, dimensions.height > 0 {
-            let ratio = dimensions.width / dimensions.height
-            let clamped = min(max(ratio, 0.4), 2.5)
-            return clamped
-        }
-
-        // Fallback to defaults
-        switch item.fileType {
-        case .image, .video:
-            return 4.0 / 3.0
-        default:
-            return 1.0
-        }
-    }
-
-    private func tileHeight(for item: FileItem) -> CGFloat {
-        if item.isDirectory {
-            return folderTileHeight
-        }
-        let ratio = aspectRatio(for: item)
-        return columnWidth / ratio
-    }
-
-    private func estimatedItemHeight(for item: FileItem) -> CGFloat {
-        let imageHeight = tileHeight(for: item)
-        let tagHeight: CGFloat = settings.showItemTags && !item.tags.isEmpty ? 12 : 0
-        let verticalPadding: CGFloat = 12
-        return imageHeight + labelHeight(for: item) + tagHeight + verticalPadding
-    }
-
     private func labelHeight(for item: FileItem) -> CGFloat {
         // Always show labels for folders, non-media files (show icon only), when filenames setting is on, or when renaming
         shouldShowLabel(for: item) ? baseLabelHeight : 0
+    }
+
+    private func tagHeight(for item: FileItem) -> CGFloat {
+        settings.showItemTags && !item.tags.isEmpty ? 12 : 0
     }
 
     private func shouldShowLabel(for item: FileItem) -> Bool {
@@ -132,171 +92,62 @@ struct MasonryView: View {
         return false
     }
 
-    private struct MasonryPosition {
-        let column: Int
-        let indexInColumn: Int
-        let y: CGFloat
-        let height: CGFloat
+    /// Tile height: image (real aspect ratio once known, 4:3 until then) + label + tags + padding
+    private func itemHeight(for item: FileItem, dimensions: CGSize?) -> CGFloat {
+        let imageHeight: CGFloat
+        if item.isDirectory {
+            imageHeight = folderTileHeight
+        } else if let dimensions, dimensions.width > 0, dimensions.height > 0 {
+            imageHeight = columnWidth / min(max(dimensions.width / dimensions.height, 0.4), 2.5)
+        } else {
+            imageHeight = columnWidth / (4.0 / 3.0)
+        }
+        return imageHeight + labelHeight(for: item) + tagHeight(for: item) + 12
     }
 
-    private struct MasonryLayout {
-        let columns: [[FileItem]]
-        let positions: [UUID: MasonryPosition]
+    /// Layout from cached dimensions only (no file access), so it's cheap enough to run on main
+    private func calculateLayout(for sourceItems: [FileItem]) -> MasonryLayout {
+        let dimensions = thumbnailCache.cachedImageDimensions(for: sourceItems.filter { !$0.isDirectory })
+        let heights = sourceItems.map { itemHeight(for: $0, dimensions: dimensions[$0.url]) }
+        return MasonryLayout.compute(
+            keys: sourceItems.map(\.url),
+            heights: heights,
+            columnCount: columnCount,
+            columnWidth: columnWidth,
+            spacing: columnSpacing
+        )
     }
 
-    // CACHED LAYOUT - calculated once when items/dimensions change, not on every frame
-    @State private var cachedLayout: MasonryLayout?
-    @State private var cachedColumnCount: Int = 0
-    @State private var cachedColumnWidth: CGFloat = 0
-    @State private var layoutNeedsUpdate: Bool = true
+    /// Recalculate and cache the layout for the current items
+    private func recalculateLayout() {
+        let layout = calculateLayout(for: runtime.items)
+        if layout != cachedLayout {
+            cachedLayout = layout
+        }
+    }
 
-    /// Returns cached layout - only returns valid layout after dimensions are fetched
-    private var masonryLayout: MasonryLayout {
-        // Return cached layout if still valid for current column configuration
-        if let cached = cachedLayout,
-           cachedColumnCount == columnCount,
-           abs(cachedColumnWidth - columnWidth) < 1 {
+    /// Cached layout if it still matches the column configuration (otherwise computed fresh)
+    private func currentLayout(for sourceItems: [FileItem]) -> MasonryLayout {
+        guard let cached = cachedLayout else { return .empty }
+        if cached.columnCount == columnCount, abs(cached.columnWidth - columnWidth) < 1 {
             return cached
         }
-
-        // If we have a cached layout but column config changed, recalculate
-        if cachedLayout != nil {
-            return calculateLayout()
-        }
-
-        // No cached layout yet - waiting for dimensions to be prefetched
-        // Return empty layout to avoid premature calculation
-        return MasonryLayout(columns: [], positions: [:])
-    }
-
-    /// Calculate layout synchronously - called from computed property
-    private func calculateLayout(for sourceItems: [FileItem]? = nil) -> MasonryLayout {
-        let sourceItems = sourceItems ?? items
-
-        guard !sourceItems.isEmpty else {
-            return MasonryLayout(columns: [], positions: [:])
-        }
-
-        let currentColumnCount = columnCount
-
-        // SIMPLE DETERMINISTIC assignment: index % columnCount
-        var buckets = Array(repeating: [FileItem](), count: currentColumnCount)
-
-        for (index, item) in sourceItems.enumerated() {
-            let columnIndex = index % currentColumnCount
-            buckets[columnIndex].append(item)
-        }
-
-        // Calculate positions - use FIXED default heights
-        var positions: [UUID: MasonryPosition] = [:]
-        var columnHeights = Array(repeating: CGFloat(0), count: currentColumnCount)
-
-        for columnIndex in 0..<currentColumnCount {
-            for (indexInColumn, item) in buckets[columnIndex].enumerated() {
-                let itemHeight = stableItemHeight(for: item)
-                let y = columnHeights[columnIndex]
-
-                positions[item.id] = MasonryPosition(
-                    column: columnIndex,
-                    indexInColumn: indexInColumn,
-                    y: y,
-                    height: itemHeight
-                )
-                columnHeights[columnIndex] += itemHeight + columnSpacing
-            }
-        }
-
-        return MasonryLayout(columns: buckets, positions: positions)
-    }
-
-    /// Recalculate and cache the layout - called when items or dimensions change
-    private func recalculateLayout(for sourceItems: [FileItem]? = nil) {
-        let layout = calculateLayout(for: sourceItems)
-        cachedLayout = layout
-        cachedColumnCount = columnCount
-        cachedColumnWidth = columnWidth
-        layoutNeedsUpdate = false
-    }
-
-    /// Returns height for an item using CACHED dimensions (real aspect ratio)
-    /// Falls back to 4:3 if dimensions not yet cached
-    /// Layout is only calculated once per folder, so this is stable
-    private func stableItemHeight(for item: FileItem) -> CGFloat {
-        if item.isDirectory {
-            return folderTileHeight + labelHeight(for: item) + 12
-        }
-
-        // Use cached dimensions for real aspect ratio
-        let ratio: CGFloat
-        if let dimensions = thumbnailCache.getImageDimensions(for: item.url),
-           dimensions.width > 0, dimensions.height > 0 {
-            ratio = min(max(dimensions.width / dimensions.height, 0.4), 2.5)
-        } else {
-            // Fallback for items without dimensions yet
-            ratio = 4.0 / 3.0
-        }
-
-        let imageHeight = columnWidth / ratio
-        let tagHeight: CGFloat = settings.showItemTags && !item.tags.isEmpty ? 12 : 0
-        return imageHeight + labelHeight(for: item) + tagHeight + 12
-    }
-
-    /// Initial height estimate using default aspect ratios - used for column assignment only
-    private func initialEstimatedHeight(for item: FileItem) -> CGFloat {
-        if item.isDirectory {
-            return folderTileHeight
-        }
-        // Use default 4:3 for images/videos, 1:1 for others - ensures stable column assignment
-        let defaultRatio: CGFloat
-        switch item.fileType {
-        case .image, .video:
-            defaultRatio = 4.0 / 3.0
-        default:
-            defaultRatio = 1.0
-        }
-        let imageHeight = columnWidth / defaultRatio
-        let tagHeight: CGFloat = settings.showItemTags && !item.tags.isEmpty ? 12 : 0
-        let verticalPadding: CGFloat = 12
-        return imageHeight + labelHeight(for: item) + tagHeight + verticalPadding
+        return calculateLayout(for: sourceItems)
     }
 
     var body: some View {
         GeometryReader { geometry in
-            let layout = masonryLayout
+            let layout = currentLayout(for: items)
+            let itemsByURL = runtime.lookup(for: items)
             ScrollViewReader { scrollProxy in
                 ScrollView {
                     HStack(alignment: .top, spacing: columnSpacing) {
                         ForEach(layout.columns.indices, id: \.self) { columnIndex in
                             LazyVStack(spacing: columnSpacing) {
-                                ForEach(layout.columns[columnIndex]) { item in
-                                    // Use CACHED height from layout positions - never recalculate during scroll
-                                    let cachedHeight = layout.positions[item.id]?.height ?? stableItemHeight(for: item)
-                                    // Extract just the image portion (subtract label and padding)
-                                    let tagHeight: CGFloat = settings.showItemTags && !item.tags.isEmpty ? 12 : 0
-                                    let imageHeight = cachedHeight - labelHeight(for: item) - tagHeight - 12
-
-                                    MasonryItemView(
-                                        item: item,
-                                        viewModel: viewModel,
-                                        thumbnail: thumbnails[item.url],
-                                        columnWidth: columnWidth,
-                                        imageHeight: imageHeight,
-                                        labelHeight: labelHeight(for: item),
-                                        showLabels: shouldShowLabel(for: item),
-                                        dropTargetedItemID: $dropTargetedItemID,
-                                        onSelect: { item, clickedOnTextArea in
-                                            selectItem(item, clickedOnTextArea: clickedOnTextArea)
-                                        },
-                                        onDoubleClick: { item in
-                                            viewModel.openItem(item)
-                                        }
-                                    )
-                                    .id(item.id)
-                                    .onAppear {
-                                        updateVisibility(for: item, isVisible: true)
-                                    }
-                                    .onDisappear {
-                                        updateVisibility(for: item, isVisible: false)
+                                ForEach(layout.columns[columnIndex], id: \.self) { url in
+                                    // The layout stores URLs; tiles always render the current item
+                                    if let item = itemsByURL[url] {
+                                        tile(for: item, height: layout.positions[url]?.height)
                                     }
                                 }
                             }
@@ -319,52 +170,62 @@ struct MasonryView: View {
                 .scrollEdgeEffectStyle(.soft, for: .top)
                 .onAppear {
                     currentWidth = geometry.size.width
-                    refreshThumbnailTargetSize()
-                    layoutNeedsUpdate = true
-                    recalculateLayout()
-                    // Scroll to selected item when view appears (e.g., when switching view modes)
-                    if let firstSelected = viewModel.selectedItems.first {
-                        // Use DispatchQueue to ensure layout is complete before scrolling
+                    currentHeight = geometry.size.height
+                    runtime.items = items
+                    thumbnailLoader.viewModel = viewModel
+                    thumbnailLoader.loadsPhotosAssets = true
+                    thumbnailLoader.columnCount = columnCount
+                    thumbnailLoader.setTargetPixelSize(masonryThumbnailPixelSize)
+                    thumbnailLoader.setItems(items)
+                    if cachedLayout == nil {
+                        // Scroll to the selection once the first layout exists
+                        runtime.needsScrollToSelection = true
+                    } else if let primary = viewModel.primarySelectedItem {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                            scrollProxy.scrollTo(primary.url, anchor: .center)
                         }
                     }
-                    needsScrollToSelection = true
+                    // Dimensions are read in the background first; the layout follows
+                    startDimensionPrefetch()
                 }
-                .onChange(of: geometry.size.width) { newWidth in
+                .onDisappear {
+                    // Abandon pending dimension reads; the next appearance starts over
+                    runtime.prefetchGeneration += 1
+                    runtime.prefetchingURLs.removeAll()
+                    thumbnailLoader.stop()
+                    autoScrollTimer?.invalidate()
+                    autoScrollTimer = nil
+                }
+                .onChange(of: geometry.size.width) { _, newWidth in
                     currentWidth = newWidth
-                    refreshThumbnailTargetSize()
-                    // Recalculate layout when window width changes
-                    layoutNeedsUpdate = true
-                    recalculateLayout()
+                    layoutSettingsChanged()
                 }
-                .onChange(of: viewModel.selectedItems) { newSelection in
-                    if let firstSelected = newSelection.first {
-                        if suppressNextSelectionScroll {
-                            suppressNextSelectionScroll = false
-                        } else {
-                            withAnimation {
-                                scrollProxy.scrollTo(firstSelected.id)
-                            }
-                        }
-                        updateQuickLook(for: firstSelected)
-                    } else {
+                .onChange(of: viewModel.selectedItems) { _, _ in
+                    guard let primary = viewModel.primarySelectedItem else {
                         updateQuickLook(for: nil)
+                        return
                     }
+                    // Only scroll when the lead item isn't already on screen (after a delete the
+                    // next item is usually visible and the grid should stay put).
+                    if !thumbnailLoader.isOnScreen(primary.url) {
+                        withAnimation {
+                            scrollProxy.scrollTo(primary.url)
+                        }
+                    }
+                    updateQuickLook(for: primary)
                 }
-                .onChange(of: cachedLayout != nil) { hasLayout in
+                .onChange(of: cachedLayout == nil) { _, isMissing in
                     // Scroll to selected item when layout first becomes available
-                    if hasLayout && needsScrollToSelection {
-                        needsScrollToSelection = false
-                        if let firstSelected = viewModel.selectedItems.first {
-                            // Small delay to ensure layout is applied
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                                scrollProxy.scrollTo(firstSelected.id, anchor: .center)
-                            }
+                    guard !isMissing, runtime.needsScrollToSelection else { return }
+                    runtime.needsScrollToSelection = false
+                    if let primary = viewModel.primarySelectedItem {
+                        // Small delay to ensure layout is applied
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                            scrollProxy.scrollTo(primary.url, anchor: .center)
                         }
                     }
                 }
-                .onChange(of: internalDragState.isDragging) { isDragging in
+                .onChange(of: internalDragState.isDragging) { _, isDragging in
                     // Start/stop auto-scroll timer based on drag state
                     if isDragging {
                         autoScrollTimer?.invalidate()
@@ -400,23 +261,19 @@ struct MasonryView: View {
 
                             guard direction != .none else { return }
 
-                            // Find visible items by their indices using dictionary lookup
-                            let indexByID: [UUID: Int] = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($1.id, $0) })
-                            let visibleIndices = visibleItemIDs.compactMap { indexByID[$0] }
-                            guard !visibleIndices.isEmpty else { return }
-
-                            let targetIndex: Int
-                            if direction == .up {
-                                let minIndex = visibleIndices.min() ?? 0
-                                targetIndex = max(0, minIndex - 1)
-                            } else {
-                                let maxIndex = visibleIndices.max() ?? (items.count - 1)
-                                targetIndex = min(items.count - 1, maxIndex + 1)
+                            // The loader always has the current items (this timer outlives renders)
+                            let (currentItems, bounds) = MainActor.assumeIsolated {
+                                (thumbnailLoader.items, thumbnailLoader.visibleIndexBounds())
                             }
+                            guard let visible = bounds else { return }
 
-                            if targetIndex >= 0 && targetIndex < items.count {
+                            let targetIndex = direction == .up
+                                ? max(0, visible.lowerBound - 1)
+                                : min(currentItems.count - 1, visible.upperBound + 1)
+
+                            if currentItems.indices.contains(targetIndex) {
                                 withAnimation(.linear(duration: 0.1)) {
-                                    scrollProxy.scrollTo(items[targetIndex].id, anchor: direction == .up ? .top : .bottom)
+                                    scrollProxy.scrollTo(currentItems[targetIndex].url, anchor: direction == .up ? .top : .bottom)
                                 }
                             }
                         }
@@ -425,10 +282,7 @@ struct MasonryView: View {
                         autoScrollTimer = nil
                     }
                 }
-                .onAppear {
-                    currentHeight = geometry.size.height
-                }
-                .onChange(of: geometry.size.height) { newHeight in
+                .onChange(of: geometry.size.height) { _, newHeight in
                     currentHeight = newHeight
                 }
             }
@@ -442,87 +296,34 @@ struct MasonryView: View {
             items: items
         ))
         .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging, padding: UI.Spacing.medium)
-        .onChange(of: items) { newItems in
-            let oldCount = items.count
-            let newCount = newItems.count
-            let oldToken = itemsToken
-            let newToken = itemsTokenFor(newItems)
-            let isItemRemoval = newCount < oldCount && newCount > 0
-
-            os_log(
-                .info,
-                log: masonryLog,
-                "onChange(items): oldCount=%d, newCount=%d, oldToken=%d, newToken=%d, isItemRemoval=%{public}@",
-                oldCount,
-                newCount,
-                oldToken,
-                newToken,
-                isItemRemoval.description
-            )
-
-            // Only clear thumbnails if items actually changed
-            if oldToken != newToken {
-                itemsToken = newToken
-                lastHydratedRange = nil
-                hydrationWorkItem?.cancel()
-                hydrationWorkItem = nil
-
-                if isItemRemoval {
-                    os_log(.info, log: masonryLog, "  -> item removal detected, trimming caches and preserving layout state")
-                    suppressNextSelectionScroll = true
-                    trimCachesForRemovedItems(comparedTo: newItems)
-                    layoutNeedsUpdate = true
-                    recalculateLayout(for: newItems)
-                    scheduleHydration()
-                } else {
-                    os_log(.info, log: masonryLog, "  -> structural change detected, clearing all caches")
-                    thumbnails.removeAll()
-                    aspectRatios.removeAll()
-                    dimensionsFetched.removeAll()
-                    cachedLayout = nil
-                    thumbnailCache.clearForNewFolder()
-                    thumbnailCache.clearDimensionsCache()
-                    visibleItemIDs.removeAll()
-
-                    // Get list of media files that need dimensions
-                    let mediaURLs = newItems.compactMap { item -> URL? in
-                        guard !item.isDirectory && (item.fileType == .image || item.fileType == .video) else { return nil }
-                        return item.url
-                    }
-
-                    // IMPORTANT: Prefetch dimensions FIRST, then calculate layout
-                    // This ensures we have real aspect ratios for the initial layout
-                    // Layout is calculated ONCE and cached - never recalculated during scroll
-                    if !mediaURLs.isEmpty {
-                        os_log(.info, log: masonryLog, "  -> PREFETCHING dimensions for %d media files BEFORE layout", mediaURLs.count)
-                        thumbnailCache.prefetchImageDimensions(for: mediaURLs) { [self] results in
-                            os_log(.info, log: masonryLog, "  -> PREFETCH complete: got %d dimensions, NOW calculating layout", results.count)
-                            // Calculate layout ONCE with real aspect ratios
-                            layoutNeedsUpdate = true
-                            recalculateLayout(for: newItems)
-                        }
-                    } else {
-                        // No media files, calculate layout immediately
-                        layoutNeedsUpdate = true
-                        recalculateLayout(for: newItems)
-                    }
-                }
-            } else {
-                os_log(.debug, log: masonryLog, "  -> token unchanged, keeping caches")
-            }
+        .onChange(of: items) { oldItems, newItems in
+            itemsDidChange(from: oldItems, to: newItems)
         }
-        .onChange(of: settings.iconGridIconSize) { _ in
-            refreshThumbnailTargetSize()
-            layoutNeedsUpdate = true
-            recalculateLayout()
+        .onChange(of: items.map(\.contentVersion)) { _, _ in
+            // Metadata, cloud status or in-place edits: re-read changed files' dimensions/thumbnails
+            itemsDidChange(from: runtime.items, to: items)
         }
-        .onChange(of: settings.iconGridSpacing) { _ in
-            refreshThumbnailTargetSize()
-            layoutNeedsUpdate = true
-            recalculateLayout()
+        .onChange(of: settings.iconGridIconSize) { _, _ in
+            layoutSettingsChanged()
         }
-        .onChange(of: settings.thumbnailQuality) { _ in
-            refreshThumbnailTargetSize()
+        .onChange(of: settings.iconGridSpacing) { _, _ in
+            layoutSettingsChanged()
+        }
+        .onChange(of: settings.thumbnailQuality) { _, _ in
+            thumbnailLoader.setTargetPixelSize(masonryThumbnailPixelSize)
+        }
+        // Label and tag heights are part of each tile's height
+        .onChange(of: settings.masonryShowFilenames) { _, _ in
+            recalculateLayoutIfReady()
+        }
+        .onChange(of: settings.showItemTags) { _, _ in
+            recalculateLayoutIfReady()
+        }
+        .onChange(of: settings.iconGridFontSize) { _, _ in
+            recalculateLayoutIfReady()
+        }
+        .onChange(of: viewModel.renamingURL) { _, _ in
+            recalculateLayoutIfReady()
         }
         .keyboardNavigable(
             onUpArrow: { shift in navigateVertical(-1, extend: shift) },
@@ -538,6 +339,131 @@ struct MasonryView: View {
             onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
         .simultaneousGesture(magnificationGesture)
+    }
+
+    @ViewBuilder
+    private func tile(for item: FileItem, height cachedHeight: CGFloat?) -> some View {
+        // Use CACHED height from layout positions - never recalculate during scroll
+        let tileHeight = cachedHeight ?? itemHeight(for: item, dimensions: nil)
+        // Extract just the image portion (subtract label, tags and padding)
+        let imageHeight = max(1, tileHeight - labelHeight(for: item) - tagHeight(for: item) - 12)
+
+        MasonryItemView(
+            item: item,
+            viewModel: viewModel,
+            thumbnail: thumbnailLoader.image(for: item.url),
+            columnWidth: columnWidth,
+            imageHeight: imageHeight,
+            labelHeight: labelHeight(for: item),
+            showLabels: shouldShowLabel(for: item),
+            dropTargetedItemID: $dropTargetedItemID,
+            onSelect: { item, clickedOnTextArea in
+                selectItem(item, clickedOnTextArea: clickedOnTextArea)
+            },
+            onDoubleClick: { item in
+                viewModel.openItem(item)
+            }
+        )
+        .id(item.url)
+        .onAppear {
+            thumbnailLoader.tileAppeared(item.url)
+        }
+        .onDisappear {
+            thumbnailLoader.tileDisappeared(item.url)
+        }
+        .onScrollVisibilityChange(threshold: GridThumbnailLoader.onScreenThreshold) { isVisible in
+            thumbnailLoader.setOnScreen(item.url, isVisible)
+        }
+    }
+
+    // MARK: - Items, dimensions and layout
+
+    /// Items were added, removed, reordered or updated. Tiles that remain keep their thumbnails;
+    /// the layout is recomputed from cached dimensions (shortest-column placement, so tiles above
+    /// the first change don't move) and only files without known dimensions are read.
+    private func itemsDidChange(from oldItems: [FileItem], to newItems: [FileItem]) {
+        if GridThumbnailLoader.sameStorage(newItems, runtime.items) { return }
+        let change = MasonryLayout.classifyChange(from: oldItems.map(\.url), to: newItems.map(\.url))
+        os_log(.debug, log: masonryLog, "items changed: %{public}@ %d -> %d", String(describing: change), oldItems.count, newItems.count)
+
+        runtime.items = newItems
+        thumbnailLoader.setItems(newItems)
+        recalculateLayoutIfReady()
+        startDimensionPrefetch()
+    }
+
+    private func recalculateLayoutIfReady() {
+        // Before the first layout we're still waiting for dimensions
+        guard cachedLayout != nil else { return }
+        recalculateLayout()
+    }
+
+    private func layoutSettingsChanged() {
+        thumbnailLoader.columnCount = columnCount
+        thumbnailLoader.setTargetPixelSize(masonryThumbnailPixelSize)
+        recalculateLayoutIfReady()
+    }
+
+    /// Read dimensions of media files we don't know yet, in display order and in chunks, and lay
+    /// out again after each chunk. The first chunk covers the top of the folder and the selection
+    /// (whose position depends only on the items before it), so the first layout is already right
+    /// where the user looks. Completions use `runtime.items`, never a captured list, so a slow read
+    /// can't bring back a deleted file.
+    private func startDimensionPrefetch() {
+        let needed = runtime.items.filter { item in
+            !item.isDirectory
+                && (item.fileType == .image || item.fileType == .video)
+                && !runtime.prefetchingURLs.contains(item.url)
+                && !thumbnailCache.hasDimensionRecord(for: item)
+        }
+        guard !needed.isEmpty else {
+            if cachedLayout == nil && runtime.prefetchingURLs.isEmpty {
+                recalculateLayout()
+            }
+            return
+        }
+
+        var firstChunkCount = min(needed.count, 150)
+        if let primary = viewModel.primarySelectedItem,
+           let selectedIndex = thumbnailLoader.index(of: primary.url) {
+            let throughSelection = needed.prefix { (thumbnailLoader.index(of: $0.url) ?? 0) <= selectedIndex + 50 }.count
+            firstChunkCount = min(needed.count, max(firstChunkCount, min(throughSelection, 3000)))
+        }
+        var chunks: [[FileItem]] = [Array(needed.prefix(firstChunkCount))]
+        var start = firstChunkCount
+        while start < needed.count {
+            let end = min(needed.count, start + 300)
+            chunks.append(Array(needed[start..<end]))
+            start = end
+        }
+        for item in needed {
+            runtime.prefetchingURLs.insert(item.url)
+        }
+        os_log(.debug, log: masonryLog, "prefetching dimensions for %d files in %d chunks", needed.count, chunks.count)
+        prefetchDimensionChunks(chunks[...], generation: runtime.prefetchGeneration)
+    }
+
+    private func prefetchDimensionChunks(_ chunks: ArraySlice<[FileItem]>, generation: Int) {
+        guard let chunk = chunks.first else { return }
+        let state = runtime
+        thumbnailCache.prefetchImageDimensions(for: chunk) { _ in
+            // The view went away (onDisappear resets the bookkeeping): stop here
+            guard state.prefetchGeneration == generation else { return }
+            for item in chunk {
+                state.prefetchingURLs.remove(item.url)
+            }
+            recalculateLayout()
+            prefetchDimensionChunks(chunks.dropFirst(), generation: generation)
+        }
+    }
+
+    // MARK: - Selection and keyboard navigation
+
+    private func indexOfItem(at url: URL) -> Int? {
+        if let index = thumbnailLoader.index(of: url), items.indices.contains(index), items[index].url == url {
+            return index
+        }
+        return items.firstIndex { $0.url == url }
     }
 
     private func selectItem(_ item: FileItem, clickedOnTextArea: Bool = true) {
@@ -559,7 +485,7 @@ struct MasonryView: View {
         guard !items.isEmpty else { return }
 
         let currentIndex: Int
-        if let selectedItem = viewModel.selectedItems.first,
+        if let selectedItem = viewModel.primarySelectedItem,
            let index = items.firstIndex(of: selectedItem) {
             currentIndex = index
         } else {
@@ -569,29 +495,25 @@ struct MasonryView: View {
         let newIndex = max(0, min(items.count - 1, currentIndex + offset))
         let newItem = items[newIndex]
         viewModel.selectItem(newItem)
+        viewModel.lastSelectedIndex = newIndex
+        viewModel.selectionAnchorIndex = newIndex
         updateQuickLook(for: newItem)
     }
 
-    private func navigateVertical(_ direction: Int, extend: Bool = false) {
-        // When extending selection, use lastSelectedIndex to find the cursor position
-        // instead of selectedItems.first which returns an arbitrary item from the Set.
-        let currentItem: FileItem
+    /// The item the arrow keys move from: the moving end of a shift-selection, else the lead item
+    private func navigationOrigin(extend: Bool) -> FileItem? {
+        guard !items.isEmpty else { return nil }
         if extend {
             let idx = max(0, min(items.count - 1, viewModel.lastSelectedIndex))
-            currentItem = items[idx]
-        } else {
-            guard let item = ensureSelection() else { return }
-            currentItem = item
+            return items[idx]
         }
-        let layout = masonryLayout
-        guard let position = layout.positions[currentItem.id] else { return }
+        return ensureSelection()
+    }
 
-        let columnItems = layout.columns[position.column]
-        let nextIndex = position.indexInColumn + direction
-        guard columnItems.indices.contains(nextIndex) else { return }
-
-        let targetItem = columnItems[nextIndex]
-        if extend, let targetIndex = items.firstIndex(of: targetItem) {
+    private func moveSelection(to targetURL: URL, extend: Bool) {
+        guard let targetIndex = indexOfItem(at: targetURL) else { return }
+        let targetItem = items[targetIndex]
+        if extend {
             viewModel.selectRange(to: targetIndex, in: items)
             updateQuickLook(for: targetItem)
         } else {
@@ -599,50 +521,47 @@ struct MasonryView: View {
         }
     }
 
+    private func navigateVertical(_ direction: Int, extend: Bool = false) {
+        guard let currentItem = navigationOrigin(extend: extend) else { return }
+        let layout = currentLayout(for: items)
+        guard let position = layout.positions[currentItem.url] else { return }
+
+        let columnURLs = layout.columns[position.column]
+        let nextIndex = position.indexInColumn + direction
+        guard columnURLs.indices.contains(nextIndex) else { return }
+        moveSelection(to: columnURLs[nextIndex], extend: extend)
+    }
+
     private func navigateHorizontal(_ direction: Int, extend: Bool = false) {
-        // When extending selection, use lastSelectedIndex to find the cursor position
-        // instead of selectedItems.first which returns an arbitrary item from the Set.
-        let currentItem: FileItem
-        if extend {
-            let idx = max(0, min(items.count - 1, viewModel.lastSelectedIndex))
-            currentItem = items[idx]
-        } else {
-            guard let item = ensureSelection() else { return }
-            currentItem = item
-        }
-        let layout = masonryLayout
-        guard let position = layout.positions[currentItem.id] else { return }
+        guard let currentItem = navigationOrigin(extend: extend) else { return }
+        let layout = currentLayout(for: items)
+        guard let position = layout.positions[currentItem.url] else { return }
 
         let targetColumn = position.column + direction
         guard layout.columns.indices.contains(targetColumn) else { return }
 
-        let targetItems = layout.columns[targetColumn]
-        guard !targetItems.isEmpty else { return }
+        let targetURLs = layout.columns[targetColumn]
+        guard !targetURLs.isEmpty else { return }
 
         let currentCenter = position.y + (position.height / 2)
-        var closestItem = targetItems[0]
+        var closestURL = targetURLs[0]
         var closestDelta = CGFloat.greatestFiniteMagnitude
 
-        for item in targetItems {
-            guard let targetPosition = layout.positions[item.id] else { continue }
+        for url in targetURLs {
+            guard let targetPosition = layout.positions[url] else { continue }
             let targetCenter = targetPosition.y + (targetPosition.height / 2)
             let delta = abs(targetCenter - currentCenter)
             if delta < closestDelta {
                 closestDelta = delta
-                closestItem = item
+                closestURL = url
             }
         }
 
-        if extend, let targetIndex = items.firstIndex(of: closestItem) {
-            viewModel.selectRange(to: targetIndex, in: items)
-            updateQuickLook(for: closestItem)
-        } else {
-            selectItem(closestItem)
-        }
+        moveSelection(to: closestURL, extend: extend)
     }
 
     private func openSelectedItem() {
-        if let selectedItem = viewModel.selectedItems.first {
+        if let selectedItem = viewModel.primarySelectedItem {
             viewModel.openItem(selectedItem)
         }
     }
@@ -667,297 +586,18 @@ struct MasonryView: View {
         viewModel.updateQuickLookPreview(for: item)
     }
 
-    private func refreshThumbnailTargetSize() {
-        let newSize = masonryThumbnailPixelSize
-        guard abs(newSize - targetThumbnailPixelSize) >= 8 else { return }
-        targetThumbnailPixelSize = newSize
-        // Reset hydration range to force reload of visible items at new size
-        lastHydratedRange = nil
-        scheduleHydration()
-    }
-
     @discardableResult
     private func ensureSelection() -> FileItem? {
-        if let current = viewModel.selectedItems.first {
+        if let current = viewModel.primarySelectedItem {
             return current
         }
 
         guard let first = items.first else { return nil }
         viewModel.selectItem(first)
+        viewModel.lastSelectedIndex = 0
+        viewModel.selectionAnchorIndex = 0
         updateQuickLook(for: first)
         return first
-    }
-
-    // MARK: - Scroll-Optimized Loading
-
-    private func updateVisibility(for item: FileItem, isVisible: Bool) {
-        if isVisible {
-            visibleItemIDs.insert(item.id)
-        } else {
-            visibleItemIDs.remove(item.id)
-        }
-
-        markScrolling()
-        scheduleHydration()
-    }
-
-    private func markScrolling() {
-        isScrolling = true
-        scrollEndTimer?.invalidate()
-
-        scrollEndTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [self] _ in
-            DispatchQueue.main.async {
-                isScrolling = false
-                // Trigger a final hydration pass when scroll stops
-                scheduleHydration()
-            }
-        }
-    }
-
-    private func scheduleHydration() {
-        hydrationWorkItem?.cancel()
-
-        // During active scrolling, use longer debounce to reduce work
-        let debounceTime: TimeInterval = isScrolling ? 0.1 : 0.02
-
-        let itemsSnapshot = items
-        let visibleSnapshot = visibleItemIDs
-        let currentColumnCount = columnCount
-        let scrolling = isScrolling
-        let fetchedDimensions = dimensionsFetched
-
-        let workItem = DispatchWorkItem { [itemsSnapshot, visibleSnapshot, currentColumnCount, scrolling, fetchedDimensions] in
-            guard !visibleSnapshot.isEmpty else { return }
-
-            // Find visible indices using dictionary lookup instead of linear scan
-            let indexByID: [UUID: Int] = Dictionary(uniqueKeysWithValues: itemsSnapshot.enumerated().map { ($1.id, $0) })
-            let visibleIndices = visibleSnapshot.compactMap { indexByID[$0] }
-            guard let minIndex = visibleIndices.min(),
-                  let maxIndex = visibleIndices.max() else { return }
-
-            // Use larger buffer when not scrolling for better preloading
-            // During scroll: small buffer to prioritize visible items
-            // When stopped: large buffer to preload ahead
-            let buffer: Int
-            if scrolling {
-                buffer = max(12, currentColumnCount * 3)
-            } else {
-                // Preload 8 screens worth when stopped
-                let visibleCount = maxIndex - minIndex + 1
-                buffer = max(80, visibleCount * 4)
-            }
-
-            let start = max(0, minIndex - buffer)
-            let end = min(itemsSnapshot.count - 1, maxIndex + buffer)
-            let range = start..<(end + 1)
-
-            DispatchQueue.main.async {
-                // Skip if we already hydrated this exact range while scrolling
-                if range == self.lastHydratedRange && scrolling { return }
-                self.lastHydratedRange = range
-
-                // Hydrate metadata for items in range
-                var urlsToHydrate: [URL] = []
-                urlsToHydrate.reserveCapacity(range.count)
-                for index in range {
-                    let item = itemsSnapshot[index]
-                    if self.viewModel.needsHydration(item) {
-                        urlsToHydrate.append(item.url)
-                    }
-                }
-                if !urlsToHydrate.isEmpty {
-                    self.viewModel.hydrateMetadata(for: urlsToHydrate)
-                }
-
-                // FIRST: Prefetch image/video dimensions for stable layout
-                // This is very fast (just reads file headers) and prevents layout shifts
-                var urlsNeedingDimensions: [URL] = []
-                for index in range {
-                    let item = itemsSnapshot[index]
-                    if !item.isDirectory && (item.fileType == .image || item.fileType == .video) && !fetchedDimensions.contains(item.url) {
-                        urlsNeedingDimensions.append(item.url)
-                    }
-                }
-
-                if !urlsNeedingDimensions.isEmpty {
-                    // Mark as fetched immediately to avoid duplicate requests
-                    for url in urlsNeedingDimensions {
-                        self.dimensionsFetched.insert(url)
-                    }
-
-                    // Prefetch dimensions (very fast, runs on background thread)
-                    self.thumbnailCache.prefetchImageDimensions(for: urlsNeedingDimensions) { results in
-                        // Dimensions are now cached - no need to store them here
-                        // Just trigger a layout refresh if we're not scrolling
-                        if !self.isScrolling {
-                            // Force view update by touching a state variable
-                            // The aspectRatio function will now find the cached dimensions
-                        }
-                    }
-                }
-
-                // THEN: Load thumbnails
-                // During scroll: limit to avoid blocking UI
-                // When stopped: load all items in range, batched for responsiveness
-                let maxLoadsPerPass = scrolling ? 8 : 48
-                var loadCount = 0
-                var hasMoreToLoad = false
-
-                for index in range {
-                    let item = itemsSnapshot[index]
-                    if self.thumbnails[item.url] == nil && !item.isDirectory {
-                        if loadCount < maxLoadsPerPass {
-                            self.loadThumbnail(for: item)
-                            loadCount += 1
-                        } else {
-                            hasMoreToLoad = true
-                        }
-                    }
-                }
-
-                // If not scrolling and there are more items to load, schedule another pass
-                if hasMoreToLoad && !self.isScrolling {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        // Clear lastHydratedRange to allow another pass
-                        self.lastHydratedRange = nil
-                        self.scheduleHydration()
-                    }
-                }
-
-                // Evict thumbnails far from visible range to limit memory
-                if !self.isScrolling {
-                    let evictionBuffer = range.count * 2
-                    let evStart = max(0, range.lowerBound - evictionBuffer)
-                    let evEnd = min(itemsSnapshot.count, range.upperBound + evictionBuffer)
-                    let extendedKeepURLs = Set(itemsSnapshot[evStart..<evEnd].map { $0.url })
-                    for url in self.thumbnails.keys {
-                        if !extendedKeepURLs.contains(url) {
-                            self.thumbnails.removeValue(forKey: url)
-                        }
-                    }
-                }
-            }
-        }
-
-        hydrationWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + debounceTime, execute: workItem)
-    }
-
-    private func loadThumbnail(for item: FileItem) {
-        let url = item.url
-        let targetPixelSize = targetThumbnailPixelSize
-
-        // For folders, always use the file system icon (preserves custom folder colors)
-        // QuickLook returns a generic blue folder icon which loses custom colors
-        if item.isDirectory {
-            if thumbnails[url] == nil {
-                thumbnails[url] = item.icon
-            }
-            return
-        }
-
-        if viewModel.isPhotosItem(item) {
-            loadPhotosThumbnail(for: item, targetPixelSize: targetPixelSize)
-            return
-        }
-
-        if let existing = thumbnails[url], imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
-            return
-        }
-        if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) {
-            return
-        }
-
-        if thumbnailCache.hasFailed(url: url) {
-            DispatchQueue.main.async {
-                thumbnails[url] = item.icon
-            }
-            return
-        }
-
-        if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
-            DispatchQueue.main.async {
-                thumbnails[url] = cached
-            }
-            return
-        }
-
-        thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { url, image in
-            DispatchQueue.main.async {
-                if let image = image {
-                    thumbnails[url] = image
-                } else {
-                    thumbnails[url] = item.icon
-                }
-            }
-        }
-    }
-
-    private func loadPhotosThumbnail(for item: FileItem, targetPixelSize: CGFloat) {
-        let url = item.url
-
-        if let existing = thumbnails[url], imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
-            return
-        }
-
-        viewModel.requestPhotoThumbnail(for: item, targetPixelSize: targetPixelSize) { image, ratio in
-            if let image {
-                thumbnails[url] = image
-            } else {
-                thumbnails[url] = item.icon
-            }
-            // NOTE: For Photos items, we DO use the ratio since we can't read dimensions from URL
-            // But only set it if we don't already have one (to avoid shifts)
-            if let ratio, aspectRatios[url] == nil {
-                aspectRatios[url] = ratio
-            }
-        }
-    }
-
-    private func updateAspectRatio(for item: FileItem, image: NSImage) {
-        let size = image.size
-        guard size.width > 0 && size.height > 0 else { return }
-        let ratio = size.width / size.height
-        let clamped = min(max(ratio, 0.6), 2.4)
-
-        let oldRatio = aspectRatios[item.url]
-        aspectRatios[item.url] = clamped
-
-        if let old = oldRatio {
-            if abs(old - clamped) > 0.01 {
-                os_log(.info, log: masonryLog, "updateAspectRatio [%{public}@]: CHANGED %.3f -> %.3f (delta=%.3f) ⚠️", item.name, old, clamped, abs(old - clamped))
-            }
-        } else {
-            os_log(.debug, log: masonryLog, "updateAspectRatio [%{public}@]: SET to %.3f (size=%.0fx%.0f)", item.name, clamped, size.width, size.height)
-        }
-    }
-
-    private func imageSatisfiesMinimum(_ image: NSImage, minPixelSize: CGFloat) -> Bool {
-        let maxDimension = max(image.size.width, image.size.height)
-        return maxDimension >= minPixelSize * 0.9
-    }
-
-    private func handleDrop(providers: [NSItemProvider]) {
-        DropHelper.handleDrop(providers: providers, viewModel: viewModel)
-    }
-
-    private func itemsTokenFor(_ items: [FileItem]) -> Int {
-        var hasher = Hasher()
-        hasher.combine(items.count)
-        for item in items {
-            hasher.combine(item.id)
-        }
-        return hasher.finalize()
-    }
-
-    private func trimCachesForRemovedItems(comparedTo newItems: [FileItem]) {
-        let remainingURLs = Set(newItems.map(\.url))
-        let remainingIDs = Set(newItems.map(\.id))
-
-        thumbnails = thumbnails.filter { remainingURLs.contains($0.key) }
-        aspectRatios = aspectRatios.filter { remainingURLs.contains($0.key) }
-        dimensionsFetched = dimensionsFetched.filter { remainingURLs.contains($0) }
-        visibleItemIDs = visibleItemIDs.filter { remainingIDs.contains($0) }
     }
 
     private var magnificationGesture: some Gesture {
@@ -986,6 +626,103 @@ struct MasonryView: View {
 
     private func clamp(_ value: Double, range: ClosedRange<Double>) -> Double {
         min(max(value, range.lowerBound), range.upperBound)
+    }
+}
+
+// MARK: - Masonry Layout
+
+/// Column layout for Masonry, keyed by file URL. Each item goes into the currently shortest
+/// column (ties go left), so an item's position depends only on the items before it: removing or
+/// adding a file leaves everything above it in place, appending never moves existing tiles, and
+/// the same items always produce the same layout.
+struct MasonryLayout: Equatable {
+    struct Position: Equatable {
+        let column: Int
+        let indexInColumn: Int
+        let y: CGFloat
+        let height: CGFloat
+    }
+
+    var columns: [[URL]]
+    var positions: [URL: Position]
+    var columnCount: Int
+    var columnWidth: CGFloat
+
+    static let empty = MasonryLayout(columns: [], positions: [:], columnCount: 0, columnWidth: 0)
+
+    static func compute(keys: [URL], heights: [CGFloat], columnCount: Int, columnWidth: CGFloat, spacing: CGFloat) -> MasonryLayout {
+        let count = max(1, columnCount)
+        guard !keys.isEmpty else {
+            return MasonryLayout(columns: [], positions: [:], columnCount: count, columnWidth: columnWidth)
+        }
+
+        var columns = Array(repeating: [URL](), count: count)
+        var columnHeights = Array(repeating: CGFloat(0), count: count)
+        var positions: [URL: Position] = [:]
+        positions.reserveCapacity(keys.count)
+
+        for (index, key) in keys.enumerated() where positions[key] == nil {
+            let height = index < heights.count ? heights[index] : 0
+            var shortest = 0
+            for column in 1..<count where columnHeights[column] < columnHeights[shortest] {
+                shortest = column
+            }
+            positions[key] = Position(
+                column: shortest,
+                indexInColumn: columns[shortest].count,
+                y: columnHeights[shortest],
+                height: height
+            )
+            columns[shortest].append(key)
+            columnHeights[shortest] += height + spacing
+        }
+
+        return MasonryLayout(columns: columns, positions: positions, columnCount: count, columnWidth: columnWidth)
+    }
+
+    enum Change: Equatable {
+        case none
+        /// Only removals (the new items are a subset of the old ones)
+        case removal
+        /// Only additions
+        case addition
+        /// Same items, different order (sort)
+        case reorder
+        /// Items both added and removed (filter edits, renames, refresh)
+        case mixed
+    }
+
+    static func classifyChange(from old: [URL], to new: [URL]) -> Change {
+        if old == new { return .none }
+        let oldSet = Set(old)
+        let newSet = Set(new)
+        if oldSet == newSet { return .reorder }
+        if !newSet.isEmpty && newSet.isSubset(of: oldSet) { return .removal }
+        if oldSet.isSubset(of: newSet) { return .addition }
+        return .mixed
+    }
+}
+
+/// Masonry state that must not trigger re-renders (it never publishes).
+final class MasonryRuntime: ObservableObject {
+    /// Always the latest items: async work reads this, never a captured copy.
+    var items: [FileItem] = []
+    var needsScrollToSelection = false
+    /// Media files whose dimensions are being read
+    var prefetchingURLs: Set<URL> = []
+    /// Bumped when the view disappears so in-flight dimension reads stop
+    var prefetchGeneration = 0
+
+    private var lookupSource: [FileItem] = []
+    private var itemsByURL: [URL: FileItem] = [:]
+
+    /// URL → current item, rebuilt only when the array changes.
+    func lookup(for items: [FileItem]) -> [URL: FileItem] {
+        if !GridThumbnailLoader.sameStorage(items, lookupSource) {
+            lookupSource = items
+            itemsByURL = Dictionary(items.map { ($0.url, $0) }, uniquingKeysWith: { first, _ in first })
+        }
+        return itemsByURL
     }
 }
 
@@ -1273,11 +1010,6 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
 
     @MainActor
     final class Coordinator: NSObject, NSCollectionViewDataSource, NSCollectionViewDelegate, NSFilePromiseProviderDelegate {
-        private struct ItemsSignature: Equatable {
-            let count: Int
-            let firstID: UUID?
-            let lastID: UUID?
-        }
         private struct PromiseInfo {
             let item: FileItem
             let filename: String
@@ -1289,7 +1021,8 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
 
         private var items: [FileItem] = []
         private var itemIndexByID: [UUID: Int] = [:]
-        private var itemsSignature: ItemsSignature?
+        /// IDs of `items`, compared in full so changes in the middle are noticed
+        private var itemIDs: [UUID]?
 
         private var iconSize: CGFloat = 80
         private var spacing: CGFloat = 24
@@ -1302,7 +1035,10 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
         private var lastLayoutWidth: CGFloat = 0
 
         private let thumbnailCache = NSCache<NSString, NSImage>()
-        private var pendingThumbnailKeys: Set<String> = []
+        /// Thumbnail requests in flight (key -> start). The view model ignores a request whose key is
+        /// already in flight, so entries older than `pendingThumbnailTimeout` are retried.
+        private var pendingThumbnailKeys: [String: Date] = [:]
+        private let pendingThumbnailTimeout: TimeInterval = 10
         private var aspectRatios: [String: CGFloat] = [:]
 
         private var isUpdatingSelection = false
@@ -1324,11 +1060,9 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
         ) {
             self.viewModel = viewModel
 
-            let newSignature = ItemsSignature(
-                count: items.count,
-                firstID: items.first?.id,
-                lastID: items.last?.id
-            )
+            let newIDs = items.map(\.id)
+            let previousIDs = itemIDs ?? []
+            let idsChanged = itemIDs != newIDs
 
             let settingsChanged = updateSettings(
                 iconSize: iconSize,
@@ -1342,31 +1076,35 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
 
             let previousCount = self.items.count
             let canAppend = !forceReload &&
-                itemsSignature?.firstID == newSignature.firstID &&
                 items.count > previousCount &&
+                newIDs.starts(with: previousIDs) &&
                 (collectionView?.numberOfItems(inSection: 0) ?? previousCount) == previousCount
 
             if canAppend {
-                itemsSignature = newSignature
+                itemIDs = newIDs
                 self.items = items
                 for index in previousCount..<items.count {
                     itemIndexByID[items[index].id] = index
                 }
                 let indexPaths = Set((previousCount..<items.count).map { IndexPath(item: $0, section: 0) })
                 collectionView?.insertItems(at: indexPaths)
-            } else if forceReload || itemsSignature != newSignature {
-                itemsSignature = newSignature
+            } else if forceReload || idsChanged {
+                itemIDs = newIDs
                 self.items = items
                 rebuildIndexMap()
                 collectionView?.reloadData()
                 resetPreheat()
-            } else if settingsChanged {
-                collectionView?.collectionViewLayout?.invalidateLayout()
-                refreshVisibleItems()
+            } else {
+                // Same items; pick up updated metadata
+                self.items = items
+                if settingsChanged {
+                    collectionView?.collectionViewLayout?.invalidateLayout()
+                    refreshVisibleItems()
+                }
             }
 
             applySelectionFromViewModel()
-            if forceReload || itemsSignature != newSignature || canAppend || settingsChanged {
+            if forceReload || idsChanged || canAppend || settingsChanged {
                 updatePreheat()
             }
         }
@@ -1511,27 +1249,43 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
             if let cached = thumbnailCache.object(forKey: cacheKey as NSString) {
                 return cached
             }
-            if pendingThumbnailKeys.contains(cacheKey) {
+            if let started = pendingThumbnailKeys[cacheKey],
+               Date().timeIntervalSince(started) < pendingThumbnailTimeout {
                 return nil
             }
 
-            pendingThumbnailKeys.insert(cacheKey)
+            let requestStart = Date()
+            pendingThumbnailKeys[cacheKey] = requestStart
             let itemID = item.id
             viewModel.requestPhotoThumbnail(for: item, targetPixelSize: targetPixelSize) { [weak self] image, _ in
                 guard let self else { return }
-                self.pendingThumbnailKeys.remove(cacheKey)
+                self.pendingThumbnailKeys.removeValue(forKey: cacheKey)
 
                 if let image {
                     self.thumbnailCache.setObject(image, forKey: cacheKey as NSString)
                 }
+                self.updateVisibleCell(forItemID: itemID, image: image)
+            }
 
-                guard let index = self.itemIndexByID[itemID] else { return }
-                let indexPath = IndexPath(item: index, section: 0)
-                guard let cell = self.collectionView?.item(at: indexPath) as? PhotosMasonryItem else { return }
-                cell.updateImage(image)
+            // If no answer arrives (e.g. a request from a previous coordinator for the same key was
+            // still in flight, so this one was dropped), forget the key and ask again.
+            DispatchQueue.main.asyncAfter(deadline: .now() + pendingThumbnailTimeout + 0.5) { [weak self] in
+                guard let self, self.pendingThumbnailKeys[cacheKey] == requestStart else { return }
+                self.pendingThumbnailKeys.removeValue(forKey: cacheKey)
+                guard let index = self.itemIndexByID[itemID],
+                      let cell = self.collectionView?.item(at: IndexPath(item: index, section: 0)) as? PhotosMasonryItem,
+                      self.items.indices.contains(index) else { return }
+                self.configure(item: cell, at: IndexPath(item: index, section: 0))
             }
 
             return nil
+        }
+
+        private func updateVisibleCell(forItemID itemID: UUID, image: NSImage?) {
+            guard let index = itemIndexByID[itemID] else { return }
+            let indexPath = IndexPath(item: index, section: 0)
+            guard let cell = collectionView?.item(at: indexPath) as? PhotosMasonryItem else { return }
+            cell.updateImage(image)
         }
 
         private func resetPreheat() {
@@ -1697,14 +1451,6 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
                 updateQuickLook(for: nil)
             }
             isUpdatingSelection = false
-        }
-
-        @objc func handleDoubleClick(_ sender: NSClickGestureRecognizer) {
-            guard let collectionView else { return }
-            let point = sender.location(in: collectionView)
-            guard let indexPath = collectionView.indexPathForItem(at: point),
-                  items.indices.contains(indexPath.item) else { return }
-            viewModel.openItem(items[indexPath.item])
         }
 
         func openSelection() {
