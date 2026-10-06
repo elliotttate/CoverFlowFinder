@@ -2667,73 +2667,48 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
-    /// Extract an archive item to a temp directory for copy/paste operations
+    /// Extract an archive item into a fresh private temp directory for copy/paste operations.
+    /// `entries` is the view's snapshot; ZipArchiveManager re-validates against the archive on disk
+    /// (path containment, size caps, CRC, permissions, quarantine). Problems are shown in a sheet.
     nonisolated private func extractArchiveItemForCopy(_ item: FileItem, entries: [ZipEntry]) -> URL? {
         guard let archiveURL = item.archiveURL,
               let archivePath = item.archivePath else { return nil }
 
-        // Create temp directory for extractions
-        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("FlowFinder-Extract")
-        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
-
-        let destURL = tempDir.appendingPathComponent(item.name)
-
-        // Remove existing file if present
-        try? FileManager.default.removeItem(at: destURL)
-
-        if item.isDirectory {
-            // For directories, we need to extract all contents
-            return extractArchiveDirectory(item, from: archiveURL, to: destURL, entries: entries)
-        } else {
-            // For files, extract single file
-            if let entry = entries.first(where: { $0.path == archivePath || $0.path == archivePath + "/" }) {
-                do {
-                    let extractedURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
-                    // Move from temp extraction location to our desired location
-                    try? FileManager.default.removeItem(at: destURL)
-                    try FileManager.default.copyItem(at: extractedURL, to: destURL)
-                    return destURL
-                } catch {
-                    // Extraction failed
+        func showProblem(_ message: String, _ details: String) {
+            Task { @MainActor in
+                guard let window = NSApp?.keyWindow ?? NSApp?.mainWindow else {
+                    NSSound.beep()
+                    return
                 }
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = message
+                alert.informativeText = details
+                alert.beginSheetModal(for: window)
             }
         }
-        return nil
-    }
 
-    /// Extract an entire directory from archive
-    nonisolated private func extractArchiveDirectory(_ item: FileItem, from archiveURL: URL, to destURL: URL, entries: [ZipEntry]) -> URL? {
-        guard let basePath = item.archivePath else { return nil }
-
-        let normalizedBase = basePath.hasSuffix("/") ? basePath : basePath + "/"
-
+        let result: ZipExtractionResult
         do {
-            try FileManager.default.createDirectory(at: destURL, withIntermediateDirectories: true)
-
-            // Find all entries under this directory
-            for entry in entries {
-                guard entry.path.hasPrefix(normalizedBase) else { continue }
-
-                let relativePath = String(entry.path.dropFirst(normalizedBase.count))
-                guard !relativePath.isEmpty else { continue }
-
-                let itemDestURL = destURL.appendingPathComponent(relativePath)
-
-                if entry.isDirectory {
-                    try FileManager.default.createDirectory(at: itemDestURL, withIntermediateDirectories: true)
-                } else {
-                    // Extract file
-                    let extractedURL = try ZipArchiveManager.shared.extractFile(entry, from: archiveURL)
-                    // Ensure parent directory exists
-                    try FileManager.default.createDirectory(at: itemDestURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-                    try? FileManager.default.removeItem(at: itemDestURL)
-                    try FileManager.default.copyItem(at: extractedURL, to: itemDestURL)
-                }
-            }
-            return destURL
+            result = try ZipArchiveManager.shared.extractItemForCopy(archivePath: archivePath, from: archiveURL)
         } catch {
+            zipNavLogger.error("Couldn't extract archive item for copy: \(error.localizedDescription)")
+            showProblem("“\(item.name)” couldn't be copied from “\(archiveURL.lastPathComponent)”.",
+                        error.localizedDescription)
             return nil
         }
+
+        if !result.failures.isEmpty {
+            zipNavLogger.error("Extracted archive folder for copy with \(result.failures.count) failed entries")
+            var details = result.failures.prefix(5)
+                .map { "\($0.path): \($0.error.localizedDescription)" }
+                .joined(separator: "\n")
+            if result.failures.count > 5 {
+                details += "\n…and \(result.failures.count - 5) more."
+            }
+            showProblem("Some items in “\(item.name)” couldn't be extracted. The rest were copied.", details)
+        }
+        return result.url
     }
 
     func cutSelectedItems() {
