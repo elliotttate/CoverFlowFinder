@@ -5,6 +5,31 @@ import os.log
 
 private let audioPreviewLog = OSLog(subsystem: "com.flowfinder", category: "InlineAudioPreview")
 
+/// Safety net for audio previews whose hover-end never arrives (e.g. the hovered cell was recycled
+/// or scrolled away). The overlay reports a heartbeat while the mouse moves over it; if the mouse
+/// has since moved somewhere else and no heartbeat came for a while, the preview is stale.
+/// A stationary mouse never trips it, so audio keeps playing while the user rests on a track.
+struct InlineAudioHoverWatchdog {
+    /// How long without a heartbeat before the preview may be stopped.
+    var gracePeriod: TimeInterval = 2.0
+    /// How far (in points) the mouse must have moved since the last heartbeat.
+    var movementTolerance: CGFloat = 24
+
+    private(set) var lastHeartbeatTime: TimeInterval = 0
+    private(set) var lastHeartbeatLocation: CGPoint = .zero
+
+    mutating func noteHeartbeat(at location: CGPoint, now: TimeInterval) {
+        lastHeartbeatTime = now
+        lastHeartbeatLocation = location
+    }
+
+    func shouldStop(mouseLocation: CGPoint, now: TimeInterval) -> Bool {
+        guard now - lastHeartbeatTime >= gracePeriod else { return false }
+        let distance = hypot(mouseLocation.x - lastHeartbeatLocation.x, mouseLocation.y - lastHeartbeatLocation.y)
+        return distance >= movementTolerance
+    }
+}
+
 /// Manages inline audio preview playback within file thumbnails.
 /// Similar to InlineVideoPreviewManager but for audio files, with playback progress tracking.
 @MainActor
@@ -16,8 +41,13 @@ final class InlineAudioPreviewManager: ObservableObject {
     @Published private(set) var currentPreviewURL: URL?
     @Published private(set) var isPreviewActive: Bool = false
     @Published private(set) var isPaused: Bool = false
-    @Published private(set) var progress: Double = 0  // 0.0 to 1.0
     @Published private(set) var duration: TimeInterval = 0
+
+    /// Playback position (0...1). Observed only by the overlay that draws the progress bar.
+    let progressState = InlinePreviewProgress()
+
+    /// Playback position, 0.0 to 1.0
+    var progress: Double { progressState.value }
 
     // MARK: - State Machine
 
@@ -40,11 +70,15 @@ final class InlineAudioPreviewManager: ObservableObject {
     // MARK: - Configuration
 
     private let debounceInterval: TimeInterval = 0.3
+    private let progressInterval: TimeInterval = 1.0 / 10.0
+    private let watchdogInterval: TimeInterval = 0.5
 
     // MARK: - Resources
 
     private var debounceTimer: Timer?
     private var progressTimer: Timer?
+    private var watchdogTimer: Timer?
+    private var watchdog = InlineAudioHoverWatchdog()
     private var statusObserver: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
 
@@ -62,7 +96,7 @@ final class InlineAudioPreviewManager: ObservableObject {
 
         let url = item.url
 
-        if currentPreviewURL == url {
+        if state.isActive, currentPreviewURL == url {
             return
         }
 
@@ -70,6 +104,8 @@ final class InlineAudioPreviewManager: ObservableObject {
 
         state = .debouncing(url)
         currentPreviewURL = url
+        watchdog.noteHeartbeat(at: NSEvent.mouseLocation, now: CACurrentMediaTime())
+        startWatchdog()
 
         debounceTimer = Timer.scheduledTimer(withTimeInterval: debounceInterval, repeats: false) { [weak self] _ in
             Task { @MainActor in
@@ -78,9 +114,27 @@ final class InlineAudioPreviewManager: ObservableObject {
         }
     }
 
+    /// Cancel the current preview, whatever it is.
     func cancelPreview() {
         guard state.isActive else { return }
         cancelCurrentState()
+    }
+
+    /// Cancel the preview only if it is for `url` (hover-exit / disappearing cells).
+    func cancelPreview(for url: URL) {
+        guard state.isActive, currentPreviewURL == url else { return }
+        cancelCurrentState()
+    }
+
+    /// Called while the mouse moves over `item`'s overlay. Keeps the current preview alive, or
+    /// restarts it if the user came back to a track whose preview was stopped.
+    func noteHover(for item: FileItem) {
+        if state.isActive {
+            guard currentPreviewURL == item.url else { return }
+            watchdog.noteHeartbeat(at: NSEvent.mouseLocation, now: CACurrentMediaTime())
+        } else {
+            requestPreview(for: item)
+        }
     }
 
     func togglePause() {
@@ -125,7 +179,7 @@ final class InlineAudioPreviewManager: ObservableObject {
                 case .readyToPlay:
                     self.beginPlayback(url: url, player: player)
                 case .failed:
-                    os_log(.error, log: audioPreviewLog, "Failed to load: %{public}@", url.lastPathComponent)
+                    os_log(.error, log: audioPreviewLog, "Failed to load: %{private}@", url.lastPathComponent)
                     self.cancelCurrentState()
                 default:
                     break
@@ -135,18 +189,13 @@ final class InlineAudioPreviewManager: ObservableObject {
     }
 
     private func beginPlayback(url: URL, player: AVPlayer) {
-        let durationCMTime = player.currentItem?.duration ?? .zero
-        if durationCMTime != .zero && durationCMTime != .indefinite {
-            duration = CMTimeGetSeconds(durationCMTime)
-        } else {
-            duration = 0
-        }
+        duration = InlinePreviewTiming.seconds(of: player.currentItem?.duration ?? .invalid) ?? 0
 
         player.play()
         state = .playing(url, player)
         isPreviewActive = true
         isPaused = false
-        progress = 0
+        progressState.reset()
 
         setupLooping(for: player)
         startProgressTimer(player: player)
@@ -169,12 +218,13 @@ final class InlineAudioPreviewManager: ObservableObject {
 
     private func startProgressTimer(player: AVPlayer) {
         stopProgressTimer()
-        progressTimer = Timer.scheduledTimer(withTimeInterval: 1.0 / 30.0, repeats: true) { [weak self, weak player] _ in
+        progressTimer = Timer.scheduledTimer(withTimeInterval: progressInterval, repeats: true) { [weak self, weak player] _ in
             Task { @MainActor in
                 guard let self = self, let player = player else { return }
                 guard self.duration > 0 else { return }
                 let currentTime = CMTimeGetSeconds(player.currentTime())
-                self.progress = min(1.0, max(0.0, currentTime / self.duration))
+                guard currentTime.isFinite else { return }
+                self.progressState.update(currentTime / self.duration)
             }
         }
     }
@@ -184,9 +234,32 @@ final class InlineAudioPreviewManager: ObservableObject {
         progressTimer = nil
     }
 
+    private func startWatchdog() {
+        watchdogTimer?.invalidate()
+        watchdogTimer = Timer.scheduledTimer(withTimeInterval: watchdogInterval, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                self?.checkWatchdog()
+            }
+        }
+    }
+
+    private func checkWatchdog() {
+        guard state.isActive else {
+            watchdogTimer?.invalidate()
+            watchdogTimer = nil
+            return
+        }
+        if watchdog.shouldStop(mouseLocation: NSEvent.mouseLocation, now: CACurrentMediaTime()) {
+            os_log(.debug, log: audioPreviewLog, "Stopping stale audio preview (no hover heartbeat)")
+            cancelCurrentState()
+        }
+    }
+
     private func cancelCurrentState() {
         debounceTimer?.invalidate()
         debounceTimer = nil
+        watchdogTimer?.invalidate()
+        watchdogTimer = nil
         stopProgressTimer()
 
         statusObserver?.invalidate()
@@ -205,11 +278,11 @@ final class InlineAudioPreviewManager: ObservableObject {
         }
 
         state = .idle
-        currentPreviewURL = nil
-        isPreviewActive = false
-        isPaused = false
-        progress = 0
-        duration = 0
+        if currentPreviewURL != nil { currentPreviewURL = nil }
+        if isPreviewActive { isPreviewActive = false }
+        if isPaused { isPaused = false }
+        if duration != 0 { duration = 0 }
+        progressState.reset()
     }
 
     // MARK: - Notifications

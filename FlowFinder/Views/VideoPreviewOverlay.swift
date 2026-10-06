@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 import AppKit
+import Combine
 
 /// Custom NSView that keeps its AVPlayerLayer sublayer sized to fill the view bounds.
 private class VideoPreviewHostView: NSView {
@@ -66,38 +67,6 @@ struct VideoPreviewLayerView: NSViewRepresentable {
     }
 }
 
-/// View modifier that adds inline video preview on hover for video items.
-/// Wraps the content with a video overlay that appears when hovering.
-struct VideoPreviewModifier: ViewModifier {
-    let item: FileItem
-    @Binding var isHovering: Bool
-    let size: CGSize
-
-    @ObservedObject private var previewManager = InlineVideoPreviewManager.shared
-
-    func body(content: Content) -> some View {
-        content
-            .overlay {
-                if item.fileType == .video && isHovering && previewManager.currentPreviewURL == item.url && previewManager.isPreviewActive {
-                    VideoPreviewLayerView(url: item.url, isActive: previewManager.isPreviewActive)
-                        .frame(width: size.width, height: size.height)
-                        .allowsHitTesting(false)
-                        .transition(.opacity.animation(.easeInOut(duration: 0.15)))
-                }
-            }
-            .onChange(of: isHovering) { _, hovering in
-                guard AppSettings.shared.inlineVideoPreview else { return }
-                if item.fileType == .video {
-                    if hovering {
-                        InlineVideoPreviewManager.shared.requestPreview(for: item)
-                    } else {
-                        InlineVideoPreviewManager.shared.cancelPreview()
-                    }
-                }
-            }
-    }
-}
-
 // MARK: - Audio Preview Overlay
 
 /// Overlay that shows a progress bar and pause button for audio preview on hover.
@@ -123,22 +92,9 @@ struct AudioPreviewOverlayView: View {
                 }
                 .buttonStyle(.plain)
 
-                // Progress bar
-                GeometryReader { geo in
-                    ZStack(alignment: .leading) {
-                        // Track
-                        Capsule()
-                            .fill(Color.white.opacity(0.3))
-                            .frame(height: 4)
-
-                        // Fill
-                        Capsule()
-                            .fill(Color.white.opacity(0.9))
-                            .frame(width: max(0, geo.size.width * audioManager.progress), height: 4)
-                    }
-                    .frame(height: geo.size.height)
-                }
-                .frame(height: 20)
+                // Progress bar (observes only the progress value)
+                AudioPreviewProgressBar(progress: audioManager.progressState)
+                    .frame(height: 20)
             }
             .padding(.horizontal, 6)
             .padding(.vertical, 4)
@@ -154,9 +110,30 @@ struct AudioPreviewOverlayView: View {
     }
 }
 
+private struct AudioPreviewProgressBar: View {
+    @ObservedObject var progress: InlinePreviewProgress
+
+    var body: some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                // Track
+                Capsule()
+                    .fill(Color.white.opacity(0.3))
+                    .frame(height: 4)
+
+                // Fill
+                Capsule()
+                    .fill(Color.white.opacity(0.9))
+                    .frame(width: max(0, geo.size.width * progress.value), height: 4)
+            }
+            .frame(height: geo.size.height)
+        }
+    }
+}
+
 /// Overlay that shows a thin scrub progress bar at the bottom of a video thumbnail during skimming.
 struct VideoSkimProgressBar: View {
-    let progress: Double
+    @ObservedObject var progress: InlinePreviewProgress
     let size: CGSize
 
     var body: some View {
@@ -171,7 +148,7 @@ struct VideoSkimProgressBar: View {
                 // Fill
                 Rectangle()
                     .fill(Color.white.opacity(0.9))
-                    .frame(width: max(0, size.width * progress), height: 3)
+                    .frame(width: max(0, size.width * progress.value), height: 3)
             }
         }
         .frame(width: size.width, height: size.height)
@@ -180,36 +157,47 @@ struct VideoSkimProgressBar: View {
 }
 
 /// View modifier that adds inline audio/video preview on hover.
+///
+/// Cells don't observe the preview managers directly (every visible cell would re-render on each
+/// preview change); each cell subscribes to "is the preview for my URL" and only re-renders when
+/// that answer changes. High-frequency progress values are observed only by the overlay drawing them.
 struct MediaPreviewModifier: ViewModifier {
     let item: FileItem
     @Binding var isHovering: Bool
     let size: CGSize
 
-    @ObservedObject private var videoManager = InlineVideoPreviewManager.shared
-    @ObservedObject private var audioManager = InlineAudioPreviewManager.shared
+    @State private var videoStatus = VideoMatch()
+    @State private var isAudioPreviewing = false
+
+    fileprivate struct VideoMatch: Equatable {
+        var isPreviewing = false
+        var isSkimming = false
+    }
 
     func body(content: Content) -> some View {
         content
             .overlay {
                 // Video preview overlay
-                if item.fileType == .video && isHovering && videoManager.currentPreviewURL == item.url && videoManager.isPreviewActive {
-                    VideoPreviewLayerView(url: item.url, isActive: videoManager.isPreviewActive)
+                if item.fileType == .video && isHovering && videoStatus.isPreviewing {
+                    VideoPreviewLayerView(url: item.url, isActive: videoStatus.isPreviewing)
                         .frame(width: size.width, height: size.height)
                         .allowsHitTesting(false)
                         .transition(.opacity.animation(.easeInOut(duration: 0.15)))
 
                     // Scrub progress bar during skimming
-                    if videoManager.isSkimming {
-                        VideoSkimProgressBar(progress: videoManager.skimProgress, size: size)
+                    if videoStatus.isSkimming {
+                        VideoSkimProgressBar(progress: InlineVideoPreviewManager.shared.skimProgressState, size: size)
                             .transition(.opacity.animation(.easeInOut(duration: 0.1)))
                     }
                 }
                 // Audio preview overlay (progress bar + pause)
-                if item.fileType == .audio && isHovering && audioManager.currentPreviewURL == item.url && audioManager.isPreviewActive {
+                if item.fileType == .audio && isHovering && isAudioPreviewing {
                     AudioPreviewOverlayView(url: item.url, size: size)
                         .transition(.opacity.animation(.easeInOut(duration: 0.15)))
                 }
             }
+            .onReceive(videoMatchPublisher) { videoStatus = $0 }
+            .onReceive(audioMatchPublisher) { isAudioPreviewing = $0 }
             // Use onContinuousHover to get mouse position for video skimming
             .onContinuousHover { phase in
                 switch phase {
@@ -218,33 +206,75 @@ struct MediaPreviewModifier: ViewModifier {
                     if item.fileType == .video && AppSettings.shared.videoSkimming && size.width > 0 {
                         let fraction = location.x / size.width
                         InlineVideoPreviewManager.shared.seekToFraction(fraction, for: item.url)
+                    } else if item.fileType == .audio && isHovering && AppSettings.shared.inlineAudioPreview {
+                        InlineAudioPreviewManager.shared.noteHover(for: item)
                     }
                 case .ended:
-                    // End skimming when mouse leaves the thumbnail area
+                    // Leaving the thumbnail ends skimming; the preview stays on the last frame
                     if item.fileType == .video {
-                        InlineVideoPreviewManager.shared.endSkimming()
+                        InlineVideoPreviewManager.shared.endSkimming(for: item.url)
                     }
                 }
             }
             // Preview lifecycle driven by parent's onHover binding
             .onChange(of: isHovering) { _, hovering in
                 if item.fileType == .video {
-                    guard AppSettings.shared.inlineVideoPreview else { return }
                     if hovering {
+                        guard AppSettings.shared.inlineVideoPreview else { return }
                         InlineVideoPreviewManager.shared.requestPreview(for: item)
                     } else {
-                        InlineVideoPreviewManager.shared.endSkimming()
-                        InlineVideoPreviewManager.shared.cancelPreview()
+                        InlineVideoPreviewManager.shared.endSkimming(for: item.url)
+                        InlineVideoPreviewManager.shared.cancelPreview(for: item.url)
                     }
                 } else if item.fileType == .audio {
-                    guard AppSettings.shared.inlineAudioPreview else { return }
                     if hovering {
+                        guard AppSettings.shared.inlineAudioPreview else { return }
                         InlineAudioPreviewManager.shared.requestPreview(for: item)
                     } else {
-                        InlineAudioPreviewManager.shared.cancelPreview()
+                        InlineAudioPreviewManager.shared.cancelPreview(for: item.url)
                     }
                 }
             }
+            // Cells can disappear (scrolling, navigation, view switches) without ever
+            // reporting hover end; don't leave their preview running.
+            .onDisappear {
+                guard isHovering else { return }
+                if item.fileType == .video {
+                    InlineVideoPreviewManager.shared.cancelPreview(for: item.url)
+                } else if item.fileType == .audio {
+                    InlineAudioPreviewManager.shared.cancelPreview(for: item.url)
+                }
+            }
+    }
+
+    private var videoMatchPublisher: AnyPublisher<VideoMatch, Never> {
+        guard item.fileType == .video else {
+            return Just(VideoMatch()).eraseToAnyPublisher()
+        }
+        let manager = InlineVideoPreviewManager.shared
+        let url = item.url
+        return manager.$currentPreviewURL
+            .combineLatest(manager.$isPreviewActive, manager.$isSkimming)
+            .map { [weak manager] previewURL, isActive, isSkimming in
+                // Previews requested by CALayer hosts (Cover Flow) are shown by those hosts
+                let isMine = isActive && previewURL == url && manager?.currentHost == nil
+                return VideoMatch(isPreviewing: isMine, isSkimming: isMine && isSkimming)
+            }
+            .removeDuplicates()
+            .eraseToAnyPublisher()
+    }
+
+    private var audioMatchPublisher: AnyPublisher<Bool, Never> {
+        guard item.fileType == .audio else {
+            return Just(false).eraseToAnyPublisher()
+        }
+        let manager = InlineAudioPreviewManager.shared
+        let url = item.url
+        return manager.$currentPreviewURL
+            .combineLatest(manager.$isPreviewActive)
+            .map { previewURL, isActive in isActive && previewURL == url }
+            .removeDuplicates()
+            .eraseToAnyPublisher()
     }
 }
 
