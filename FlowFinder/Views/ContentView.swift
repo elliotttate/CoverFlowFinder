@@ -982,6 +982,7 @@ struct PathBarView: View {
                     .onAppear {
                         editText = viewModel.currentPath.path
                         isTextFieldFocused = true
+                        selectAllPathText()
                     }
 
                 Button(action: { navigateToPath(editText) }) {
@@ -1037,8 +1038,8 @@ struct PathBarView: View {
                     }
             }
         }
-        .padding(.horizontal, 12)
-        .frame(height: 28)
+        .padding(.horizontal, 16)
+        .frame(height: 36)
         .background(Color(nsColor: .controlBackgroundColor).opacity(0.5))
     }
 
@@ -1057,6 +1058,20 @@ struct PathBarView: View {
     private func startEditing() {
         editText = viewModel.currentPath.path
         isEditing = true
+    }
+
+    /// Selects the whole path once the field editor is up, so it can be copied right away.
+    /// Targets the field editor directly so a not-yet-focused field never sends Select All to the file list.
+    private func selectAllPathText(attempt: Int = 0) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + (attempt == 0 ? 0 : 0.03)) {
+            guard isEditing else { return }
+            if let editor = NSApp.keyWindow?.firstResponder as? NSTextView, editor.isFieldEditor,
+               editor.string == editText {
+                editor.selectAll(nil)
+            } else if attempt < 10 {
+                selectAllPathText(attempt: attempt + 1)
+            }
+        }
     }
 
     private func cancelEditing() {
