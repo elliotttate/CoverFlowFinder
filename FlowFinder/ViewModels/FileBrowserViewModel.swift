@@ -866,6 +866,12 @@ class FileBrowserViewModel: ObservableObject {
     @Published var filterTag: String? = nil
     @Published var isLoading: Bool = false
     @Published var isSearching: Bool = false
+    /// This pane's sort. Navigating seeds it from the folder's saved state (per-folder memory) or
+    /// the default sort; `setSort`/`setSortColumn` change it.
+    @Published private(set) var sortState = SortState(column: .name, direction: .ascending)
+    /// The current folder's own column layout (per-folder memory); nil shows the shared layout
+    /// (`ListColumnConfigManager.columns`).
+    @Published private(set) var folderColumns: [ColumnSettings]?
 
     // Search results for Finder and Everything modes
     @Published var searchResults: [FileItem] = [] {
@@ -883,8 +889,8 @@ class FileBrowserViewModel: ObservableObject {
     private var sortedSearchResultsCacheKey: SortedSearchResultsCacheKey?
     private var sortedSearchResultsCache: [FileItem] = []
 
-    /// Sorted search results - uses ListColumnConfigManager for consistency with normal file sorting
-    /// This means clicking column headers in List View sorts search results too.
+    /// Sorted search results, in this pane's sort like the folder's items, so clicking column
+    /// headers in List View sorts search results too.
     /// Cached per (results, sort state): views read this several times per render.
     var sortedSearchResults: [FileItem] {
         guard !searchResults.isEmpty else {
@@ -892,7 +898,7 @@ class FileBrowserViewModel: ObservableObject {
             return []
         }
 
-        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let sortState = self.sortState
         let cacheKey = SortedSearchResultsCacheKey(
             revision: searchResultsRevision,
             sortState: sortState,
@@ -1038,8 +1044,6 @@ class FileBrowserViewModel: ObservableObject {
     /// Track which items have had their cloud status loaded
     private var cloudStatusLoadedURLs: Set<URL> = []
     private var pendingCloudStatusURLs: Set<URL> = []
-    /// Flag to prevent redundant reloads during navigation
-    private var isNavigating = false
     /// Queue for metadata hydration requests
     private var pendingHydrationURLs: Set<URL> = []
     private let hydrationQueue = DispatchQueue(label: "com.coverflowfinder.hydration", qos: .userInitiated)
@@ -1173,7 +1177,7 @@ class FileBrowserViewModel: ObservableObject {
 
     /// Filter items in the current directory (original filter behavior)
     private func filterCurrentDirectoryItems() -> [FileItem] {
-        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let sortState = self.sortState
         let foldersFirst = AppSettings.shared.foldersFirst
         let tagsMatter = (filterTag != nil && !isInsideArchive) || sortState.column == .tags
         let cacheKey = FilteredItemsCacheKey(
@@ -1229,6 +1233,7 @@ class FileBrowserViewModel: ObservableObject {
 
     init(initialPath: URL = FileManager.default.homeDirectoryForCurrentUser) {
         self.currentPath = initialPath
+        applyFolderColumnState(for: initialPath)
         loadContents()
         addToHistory(.filesystem(initialPath))
 
@@ -1277,29 +1282,6 @@ class FileBrowserViewModel: ObservableObject {
             .filter { $0 == true }
             .sink { [weak self] _ in
                 self?.cancelPendingRename()
-            }
-            .store(in: &cancellables)
-
-        let columnConfig = ListColumnConfigManager.shared
-        columnConfig.$sortColumn
-            .dropFirst() // Skip initial value
-            .sink { [weak self] _ in
-                guard let self else { return }
-                self.objectWillChange.send()
-
-                // Skip reload during navigation - loadContents will be called with correct sort state
-                guard !self.isNavigating else { return }
-                self.scheduleSortChangeHandling()
-            }
-            .store(in: &cancellables)
-
-        columnConfig.$sortDirection
-            .dropFirst()
-            .sink { [weak self] _ in
-                guard let self else { return }
-                self.objectWillChange.send()
-                guard !self.isNavigating else { return }
-                self.scheduleSortChangeHandling()
             }
             .store(in: &cancellables)
 
@@ -1405,7 +1387,7 @@ class FileBrowserViewModel: ObservableObject {
         let listingURL = resolvedListingURL(for: pathToLoad)
         startDirectoryWatcher(for: listingURL)
 
-        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let sortState = self.sortState
         let showHiddenFiles = AppSettings.shared.showHiddenFiles
         let batchSize = directoryBatchSize
         let existingIDs = itemIDsByPath
@@ -1688,9 +1670,92 @@ class FileBrowserViewModel: ObservableObject {
         return indexByURL
     }
 
-    /// Handles a sort column/direction change on the next run-loop turn: `@Published` emits in
-    /// willSet and `setSortColumn` sets the column and then the direction, so the final sort
-    /// state is only readable afterwards.
+    // MARK: - Sort & Column State
+
+    /// Sorts this pane by `column` (column header click, Sort menu), or reverses the direction
+    /// when it's already sorted by it.
+    func setSortColumn(_ column: ListColumn) {
+        if sortState.column == column {
+            setSort(SortState(column: column, direction: sortState.direction == .ascending ? .descending : .ascending))
+        } else {
+            setSort(SortState(column: column, direction: column.defaultSortDirection))
+        }
+    }
+
+    /// An explicit sort change by the user. Only this pane re-sorts; the sort becomes the default
+    /// for folders without saved state and, with per-folder memory on, is saved for this folder.
+    func setSort(_ newSort: SortState) {
+        guard newSort != sortState else { return }
+        sortState = newSort
+        ListColumnConfigManager.shared.defaultSortState = newSort
+        saveFolderColumnState()
+        scheduleSortChangeHandling()
+    }
+
+    /// An explicit column change (show/hide, resize, reorder) made in this pane's list: `columns`
+    /// is the layout it now shows. The list also applied the change to the shared layout. With
+    /// per-folder memory on, this folder keeps `columns`.
+    func columnLayoutChangedByUser(_ columns: [ColumnSettings]) {
+        guard AppSettings.shared.usePerFolderColumnState, columnStateFolderURL != nil else {
+            // Show the shared layout, which has the change
+            if folderColumns != nil {
+                folderColumns = nil
+            }
+            return
+        }
+        saveFolderColumnState(columns: columns)
+    }
+
+    /// Column header menu "Reset to Defaults" (after the shared layout and default sort were
+    /// reset): forgets this folder's saved state and shows the defaults.
+    func resetFolderColumnState() {
+        if let folder = columnStateFolderURL {
+            PerFolderColumnStateManager.shared.clearState(for: folder)
+        }
+        if folderColumns != nil {
+            folderColumns = nil
+        }
+        let defaultSort = ListColumnConfigManager.shared.defaultSortState
+        if sortState != defaultSort {
+            sortState = defaultSort
+            scheduleSortChangeHandling()
+        }
+    }
+
+    /// The folder whose saved column state applies to the current location: nil inside an
+    /// archive, the Photos library and /Network (they keep the pane's current sort and columns).
+    private var columnStateFolderURL: URL? {
+        guard !isInsideArchive, photosLibraryInfo == nil, currentPath.path != "/Network" else { return nil }
+        return currentPath
+    }
+
+    /// Saves this pane's sort and columns for the current folder when per-folder memory is on.
+    /// The folder then shows its own column layout rather than the shared one.
+    private func saveFolderColumnState(columns: [ColumnSettings]? = nil) {
+        guard AppSettings.shared.usePerFolderColumnState, let folder = columnStateFolderURL else { return }
+        let layout = columns ?? folderColumns ?? ListColumnConfigManager.shared.columns
+        if folderColumns != layout {
+            folderColumns = layout
+        }
+        PerFolderColumnStateManager.shared.saveState(for: folder, columns: layout, sortState: sortState)
+    }
+
+    /// Shows `url` with its saved sort and columns (per-folder memory) or with the default sort and
+    /// the shared layout. Called while navigating, before the load: no reload for the sort here.
+    private func applyFolderColumnState(for url: URL) {
+        let saved = AppSettings.shared.usePerFolderColumnState ? PerFolderColumnStateManager.shared.getState(for: url) : nil
+        let sort = saved?.sortState ?? ListColumnConfigManager.shared.defaultSortState
+        if sortState != sort {
+            sortState = sort
+        }
+        // Saved layouts predating a column get it (hidden)
+        let columns = saved.map { ListColumnConfigManager.normalizedColumns($0.columns) }
+        if folderColumns != columns {
+            folderColumns = columns
+        }
+    }
+
+    /// Reloads for a sort change on the next run-loop turn, once for quick successive changes.
     private func scheduleSortChangeHandling() {
         guard !sortChangeWorkScheduled else { return }
         sortChangeWorkScheduled = true
@@ -1702,7 +1767,7 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     private func handleSortChange() {
-        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let sortState = self.sortState
         guard Self.sortStateRequiresMetadata(sortState),
               !isInsideArchive,
               photosLibraryInfo == nil,
@@ -2199,7 +2264,7 @@ class FileBrowserViewModel: ObservableObject {
               !isInsideArchive, photosLibraryInfo == nil else { return }
 
         let showHidden = AppSettings.shared.showHiddenFiles
-        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let sortState = self.sortState
         let shouldLoadMetadata = items.count <= directoryBatchSize || Self.sortStateRequiresMetadata(sortState)
         var existingIDs: [String: UUID] = [:]
         for path in paths {
@@ -2386,7 +2451,7 @@ class FileBrowserViewModel: ObservableObject {
         beginLoadingNewLocation()
         let infoSnapshot = info
         let pendingURL = pendingSelectionURL
-        let sortState = ListColumnConfigManager.shared.sortStateSnapshot()
+        let sortState = self.sortState
         let useOriginalFilenames = AppSettings.shared.masonryShowFilenames
         let loadToken = UUID()
         photosLoadToken = loadToken
@@ -2950,14 +3015,11 @@ class FileBrowserViewModel: ObservableObject {
 
     // MARK: - Navigation
 
-    /// Bookkeeping before leaving the current location: stops inline previews, saves the
-    /// folder's column state and resets per-folder selection state.
+    /// Bookkeeping before leaving the current location: stops inline previews and resets
+    /// per-folder selection state. (Column state is saved when the user changes it, not here.)
     private func prepareForNavigation() {
         InlinePreviews.stopAll()
         cancelPendingRename()
-        if !isInsideArchive, photosLibraryInfo == nil, currentPath.path != "/Network" {
-            ListColumnConfigManager.shared.saveCurrentStateForFolder(currentPath, appSettings: AppSettings.shared)
-        }
         archiveReadToken = UUID()
         selectedItems.removeAll()
         lastSelectedIndex = 0
@@ -2972,13 +3034,6 @@ class FileBrowserViewModel: ObservableObject {
         currentArchiveURL = nil
         currentArchivePath = ""
         archiveEntries = []
-    }
-
-    /// Applies the folder's saved column state without the sort sink reloading (a load follows).
-    private func applyFolderColumnState(for url: URL) {
-        isNavigating = true
-        ListColumnConfigManager.shared.applyPerFolderState(for: url, appSettings: AppSettings.shared)
-        isNavigating = false
     }
 
     /// Whether `url` is the folder that's already shown. Inside an archive or the Photos

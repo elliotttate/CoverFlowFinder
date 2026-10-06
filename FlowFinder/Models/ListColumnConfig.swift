@@ -86,7 +86,12 @@ struct SortState: Equatable {
     let direction: SortDirection
 }
 
-// Observable column configuration manager
+/// The list view's shared column layout and the default sort.
+///
+/// Each `FileBrowserViewModel` owns the sort it shows (`sortState`); `sortColumn`/`sortDirection`
+/// here are only the sort a pane starts with in a folder without saved per-folder state. The
+/// column layout is shared by every list, except in a folder with its own saved layout
+/// (`FileBrowserViewModel.folderColumns`).
 class ListColumnConfigManager: ObservableObject {
     static let shared = ListColumnConfigManager()
 
@@ -94,10 +99,12 @@ class ListColumnConfigManager: ObservableObject {
         didSet { scheduleSave() }
     }
 
+    /// Default sort column for folders without saved state (see `defaultSortState`)
     @Published var sortColumn: ListColumn {
         didSet { scheduleSave() }
     }
 
+    /// Default sort direction for folders without saved state (see `defaultSortState`)
     @Published var sortDirection: SortDirection {
         didSet { scheduleSave() }
     }
@@ -177,13 +184,24 @@ class ListColumnConfigManager: ObservableObject {
     }
 
     func toggleColumnVisibility(_ column: ListColumn) {
-        // Don't allow hiding the name column
-        if column == .name { return }
-        if let index = columns.firstIndex(where: { $0.column == column }) {
-            columns[index].isVisible.toggle()
-        } else {
-            columns.append(ColumnSettings(column: column, isVisible: true))
+        let isVisible = columns.first(where: { $0.column == column })?.isVisible ?? false
+        let updated = Self.columns(columns, setting: column, visible: !isVisible)
+        if updated != columns {
+            columns = updated
         }
+    }
+
+    /// `columns` with `column` shown or hidden. Name can't be hidden; a column missing from
+    /// `columns` is added.
+    static func columns(_ columns: [ColumnSettings], setting column: ListColumn, visible: Bool) -> [ColumnSettings] {
+        guard column != .name else { return columns }
+        var updated = columns
+        if let index = updated.firstIndex(where: { $0.column == column }) {
+            updated[index].isVisible = visible
+        } else {
+            updated.append(ColumnSettings(column: column, isVisible: visible))
+        }
+        return updated
     }
 
     func setColumnWidth(_ column: ListColumn, width: CGFloat) {
@@ -195,6 +213,18 @@ class ListColumnConfigManager: ObservableObject {
     /// Applies a new visible-column order and widths in one change (one publish, one save).
     /// Hidden columns keep their settings and stay after the visible ones.
     func applyColumnLayout(visibleOrder: [ListColumn], widths: [ListColumn: CGFloat]) {
+        let updated = Self.columns(columns, applyingVisibleOrder: visibleOrder, widths: widths)
+        if updated != columns {
+            columns = updated
+        }
+    }
+
+    /// `columns` with the visible columns in `visibleOrder`, with the given widths.
+    static func columns(
+        _ columns: [ColumnSettings],
+        applyingVisibleOrder visibleOrder: [ListColumn],
+        widths: [ListColumn: CGFloat]
+    ) -> [ColumnSettings] {
         var updated: [ColumnSettings] = []
         for column in visibleOrder {
             guard var settings = columns.first(where: { $0.column == column }) else { continue }
@@ -207,18 +237,29 @@ class ListColumnConfigManager: ObservableObject {
         for settings in columns where !visibleOrder.contains(settings.column) {
             updated.append(settings)
         }
-        if updated != columns {
-            columns = updated
-        }
+        return updated
     }
 
-    func setSortColumn(_ column: ListColumn) {
-        if sortColumn == column {
-            sortDirection.toggle()
-        } else {
-            sortColumn = column
-            sortDirection = column.defaultSortDirection
+    /// `columns` with the given widths, and the columns in `order` rearranged into that order
+    /// within the positions they occupy. Visibility is unchanged.
+    static func columns(
+        _ columns: [ColumnSettings],
+        reordering order: [ListColumn],
+        widths: [ListColumn: CGFloat]
+    ) -> [ColumnSettings] {
+        var updated = columns
+        for index in updated.indices {
+            if let width = widths[updated[index].column] {
+                updated[index].width = max(updated[index].column.minWidth, width)
+            }
         }
+        let moving = Set(order)
+        let slots = updated.indices.filter { moving.contains(updated[$0].column) }
+        let settingsByColumn = Dictionary(slots.map { (updated[$0].column, updated[$0]) }, uniquingKeysWith: { first, _ in first })
+        for (slot, settings) in zip(slots, order.compactMap { settingsByColumn[$0] }) {
+            updated[slot] = settings
+        }
+        return updated
     }
 
     func moveColumn(from source: IndexSet, to destination: Int) {
@@ -231,8 +272,19 @@ class ListColumnConfigManager: ObservableObject {
         sortDirection = .ascending
     }
 
+    /// The sort a pane starts with in a folder without saved state of its own. An explicit sort
+    /// change in any pane updates it.
+    var defaultSortState: SortState {
+        get { SortState(column: sortColumn, direction: sortDirection) }
+        set {
+            if sortColumn != newValue.column { sortColumn = newValue.column }
+            if sortDirection != newValue.direction { sortDirection = newValue.direction }
+        }
+    }
+
+    @available(*, deprecated, message: "Sort is per pane: use FileBrowserViewModel.sortState (this is only the default)")
     func sortStateSnapshot() -> SortState {
-        SortState(column: sortColumn, direction: sortDirection)
+        defaultSortState
     }
 
     private func scheduleSave() {
@@ -265,11 +317,6 @@ class ListColumnConfigManager: ObservableObject {
         let sortDirection: SortDirection
     }
 
-    // Sort items based on current configuration
-    func sortedItems(_ items: [FileItem], foldersFirst: Bool = true) -> [FileItem] {
-        Self.sortedItems(items, sortState: sortStateSnapshot(), foldersFirst: foldersFirst)
-    }
-
     /// Sorts `items` for display with the given sort state. Pure (no shared state), safe off the main thread;
     /// any view that shows a sorted file list can reuse it.
     static func sortedItems(_ items: [FileItem], sortState: SortState, foldersFirst: Bool = true) -> [FileItem] {
@@ -299,14 +346,16 @@ class ListColumnConfigManager: ObservableObject {
             keys = []
         }
 
+        // Folders first. Packages (.app, .rtfd, …) open as documents, so like Finder they sort with files.
+        let isFolder: [Bool] = foldersFirst ? items.map { $0.isDirectory && !$0.isPackage } : []
+
         let ascending = sortState.direction == .ascending
         let order = items.indices.sorted { lhs, rhs in
             let item1 = items[lhs]
             let item2 = items[rhs]
 
-            // Folders always come first
-            if foldersFirst, item1.isDirectory != item2.isDirectory {
-                return item1.isDirectory
+            if foldersFirst, isFolder[lhs] != isFolder[rhs] {
+                return isFolder[lhs]
             }
 
             let comparison: ComparisonResult

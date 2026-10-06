@@ -316,6 +316,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var appliedColumns: [ColumnSettings] = []
     private var isApplyingColumnLayout = false
     private var columnCommitWorkItem: DispatchWorkItem?
+    private weak var columnCommitViewModel: FileBrowserViewModel?
+    private var columnCommitFolderKey: String?
     private static let columnCommitDelay: TimeInterval = 0.15
 
     // Display settings
@@ -552,7 +554,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         let oldItems = items
 
         // A re-sort by the user shows the selection (or the top); data-driven changes keep the position
-        let sortKey = SortKey(sort: columnConfig.sortStateSnapshot(), foldersFirst: appSettings.foldersFirst)
+        let sortKey = SortKey(sort: viewModel.sortState, foldersFirst: appSettings.foldersFirst)
         let sortChanged = lastSortKey != nil && lastSortKey != sortKey
         lastSortKey = sortKey
 
@@ -1004,11 +1006,17 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         return column
     }
 
+    /// The column layout this list shows: the folder's own (per-folder memory) or the shared one.
+    private var currentColumns: [ColumnSettings] {
+        viewModel.folderColumns ?? columnConfig.columns
+    }
+
     /// Makes the table's columns match the configuration in place (visibility, order, width)
     /// instead of rebuilding them, so nothing is reloaded for a width or order change.
     private func applyColumnConfiguration() {
         guard let tableView = tableView else { return }
-        let desired = columnConfig.visibleColumns
+        let columns = currentColumns
+        let desired = columns.filter(\.isVisible)
         let desiredIDs = Set(desired.map { $0.column.rawValue })
 
         isApplyingColumnLayout = true
@@ -1038,7 +1046,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
                 column.width = settings.width
             }
         }
-        appliedColumns = columnConfig.columns
+        appliedColumns = columns
 
         if columnsChanged {
             // The sort column may have just been added
@@ -1057,37 +1065,35 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         }
     }
 
+    /// Shows the view model's sort (this pane's) in the header.
     private func applySortDescriptorToTableView() {
         guard let tableView = tableView else { return }
+        let sort = viewModel.sortState
 
         // Only update if sort actually changed
-        guard lastSortColumn != columnConfig.sortColumn ||
-              lastSortDirection != columnConfig.sortDirection else { return }
+        guard lastSortColumn != sort.column ||
+              lastSortDirection != sort.direction else { return }
 
-        // Find the column matching our current sort
-        let sortColumnID = columnConfig.sortColumn.rawValue
-        guard let column = tableView.tableColumns.first(where: { $0.identifier.rawValue == sortColumnID }),
-              let prototype = column.sortDescriptorPrototype else { return }
-
-        // Create a new descriptor with the correct direction
-        let descriptor = NSSortDescriptor(
-            key: prototype.key,
-            ascending: columnConfig.sortDirection == .ascending,
-            selector: prototype.selector
-        )
+        // Find the column matching our current sort. Sorted by a hidden column (e.g. from the
+        // toolbar's Sort menu): no header shows a sort. Showing the column re-applies it.
+        let sortColumnID = sort.column.rawValue
+        let prototype = tableView.tableColumns.first(where: { $0.identifier.rawValue == sortColumnID })?.sortDescriptorPrototype
+        let descriptors = prototype.map {
+            [NSSortDescriptor(key: $0.key, ascending: sort.direction == .ascending, selector: $0.selector)]
+        } ?? []
 
         // Set this as the active sort descriptor (prevent feedback loop)
         isUpdatingSort = true
-        tableView.sortDescriptors = [descriptor]
-        lastSortColumn = columnConfig.sortColumn
-        lastSortDirection = columnConfig.sortDirection
+        tableView.sortDescriptors = descriptors
+        lastSortColumn = sort.column
+        lastSortDirection = sort.direction
         updateSortIndicator()
         isUpdatingSort = false
     }
 
     func syncColumnsIfNeeded() {
         // While a resize/reorder drag is uncommitted the table is ahead of the configuration
-        if columnCommitWorkItem == nil && columnConfig.columns != appliedColumns {
+        if columnCommitWorkItem == nil && currentColumns != appliedColumns {
             applyColumnConfiguration()
         }
         applySortDescriptorToTableView()
@@ -1102,13 +1108,15 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         }
 
         // Set indicator on sorted column
-        let sortColumnID = columnConfig.sortColumn.rawValue
-        if let column = tableView.tableColumns.first(where: { $0.identifier.rawValue == sortColumnID }) {
-            let image = columnConfig.sortDirection == .ascending
+        let sort = viewModel.sortState
+        if let column = tableView.tableColumns.first(where: { $0.identifier.rawValue == sort.column.rawValue }) {
+            let image = sort.direction == .ascending
                 ? NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "Ascending")
                 : NSImage(systemSymbolName: "chevron.down", accessibilityDescription: "Descending")
             tableView.setIndicatorImage(image, in: column)
             tableView.highlightedTableColumn = column
+        } else {
+            tableView.highlightedTableColumn = nil
         }
     }
 
@@ -1128,7 +1136,13 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     }
 
     private func scheduleColumnLayoutCommit() {
-        columnCommitWorkItem?.cancel()
+        if let pending = columnCommitWorkItem {
+            pending.cancel()
+        } else {
+            // The pane and folder the drag happened in
+            columnCommitViewModel = viewModel
+            columnCommitFolderKey = viewModel.currentPath.standardizedPathKey
+        }
         let work = DispatchWorkItem { [weak self] in
             self?.commitColumnLayoutWhenMouseUp()
         }
@@ -1142,6 +1156,13 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             return
         }
         columnCommitWorkItem = nil
+        guard columnCommitViewModel === viewModel,
+              columnCommitFolderKey == viewModel.currentPath.standardizedPathKey else {
+            // The pane moved to another folder before the commit: show that folder's layout
+            // rather than storing the old one there
+            syncColumnsIfNeeded()
+            return
+        }
         commitColumnLayout()
     }
 
@@ -1155,8 +1176,22 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             order.append(listColumn)
             widths[listColumn] = column.width
         }
-        columnConfig.applyColumnLayout(visibleOrder: order, widths: widths)
-        appliedColumns = columnConfig.columns
+        applyUserColumnChange(
+            shown: ListColumnConfigManager.columns(currentColumns, applyingVisibleOrder: order, widths: widths),
+            // The shared layout takes the new widths and order, not this folder's column visibility
+            shared: ListColumnConfigManager.columns(columnConfig.columns, reordering: order, widths: widths)
+        )
+        appliedColumns = currentColumns
+    }
+
+    /// Applies a column change the user made in this list: `shown` is the layout the list now
+    /// shows (with per-folder memory on, saved as this folder's), `shared` the change applied to
+    /// the shared layout that folders without their own use (one publish, one debounced save).
+    private func applyUserColumnChange(shown: [ColumnSettings], shared: [ColumnSettings]) {
+        if columnConfig.columns != shared {
+            columnConfig.columns = shared
+        }
+        viewModel.columnLayoutChangedByUser(shown)
     }
 
     // MARK: - Header Menu
@@ -1334,15 +1369,14 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
               let key = descriptor.key,
               let column = ListColumn(rawValue: key) else { return }
 
-        let newDirection: SortDirection = descriptor.ascending ? .ascending : .descending
+        let newSort = SortState(column: column, direction: descriptor.ascending ? .ascending : .descending)
 
-        // Only update if something actually changed
-        if columnConfig.sortColumn != column || columnConfig.sortDirection != newDirection {
+        // Only update if something actually changed. Sorts this pane only.
+        if viewModel.sortState != newSort {
             isUpdatingSort = true
-            columnConfig.sortColumn = column
-            columnConfig.sortDirection = newDirection
-            lastSortColumn = column
-            lastSortDirection = newDirection
+            viewModel.setSort(newSort)
+            lastSortColumn = newSort.column
+            lastSortDirection = newSort.direction
             updateSortIndicator()
             isUpdatingSort = false
         }
@@ -1798,8 +1832,9 @@ extension FileTableCoordinator: NSMenuDelegate {
         menu.addItem(titleItem)
         menu.addItem(NSMenuItem.separator())
 
+        let columns = currentColumns
         for column in ListColumn.allCases {
-            let isVisible = columnConfig.columns.first(where: { $0.column == column })?.isVisible ?? false
+            let isVisible = columns.first(where: { $0.column == column })?.isVisible ?? false
             let item = NSMenuItem(
                 title: column.rawValue,
                 action: #selector(toggleColumnVisibility(_:)),
@@ -1993,12 +2028,22 @@ extension FileTableCoordinator: NSMenuDelegate {
 
     @objc private func toggleColumnVisibility(_ sender: NSMenuItem) {
         guard let column = sender.representedObject as? ListColumn else { return }
-        columnConfig.toggleColumnVisibility(column)
+        toggleColumn(column)
+    }
+
+    /// Shows or hides a column (header menu).
+    func toggleColumn(_ column: ListColumn) {
+        let visible = !(currentColumns.first(where: { $0.column == column })?.isVisible ?? false)
+        applyUserColumnChange(
+            shown: ListColumnConfigManager.columns(currentColumns, setting: column, visible: visible),
+            shared: ListColumnConfigManager.columns(columnConfig.columns, setting: column, visible: visible)
+        )
         syncColumnsIfNeeded()
     }
 
     @objc private func resetColumnsToDefaults(_ sender: NSMenuItem) {
         columnConfig.resetToDefaults()
+        viewModel.resetFolderColumnState()
         syncColumnsIfNeeded()
     }
 
