@@ -17,13 +17,8 @@ struct IconGridView: View {
     @State private var pinchStartSpacing: Double?
     @State private var pinchStartFontSize: Double?
 
-    // Thumbnail loading
-    @State private var thumbnails: [URL: NSImage] = [:]
-    private let thumbnailCache = ThumbnailCacheManager.shared
-    @State private var itemsToken: Int = 0
-    @State private var visibleItemIDs: Set<UUID> = []
-    @State private var hydrationWorkItem: DispatchWorkItem?
-    @State private var lastHydratedRange: Range<Int>?
+    // Thumbnail loading (visible tiles, batching, memory window)
+    @StateObject private var thumbnailLoader = GridThumbnailLoader()
 
     private var cellWidth: CGFloat {
         let iconSize = settings.iconGridIconSizeValue
@@ -64,7 +59,7 @@ struct IconGridView: View {
                                 item: item,
                                 viewModel: viewModel,
                                 isSelected: viewModel.selectedItems.contains(item),
-                                thumbnail: thumbnails[item.url],
+                                thumbnail: thumbnailLoader.image(for: item.url),
                                 onSingleClick: { clickedOnTextArea in
                                     if let index = items.firstIndex(of: item) {
                                         let modifiers = NSEvent.modifierFlags
@@ -90,10 +85,13 @@ struct IconGridView: View {
                                     .opacity(dropTargetedItemID == item.id ? 1 : 0)
                             )
                             .onAppear {
-                                updateVisibility(for: item, isVisible: true)
+                                thumbnailLoader.tileAppeared(item.url)
                             }
                             .onDisappear {
-                                updateVisibility(for: item, isVisible: false)
+                                thumbnailLoader.tileDisappeared(item.url)
+                            }
+                            .onScrollVisibilityChange(threshold: GridThumbnailLoader.onScreenThreshold) { isVisible in
+                                thumbnailLoader.setOnScreen(item.url, isVisible)
                             }
                             .internalDrag(url: item.url)
                             .onDrop(of: [.fileURL], delegate: UnifiedFolderDropDelegate(
@@ -125,28 +123,43 @@ struct IconGridView: View {
                 .scrollEdgeEffectStyle(.soft, for: .top)
                 .onAppear {
                     currentWidth = geometry.size.width
+                    currentHeight = geometry.size.height
+                    thumbnailLoader.viewModel = viewModel
+                    thumbnailLoader.columnCount = columnCount
+                    thumbnailLoader.setTargetPixelSize(iconGridThumbnailPixelSize)
+                    thumbnailLoader.setItems(items)
                     // Scroll to selected item when view appears (e.g., when switching view modes)
-                    if let firstSelected = viewModel.selectedItems.first {
+                    if let primary = viewModel.primarySelectedItem {
                         // Use DispatchQueue to ensure layout is complete before scrolling
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
-                            scrollProxy.scrollTo(firstSelected.id, anchor: .center)
+                            scrollProxy.scrollTo(primary.id, anchor: .center)
                         }
                     }
                 }
-                .onChange(of: geometry.size.width) { newWidth in
+                .onDisappear {
+                    thumbnailLoader.stop()
+                    autoScrollTimer?.invalidate()
+                    autoScrollTimer = nil
+                }
+                .onChange(of: geometry.size.width) { _, newWidth in
                     currentWidth = newWidth
+                    thumbnailLoader.columnCount = columnCount
                 }
-                .onChange(of: viewModel.selectedItems) { newSelection in
-                    if let firstSelected = newSelection.first {
-                        withAnimation {
-                            scrollProxy.scrollTo(firstSelected.id)
-                        }
-                        updateQuickLook(for: firstSelected)
-                    } else {
+                .onChange(of: viewModel.selectedItems) { _, _ in
+                    guard let primary = viewModel.primarySelectedItem else {
                         updateQuickLook(for: nil)
+                        return
                     }
+                    // Only scroll when the lead item isn't already on screen (e.g. after a delete
+                    // the next item is usually visible and the grid should stay put).
+                    if !thumbnailLoader.isOnScreen(primary.url) {
+                        withAnimation {
+                            scrollProxy.scrollTo(primary.id)
+                        }
+                    }
+                    updateQuickLook(for: primary)
                 }
-                .onChange(of: internalDragState.isDragging) { isDragging in
+                .onChange(of: internalDragState.isDragging) { _, isDragging in
                     // Start/stop auto-scroll timer based on drag state
                     if isDragging {
                         autoScrollTimer?.invalidate()
@@ -182,23 +195,19 @@ struct IconGridView: View {
 
                             guard direction != .none else { return }
 
-                            // Find visible items by their indices using dictionary lookup
-                            let indexByID: [UUID: Int] = Dictionary(uniqueKeysWithValues: items.enumerated().map { ($1.id, $0) })
-                            let visibleIndices = visibleItemIDs.compactMap { indexByID[$0] }
-                            guard !visibleIndices.isEmpty else { return }
-
-                            let targetIndex: Int
-                            if direction == .up {
-                                let minIndex = visibleIndices.min() ?? 0
-                                targetIndex = max(0, minIndex - 1)
-                            } else {
-                                let maxIndex = visibleIndices.max() ?? (items.count - 1)
-                                targetIndex = min(items.count - 1, maxIndex + 1)
+                            // The loader always has the current items (this timer outlives renders)
+                            let (currentItems, bounds) = MainActor.assumeIsolated {
+                                (thumbnailLoader.items, thumbnailLoader.visibleIndexBounds())
                             }
+                            guard let visible = bounds else { return }
 
-                            if targetIndex >= 0 && targetIndex < items.count {
+                            let targetIndex = direction == .up
+                                ? max(0, visible.lowerBound - 1)
+                                : min(currentItems.count - 1, visible.upperBound + 1)
+
+                            if currentItems.indices.contains(targetIndex) {
                                 withAnimation(.linear(duration: 0.1)) {
-                                    scrollProxy.scrollTo(items[targetIndex].id, anchor: direction == .up ? .top : .bottom)
+                                    scrollProxy.scrollTo(currentItems[targetIndex].id, anchor: direction == .up ? .top : .bottom)
                                 }
                             }
                         }
@@ -207,10 +216,7 @@ struct IconGridView: View {
                         autoScrollTimer = nil
                     }
                 }
-                .onAppear {
-                    currentHeight = geometry.size.height
-                }
-                .onChange(of: geometry.size.height) { newHeight in
+                .onChange(of: geometry.size.height) { _, newHeight in
                     currentHeight = newHeight
                 }
             }
@@ -246,28 +252,24 @@ struct IconGridView: View {
                 viewModel.showInFinder()
             }
         }
-        .onChange(of: items) { newItems in
-            let oldToken = itemsToken
-            let newToken = itemsTokenFor(newItems)
-
-            // Only clear thumbnails if items actually changed
-            if oldToken != newToken {
-                DispatchQueue.main.async {
-                    itemsToken = newToken
-                    thumbnails.removeAll()
-                    thumbnailCache.clearForNewFolder()
-                    visibleItemIDs.removeAll()
-                    lastHydratedRange = nil
-                    hydrationWorkItem?.cancel()
-                    hydrationWorkItem = nil
-                }
-            }
+        .onChange(of: items) { _, newItems in
+            // Keeps thumbnails of items that remain, drops removed ones and reloads around
+            // the visible tiles.
+            thumbnailLoader.setItems(newItems)
         }
-        .onChange(of: settings.thumbnailQuality) { _ in
-            refreshThumbnails()
+        .onChange(of: items.map(\.contentVersion)) { _, _ in
+            // Metadata/in-place edits: reload the thumbnails whose file version changed
+            thumbnailLoader.setItems(items)
         }
-        .onChange(of: settings.iconGridIconSize) { _ in
-            refreshThumbnails()
+        .onChange(of: settings.thumbnailQuality) { _, _ in
+            thumbnailLoader.setTargetPixelSize(iconGridThumbnailPixelSize)
+        }
+        .onChange(of: settings.iconGridIconSize) { _, _ in
+            thumbnailLoader.setTargetPixelSize(iconGridThumbnailPixelSize)
+            thumbnailLoader.columnCount = columnCount
+        }
+        .onChange(of: settings.iconGridSpacing) { _, _ in
+            thumbnailLoader.columnCount = columnCount
         }
         .keyboardNavigable(
             onUpArrow: { shift in navigateSelection(by: -columnCount, extend: shift) },
@@ -294,7 +296,7 @@ struct IconGridView: View {
         let currentIndex: Int
         if extend {
             currentIndex = viewModel.lastSelectedIndex
-        } else if let selected = viewModel.selectedItems.first,
+        } else if let selected = viewModel.primarySelectedItem,
                   let idx = items.firstIndex(of: selected) {
             currentIndex = idx
         } else {
@@ -318,7 +320,7 @@ struct IconGridView: View {
     }
 
     private func openSelectedItem() {
-        if let selectedItem = viewModel.selectedItems.first {
+        if let selectedItem = viewModel.primarySelectedItem {
             viewModel.openItem(selectedItem)
         }
     }
@@ -328,8 +330,11 @@ struct IconGridView: View {
         let lowercased = searchString.lowercased()
 
         // Find the first item that starts with the typed string
-        if let matchItem = items.first(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
+        if let matchIndex = items.firstIndex(where: { $0.name.lowercased().hasPrefix(lowercased) }) {
+            let matchItem = items[matchIndex]
             viewModel.selectItem(matchItem)
+            viewModel.lastSelectedIndex = matchIndex
+            viewModel.selectionAnchorIndex = matchIndex
             updateQuickLook(for: matchItem)
         }
     }
@@ -342,182 +347,6 @@ struct IconGridView: View {
 
     private func updateQuickLook(for item: FileItem?) {
         viewModel.updateQuickLookPreview(for: item)
-    }
-
-    private func updateVisibility(for item: FileItem, isVisible: Bool) {
-        if isVisible {
-            visibleItemIDs.insert(item.id)
-        } else {
-            visibleItemIDs.remove(item.id)
-        }
-        markScrolling()
-        scheduleHydration()
-    }
-
-    @State private var isScrolling = false
-    @State private var scrollEndTimer: Timer?
-
-    private func markScrolling() {
-        isScrolling = true
-        scrollEndTimer?.invalidate()
-        scrollEndTimer = Timer.scheduledTimer(withTimeInterval: 0.15, repeats: false) { [self] _ in
-            DispatchQueue.main.async {
-                isScrolling = false
-                scheduleHydration()
-            }
-        }
-    }
-
-    private func scheduleHydration() {
-        hydrationWorkItem?.cancel()
-        let debounceTime: TimeInterval = isScrolling ? 0.1 : 0.02
-        let itemsSnapshot = items
-        let visibleSnapshot = visibleItemIDs
-        let currentColumnCount = columnCount
-        let scrolling = isScrolling
-
-        let workItem = DispatchWorkItem { [itemsSnapshot, visibleSnapshot, currentColumnCount, scrolling] in
-            guard !visibleSnapshot.isEmpty else { return }
-            // Build index lookup once
-            let indexByID: [UUID: Int] = Dictionary(uniqueKeysWithValues: itemsSnapshot.enumerated().map { ($1.id, $0) })
-            let visibleIndices = visibleSnapshot.compactMap { indexByID[$0] }
-            guard let minIndex = visibleIndices.min(),
-                  let maxIndex = visibleIndices.max() else { return }
-
-            // Use larger buffer when not scrolling
-            let buffer: Int
-            if scrolling {
-                buffer = max(12, currentColumnCount * 3)
-            } else {
-                let visibleCount = maxIndex - minIndex + 1
-                buffer = max(80, visibleCount * 4)
-            }
-
-            let start = max(0, minIndex - buffer)
-            let end = min(itemsSnapshot.count - 1, maxIndex + buffer)
-            let range = start..<(end + 1)
-
-            DispatchQueue.main.async {
-                if range == self.lastHydratedRange && scrolling { return }
-                self.lastHydratedRange = range
-
-                var urlsToHydrate: [URL] = []
-                urlsToHydrate.reserveCapacity(range.count)
-                for index in range {
-                    let item = itemsSnapshot[index]
-                    if self.viewModel.needsHydration(item) {
-                        urlsToHydrate.append(item.url)
-                    }
-                }
-                if !urlsToHydrate.isEmpty {
-                    self.viewModel.hydrateMetadata(for: urlsToHydrate)
-                }
-
-                // Load thumbnails with batching
-                let maxLoadsPerPass = scrolling ? 8 : 48
-                var loadCount = 0
-                var hasMoreToLoad = false
-
-                for index in range {
-                    let item = itemsSnapshot[index]
-                    guard !item.isDirectory else { continue }
-                    if self.thumbnails[item.url] == nil {
-                        if loadCount < maxLoadsPerPass {
-                            self.loadThumbnail(for: item)
-                            loadCount += 1
-                        } else {
-                            hasMoreToLoad = true
-                        }
-                    }
-                }
-
-                // Continue loading if not scrolling
-                if hasMoreToLoad && !self.isScrolling {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                        self.lastHydratedRange = nil
-                        self.scheduleHydration()
-                    }
-                }
-
-                // Evict thumbnails far from visible range to limit memory
-                if !scrolling {
-                    let evictionBuffer = range.count * 2
-                    let evictionStart = max(0, range.lowerBound - evictionBuffer)
-                    let evictionEnd = min(itemsSnapshot.count, range.upperBound + evictionBuffer)
-                    let keepRange = evictionStart..<evictionEnd
-                    let keepURLs = Set(itemsSnapshot[keepRange].map { $0.url })
-                    for url in self.thumbnails.keys {
-                        if !keepURLs.contains(url) {
-                            self.thumbnails.removeValue(forKey: url)
-                        }
-                    }
-                }
-            }
-        }
-        hydrationWorkItem = workItem
-        DispatchQueue.main.asyncAfter(deadline: .now() + debounceTime, execute: workItem)
-    }
-
-    private func loadThumbnail(for item: FileItem) {
-        let url = item.url
-        let targetPixelSize = iconGridThumbnailPixelSize
-
-        // Already loaded or loading
-        if let existing = thumbnails[url],
-           imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
-            return
-        }
-        if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) { return }
-        if thumbnailCache.hasFailed(url: url) {
-            // Defer state change to avoid publishing during view update
-            DispatchQueue.main.async {
-                thumbnails[url] = item.icon
-            }
-            return
-        }
-
-        // Check cache first
-        if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
-            DispatchQueue.main.async {
-                thumbnails[url] = cached
-            }
-            return
-        }
-
-        // Generate thumbnail
-        thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { url, image in
-            DispatchQueue.main.async { [self] in
-                if let image = image {
-                    thumbnails[url] = image
-                } else {
-                    thumbnails[url] = item.icon
-                }
-            }
-        }
-    }
-
-    private func handleDrop(providers: [NSItemProvider]) {
-        DropHelper.handleDrop(providers: providers, viewModel: viewModel)
-    }
-
-    private func refreshThumbnails() {
-        // Clear hydration range to force reload of visible items at new size
-        lastHydratedRange = nil
-        scheduleHydration()
-    }
-
-    private func imageSatisfiesMinimum(_ image: NSImage, minPixelSize: CGFloat) -> Bool {
-        let maxDimension = max(image.size.width, image.size.height)
-        return maxDimension >= minPixelSize * 0.9
-    }
-
-    private func itemsTokenFor(_ items: [FileItem]) -> Int {
-        var hasher = Hasher()
-        hasher.combine(items.count)
-        for item in items {
-            hasher.combine(item.id)
-        }
-        return hasher.finalize()
     }
 
     private var magnificationGesture: some Gesture {
@@ -649,6 +478,439 @@ struct IconGridItem: View {
             clickState.lastClickTime = now
             clickState.lastClickId = AnyHashable(item.id)
             onSingleClick(onTextArea)
+        }
+    }
+}
+
+// MARK: - Grid Thumbnail Loader
+
+/// Thumbnail loading for the scrolling grids (Icon grid, Masonry).
+///
+/// - Tracks which tiles exist (`tileAppeared`) and which are really on screen (`setOnScreen`).
+/// - Around the visible tiles it hydrates metadata, keeps thumbnails for a small window and
+///   preloads further ahead into `ThumbnailCacheManager` (whose NSCache holds the rest).
+/// - Publishes arrivals at most once per runloop turn, and never for scroll bookkeeping.
+/// - Reloads a thumbnail when the target size grows (zoom, resize, quality) or the file changes.
+@MainActor
+final class GridThumbnailLoader: ObservableObject {
+    struct Thumbnail {
+        let image: NSImage
+        /// The size it was requested at (the image may be smaller if the source is).
+        let pixelSize: CGFloat
+        /// File version it was made from; nil when unknown (no metadata yet).
+        let version: ThumbnailFileVersion?
+        let isFallback: Bool
+    }
+
+    /// Fraction of a tile that must be visible to count as on screen.
+    static let onScreenThreshold: Double = 0.9
+
+    @Published private(set) var thumbnails: [URL: Thumbnail] = [:]
+
+    weak var viewModel: FileBrowserViewModel?
+    /// Load Photos-library items through the view model (Masonry).
+    var loadsPhotosAssets = false
+    var columnCount = 1
+    private(set) var items: [FileItem] = []
+    private(set) var targetPixelSize: CGFloat = 256
+
+    private let cache: ThumbnailCacheManager
+    private let owner = ThumbnailRequestOwner()
+    private var indexByURL: [URL: Int] = [:]
+
+    private var realizedURLs: Set<URL> = []
+    private var onScreenURLs: Set<URL> = []
+    private(set) var isScrolling = false
+    private var scrollEndTimer: Timer?
+
+    private struct Request {
+        let pixelSize: CGFloat
+        let version: ThumbnailFileVersion?
+        let token: ThumbnailRequestToken?
+        let startedAt: Date
+    }
+    private var inFlight: [URL: Request] = [:]
+    /// Preloaded into the shared cache (outside the kept window) at this size/version.
+    private var warmed: [URL: (pixelSize: CGFloat, version: ThumbnailFileVersion?)] = [:]
+    private var keepRange: Range<Int> = 0..<0
+
+    private var pendingUpdates: [URL: Thumbnail?] = [:]
+    private var publishScheduled = false
+    private var hydrationScheduled = false
+    private var hydrationDeadline = Date.distantPast
+    private var isActive = true
+
+    init(cache: ThumbnailCacheManager = .shared) {
+        self.cache = cache
+    }
+
+    deinit {
+        scrollEndTimer?.invalidate()
+    }
+
+    func image(for url: URL) -> NSImage? {
+        thumbnails[url]?.image
+    }
+
+    func index(of url: URL) -> Int? {
+        indexByURL[url]
+    }
+
+    func isOnScreen(_ url: URL) -> Bool {
+        onScreenURLs.contains(url)
+    }
+
+    /// Lowest and highest index among the tiles that currently exist.
+    func visibleIndexBounds() -> ClosedRange<Int>? {
+        let indices = realizedURLs.compactMap { indexByURL[$0] }
+        guard let low = indices.min(), let high = indices.max() else { return nil }
+        return low...high
+    }
+
+    // MARK: Inputs
+
+    func setItems(_ newItems: [FileItem]) {
+        isActive = true
+        if Self.sameStorage(newItems, items) { return }
+
+        items = newItems
+        var newIndex: [URL: Int] = [:]
+        newIndex.reserveCapacity(newItems.count)
+        for (index, item) in newItems.enumerated() where newIndex[item.url] == nil {
+            newIndex[item.url] = index
+        }
+        let removed = indexByURL.keys.filter { newIndex[$0] == nil }
+        indexByURL = newIndex
+
+        if !removed.isEmpty {
+            for url in removed {
+                if let token = inFlight.removeValue(forKey: url)?.token {
+                    cache.cancel(token)
+                }
+                warmed.removeValue(forKey: url)
+                realizedURLs.remove(url)
+                onScreenURLs.remove(url)
+                if thumbnails[url] != nil {
+                    pendingUpdates[url] = .some(nil)
+                }
+            }
+            schedulePublish()
+        }
+        // Remaining tiles keep their thumbnails; the pass reloads changed files and new items.
+        scheduleHydration(after: 0)
+    }
+
+    func setTargetPixelSize(_ size: CGFloat) {
+        guard abs(size - targetPixelSize) >= 8 else { return }
+        targetPixelSize = size
+        scheduleHydration(after: 0)
+    }
+
+    func tileAppeared(_ url: URL) {
+        realizedURLs.insert(url)
+        markScrolling()
+        scheduleHydration(after: isScrolling ? 0.1 : 0.02)
+    }
+
+    func tileDisappeared(_ url: URL) {
+        realizedURLs.remove(url)
+        onScreenURLs.remove(url)
+        markScrolling()
+        scheduleHydration(after: isScrolling ? 0.1 : 0.02)
+    }
+
+    func setOnScreen(_ url: URL, _ isOnScreen: Bool) {
+        if isOnScreen {
+            onScreenURLs.insert(url)
+        } else {
+            onScreenURLs.remove(url)
+        }
+    }
+
+    /// Cancel outstanding work (view disappeared). `setItems` resumes.
+    func stop() {
+        isActive = false
+        scrollEndTimer?.invalidate()
+        scrollEndTimer = nil
+        cache.cancelRequests(for: owner)
+        inFlight.removeAll()
+    }
+
+    // MARK: Scheduling
+
+    private func markScrolling() {
+        if !isScrolling {
+            isScrolling = true
+        }
+        // Reuse one timer: push its fire date out while tiles keep appearing.
+        let fireDate = Date().addingTimeInterval(0.15)
+        if let timer = scrollEndTimer, timer.isValid {
+            timer.fireDate = fireDate
+            return
+        }
+        let timer = Timer(fire: fireDate, interval: 0, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                self.scrollEndTimer = nil
+                self.isScrolling = false
+                // Final, wider pass once scrolling stops
+                self.scheduleHydration(after: 0)
+            }
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        scrollEndTimer = timer
+    }
+
+    /// Debounced: one pending block; later calls only move the deadline.
+    private func scheduleHydration(after delay: TimeInterval) {
+        hydrationDeadline = Date().addingTimeInterval(delay)
+        guard !hydrationScheduled else { return }
+        hydrationScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            self?.hydrationTimerFired()
+        }
+    }
+
+    private func hydrationTimerFired() {
+        let remaining = hydrationDeadline.timeIntervalSinceNow
+        if remaining > 0.001 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + remaining) { [weak self] in
+                self?.hydrationTimerFired()
+            }
+            return
+        }
+        hydrationScheduled = false
+        runHydrationPass()
+    }
+
+    private func schedulePublish() {
+        guard !publishScheduled else { return }
+        publishScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            self?.publish()
+        }
+    }
+
+    /// One @Published write for everything that arrived since the last turn.
+    private func publish() {
+        publishScheduled = false
+        guard !pendingUpdates.isEmpty else { return }
+        var updated = thumbnails
+        for (url, thumbnail) in pendingUpdates {
+            if let thumbnail, let index = indexByURL[url], keepRange.contains(index) {
+                updated[url] = thumbnail
+            } else if thumbnail == nil {
+                updated.removeValue(forKey: url)
+            }
+        }
+        pendingUpdates.removeAll()
+        thumbnails = updated
+    }
+
+    // MARK: Hydration pass
+
+    private func currentVersion(of item: FileItem) -> ThumbnailFileVersion? {
+        guard item.hasMetadata, item.modificationDate != nil else { return nil }
+        return cache.fileVersion(for: item)
+    }
+
+    private func isOutdated(pixelSize: CGFloat, version: ThumbnailFileVersion?, isFallback: Bool, for item: FileItem) -> Bool {
+        let current = currentVersion(of: item)
+        if let current, let version, current != version {
+            return true
+        }
+        // A fallback icon doesn't get better at a larger size.
+        return !isFallback && pixelSize + 0.5 < targetPixelSize
+    }
+
+    private func runHydrationPass() {
+        guard isActive, !items.isEmpty else { return }
+        guard let visible = visibleIndexBounds() else { return }
+
+        let scrolling = isScrolling
+        let visibleCount = visible.count
+        let preloadBuffer = scrolling ? max(12, columnCount * 3) : max(80, visibleCount * 4)
+        let keepBuffer = max(24, columnCount * 4, visibleCount)
+        let range = max(0, visible.lowerBound - preloadBuffer)..<min(items.count, visible.upperBound + preloadBuffer + 1)
+        keepRange = max(0, visible.lowerBound - keepBuffer)..<min(items.count, visible.upperBound + keepBuffer + 1)
+
+        // Hydrate metadata for items in range
+        if let viewModel {
+            var urlsToHydrate: [URL] = []
+            for index in range where viewModel.needsHydration(items[index]) {
+                urlsToHydrate.append(items[index].url)
+            }
+            if !urlsToHydrate.isEmpty {
+                viewModel.hydrateMetadata(for: urlsToHydrate)
+            }
+        }
+
+        // Visible tiles first, then outward
+        let maxLoadsPerPass = scrolling ? 8 : 48
+        var loadCount = 0
+        var hasMoreToLoad = false
+        for index in Self.centerOut(range, around: visible) {
+            let item = items[index]
+            guard !item.isDirectory else { continue }
+            let url = item.url
+            let inKeepWindow = keepRange.contains(index)
+
+            if let request = inFlight[url] {
+                // Photos requests have no token; the view model may drop duplicates, so retry stale ones.
+                let isStale = request.token == nil && Date().timeIntervalSince(request.startedAt) > 10
+                if !isStale && !isOutdated(pixelSize: request.pixelSize, version: request.version, isFallback: false, for: item) {
+                    continue
+                }
+            } else if inKeepWindow {
+                if let shown = displayedThumbnail(for: url),
+                   !isOutdated(pixelSize: shown.pixelSize, version: shown.version, isFallback: shown.isFallback, for: item) {
+                    continue
+                }
+                // Already in the shared memory cache: show it without a request
+                if let cached = cache.cachedThumbnail(for: item, maxPixelSize: targetPixelSize) {
+                    stage(url, Thumbnail(image: cached, pixelSize: targetPixelSize, version: currentVersion(of: item), isFallback: false))
+                    continue
+                }
+            } else if let warm = warmed[url],
+                      !isOutdated(pixelSize: warm.pixelSize, version: warm.version, isFallback: false, for: item) {
+                continue
+            }
+
+            guard loadCount < maxLoadsPerPass else {
+                hasMoreToLoad = true
+                continue
+            }
+            loadCount += 1
+            load(item)
+        }
+
+        // Keep only a window of images around the visible tiles; the shared cache has the rest.
+        for url in thumbnails.keys where !(indexByURL[url].map(keepRange.contains) ?? false) {
+            pendingUpdates[url] = .some(nil)
+        }
+        // Stop work for items scrolled far away.
+        let abandoned = inFlight.filter { !(indexByURL[$0.key].map(range.contains) ?? false) }
+        for (url, request) in abandoned {
+            inFlight.removeValue(forKey: url)
+            if let token = request.token {
+                cache.cancel(token)
+            }
+        }
+        if warmed.count > 4 * max(range.count, 100) {
+            warmed = warmed.filter { indexByURL[$0.key].map(range.contains) ?? false }
+        }
+        if !pendingUpdates.isEmpty {
+            schedulePublish()
+        }
+
+        // If not scrolling and there are more items to load, schedule another pass
+        if hasMoreToLoad && !isScrolling {
+            scheduleHydration(after: 0.05)
+        }
+    }
+
+    private func stage(_ url: URL, _ thumbnail: Thumbnail) {
+        pendingUpdates[url] = .some(thumbnail)
+        schedulePublish()
+    }
+
+    /// What the tile shows (or will show after the pending publish).
+    private func displayedThumbnail(for url: URL) -> Thumbnail? {
+        if let pending = pendingUpdates[url] {
+            return pending
+        }
+        return thumbnails[url]
+    }
+
+    private func load(_ item: FileItem) {
+        let url = item.url
+        let pixelSize = targetPixelSize
+        let version = currentVersion(of: item)
+
+        if let previous = inFlight.removeValue(forKey: url), let token = previous.token {
+            cache.cancel(token)
+        }
+
+        if loadsPhotosAssets, let viewModel, viewModel.isPhotosItem(item) {
+            inFlight[url] = Request(pixelSize: pixelSize, version: nil, token: nil, startedAt: Date())
+            // Opportunistic delivery may call back twice (degraded, then final).
+            viewModel.requestPhotoThumbnail(for: item, targetPixelSize: pixelSize) { [weak self] image, _ in
+                guard let self else { return }
+                if let request = self.inFlight[url] {
+                    guard request.token == nil, request.pixelSize == pixelSize else { return }
+                    self.inFlight.removeValue(forKey: url)
+                }
+                guard self.indexByURL[url] != nil else { return }
+                self.stage(url, Thumbnail(image: image ?? item.icon, pixelSize: pixelSize, version: nil, isFallback: image == nil))
+            }
+            return
+        }
+
+        var completedSynchronously = false
+        // Completions arrive on the main queue (or synchronously, right here)
+        let token = cache.requestThumbnail(for: item, maxPixelSize: pixelSize, owner: owner) { [weak self] result in
+            MainActor.assumeIsolated {
+                completedSynchronously = true
+                self?.handle(result, for: item, pixelSize: pixelSize, version: version)
+            }
+        }
+        if let token, !completedSynchronously {
+            inFlight[url] = Request(pixelSize: pixelSize, version: version, token: token, startedAt: Date())
+        }
+    }
+
+    private func handle(_ result: ThumbnailRequestResult, for item: FileItem, pixelSize: CGFloat, version: ThumbnailFileVersion?) {
+        let url = item.url
+        if let request = inFlight[url] {
+            // A newer request (bigger size, new version) replaced this one
+            guard request.pixelSize == pixelSize, request.version == version else { return }
+            inFlight.removeValue(forKey: url)
+        }
+        guard indexByURL[url] != nil else { return }
+
+        switch result {
+        case .loaded(let image):
+            warmed[url] = (pixelSize, version)
+            stage(url, Thumbnail(image: image, pixelSize: pixelSize, version: version, isFallback: false))
+        case .failed:
+            warmed[url] = (pixelSize, version)
+            stage(url, Thumbnail(image: item.icon, pixelSize: pixelSize, version: version, isFallback: true))
+        case .cancelled:
+            // Retried by a later pass if it's still needed
+            break
+        }
+    }
+
+    // MARK: Helpers
+
+    /// Indices of `range`, starting with `center` and moving outward.
+    nonisolated static func centerOut(_ range: Range<Int>, around center: ClosedRange<Int>) -> [Int] {
+        guard !range.isEmpty else { return [] }
+        let low = max(range.lowerBound, min(center.lowerBound, range.upperBound - 1))
+        let high = min(range.upperBound - 1, max(center.upperBound, low))
+        var result = Array(low...high)
+        result.reserveCapacity(range.count)
+        var below = low - 1
+        var above = high + 1
+        while below >= range.lowerBound || above < range.upperBound {
+            if above < range.upperBound {
+                result.append(above)
+                above += 1
+            }
+            if below >= range.lowerBound {
+                result.append(below)
+                below -= 1
+            }
+        }
+        return result
+    }
+
+    /// Cheap "same array" test: a changed array never shares storage with the one we keep.
+    nonisolated static func sameStorage(_ lhs: [FileItem], _ rhs: [FileItem]) -> Bool {
+        guard lhs.count == rhs.count else { return false }
+        if lhs.isEmpty { return true }
+        return lhs.withUnsafeBufferPointer { a in
+            rhs.withUnsafeBufferPointer { b in a.baseAddress == b.baseAddress }
         }
     }
 }

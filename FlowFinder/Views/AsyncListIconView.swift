@@ -7,10 +7,27 @@ struct AsyncListIconView: View {
     let size: CGFloat
 
     @State private var image: NSImage?
-    @State private var lastLoadKey: String?
-    @State private var pendingRetryKey: String?
+    /// The key of the request in flight or completed; a completion only applies if it's still current.
+    @State private var loadedKey: LoadKey?
+    @State private var requestToken: ThumbnailRequestToken?
 
     private let thumbnailCache = ThumbnailCacheManager.shared
+
+    /// What the icon depends on: file, file version and pixel size.
+    private struct LoadKey: Equatable {
+        let url: URL
+        let version: FileItem.ContentVersion
+        let pixelSize: Int
+    }
+
+    private var targetPixelSize: CGFloat {
+        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
+        return max(64, size * scale * settings.thumbnailQualityValue)
+    }
+
+    private var currentKey: LoadKey {
+        LoadKey(url: item.url, version: item.contentVersion, pixelSize: Int(targetPixelSize))
+    }
 
     var body: some View {
         Image(nsImage: image ?? item.placeholderIcon)
@@ -20,69 +37,60 @@ struct AsyncListIconView: View {
             .onAppear {
                 loadIconIfNeeded()
             }
-            .onChange(of: item.url) { _ in
-                image = nil
-                lastLoadKey = nil
-                pendingRetryKey = nil
+            .onDisappear {
+                cancelRequest()
+            }
+            // Item, size or quality changed: load for the new key (reads current values)
+            .onChange(of: currentKey) { oldKey, newKey in
+                if oldKey.url != newKey.url {
+                    image = nil
+                }
                 loadIconIfNeeded()
             }
-            .onChange(of: size) { _ in
-                loadIconIfNeeded(force: true)
-            }
-            .onChange(of: settings.thumbnailQuality) { _ in
-                loadIconIfNeeded(force: true)
-            }
     }
 
-    private func loadIconIfNeeded(force: Bool = false) {
-        let scale = NSScreen.main?.backingScaleFactor ?? 2.0
-        let targetPixelSize = max(64, size * scale * settings.thumbnailQualityValue)
-        let loadKey = "\(item.url.path)|\(Int(targetPixelSize))"
-
-        if !force, loadKey == lastLoadKey {
+    private func loadIconIfNeeded() {
+        let key = currentKey
+        if key == loadedKey {
             return
         }
-        lastLoadKey = loadKey
+        cancelRequest()
+        loadedKey = key
 
-        if let cached = thumbnailCache.getCachedThumbnail(for: item.url, maxPixelSize: targetPixelSize) {
-            image = cached
-            return
-        }
-
-        if thumbnailCache.isPending(url: item.url, maxPixelSize: targetPixelSize) {
-            scheduleRetry(loadKey: loadKey)
-            return
-        }
-
-        if thumbnailCache.hasFailed(url: item.url) {
-            loadFallbackIcon()
-            return
-        }
-
-        thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { _, thumbnail in
-            if let thumbnail {
+        let item = item
+        // No polling: a request already pending elsewhere is joined and completes this one too.
+        let token = thumbnailCache.requestThumbnail(for: item, maxPixelSize: targetPixelSize, owner: nil) { result in
+            // Ignore answers for an older key (item, size or quality changed meanwhile)
+            guard loadedKey == key else { return }
+            requestToken = nil
+            switch result {
+            case .loaded(let thumbnail):
                 image = thumbnail
-            } else {
-                loadFallbackIcon()
+            case .failed:
+                loadFallbackIcon(for: item, key: key)
+            case .cancelled:
+                // Load again next time
+                loadedKey = nil
             }
         }
-    }
-
-    private func scheduleRetry(loadKey: String) {
-        guard pendingRetryKey != loadKey else { return }
-        pendingRetryKey = loadKey
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            guard pendingRetryKey == loadKey else { return }
-            pendingRetryKey = nil
-            loadIconIfNeeded(force: true)
+        if loadedKey == key {
+            requestToken = token
         }
     }
 
-    private func loadFallbackIcon() {
+    private func cancelRequest() {
+        guard let requestToken else { return }
+        thumbnailCache.cancel(requestToken)
+        self.requestToken = nil
+        // The abandoned request's key must load again next time
+        loadedKey = nil
+    }
+
+    private func loadFallbackIcon(for item: FileItem, key: LoadKey) {
         DispatchQueue.global(qos: .utility).async {
             let icon = item.icon
             DispatchQueue.main.async {
+                guard loadedKey == key else { return }
                 image = icon
             }
         }
