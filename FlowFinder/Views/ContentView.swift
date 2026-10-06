@@ -107,6 +107,7 @@ private struct BrowserWindowNotifications: ViewModifier {
     let onNextTab: () -> Void
     let onPreviousTab: () -> Void
     let onSetViewMode: (ViewMode) -> Void
+    let onGoToFolder: () -> Void
     let onViewModeRequest: (FileBrowserViewModel, ViewMode) -> Void
     let onShowInfo: (FileItem) -> Void
     let onVolumeUnmount: (URL) -> Void
@@ -136,6 +137,9 @@ private struct BrowserWindowNotifications: ViewModifier {
                       let rawValue = notification.userInfo?[BrowserWindowCommand.viewModeKey] as? String,
                       let mode = ViewMode(rawValue: rawValue) else { return }
                 onSetViewMode(mode)
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .browserGoToFolder)) { notification in
+                if isTargetWindow(notification.object) { onGoToFolder() }
             }
             .onReceive(NotificationCenter.default.publisher(for: .requestViewModeChange)) { notification in
                 // Posted with the view model it applies to (e.g. the sidebar's Photos Library).
@@ -261,12 +265,13 @@ struct ContentView: View {
                 onNextTab: { tabStore.selectNextTab() },
                 onPreviousTab: { tabStore.selectPreviousTab() },
                 onSetViewMode: setViewMode,
+                onGoToFolder: presentGoToFolder,
                 onViewModeRequest: handleViewModeRequest,
                 onShowInfo: showInfoIfOwned,
                 onVolumeUnmount: leaveUnmountedVolume
             ))
-            .onReceive(activeViewModel.$currentPath) { path in
-                windowTitle = path.finderDisplayName
+            .onReceive(activeViewModel.locationTitlePublisher) { title in
+                windowTitle = title
             }
             .onReceive(viewModel.$viewMode) { mode in
                 // Keep the layout in sync when something else changes the mode (e.g. the sidebar's
@@ -412,8 +417,15 @@ struct ContentView: View {
         return target === window
     }
 
+    /// ⇧⌘G: the Go to Folder sheet for the active pane, whatever has focus (the path bars' inline
+    /// editing is only for a double-click).
+    private func presentGoToFolder() {
+        guard let window = hostWindow.window else { return }
+        GoToFolderPrompt.present(for: activeViewModel, in: window)
+    }
+
     private func syncWindowTitle() {
-        windowTitle = activeViewModel.currentPath.finderDisplayName
+        windowTitle = activeViewModel.locationTitle
     }
 
     private func setViewMode(_ mode: ViewMode) {
@@ -462,10 +474,19 @@ struct ContentView: View {
 
     // MARK: - Tab Management
 
+    /// Like Finder, a new tab opens the folder in front: the active pane's in dual/quad mode, in
+    /// the layout (view mode) this tab uses.
     private func addNewTab() {
-        let newTab = BrowserTab(initialPath: viewModel.currentPath)
+        let newTab = BrowserTab(initialPath: Self.newTabFolder(for: activeViewModel))
+        newTab.viewModel.viewMode = currentViewMode
         newTab.viewModel.setUndoManager(undoManager)
         tabStore.addTab(newTab)
+    }
+
+    /// The folder a new tab opens for `source`: its folder (the one holding the archive while
+    /// browsing a ZIP), or the home folder instead of the Photos library's package.
+    static func newTabFolder(for source: FileBrowserViewModel) -> URL {
+        source.isPhotosLibraryActive ? FileManager.default.homeDirectoryForCurrentUser : source.currentPath
     }
 
     private func closeTab(_ tabId: UUID) {
@@ -957,6 +978,9 @@ enum GoToFolderPrompt {
                 NSSound.beep()
             }
         }
+        // The current path starts selected: type to replace it, or edit it
+        alert.window.makeFirstResponder(field)
+        field.selectText(nil)
     }
 }
 
@@ -1151,17 +1175,7 @@ final class StatusBarModel: ObservableObject {
     private func recompute() {
         guard let viewModel else { return }
 
-        if viewModel.isPhotosLibraryActive {
-            totalSizeText = nil
-        } else {
-            var total: Int64 = 0
-            var hasFiles = false
-            for item in viewModel.filteredItems where !item.isDirectory {
-                total += item.size
-                hasFiles = true
-            }
-            totalSizeText = hasFiles ? ByteCountFormatter.string(fromByteCount: total, countStyle: .file) : nil
-        }
+        totalSizeText = viewModel.isPhotosLibraryActive ? nil : Self.totalSizeText(for: viewModel.filteredItems)
 
         let path = viewModel.currentPath
         guard path.isFileURL, !viewModel.isPhotosLibraryActive, path.path != "/Network" else {
@@ -1174,6 +1188,19 @@ final class StatusBarModel: ObservableObject {
             guard let self, self.availabilityRequest == request else { return }
             self.availableText = bytes.map { "\(ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)) available" }
         }
+    }
+
+    /// The listed files' total size; nil when there are no files, or while some sizes aren't
+    /// loaded (large folders load them for visible rows only) — a partial sum isn't the total.
+    static func totalSizeText(for items: [FileItem]) -> String? {
+        var total: Int64 = 0
+        var hasFiles = false
+        for item in items where !item.isDirectory {
+            guard item.hasMetadata else { return nil }
+            total += item.size
+            hasFiles = true
+        }
+        return hasFiles ? ByteCountFormatter.string(fromByteCount: total, countStyle: .file) : nil
     }
 }
 

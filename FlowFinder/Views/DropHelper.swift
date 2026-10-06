@@ -289,6 +289,66 @@ enum DropHelper {
     }
 }
 
+// MARK: - Drop highlight reset
+
+/// SwiftUI doesn't always end a drop target's highlight: `dropExited` can be skipped (a drop on a
+/// nested target, a refused or cancelled drop), which left e.g. the pane highlight on until the
+/// next drag. The drop delegates register a reset whenever they turn a highlight on; all of them run
+/// once the drag is over (the mouse button has been up for a moment).
+@MainActor
+final class DropHighlightReset {
+    static let shared = DropHighlightReset()
+
+    private var resets: [() -> Void] = []
+    private var timer: Timer?
+    private var buttonReleasedAt: Date?
+    /// How long the button must be up: a drag session swallows its mouse-up, so it's polled.
+    let releaseGrace: TimeInterval = 0.2
+
+    private init() {}
+
+    var pendingCount: Int { resets.count }
+
+    func clearWhenDragEnds(_ reset: @escaping () -> Void) {
+        resets.append(reset)
+        guard timer == nil else { return }
+        buttonReleasedAt = nil
+        let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.poll()
+            }
+        }
+        // Common modes: it must fire while the drag session tracks the mouse.
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    private func poll() {
+        if NSEvent.pressedMouseButtons & 1 != 0 {
+            buttonReleasedAt = nil
+            return
+        }
+        let now = Date()
+        guard let releasedAt = buttonReleasedAt else {
+            buttonReleasedAt = now
+            return
+        }
+        if now.timeIntervalSince(releasedAt) >= releaseGrace {
+            resetAll()
+        }
+    }
+
+    /// Runs (and forgets) every registered reset.
+    func resetAll() {
+        let pending = resets
+        resets.removeAll()
+        timer?.invalidate()
+        timer = nil
+        buttonReleasedAt = nil
+        pending.forEach { $0() }
+    }
+}
+
 // MARK: - Unified Folder Drop Delegate
 
 /// Drop delegate for dropping onto a folder item; used by every view's folder cells.
@@ -317,6 +377,13 @@ struct UnifiedFolderDropDelegate: DropDelegate {
     func dropEntered(info: DropInfo) {
         if acceptsDrops && isUsefulDrop() {
             dropTargetedItemID = item.id
+            let binding = $dropTargetedItemID
+            let itemID = item.id
+            DropHighlightReset.shared.clearWhenDragEnds {
+                if binding.wrappedValue == itemID {
+                    binding.wrappedValue = nil
+                }
+            }
         }
     }
 
@@ -417,7 +484,23 @@ struct ContainerDropDelegate: DropDelegate {
     }
 
     func dropEntered(info: DropInfo) {
-        isDropTargeted = acceptsDrops && isUsefulDrop()
+        if acceptsDrops && isUsefulDrop() {
+            setTargeted()
+        } else {
+            isDropTargeted = false
+        }
+    }
+
+    /// Turns the highlight on, making sure it goes off again when the drag ends.
+    private func setTargeted() {
+        guard !isDropTargeted else { return }
+        isDropTargeted = true
+        let binding = $isDropTargeted
+        DropHighlightReset.shared.clearWhenDragEnds {
+            if binding.wrappedValue {
+                binding.wrappedValue = false
+            }
+        }
     }
 
     func dropExited(info: DropInfo) {
@@ -443,7 +526,7 @@ struct ContainerDropDelegate: DropDelegate {
             if isDropTargeted { isDropTargeted = false }
             return DropProposal(operation: .forbidden)
         }
-        if !isDropTargeted { isDropTargeted = true }
+        setTargeted()
         let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
         return DropProposal(operation: DropHelper.dropOperation(
             for: operation,

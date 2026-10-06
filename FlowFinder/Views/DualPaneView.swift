@@ -79,6 +79,7 @@ struct DualPaneView: View {
                 viewModel.selectItem(first)
             }
         }
+        .background(PaneFocusRequestHandler(activeViewModel: activeViewModel))
         // Same guarded, per-window handling as the single-pane views; keys go to the active pane.
         // The closures read the active pane, its mode and column count when the key is pressed.
         .keyboardNavigable(
@@ -101,6 +102,321 @@ struct DualPaneView: View {
     }
 }
 
+// MARK: - Pane path bar
+
+/// Which components a pane's breadcrumb shows when they don't all fit (Finder-like): the root and
+/// the current folder always, then as many of the components just above the current folder as fit;
+/// everything in between collapses into one "…" item.
+enum BreadcrumbCollapse {
+    enum Element: Equatable {
+        case component(Int)
+        /// Stands for these components (in path order).
+        case ellipsis(hidden: [Int])
+    }
+
+    /// - Parameters:
+    ///   - widths: Each component's natural width, padding included.
+    ///   - available: The width the breadcrumb may use.
+    ///   - separatorWidth: What a chevron between two items adds, spacing included.
+    ///   - ellipsisWidth: The width of the "…" item.
+    static func layout(widths: [CGFloat], available: CGFloat, separatorWidth: CGFloat, ellipsisWidth: CGFloat) -> [Element] {
+        let count = widths.count
+        let all = (0..<count).map(Element.component)
+        guard count > 2 else { return all }
+        let fullWidth = widths.reduce(0, +) + CGFloat(count - 1) * separatorWidth
+        guard fullWidth > available else { return all }
+
+        // Root, "…" and the current folder, then the components above the current folder while they fit.
+        var used = widths[0] + ellipsisWidth + widths[count - 1] + 2 * separatorWidth
+        var firstTrailing = count - 1
+        while firstTrailing - 1 > 1 {
+            let extra = widths[firstTrailing - 1] + separatorWidth
+            guard used + extra <= available else { break }
+            used += extra
+            firstTrailing -= 1
+        }
+        // Hiding a single component no wider than "…" saves nothing.
+        if firstTrailing == 2 && widths[1] <= ellipsisWidth {
+            return all
+        }
+        return [.component(0), .ellipsis(hidden: Array(1..<firstTrailing))]
+            + (firstTrailing..<count).map(Element.component)
+    }
+}
+
+/// A dual/quad pane's path bar: a breadcrumb (archive-aware, like the main path bar) that keeps the
+/// current folder readable and collapses the middle of long paths into "…", or, after a
+/// double-click on its empty part, a field to type a path.
+struct PanePathBar: View {
+    struct Style {
+        let font: NSFont
+        let chevronSize: CGFloat
+        let itemSpacing: CGFloat
+        let itemPadding: CGFloat
+        let horizontalPadding: CGFloat
+        let height: CGFloat
+
+        /// A truncated component (other than the current folder) stays at least this wide.
+        var minimumItemWidth: CGFloat { 44 }
+
+        static let dual = Style(font: .preferredFont(forTextStyle: .caption1), chevronSize: 9, itemSpacing: 4,
+                                itemPadding: 6, horizontalPadding: 12, height: 24)
+        static let quad = Style(font: .preferredFont(forTextStyle: .caption2), chevronSize: 8, itemSpacing: 2,
+                                itemPadding: 4, horizontalPadding: 8, height: 20)
+    }
+
+    @ObservedObject var viewModel: FileBrowserViewModel
+    let style: Style
+    let onActivate: () -> Void
+
+    @State private var isEditingPath = false
+    @State private var editPathText = ""
+    @FocusState private var isPathFieldFocused: Bool
+
+    var body: some View {
+        HStack(spacing: style.itemSpacing) {
+            if isEditingPath {
+                TextField("Path", text: $editPathText)
+                    .textFieldStyle(.plain)
+                    .font(Font(style.font))
+                    .focused($isPathFieldFocused)
+                    .onSubmit { navigateToEditedPath() }
+                    .onExitCommand { cancelPathEditing() }
+                    .onAppear {
+                        editPathText = viewModel.currentPath.path
+                        isPathFieldFocused = true
+                    }
+
+                Button(action: { navigateToEditedPath() }) {
+                    Image(systemName: "arrow.right.circle.fill")
+                        .font(Font(style.font))
+                        .foregroundColor(.accentColor)
+                }
+                .buttonStyle(.plain)
+
+                Button(action: { cancelPathEditing() }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(Font(style.font))
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            } else {
+                GeometryReader { geometry in
+                    breadcrumbs(availableWidth: geometry.size.width)
+                        .frame(width: geometry.size.width, height: geometry.size.height, alignment: .leading)
+                        .clipped()
+                }
+            }
+        }
+        .padding(.horizontal, style.horizontalPadding)
+        .frame(height: style.height)
+        .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+    }
+
+    private func breadcrumbs(availableWidth: CGFloat) -> some View {
+        let components = viewModel.pathComponents
+        let names = components.map { $0.name.finderDisplayName }
+        let widths = names.map { textWidth($0) + 2 * style.itemPadding }
+        let layout = BreadcrumbCollapse.layout(
+            widths: widths,
+            available: availableWidth,
+            separatorWidth: ceil(style.chevronSize * 0.6) + 2 * style.itemSpacing,
+            ellipsisWidth: textWidth("…") + 2 * style.itemPadding
+        )
+        let lastIndex = components.count - 1
+
+        return HStack(spacing: style.itemSpacing) {
+            ForEach(Array(layout.enumerated()), id: \.offset) { position, element in
+                if position > 0 {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: style.chevronSize))
+                        .foregroundColor(.secondary)
+                }
+                switch element {
+                case .component(let index):
+                    componentLabel(names[index], index: index, isCurrent: index == lastIndex, naturalWidth: widths[index])
+                case .ellipsis(let hidden):
+                    hiddenComponentsMenu(hidden, names: names)
+                }
+            }
+
+            // The empty part: double-click to type a path
+            Rectangle()
+                .fill(Color.primary.opacity(0.001))
+                .contentShape(Rectangle())
+                .frame(minWidth: 0, maxWidth: .infinity)
+                .onTapGesture(count: 2) {
+                    startPathEditing()
+                }
+        }
+    }
+
+    /// The current folder gets its full width first and only truncates when it can't fit on its
+    /// own; the others truncate in the middle down to `minimumItemWidth`.
+    private func componentLabel(_ name: String, index: Int, isCurrent: Bool, naturalWidth: CGFloat) -> some View {
+        Text(name)
+            .font(Font(style.font))
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .foregroundColor(isCurrent ? .primary : .secondary)
+            .padding(.horizontal, style.itemPadding)
+            .padding(.vertical, 1)
+            .frame(minWidth: isCurrent ? nil : min(naturalWidth, style.minimumItemWidth))
+            .layoutPriority(isCurrent ? 2 : 1)
+            .contentShape(Rectangle())
+            .help(name)
+            .onTapGesture {
+                navigateToComponent(at: index)
+            }
+    }
+
+    private func hiddenComponentsMenu(_ hidden: [Int], names: [String]) -> some View {
+        Menu {
+            ForEach(hidden, id: \.self) { index in
+                Button(names[index]) {
+                    navigateToComponent(at: index)
+                }
+            }
+        } label: {
+            Text("…")
+                .font(Font(style.font))
+        }
+        .menuStyle(.borderlessButton)
+        .menuIndicator(.hidden)
+        .fixedSize()
+        .padding(.horizontal, style.itemPadding)
+        .layoutPriority(1)
+        .help(hidden.map { names[$0] }.joined(separator: " › "))
+    }
+
+    private func textWidth(_ text: String) -> CGFloat {
+        ceil((text as NSString).size(withAttributes: [.font: style.font]).width)
+    }
+
+    private func navigateToComponent(at index: Int) {
+        let components = viewModel.pathComponents
+        guard components.indices.contains(index) else { return }
+        let component = components[index]
+        if let url = component.url {
+            // Also leaves an archive, in one history step
+            viewModel.navigateToAndSelectCurrent(url)
+        } else if let archivePath = component.archivePath {
+            viewModel.navigateInArchive(to: archivePath)
+        }
+        onActivate()
+    }
+
+    private func startPathEditing() {
+        editPathText = viewModel.currentPath.path
+        isEditingPath = true
+    }
+
+    private func cancelPathEditing() {
+        isEditingPath = false
+        isPathFieldFocused = false
+    }
+
+    private func navigateToEditedPath() {
+        if PathEntryResolver.navigate(viewModel, to: editPathText) {
+            cancelPathEditing()
+            onActivate()
+        } else {
+            NSSound.beep()
+        }
+    }
+}
+
+/// A pane's status row: item and selection counts, and a slow copy out of an archive (shown even
+/// when the status bar is hidden, like the single-pane status bar).
+struct PaneStatusBar: View {
+    @EnvironmentObject private var appSettings: AppSettings
+    @ObservedObject var viewModel: FileBrowserViewModel
+    let horizontalPadding: CGFloat
+    let verticalPadding: CGFloat
+
+    var body: some View {
+        if appSettings.showStatusBar {
+            HStack {
+                Text("\(viewModel.filteredItems.count) items")
+                    .font(appSettings.compactListDetailFont)
+                    .foregroundColor(.secondary)
+
+                Spacer()
+
+                archiveCopyProgress
+
+                if !viewModel.selectedItems.isEmpty {
+                    Text("\(viewModel.selectedItems.count) selected")
+                        .font(appSettings.compactListDetailFont)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(.horizontal, horizontalPadding)
+            .padding(.vertical, verticalPadding)
+            .background(Color(nsColor: .controlBackgroundColor))
+        } else if viewModel.archiveCopyProgress != nil {
+            HStack {
+                Spacer()
+                archiveCopyProgress
+            }
+            .padding(.horizontal, horizontalPadding)
+            .padding(.vertical, verticalPadding)
+            .background(Color(nsColor: .controlBackgroundColor))
+        }
+    }
+
+    @ViewBuilder
+    private var archiveCopyProgress: some View {
+        if let activity = viewModel.archiveCopyProgress {
+            ArchiveCopyProgressView(activity: activity) {
+                viewModel.cancelArchiveCopy()
+            }
+        }
+    }
+}
+
+/// Dual/quad panes have no list view of their own to focus: a `.focusFileList` request (Escape in
+/// the search field) naming the active pane's view model, or this window, hands keyboard focus back
+/// to the file area, where the window's key handling acts on the active pane. A request naming
+/// another pane's view model is ignored.
+struct PaneFocusRequestHandler: NSViewRepresentable {
+    let activeViewModel: FileBrowserViewModel
+
+    func makeNSView(context: Context) -> PaneFocusRequestView {
+        let view = PaneFocusRequestView()
+        view.activeViewModel = activeViewModel
+        return view
+    }
+
+    func updateNSView(_ nsView: PaneFocusRequestView, context: Context) {
+        nsView.activeViewModel = activeViewModel
+    }
+}
+
+final class PaneFocusRequestView: NSView {
+    weak var activeViewModel: FileBrowserViewModel?
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        NotificationCenter.default.removeObserver(self, name: .focusFileList, object: nil)
+        if window != nil {
+            NotificationCenter.default.addObserver(self, selector: #selector(handleFocusFileList(_:)), name: .focusFileList, object: nil)
+        }
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+
+    @objc private func handleFocusFileList(_ notification: Notification) {
+        guard let window, window.isKeyWindow else { return }
+        if let targetWindow = notification.object as? NSWindow, targetWindow !== window { return }
+        if let targetViewModel = notification.object as? FileBrowserViewModel, targetViewModel !== activeViewModel { return }
+        // The window itself as first responder counts as the file area (see KeyboardResponderKind)
+        window.makeFirstResponder(nil)
+    }
+}
+
+// MARK: - Dual pane
+
 struct PaneView: View {
     @EnvironmentObject private var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
@@ -110,23 +426,6 @@ struct PaneView: View {
     let onActivate: () -> Void
     let onColumnsCalculated: (Int) -> Void
     @State private var isDropTargeted = false
-    @State private var isEditingPath = false
-    @State private var editPathText = ""
-    @FocusState private var isPathFieldFocused: Bool
-
-    // Cache path components
-    private var pathComponents: [URL] {
-        var components: [URL] = []
-        var current = viewModel.currentPath
-
-        while current.path != "/" {
-            components.insert(current, at: 0)
-            current = current.deletingLastPathComponent()
-        }
-        components.insert(URL(fileURLWithPath: "/"), at: 0)
-
-        return components
-    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -145,8 +444,8 @@ struct PaneView: View {
                 .disabled(viewModel.historyIndex >= viewModel.navigationHistory.count - 1)
                 .buttonStyle(.borderless)
 
-                // Path display
-                Text(viewModel.currentPath.finderDisplayName)
+                // Location name (the archive or the folder in it while inside an archive)
+                Text(viewModel.locationTitle)
                     .font(.headline)
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -173,64 +472,7 @@ struct PaneView: View {
 
             // Path bar
             if appSettings.showPathBar {
-                HStack(spacing: 4) {
-                    if isEditingPath {
-                        TextField("Path", text: $editPathText)
-                            .textFieldStyle(.plain)
-                            .font(.caption)
-                            .focused($isPathFieldFocused)
-                            .onSubmit { navigateToEditedPath() }
-                            .onExitCommand { cancelPathEditing() }
-                            .onAppear {
-                                editPathText = viewModel.currentPath.path
-                                isPathFieldFocused = true
-                            }
-
-                        Button(action: { navigateToEditedPath() }) {
-                            Image(systemName: "arrow.right.circle.fill")
-                                .font(.caption)
-                                .foregroundColor(.accentColor)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: { cancelPathEditing() }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    } else {
-                        HStack(spacing: 4) {
-                            ForEach(pathComponents, id: \.self) { component in
-                                Text(component.lastPathComponent.isEmpty ? "/" : component.finderDisplayName)
-                                    .font(.caption)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        viewModel.navigateToAndSelectCurrent(component)
-                                        onActivate()
-                                    }
-
-                                if component != viewModel.currentPath {
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                        }
-
-                        Rectangle()
-                            .fill(Color.primary.opacity(0.001))
-                            .contentShape(Rectangle())
-                            .onTapGesture(count: 2) {
-                                startPathEditing()
-                            }
-                    }
-                }
-                .padding(.horizontal, 12)
-                .frame(height: 24)
-                .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+                PanePathBar(viewModel: viewModel, style: .dual, onActivate: onActivate)
 
                 Divider()
             }
@@ -258,25 +500,8 @@ struct PaneView: View {
 
             Divider()
 
-            // Status bar
-            if appSettings.showStatusBar {
-                HStack {
-                    Text("\(viewModel.filteredItems.count) items")
-                        .font(appSettings.compactListDetailFont)
-                        .foregroundColor(.secondary)
-
-                    Spacer()
-
-                    if !viewModel.selectedItems.isEmpty {
-                        Text("\(viewModel.selectedItems.count) selected")
-                            .font(appSettings.compactListDetailFont)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 4)
-                .background(Color(nsColor: .controlBackgroundColor))
-            }
+            // Status bar (an archive copy-out in progress shows even when it's hidden)
+            PaneStatusBar(viewModel: viewModel, horizontalPadding: 12, verticalPadding: 4)
         }
         .background(isActive ? Color.clear : Color(nsColor: .windowBackgroundColor).opacity(0.5))
         .overlay(
@@ -286,25 +511,6 @@ struct PaneView: View {
         .contentShape(Rectangle())
         .onTapGesture {
             onActivate()
-        }
-    }
-
-    private func startPathEditing() {
-        editPathText = viewModel.currentPath.path
-        isEditingPath = true
-    }
-
-    private func cancelPathEditing() {
-        isEditingPath = false
-        isPathFieldFocused = false
-    }
-
-    private func navigateToEditedPath() {
-        if PathEntryResolver.navigate(viewModel, to: editPathText) {
-            cancelPathEditing()
-            onActivate()
-        } else {
-            NSSound.beep()
         }
     }
 }
@@ -361,7 +567,7 @@ struct PaneListView: View {
                         )
                         .contentShape(Rectangle())
                         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
-                        .internalDrag(url: item.url)
+                        .internalDrag(item: item)
                         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                             item: item,
                             viewModel: viewModel,
@@ -573,7 +779,7 @@ struct PaneIconView: View {
                             .cornerRadius(8)
                             .contentShape(Rectangle())
                             .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
-                            .internalDrag(url: item.url)
+                            .internalDrag(item: item)
                             .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                                 item: item,
                                 viewModel: viewModel,

@@ -30,15 +30,30 @@ struct FinderTag: Identifiable, Hashable {
 }
 
 extension URL {
-    /// Path used to compare and key file URLs: standardized, without a trailing slash.
+    /// Path used to compare and key file URLs: without "." / ".." segments or a trailing slash.
     /// Directory URLs from `contentsOfDirectory` end in "/" while FSEvents paths and
     /// `URL(fileURLWithPath:)` for deleted folders don't, so `URL ==` can't be used for lookups.
+    /// Purely textual: `standardizedFileURL` also drops "/private" from /private/tmp/… paths, but
+    /// only while they exist, so a renamed or deleted item's key wouldn't match the one it was
+    /// listed under.
     var standardizedPathKey: String {
-        let path = standardizedFileURL.path
+        let path = standardized.path
         if path.count > 1, path.hasSuffix("/") {
             return String(path.dropLast())
         }
         return path
+    }
+
+    /// `contentsOfDirectory` lists a folder's children under its resolved path (/private/tmp/… for
+    /// /tmp/…, a symlinked folder's target). Re-roots `children` under `folder` so a listing keeps
+    /// the path form the user navigated with (path bar, watcher events, selection by URL). Returned
+    /// unchanged — prefetched resource values included — when they already are under it.
+    static func childURLs(_ children: [URL], reRootedUnder folder: URL) -> [URL] {
+        guard let first = children.first,
+              first.deletingLastPathComponent().standardizedPathKey != folder.standardizedPathKey else {
+            return children
+        }
+        return children.map { folder.appendingPathComponent($0.lastPathComponent, isDirectory: $0.hasDirectoryPath) }
     }
 }
 
@@ -612,6 +627,8 @@ struct FileItem: Identifiable, Hashable {
     }()
 
     var formattedSize: String {
+        // Not hydrated yet (large folders load sizes for visible rows): unknown, not "Zero KB"
+        guard hasMetadata else { return "--" }
         // Folders have no size; packages show theirs when it's known
         if isDirectory && !(isPackage && size > 0) { return "--" }
         return Self.byteCountFormatter.string(fromByteCount: size)

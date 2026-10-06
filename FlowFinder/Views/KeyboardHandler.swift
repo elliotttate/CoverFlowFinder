@@ -556,6 +556,9 @@ final class KeyboardManager {
 extension Notification.Name {
     /// Posted with `object:` the target browser window; `userInfo[BrowserWindowCommand.viewModeKey]` is a `ViewMode` raw value.
     static let browserSetViewMode = Notification.Name("browserSetViewMode")
+    /// Go ▸ Go to Folder…: posted with `object:` the target browser window, which asks for a path
+    /// for its active pane.
+    static let browserGoToFolder = Notification.Name("browserGoToFolder")
 }
 
 /// Window-scoped menu commands. Notifications are posted with the target window as `object` and

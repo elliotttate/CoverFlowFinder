@@ -93,7 +93,7 @@ struct IconGridView: View {
                             .onScrollVisibilityChange(threshold: GridThumbnailLoader.onScreenThreshold) { isVisible in
                                 thumbnailLoader.setOnScreen(item.url, isVisible)
                             }
-                            .internalDrag(url: item.url)
+                            .internalDrag(item: item)
                             .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                                 item: item,
                                 viewModel: viewModel,

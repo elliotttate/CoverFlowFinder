@@ -1114,6 +1114,35 @@ class FileBrowserViewModel: ObservableObject {
         return components
     }
 
+    /// The name of the location shown, as the path bar's last component: the folder, or inside an
+    /// archive the archive or the folder in it. Window, tab and pane titles show it.
+    var locationTitle: String {
+        Self.locationTitle(currentPath: currentPath, archiveURL: isInsideArchive ? currentArchiveURL : nil, archivePath: currentArchivePath)
+    }
+
+    /// `locationTitle` as it changes. (`@Published` publishes before the new value is stored, so this
+    /// is built from the published values rather than by reading `locationTitle`.)
+    var locationTitlePublisher: AnyPublisher<String, Never> {
+        Publishers.CombineLatest4($currentPath, $isInsideArchive, $currentArchiveURL, $currentArchivePath)
+            .map { path, isInsideArchive, archiveURL, archivePath in
+                Self.locationTitle(currentPath: path, archiveURL: isInsideArchive ? archiveURL : nil, archivePath: archivePath)
+            }
+            .removeDuplicates()
+            .eraseToAnyPublisher()
+    }
+
+    /// `archiveURL` is the archive being browsed (nil outside one), `archivePath` the folder in it.
+    nonisolated static func locationTitle(currentPath: URL, archiveURL: URL?, archivePath: String) -> String {
+        if let archiveURL {
+            let folderName = archivePath.split(separator: "/").last.map(String.init)
+            return (folderName ?? archiveURL.lastPathComponent).finderDisplayName
+        }
+        if currentPath.isFileURL, currentPath.standardizedPathKey == "/" {
+            return FileManager.default.displayName(atPath: "/")
+        }
+        return currentPath.finderDisplayName
+    }
+
     private var cancellables = Set<AnyCancellable>()
 
     var canGoBack: Bool {
@@ -1466,9 +1495,8 @@ class FileBrowserViewModel: ObservableObject {
                 options: showHiddenFiles ? [] : [.skipsHiddenFiles]
             )
         }
-        if directoryToList != listingURL {
-            contents = contents.map { listingURL.appendingPathComponent($0.lastPathComponent, isDirectory: $0.hasDirectoryPath) }
-        }
+        // Children keep the folder's path form (/tmp rather than /private/tmp, the link's path)
+        contents = URL.childURLs(contents, reRootedUnder: listingURL)
 
         // Phase 2: Create items. If sorting by date or size we MUST load metadata to sort correctly.
         let loadMetadataUpfront = contents.count <= batchSize || sortStateRequiresMetadata(sortState)
@@ -2281,7 +2309,8 @@ class FileBrowserViewModel: ObservableObject {
         }
         let affectedIDs = Set(existingIDs.values)
         let idsWithMetadata = Set(items.lazy.filter { affectedIDs.contains($0.id) && $0.hasMetadata }.map(\.id))
-        // Build URLs the way the listing does (same base, e.g. /private/tmp rather than /tmp)
+        // Build URLs the way the listing does: under the folder's path as shown (e.g. /tmp, not
+        // /private/tmp), like the event paths
         let listingURL = resolvedListingURL(for: currentPath)
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -2294,8 +2323,14 @@ class FileBrowserViewModel: ObservableObject {
                     continue
                 }
                 let url = listingURL.appendingPathComponent((path as NSString).lastPathComponent)
-                if !showHidden,
-                   url.lastPathComponent.hasPrefix(".") || (try? url.resourceValues(forKeys: [.isHiddenKey]))?.isHidden == true {
+                let values = try? url.resourceValues(forKeys: [.nameKey, .isHiddenKey])
+                // On a case-insensitive volume the old name of a case-only rename ("b.txt" after
+                // b.txt → B.TXT) still resolves to the file: it's only listed under its on-disk name
+                if let onDiskName = values?.name, onDiskName != url.lastPathComponent {
+                    changes.append(.removed(key: path))
+                    continue
+                }
+                if !showHidden, url.lastPathComponent.hasPrefix(".") || values?.isHidden == true {
                     changes.append(.removed(key: path))
                     continue
                 }
@@ -2337,8 +2372,12 @@ class FileBrowserViewModel: ObservableObject {
 
         for change in changes {
             switch change {
+            // Events can be older than the IDs: a rename (or its undo) moves its ID to the new path
+            // while events read off the main thread still name the old one. Only ever act on the
+            // row that is at the event's path, and never let two rows share an ID.
             case .removed(let key):
-                if let id = itemIDsByPath[key], indexByID[id] != nil {
+                if let id = itemIDsByPath[key], let index = indexByID[id],
+                   updatedItems[index].url.standardizedPathKey == key {
                     removedIDs.insert(id)
                 }
             case .present(let key, let newItem):
@@ -2346,7 +2385,11 @@ class FileBrowserViewModel: ObservableObject {
                 if let registered = itemIDsByPath[key] {
                     id = registered
                 } else {
-                    id = newItem.id
+                    if let index = indexByID[newItem.id], updatedItems[index].url.standardizedPathKey != key {
+                        id = UUID()
+                    } else {
+                        id = newItem.id
+                    }
                     itemIDsByPath[key] = id
                 }
                 var item = newItem.id == id ? newItem : newItem.withID(id)
@@ -3667,6 +3710,8 @@ class FileBrowserViewModel: ObservableObject {
             FileOperationEngine.queue.async {
                 let result = FileOperationEngine.reverse(journal.steps, journal: reversal)
                 DispatchQueue.main.async {
+                    // Undoing (or redoing) a rename keeps the item's identity, like the rename itself
+                    viewModel?.carryItemIDs(movedIn: reversal)
                     viewModel?.refresh()
                     FileOperationAlerts.reportFailures(result.failures, verb: "restored")
                 }
@@ -4404,6 +4449,14 @@ class FileBrowserViewModel: ObservableObject {
     private func carryItemID(from source: URL, to destination: URL) {
         guard let id = itemIDsByPath.removeValue(forKey: source.standardizedPathKey) else { return }
         itemIDsByPath[destination.standardizedPathKey] = id
+    }
+
+    /// `carryItemID` for every item `journal` moved (an undone or redone rename). Call once the
+    /// moves are done and before the reload.
+    private func carryItemIDs(movedIn journal: FileOperationJournal) {
+        for case let .moved(from, to) in journal.steps {
+            carryItemID(from: from, to: to)
+        }
     }
 
     /// Commit current rename and start renaming the next item (Tab behavior)

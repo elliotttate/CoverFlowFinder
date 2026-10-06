@@ -761,11 +761,13 @@ struct MediaMetadata {
         if let lensModel = exif[kCGImagePropertyExifLensModel as String] as? String {
             cameraInfo.append(("Lens Model", lensModel))
         }
-        if let focalLength = exif[kCGImagePropertyExifFocalLength as String] as? Double {
-            cameraInfo.append(("Focal Length", String(format: "%.2f mm", focalLength)))
+        if let focalLength = exif[kCGImagePropertyExifFocalLength as String] as? Double,
+           let formatted = MediaInfoFormatting.focalLength(focalLength) {
+            cameraInfo.append(("Focal Length", formatted))
         }
-        if let focalLength35mm = exif[kCGImagePropertyExifFocalLenIn35mmFilm as String] as? Int {
-            cameraInfo.append(("35mm Equivalent", "\(focalLength35mm) mm"))
+        if let focalLength35mm = exif[kCGImagePropertyExifFocalLenIn35mmFilm as String] as? Int,
+           let formatted = MediaInfoFormatting.focalLength35mm(focalLength35mm) {
+            cameraInfo.append(("35mm Equivalent", formatted))
         }
 
         // Exposure info
@@ -773,11 +775,13 @@ struct MediaMetadata {
            let shutterSpeed = MediaInfoFormatting.shutterSpeed(exposureTime) {
             exposureInfo.append(("Shutter Speed", shutterSpeed))
         }
-        if let fNumber = exif[kCGImagePropertyExifFNumber as String] as? Double {
-            exposureInfo.append(("Aperture", String(format: "f/%.1f", fNumber)))
+        if let fNumber = exif[kCGImagePropertyExifFNumber as String] as? Double,
+           let aperture = MediaInfoFormatting.aperture(fNumber) {
+            exposureInfo.append(("Aperture", aperture))
         }
-        if let iso = exif[kCGImagePropertyExifISOSpeedRatings as String] as? [Int], let isoValue = iso.first {
-            exposureInfo.append(("ISO", "\(isoValue)"))
+        if let iso = exif[kCGImagePropertyExifISOSpeedRatings as String] as? [Int],
+           let isoValue = iso.first, let formatted = MediaInfoFormatting.iso(isoValue) {
+            exposureInfo.append(("ISO", formatted))
         }
         if let exposureBias = exif[kCGImagePropertyExifExposureBiasValue as String] as? Double {
             exposureInfo.append(("Exposure Bias", String(format: "%.1f EV", exposureBias)))
@@ -886,14 +890,15 @@ struct MediaMetadata {
             locationInfo.append(("Altitude", String(format: "%.1f m", altitude * altSign)))
         }
 
-        if let speed = gps[kCGImagePropertyGPSSpeed as String] as? Double {
+        if let speed = gps[kCGImagePropertyGPSSpeed as String] as? Double, speed.isFinite, speed >= 0 {
             let speedRef = gps[kCGImagePropertyGPSSpeedRef as String] as? String ?? "K"
             let unit = speedRef == "M" ? "mph" : (speedRef == "N" ? "knots" : "km/h")
             locationInfo.append(("Speed", String(format: "%.1f %@", speed, unit)))
         }
 
-        if let imgDirection = gps[kCGImagePropertyGPSImgDirection as String] as? Double {
-            locationInfo.append(("Direction", String(format: "%.1f°", imgDirection)))
+        if let imgDirection = gps[kCGImagePropertyGPSImgDirection as String] as? Double,
+           let direction = MediaInfoFormatting.direction(imgDirection) {
+            locationInfo.append(("Direction", direction))
         }
 
         if let timestamp = gps[kCGImagePropertyGPSTimeStamp as String] as? String {
@@ -970,8 +975,10 @@ struct MediaMetadata {
                     }
 
                     let channels = asbd.pointee.mChannelsPerFrame
-                    let channelString = channels == 1 ? "Mono" : (channels == 2 ? "Stereo" : "\(channels) channels")
-                    audioInfo.append(("Channels", channelString))
+                    if channels > 0 {
+                        let channelString = channels == 1 ? "Mono" : (channels == 2 ? "Stereo" : "\(channels) channels")
+                        audioInfo.append(("Channels", channelString))
+                    }
                 }
 
                 let codec = CMFormatDescriptionGetMediaSubType(formatDesc)
@@ -1008,8 +1015,10 @@ struct MediaMetadata {
                     }
 
                     let channels = asbd.pointee.mChannelsPerFrame
-                    let channelString = channels == 1 ? "Mono" : (channels == 2 ? "Stereo" : "\(channels) channels")
-                    audioInfo.append(("Channels", channelString))
+                    if channels > 0 {
+                        let channelString = channels == 1 ? "Mono" : (channels == 2 ? "Stereo" : "\(channels) channels")
+                        audioInfo.append(("Channels", channelString))
+                    }
 
                     let bitsPerChannel = asbd.pointee.mBitsPerChannel
                     if bitsPerChannel > 0 {
@@ -1331,6 +1340,37 @@ enum MediaInfoFormatting {
     static func sampleRate(_ hertz: Double) -> String? {
         guard hertz > 0, let value = integer(hertz) else { return nil }
         return "\(value) Hz"
+    }
+
+    // EXIF stores 0 (or garbage) when a camera doesn't know a value: "f/0.0", "0.00 mm" and
+    // "ISO 0" mean "unknown", so those are omitted.
+
+    /// EXIF FNumber as "f/2.8". Nil for values that aren't positive and finite.
+    static func aperture(_ fNumber: Double) -> String? {
+        guard fNumber.isFinite, fNumber > 0 else { return nil }
+        return String(format: "f/%.1f", fNumber)
+    }
+
+    /// EXIF FocalLength (mm) as "4.25 mm". Nil for values that aren't positive and finite.
+    static func focalLength(_ millimetres: Double) -> String? {
+        guard millimetres.isFinite, millimetres > 0 else { return nil }
+        return String(format: "%.2f mm", millimetres)
+    }
+
+    /// EXIF FocalLenIn35mmFilm as "26 mm". Nil when not positive.
+    static func focalLength35mm(_ millimetres: Int) -> String? {
+        millimetres > 0 ? "\(millimetres) mm" : nil
+    }
+
+    /// The first EXIF ISOSpeedRatings value. Nil when not positive.
+    static func iso(_ value: Int) -> String? {
+        value > 0 ? "\(value)" : nil
+    }
+
+    /// GPS image direction (degrees, 0 up to but not including 360) as "123.4°". Nil when out of range.
+    static func direction(_ degrees: Double) -> String? {
+        guard degrees.isFinite, degrees >= 0, degrees < 360 else { return nil }
+        return String(format: "%.1f°", degrees)
     }
 }
 
