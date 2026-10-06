@@ -646,10 +646,20 @@ struct FileItem: Identifiable, Hashable {
 }
 
 extension FileItem {
+    /// The name as Finder shows it: a ":" in the on-disk name is displayed as "/".
+    /// Use this for display; `name` stays the real file-system name for path operations.
+    var displayName: String {
+        Self.displayForm(of: name)
+    }
+
     func displayName(showFileExtensions: Bool) -> String {
         if showFileExtensions || isDirectory {
-            return name
+            return displayName
         }
-        return nameWithoutExtension
+        return Self.displayForm(of: nameWithoutExtension)
+    }
+
+    private static func displayForm(of fileSystemName: String) -> String {
+        fileSystemName.contains(":") ? fileSystemName.replacingOccurrences(of: ":", with: "/") : fileSystemName
     }
 }

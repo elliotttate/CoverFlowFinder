@@ -1198,7 +1198,7 @@ class FileBrowserViewModel: ObservableObject {
         // Filter by search text (only in filter mode)
         if searchMode == .filter && !searchText.isEmpty {
             filtered = filtered.filter {
-                $0.name.localizedCaseInsensitiveContains(searchText)
+                $0.displayName.localizedCaseInsensitiveContains(searchText)
             }
         }
 
@@ -3256,9 +3256,8 @@ class FileBrowserViewModel: ObservableObject {
                     NSWorkspace.shared.open(tempURL)
                 }
             } catch {
-                zipNavLogger.error("Failed to extract archive item: \(error.localizedDescription)")
                 DispatchQueue.main.async {
-                    NSSound.beep()
+                    FileOperationAlerts.reportFailures([FileOperationFailure(url: item.url, error: error)], verb: "opened")
                 }
             }
         }
