@@ -184,6 +184,14 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
             window?.makeFirstResponder(self)
             panel.updateController()
         }
+        // The panel finds its controller through the key window's responder chain. With no key
+        // window (app not active, e.g. invoked from a Service or automation) that finds nothing and
+        // the panel shows "No items selected" — take control directly in that case.
+        if panel.dataSource as? QuickLookControllerView !== self {
+            panel.dataSource = self
+            panel.delegate = self
+            observePanelClose(panel)
+        }
 
         // Show panel and reload data
         panel.orderFront(nil)
