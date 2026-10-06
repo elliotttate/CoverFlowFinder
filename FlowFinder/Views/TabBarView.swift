@@ -16,6 +16,55 @@ struct BrowserTab: Identifiable {
 
 }
 
+/// The tabs of one browser window. Held in a `@StateObject` so the initial tab (and its view model,
+/// which starts a directory listing and a folder watcher) is created exactly once per window, not on
+/// every `ContentView` initialization.
+@MainActor
+final class BrowserTabStore: ObservableObject {
+    @Published var tabs: [BrowserTab]
+    @Published var selectedTabId: UUID
+
+    convenience init() {
+        self.init(initialTab: BrowserTab())
+    }
+
+    init(initialTab: BrowserTab) {
+        tabs = [initialTab]
+        selectedTabId = initialTab.id
+    }
+
+    var selectedTab: BrowserTab {
+        tabs.first(where: { $0.id == selectedTabId }) ?? tabs[0]
+    }
+
+    func addTab(_ tab: BrowserTab) {
+        tabs.append(tab)
+        selectedTabId = tab.id
+    }
+
+    /// Removes a tab (never the last one) and selects a neighbour if it was selected.
+    /// Returns the removed tab so its view model can be shut down.
+    @discardableResult
+    func closeTab(_ tabId: UUID) -> BrowserTab? {
+        guard tabs.count > 1, let index = tabs.firstIndex(where: { $0.id == tabId }) else { return nil }
+        let removed = tabs.remove(at: index)
+        if selectedTabId == tabId {
+            selectedTabId = tabs[min(index, tabs.count - 1)].id
+        }
+        return removed
+    }
+
+    func selectNextTab() {
+        guard let currentIndex = tabs.firstIndex(where: { $0.id == selectedTabId }) else { return }
+        selectedTabId = tabs[(currentIndex + 1) % tabs.count].id
+    }
+
+    func selectPreviousTab() {
+        guard let currentIndex = tabs.firstIndex(where: { $0.id == selectedTabId }) else { return }
+        selectedTabId = tabs[currentIndex == 0 ? tabs.count - 1 : currentIndex - 1].id
+    }
+}
+
 struct TabBarView: View {
     @Binding var tabs: [BrowserTab]
     @Binding var selectedTabId: UUID
@@ -58,6 +107,8 @@ struct TabBarView: View {
 
 struct TabItemView: View {
     let tab: BrowserTab
+    // Observed so the title follows the tab's navigation.
+    @ObservedObject private var viewModel: FileBrowserViewModel
     let isSelected: Bool
     let canClose: Bool
     let onSelect: () -> Void
@@ -65,13 +116,22 @@ struct TabItemView: View {
 
     @State private var isHovering = false
 
+    init(tab: BrowserTab, isSelected: Bool, canClose: Bool, onSelect: @escaping () -> Void, onClose: @escaping () -> Void) {
+        self.tab = tab
+        self.viewModel = tab.viewModel
+        self.isSelected = isSelected
+        self.canClose = canClose
+        self.onSelect = onSelect
+        self.onClose = onClose
+    }
+
     var body: some View {
         HStack(spacing: 6) {
             Image(systemName: "folder.fill")
                 .font(.system(size: 11))
                 .foregroundColor(isSelected ? .accentColor : .secondary)
 
-            Text(tab.viewModel.currentPath.lastPathComponent)
+            Text(viewModel.currentPath.lastPathComponent)
                 .font(.system(size: 12))
                 .lineLimit(1)
                 .frame(maxWidth: 120)
