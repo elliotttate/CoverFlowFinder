@@ -3,11 +3,68 @@ import QuickLookThumbnailing
 import AppKit
 import Quartz
 import AVFoundation
+import Combine
 
 /// Simple reference-type flag so mutations are immediately visible
 /// regardless of SwiftUI's @State batching.
 private class SelectionFlag {
     var userClearedSelection = false
+}
+
+/// Thumbnail-loading bookkeeping. Kept in a reference type held by @State so that updating it
+/// doesn't re-render the view; only `thumbnails` (what the covers show) is real view state.
+private final class CoverFlowThumbnailState {
+    /// What each displayed image is good for, and which requests are in flight
+    var ledger = CoverFlowThumbnailLedger()
+    /// This view's thumbnail requests, cancelled together (other views' requests are untouched)
+    let requestOwner = ThumbnailRequestOwner()
+    /// Finished thumbnails waiting for the next batched apply
+    var pendingUpdates: [URL: NSImage] = [:]
+    var batchTimer: Timer?
+    /// Bumped when work is suspended; completions from older generations are dropped
+    var generation = 0
+    var isActive = true
+    var isScrolling = false
+    var passScheduled = false
+    /// The last pass had to leave items for later (concurrency limit)
+    var hasMoreWork = false
+    var retryWorkItem: DispatchWorkItem?
+    var settleWorkItem: DispatchWorkItem?
+    var lastSelectionChangeTime: CFTimeInterval = 0
+    /// Selection is changing faster than a pass is worth (key repeat): do the minimum until it settles
+    var isRapidNavigation = false
+    var lastHydrationRange: Range<Int>?
+    /// Index of each displayed URL in `sortedItemsCache`
+    var indexByURL: [URL: Int] = [:]
+    var metadataRefreshScheduled = false
+    var loadedFolderPath: URL?
+    /// The centre cover's size in device pixels, reported by the AppKit view
+    var centreCoverPixels: CGFloat = 0
+
+    func rebuildIndex(for items: [FileItem]) {
+        var index: [URL: Int] = [:]
+        index.reserveCapacity(items.count)
+        for (offset, item) in items.enumerated() {
+            index[item.url] = offset
+        }
+        indexByURL = index
+    }
+
+    func suspend() {
+        batchTimer?.invalidate()
+        batchTimer = nil
+        retryWorkItem?.cancel()
+        retryWorkItem = nil
+        settleWorkItem?.cancel()
+        settleWorkItem = nil
+        pendingUpdates.removeAll()
+        passScheduled = false
+        isScrolling = false
+        isRapidNavigation = false
+        ledger.cancelAllRequests()
+        ThumbnailCacheManager.shared.cancelRequests(for: requestOwner)
+        generation &+= 1
+    }
 }
 
 struct CoverFlowView: View {
@@ -17,27 +74,22 @@ struct CoverFlowView: View {
 
     @State private var sortedItemsCache: [FileItem] = []
     @State private var thumbnails: [URL: NSImage] = [:]
-    @State private var iconPlaceholders: Set<URL> = []
-    @State private var thumbnailLoadGeneration: Int = 0
-    @State private var rightClickedIndex: Int?
-    @State private var isCoverFlowScrolling: Bool = false
     @State private var dragStartCoverFlowHeight: CGFloat?
     @State private var liveCoverFlowHeight: CGFloat?
     @State private var infoPanelHeight: CGFloat = 0
 
-    @State private var lastThumbnailLoadTime: Date = .distantPast
-    @State private var thumbnailLoadTimer: Timer?
-    private let thumbnailLoadThrottle: TimeInterval = 0.016
-    @State private var lastHydrationRange: Range<Int>? = nil
     @State private var itemsToken: Int = 0
     @State private var selectionFlag = SelectionFlag()
-    @State private var isCoverFlowActive: Bool = true
-    @State private var deferredThumbnailReloadWorkItem: DispatchWorkItem?
+    @State private var thumbState = CoverFlowThumbnailState()
 
-    // Pending thumbnail updates - batched to reduce re-renders
-    @State private var pendingThumbnailUpdates: [URL: NSImage] = [:]
-    @State private var thumbnailBatchTimer: Timer?
+    // Pending thumbnail updates are applied in batches to reduce re-renders
     private let thumbnailBatchInterval: TimeInterval = 0.1
+    /// Selection changes closer together than this count as key repeat
+    private let rapidNavigationInterval: CFTimeInterval = 0.12
+    private let thumbnailPolicy = CoverFlowThumbnailPolicy()
+    private let maxConcurrentThumbnails = 12
+    private let maxConcurrentPreloadThumbnails = 8
+    private let thumbnailCache = ThumbnailCacheManager.shared
 
     // Debug logging (set to false for release)
     private static let debugEnabled = ProcessInfo.processInfo.environment["FLOWFINDER_COVERFLOW_DEBUG"] == "1" ||
@@ -55,10 +107,10 @@ struct CoverFlowView: View {
         debugEnabled
     }
 
-
-    static func debugLog(_ message: String) {
+    /// The message is only built when debug logging is on.
+    static func debugLog(_ message: @autoclosure () -> String) {
         guard debugEnabled else { return }
-        let line = "\(Date()): \(message)\n"
+        let line = "\(Date()): \(message())\n"
         if let data = line.data(using: .utf8) {
             debugLogHandle?.write(data)
         }
@@ -71,27 +123,18 @@ struct CoverFlowView: View {
         let interval = now.timeIntervalSince(Self.lastBodyTime)
         Self.lastBodyTime = now
         if interval < 0.5 {
-            Self.debugLog("[CoverFlow] BODY #\(Self.bodyCallCount) - \(String(format: "%.3f", interval))s | thumbs:\(thumbnails.count) pending:\(pendingThumbnailUpdates.count) items:\(sortedItemsCache.count)")
+            Self.debugLog("[CoverFlow] BODY #\(Self.bodyCallCount) - \(String(format: "%.3f", interval))s | thumbs:\(thumbnails.count) items:\(sortedItemsCache.count)")
         }
     }
 
-    private var coverFlowThumbnailPixelSize: CGFloat {
-        let base = 192 * settings.coverFlowScaleValue * settings.thumbnailQualityValue
-        let bucket = (base / 64).rounded() * 64
-        return min(1024, max(128, bucket))
+    private var thumbnailSizes: CoverFlowThumbnailSizing.Sizes {
+        CoverFlowThumbnailSizing.sizes(
+            coverScale: settings.coverFlowScaleValue,
+            qualityValue: settings.thumbnailQualityValue,
+            quality: CGFloat(settings.thumbnailQuality),
+            centreCoverPixels: thumbState.centreCoverPixels
+        )
     }
-
-    private var coverFlowPlaceholderPixelSize: CGFloat {
-        let base = coverFlowThumbnailPixelSize * 0.5
-        let bucket = (base / 32).rounded() * 32
-        return min(256, max(96, bucket))
-    }
-
-    private let visibleRange = 12
-    private let maxConcurrentThumbnails = 12
-    private let maxConcurrentPreloadThumbnails = 8
-    private let preloadRangeMultiplier = 8
-    private let thumbnailCache = ThumbnailCacheManager.shared
 
     var body: some View {
         let _ = logBodyCall()
@@ -122,30 +165,21 @@ struct CoverFlowView: View {
                     thumbnailCount: thumbnails.count,
                     navigationGeneration: viewModel.navigationGeneration,
                     selectedItems: viewModel.selectedItems,
-                    cutItemURLs: Set(viewModel.clipboardOperation == .cut ? viewModel.clipboardItems : []),
+                    cutItemURLs: viewModel.cutItemURLs,
                     coverScale: settings.coverFlowScaleValue,
                     scrollSensitivity: settings.coverFlowSwipeSpeedValue,
-                    onSelect: { index in
-                        selectionFlag.userClearedSelection = false
-                        viewModel.coverFlowSelectedIndex = index
-                        if index < sortedItemsCache.count {
-                            let item = sortedItemsCache[index]
-                            let modifiers = NSEvent.modifierFlags
-                            viewModel.handleSelection(
-                                item: item,
-                                index: index,
-                                in: sortedItemsCache,
-                                withShift: modifiers.contains(.shift),
-                                withCommand: modifiers.contains(.command),
-                                allowRename: false  // Disable click-to-rename in CoverFlow
-                            )
-                            updateQuickLook(for: item)
-                        }
+                    currentFolderURL: viewModel.isInsideArchive ? nil : viewModel.currentPath,
+                    canModifyFolder: !viewModel.isInsideArchive,
+                    onSelect: { index, intent in
+                        applySelection(at: index, intent: intent)
                     },
                     onOpen: { index in
                         if index < sortedItemsCache.count {
                             viewModel.openItem(sortedItemsCache[index])
                         }
+                    },
+                    onOpenItems: { targets in
+                        openItems(targets)
                     },
                     onDeselect: {
                         selectionFlag.userClearedSelection = true
@@ -153,20 +187,17 @@ struct CoverFlowView: View {
                         viewModel.cancelPendingRename()
                         updateQuickLook(for: nil)
                     },
-                    onRightClick: { index in
-                        rightClickedIndex = index
+                    onDrop: { urls, operation in
+                        viewModel.handleDrop(urls: urls, operation: operation)
                     },
-                    onDrop: { urls in
-                        handleDrop(urls: urls)
-                    },
-                    onDropToFolder: { urls, folderURL in
-                        viewModel.handleDrop(urls: urls, to: folderURL)
+                    onDropToFolder: { urls, folderURL, operation in
+                        viewModel.handleDrop(urls: urls, to: folderURL, operation: operation)
                     },
                     onScrollStateChange: { scrolling in
                         DispatchQueue.main.async {
-                            isCoverFlowScrolling = scrolling
+                            thumbState.isScrolling = scrolling
                             if !scrolling {
-                                throttledLoadThumbnails()
+                                scheduleThumbnailPass()
                             }
                         }
                     },
@@ -182,10 +213,8 @@ struct CoverFlowView: View {
                     onDelete: {
                         viewModel.deleteSelectedItems()
                     },
-                    onShowPackageContents: { index in
-                        if index < sortedItemsCache.count {
-                            viewModel.navigateTo(sortedItemsCache[index].url)
-                        }
+                    onShowPackageContents: { item in
+                        viewModel.navigateTo(item.url)
                     },
                     onQuickLook: { item in
                         viewModel.previewURL(for: item) { previewURL in
@@ -208,10 +237,28 @@ struct CoverFlowView: View {
                     },
                     onSelectAll: {
                         selectionFlag.userClearedSelection = false
+                        // Keep the centred item as the lead of the selection
+                        viewModel.lastSelectedIndex = viewModel.coverFlowSelectedIndex
                         viewModel.selectedItems = Set(sortedItemsCache)
                     },
+                    onNewFolder: {
+                        viewModel.createNewFolder()
+                    },
+                    onGetInfo: {
+                        showInfoForCurrentFolder()
+                    },
                     onActivityStateChange: { isActive in
-                        handleCoverFlowActivityChange(isActive)
+                        // Called from updateNSView; don't touch view state during the update
+                        DispatchQueue.main.async {
+                            handleCoverFlowActivityChange(isActive)
+                        }
+                    },
+                    onCentreCoverPixelSizeChange: { pixels in
+                        DispatchQueue.main.async {
+                            guard thumbState.centreCoverPixels != pixels else { return }
+                            thumbState.centreCoverPixels = pixels
+                            scheduleThumbnailPass()
+                        }
                     }
                 )
                 .id("coverFlowContainer")  // Stable identity to prevent view recreation
@@ -266,15 +313,6 @@ struct CoverFlowView: View {
 
                 FileListSection(
                     items: sortedItemsCache,
-                    selectedItems: viewModel.selectedItems,
-                    onSelect: { item, index in
-                        selectionFlag.userClearedSelection = false
-                        viewModel.coverFlowSelectedIndex = index
-                        updateQuickLook(for: item)
-                    },
-                    onOpen: { item in
-                        viewModel.openItem(item)
-                    },
                     viewModel: viewModel,
                     onEmptySpaceClick: {
                         // Click on empty space - deselect all
@@ -288,92 +326,34 @@ struct CoverFlowView: View {
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
         .onAppear {
-            isCoverFlowActive = true
+            thumbState.isActive = true
+            thumbState.loadedFolderPath = viewModel.currentPath
             KeyboardManager.shared.clearHandler()
             updateSortedItems(using: items, updateToken: true, newToken: viewModel.coverFlowItemsToken)
-            loadVisibleThumbnails()
             syncSelection()
+            scheduleThumbnailPass()
         }
         .onDisappear {
-            isCoverFlowActive = false
+            thumbState.isActive = false
             suspendCoverFlowWork()
         }
-        .onChange(of: items) { newItems in
-            let oldCount = sortedItemsCache.count
-            let newCount = newItems.count
-            let oldToken = itemsToken
-            let newToken = viewModel.coverFlowItemsToken
-            let oldOrder = sortedItemsCache.map { $0.url }
-            let newOrder = newItems.map { $0.url }
-            let orderChanged = oldOrder != newOrder
-            let tokenChanged = oldToken != newToken
-            Self.debugLog("[CoverFlow] onChange(items) FIRED! old:\(oldCount) new:\(newCount) oldToken:\(oldToken) newToken:\(newToken) tokenMatch:\(oldToken == newToken)")
-
-            // Detect item removal (deletion) vs folder navigation
-            // For removals, update sortedItemsCache synchronously so the FileTableView
-            // coordinator immediately has the correct items for selection/navigation.
-            let isItemRemoval = newCount < oldCount && newCount > 0
-
-            // Only clear thumbnails if items actually changed
-            if tokenChanged {
-                Self.debugLog("[CoverFlow] Items actually changed - clearing thumbnails")
-
-                // Update sortedItemsCache and selection synchronously to prevent
-                // stale items in the FileTableView coordinator after deletion.
-                // This ensures arrow key navigation works correctly immediately.
-                updateSortedItems(using: newItems, updateToken: true, newToken: newToken)
-                syncSelection()
-
-                if isItemRemoval {
-                    // For deletions: only remove thumbnails for deleted items, don't clear everything
-                    let newURLs = Set(newItems.map { $0.url })
-                    let removedURLs = thumbnails.keys.filter { !newURLs.contains($0) }
-                    for url in removedURLs {
-                        thumbnails.removeValue(forKey: url)
-                        iconPlaceholders.remove(url)
-                    }
-                    DispatchQueue.main.async {
-                        loadVisibleThumbnails()
-                    }
-                } else {
-                    // For folder navigation: clear all thumbnails (deferred for performance)
-                    DispatchQueue.main.async {
-                        NSLog("[NewFolder] onChange(items) DEFERRED ASYNC: clearing thumbnails, items=%d, selectedItems='%@'",
-                              newItems.count,
-                              viewModel.selectedItems.first?.name ?? "nil")
-                        thumbnails.removeAll()
-                        iconPlaceholders.removeAll()
-                        thumbnailLoadGeneration += 1
-                        thumbnailCache.clearForNewFolder()
-                        selectionFlag.userClearedSelection = false  // Reset for new folder
-                        loadVisibleThumbnails()
-                    }
-                }
-            } else {
-                Self.debugLog("[CoverFlow] Items unchanged (same token) - skipping clear")
-                // Update synchronously for consistent selection state
-                updateSortedItems(using: newItems, updateToken: false)
-                syncSelection()
-                if orderChanged {
-                    DispatchQueue.main.async {
-                        loadVisibleThumbnails()
-                    }
-                }
-            }
+        .onChange(of: items) { _, newItems in
+            handleItemsChange(newItems)
         }
-        .onChange(of: viewModel.coverFlowSelectedIndex) { _ in
-            DispatchQueue.main.async {
-                throttledLoadThumbnails()
-                updateQuickLookForSelection()
-            }
+        // FileItem equality is URL-only, so metadata hydration and in-place edits don't trigger
+        // onChange(of: items). Re-read the items whenever the view model replaces them.
+        .onReceive(viewModel.$items) { _ in
+            scheduleMetadataRefresh()
         }
-        .onChange(of: viewModel.selectedItems) { newSelection in
+        .onReceive(viewModel.$searchResults) { _ in
+            scheduleMetadataRefresh()
+        }
+        .onChange(of: viewModel.coverFlowSelectedIndex) { _, _ in
+            noteSelectionChange()
+            updateQuickLookForSelection()
+        }
+        .onChange(of: viewModel.selectedItems) { _, newSelection in
             // Sync Cover Flow selection when file list selection changes
-            NSLog("[NewFolder] onChange(selectedItems): count=%d, first='%@', sortedItemsCache.count=%d, items.count=%d",
-                  newSelection.count,
-                  newSelection.first?.name ?? "nil",
-                  sortedItemsCache.count,
-                  items.count)
             if newSelection.isEmpty {
                 updateQuickLook(for: nil)
             } else {
@@ -385,17 +365,93 @@ struct CoverFlowView: View {
                 infoPanelHeight = newValue
             }
         }
-        .onChange(of: settings.coverFlowScale) { _ in
-            throttledLoadThumbnails()
+        .onChange(of: settings.coverFlowScale) { _, _ in
+            scheduleThumbnailPass()
         }
-        .onChange(of: settings.thumbnailQuality) { _ in
-            throttledLoadThumbnails()
+        .onChange(of: settings.thumbnailQuality) { _, _ in
+            scheduleThumbnailPass()
         }
     }
 
+    // MARK: - Items
+
+    private func handleItemsChange(_ newItems: [FileItem]) {
+        let newToken = viewModel.coverFlowItemsToken
+        let tokenChanged = itemsToken != newToken
+        let orderChanged = !sortedItemsCache.elementsEqual(newItems) { $0.url == $1.url }
+        Self.debugLog("[CoverFlow] onChange(items) old:\(sortedItemsCache.count) new:\(newItems.count) tokenChanged:\(tokenChanged) orderChanged:\(orderChanged)")
+
+        // Update sortedItemsCache and selection synchronously so the embedded table
+        // has the correct items for selection/navigation immediately (e.g. after deletion).
+        updateSortedItems(using: newItems, updateToken: tokenChanged, newToken: newToken)
+        syncSelection()
+
+        if tokenChanged {
+            if viewModel.currentPath != thumbState.loadedFolderPath {
+                // A different folder in the same view: start over (cancels only our requests)
+                thumbState.loadedFolderPath = viewModel.currentPath
+                selectionFlag.userClearedSelection = false
+                thumbState.suspend()
+                thumbState.ledger.removeAll()
+                thumbState.lastHydrationRange = nil
+                thumbnails = [:]
+            } else if !newItems.isEmpty {
+                // Adds, renames, deletions and refreshes: keep the thumbnails of items still shown.
+                // (A reload empties the list first; keep everything through that.)
+                retainThumbnailsForDisplayedItems()
+            }
+            scheduleThumbnailPass()
+        } else if orderChanged {
+            scheduleThumbnailPass()
+        }
+    }
+
+    private func retainThumbnailsForDisplayedItems() {
+        let state = thumbState
+        state.ledger.retain { state.indexByURL[$0] != nil }
+        state.pendingUpdates = state.pendingUpdates.filter { state.indexByURL[$0.key] != nil }
+        let removed = thumbnails.keys.filter { state.indexByURL[$0] == nil }
+        guard !removed.isEmpty else { return }
+        var newThumbnails = thumbnails
+        for url in removed {
+            newThumbnails.removeValue(forKey: url)
+        }
+        thumbnails = newThumbnails
+    }
+
+    private func scheduleMetadataRefresh() {
+        let state = thumbState
+        guard !state.metadataRefreshScheduled else { return }
+        state.metadataRefreshScheduled = true
+        // @Published fires before the new value is stored; read it on the next turn
+        DispatchQueue.main.async {
+            refreshItemMetadata()
+        }
+    }
+
+    /// Picks up new metadata (hydration, cloud status, in-place edits) for the same items in the
+    /// same order. Structural changes go through `handleItemsChange` instead.
+    private func refreshItemMetadata() {
+        thumbState.metadataRefreshScheduled = false
+        let cached = sortedItemsCache
+        let fresh = viewModel.filteredItems
+        guard !fresh.isEmpty, fresh.count == cached.count else { return }
+        var metadataChanged = false
+        for (freshItem, cachedItem) in zip(fresh, cached) {
+            guard freshItem.url == cachedItem.url else { return }
+            if !metadataChanged && freshItem.contentVersion != cachedItem.contentVersion {
+                metadataChanged = true
+            }
+        }
+        guard metadataChanged else { return }
+        sortedItemsCache = fresh
+        // Thumbnails of items whose content changed are reloaded by the next pass
+        scheduleThumbnailPass()
+    }
+
     private func handleCoverFlowActivityChange(_ isActive: Bool) {
-        guard isCoverFlowActive != isActive else { return }
-        isCoverFlowActive = isActive
+        guard thumbState.isActive != isActive else { return }
+        thumbState.isActive = isActive
 
         if isActive {
             resumeCoverFlowWork()
@@ -405,131 +461,132 @@ struct CoverFlowView: View {
     }
 
     private func suspendCoverFlowWork() {
-        isCoverFlowScrolling = false
-        thumbnailLoadTimer?.invalidate()
-        thumbnailLoadTimer = nil
-        thumbnailBatchTimer?.invalidate()
-        thumbnailBatchTimer = nil
-        deferredThumbnailReloadWorkItem?.cancel()
-        deferredThumbnailReloadWorkItem = nil
-        pendingThumbnailUpdates.removeAll()
-        thumbnailLoadGeneration &+= 1
+        thumbState.suspend()
     }
 
     private func resumeCoverFlowWork() {
-        lastThumbnailLoadTime = .distantPast
         guard !sortedItemsCache.isEmpty else { return }
-        loadVisibleThumbnails()
-    }
-
-    private func throttledLoadThumbnails() {
-        guard isCoverFlowActive else { return }
-        let now = Date()
-        let timeSinceLastLoad = now.timeIntervalSince(lastThumbnailLoadTime)
-
-        if timeSinceLastLoad >= thumbnailLoadThrottle {
-            lastThumbnailLoadTime = now
-            loadVisibleThumbnails()
-        } else {
-            thumbnailLoadTimer?.invalidate()
-            let delay = thumbnailLoadThrottle - timeSinceLastLoad
-            thumbnailLoadTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { _ in
-                DispatchQueue.main.async {
-                    self.lastThumbnailLoadTime = Date()
-                    self.loadVisibleThumbnails()
-                }
-            }
-        }
+        scheduleThumbnailPass()
     }
 
     private func updateSortedItems(using newItems: [FileItem], updateToken: Bool, newToken: Int? = nil) {
-        let oldIndex = viewModel.coverFlowSelectedIndex
-        Self.debugLog("[SELECTION] updateSortedItems called: newItems.count=\(newItems.count), currentIndex=\(oldIndex), updateToken=\(updateToken)")
+        Self.debugLog("[SELECTION] updateSortedItems: newItems.count=\(newItems.count), currentIndex=\(viewModel.coverFlowSelectedIndex), updateToken=\(updateToken)")
 
         sortedItemsCache = newItems
+        thumbState.rebuildIndex(for: newItems)
         if updateToken {
             itemsToken = newToken ?? viewModel.coverFlowItemsToken
         }
 
-        // Don't adjust selection when items become empty - this is a transient state during refresh
-        // The deletion code will set the proper selection after items are reloaded
-        guard !newItems.isEmpty else {
-            Self.debugLog("[SELECTION] updateSortedItems: newItems is EMPTY, preserving index \(oldIndex)")
-            return
-        }
+        // Nothing to centre on when empty
+        guard !newItems.isEmpty else { return }
 
-        if let selected = viewModel.selectedItems.first,
-           let index = newItems.firstIndex(of: selected) {
-            Self.debugLog("[SELECTION] updateSortedItems: found selected item at index \(index), was \(oldIndex)")
-            viewModel.coverFlowSelectedIndex = index
-        } else {
+        if let primary = viewModel.primarySelectedItem,
+           let index = thumbState.indexByURL[primary.url] {
+            setCentredIndex(index)
+        } else if viewModel.coverFlowSelectedIndex >= newItems.count {
             // Only clamp if index is out of bounds, don't reset unnecessarily
-            if viewModel.coverFlowSelectedIndex >= newItems.count {
-                let newIndex = max(0, newItems.count - 1)
-                Self.debugLog("[SELECTION] updateSortedItems: index \(viewModel.coverFlowSelectedIndex) out of bounds, clamping to \(newIndex)")
-                viewModel.coverFlowSelectedIndex = newIndex
-            } else {
-                Self.debugLog("[SELECTION] updateSortedItems: index \(viewModel.coverFlowSelectedIndex) is valid, no change needed")
-            }
-        }
-        Self.debugLog("[SELECTION] updateSortedItems done: finalIndex=\(viewModel.coverFlowSelectedIndex)")
-    }
-
-    private func logTokenState(_ context: String) {
-        if Self.debugEnabled {
-            Self.debugLog("[CoverFlow] TOKEN \(context): itemsToken=\(itemsToken), items=\(sortedItemsCache.count)")
+            setCentredIndex(max(0, newItems.count - 1))
         }
     }
 
+    private func setCentredIndex(_ index: Int) {
+        if viewModel.coverFlowSelectedIndex != index {
+            viewModel.coverFlowSelectedIndex = index
+        }
+    }
+
+    // MARK: - Selection
+
+    /// Selection flows one way: the view model's lead item decides which cover is centred.
     private func syncSelection() {
-        Self.debugLog("[SELECTION] syncSelection called: sortedItemsCache.count=\(sortedItemsCache.count), coverFlowSelectedIndex=\(viewModel.coverFlowSelectedIndex), selectedItems.count=\(viewModel.selectedItems.count)")
+        Self.debugLog("[SELECTION] syncSelection: items=\(sortedItemsCache.count), index=\(viewModel.coverFlowSelectedIndex), selected=\(viewModel.selectedItems.count)")
 
-        // Don't sync selection when items are empty (transient state during refresh)
-        guard !sortedItemsCache.isEmpty else {
-            Self.debugLog("[SELECTION] syncSelection: sortedItemsCache is EMPTY, skipping")
-            return
-        }
-
-        // Check for transient state: selected item exists in incoming items but
-        // sortedItemsCache hasn't caught up yet (e.g., new folder just created).
-        // Don't clamp the index or overwrite selection — wait for the cache to sync.
-        if let selected = viewModel.selectedItems.first,
-           !sortedItemsCache.contains(selected),
-           items.contains(selected) {
-            NSLog("[NewFolder] syncSelection: TRANSIENT STATE - item '%@' in items(%d) but not sortedItemsCache(%d), skipping", selected.name, items.count, sortedItemsCache.count)
-            return
-        }
+        guard !sortedItemsCache.isEmpty else { return }
 
         // Clamp index to valid range
         let safeIndex = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
-        if safeIndex != viewModel.coverFlowSelectedIndex {
-            Self.debugLog("[SELECTION] syncSelection: clamping index from \(viewModel.coverFlowSelectedIndex) to \(safeIndex)")
-            viewModel.coverFlowSelectedIndex = safeIndex
-        }
+        setCentredIndex(safeIndex)
 
         if viewModel.selectedItems.isEmpty {
             if selectionFlag.userClearedSelection {
-                Self.debugLog("[SELECTION] syncSelection: selection empty (user-cleared), preserving empty selection")
                 updateQuickLook(for: nil)
                 return
             }
-            let item = sortedItemsCache[safeIndex]
-            Self.debugLog("[SELECTION] syncSelection: selection empty, auto-selecting item '\(item.name)' at index \(safeIndex)")
-            viewModel.selectedItems = [item]
-            updateQuickLook(for: item)
+            selectCentredItemOnly(at: safeIndex)
             return
         }
 
-        if let selected = viewModel.selectedItems.first,
-           let index = sortedItemsCache.firstIndex(of: selected) {
-            Self.debugLog("[SELECTION] syncSelection: found selected item '\(selected.name)' at index \(index), setting coverFlowSelectedIndex")
-            viewModel.coverFlowSelectedIndex = index
-        } else {
-            let item = sortedItemsCache[safeIndex]
-            Self.debugLog("[SELECTION] syncSelection: selected item missing, auto-selecting item '\(item.name)' at index \(safeIndex)")
-            viewModel.selectedItems = [item]
-            updateQuickLook(for: item)
+        if let primary = viewModel.primarySelectedItem,
+           let index = thumbState.indexByURL[primary.url] {
+            setCentredIndex(index)
+            return
         }
+
+        // The lead item isn't displayed: centre on the first selected item that is,
+        // without collapsing the selection.
+        if let firstShown = viewModel.selectedItems.compactMap({ thumbState.indexByURL[$0.url] }).min() {
+            setCentredIndex(firstShown)
+            return
+        }
+
+        // Transient state: the selected item is in the incoming items but sortedItemsCache
+        // hasn't caught up yet (e.g. new folder just created). Wait for the cache to sync.
+        if let primary = viewModel.primarySelectedItem, items.contains(primary) {
+            return
+        }
+
+        // None of the selected items is shown any more
+        selectCentredItemOnly(at: safeIndex)
+    }
+
+    private func selectCentredItemOnly(at index: Int) {
+        let item = sortedItemsCache[index]
+        viewModel.selectedItems = [item]
+        viewModel.lastSelectedIndex = index
+        viewModel.selectionAnchorIndex = index
+        updateQuickLook(for: item)
+    }
+
+    /// Applies a selection made in the cover strip. The intent comes from the triggering event,
+    /// never from the live keyboard state.
+    private func applySelection(at index: Int, intent: CoverFlowSelectionIntent) {
+        guard index >= 0, index < sortedItemsCache.count else { return }
+        selectionFlag.userClearedSelection = false
+        viewModel.coverFlowSelectedIndex = index
+        let item = sortedItemsCache[index]
+        viewModel.handleSelection(
+            item: item,
+            index: index,
+            in: sortedItemsCache,
+            withShift: intent.extendsRange,
+            withCommand: intent.toggles,
+            allowRename: false  // Disable click-to-rename in CoverFlow
+        )
+        updateQuickLook(for: item)
+    }
+
+    private func openItems(_ targets: [FileItem]) {
+        guard !targets.isEmpty else { return }
+        if targets.count == 1 {
+            viewModel.openItem(targets[0])
+            return
+        }
+        // Open every file; folders would each navigate this view, so open just the first one
+        let files = targets.filter { $0.fileType != .folder }
+        if files.isEmpty {
+            viewModel.openItem(targets[0])
+        } else {
+            files.forEach { viewModel.openItem($0) }
+        }
+    }
+
+    private func showInfoForCurrentFolder() {
+        guard !viewModel.isInsideArchive else {
+            NSSound.beep()
+            return
+        }
+        NotificationCenter.default.post(name: .showGetInfo, object: FileItem(url: viewModel.currentPath))
     }
 
     private func updateQuickLook(for item: FileItem?) {
@@ -560,287 +617,286 @@ struct CoverFlowView: View {
         let newIndex = max(0, min(sortedItemsCache.count - 1, currentIndex + offset))
         guard newIndex != currentIndex else { return }
 
-        viewModel.coverFlowSelectedIndex = newIndex
-        let item = sortedItemsCache[newIndex]
-        viewModel.selectItem(item)
-        updateQuickLook(for: item)
+        applySelection(at: newIndex, intent: .plain)
     }
 
-    private func handleDrop(urls: [URL]) {
-        viewModel.handleDrop(urls: urls)
+    // MARK: - Thumbnails
+
+    private func noteSelectionChange() {
+        let state = thumbState
+        let now = CACurrentMediaTime()
+        state.isRapidNavigation = now - state.lastSelectionChangeTime < rapidNavigationInterval
+        state.lastSelectionChangeTime = now
+        scheduleThumbnailPass()
+
+        // During key repeat only the covers on screen are served; do the rest once it settles
+        state.settleWorkItem?.cancel()
+        state.settleWorkItem = nil
+        if state.isRapidNavigation {
+            let workItem = DispatchWorkItem {
+                state.settleWorkItem = nil
+                state.isRapidNavigation = false
+                scheduleThumbnailPass()
+            }
+            state.settleWorkItem = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
+        }
     }
 
-    private let thumbnailWindowSize = 100
-
-    private static var loadVisibleCount = 0
-
-    private func loadVisibleThumbnails() {
-        guard isCoverFlowActive, !sortedItemsCache.isEmpty else { return }
-        Self.loadVisibleCount += 1
-        if Self.debugEnabled {
-            Self.debugLog("[CoverFlow] loadVisibleThumbnails #\(Self.loadVisibleCount) - items:\(sortedItemsCache.count) scrolling:\(isCoverFlowScrolling)")
+    /// Coalesces requests: at most one pass is pending, and it runs on the next turn of the run loop.
+    private func scheduleThumbnailPass() {
+        let state = thumbState
+        guard state.isActive, !state.passScheduled else { return }
+        state.passScheduled = true
+        DispatchQueue.main.async {
+            runThumbnailPass()
         }
-        // Allow limited loading during scroll for smoother experience
-        let isScrolling = isCoverFlowScrolling
-        let thumbnailPixelSize = coverFlowThumbnailPixelSize
-        let placeholderPixelSize = coverFlowPlaceholderPixelSize
-        let selected = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
-        let start = max(0, selected - visibleRange)
-        let end = min(sortedItemsCache.count - 1, selected + visibleRange)
-        guard start <= end else { return }
+    }
 
-        var thumbnailUpdates: [URL: NSImage] = [:]
-        var placeholdersToAdd: Set<URL> = []
-        var placeholdersToRemove: Set<URL> = []
-        var itemsToLoadHigh: [(item: FileItem, distance: Int)] = []
-        var itemsToLoadLow: [(item: FileItem, distance: Int)] = []
-
-        let windowStart = max(0, selected - thumbnailWindowSize)
-        let windowEnd = min(sortedItemsCache.count - 1, selected + thumbnailWindowSize)
-        let preloadRange = min(visibleRange * preloadRangeMultiplier, thumbnailWindowSize)
-        let preloadStart = max(0, selected - preloadRange)
-        let preloadEnd = min(sortedItemsCache.count - 1, selected + preloadRange)
-
-        if preloadStart <= preloadEnd {
-            let hydrationEnd = min(sortedItemsCache.count, preloadEnd + 1)
-            let hydrationRange = preloadStart..<hydrationEnd
-            if hydrationRange != lastHydrationRange {
-                lastHydrationRange = hydrationRange
-                var urlsToHydrate: [URL] = []
-                urlsToHydrate.reserveCapacity(hydrationRange.count)
-                for index in hydrationRange {
-                    let item = sortedItemsCache[index]
-                    if viewModel.needsHydration(item) {
-                        urlsToHydrate.append(item.url)
-                    }
-                }
-                if !urlsToHydrate.isEmpty {
-                    viewModel.hydrateMetadata(for: urlsToHydrate)
-                }
-            }
+    private func scheduleRetryPass(after delay: TimeInterval) {
+        let state = thumbState
+        guard state.retryWorkItem == nil else { return }
+        let workItem = DispatchWorkItem {
+            state.retryWorkItem = nil
+            scheduleThumbnailPass()
         }
+        state.retryWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
 
-        var keepURLs = Set<URL>()
-        for i in windowStart...windowEnd {
-            keepURLs.insert(sortedItemsCache[i].url)
-        }
-        var urlsToEvict: [URL] = []
-        for url in thumbnails.keys {
-            if !keepURLs.contains(url) {
-                urlsToEvict.append(url)
-            }
-        }
+    /// Brings the thumbnails around the centred cover up to the resolution their distance needs
+    /// and releases what's no longer needed. Items whose image is already good enough for their
+    /// content version are skipped without touching the thumbnail cache.
+    private func runThumbnailPass() {
+        let state = thumbState
+        state.passScheduled = false
+        guard state.isActive, !sortedItemsCache.isEmpty else { return }
 
-        for index in start...end {
-            let item = sortedItemsCache[index]
-            let distance = abs(index - selected)
-            let hasRealThumbnail = hasSufficientThumbnail(
-                for: item.url,
-                minPixelSize: thumbnailPixelSize
-            )
+        let items = sortedItemsCache
+        let count = items.count
+        let selected = min(max(0, viewModel.coverFlowSelectedIndex), count - 1)
+        let sizes = thumbnailSizes
+        let policy = thumbnailPolicy
+        let rapid = state.isRapidNavigation
+        let now = CACurrentMediaTime()
+        state.ledger.pruneStaleRequests(now: now)
 
-            if hasRealThumbnail {
-                continue
-            } else if thumbnailCache.hasFailed(url: item.url) {
-                thumbnailUpdates[item.url] = item.placeholderIcon
-                placeholdersToRemove.insert(item.url)
-            } else {
-                if let cachedHigh = thumbnailCache.getCachedThumbnail(for: item.url, maxPixelSize: thumbnailPixelSize) {
-                    thumbnailUpdates[item.url] = cachedHigh
-                    placeholdersToRemove.insert(item.url)
+        var updates: [URL: NSImage] = [:]
+        var removals: [URL] = []
+
+        // 1. Memory: release images far from the centre, and swap oversized ones for smaller copies
+        if !rapid {
+            for url in thumbnails.keys {
+                guard let index = state.indexByURL[url] else {
+                    removals.append(url)
                     continue
                 }
-
-                let cachedLow = thumbnailCache.getCachedThumbnail(for: item.url, maxPixelSize: placeholderPixelSize)
-                if let cachedLow {
-                    if thumbnails[item.url] == nil || iconPlaceholders.contains(item.url) {
-                        thumbnailUpdates[item.url] = cachedLow
-                        placeholdersToAdd.insert(item.url)
-                    }
-                } else if thumbnails[item.url] == nil {
-                    thumbnailUpdates[item.url] = item.placeholderIcon
-                    placeholdersToAdd.insert(item.url)
-                }
-
-                if !thumbnailCache.isPending(url: item.url, maxPixelSize: thumbnailPixelSize) {
-                    itemsToLoadHigh.append((item, distance))
-                }
-                if cachedLow == nil && !thumbnailCache.isPending(url: item.url, maxPixelSize: placeholderPixelSize) {
-                    itemsToLoadLow.append((item, distance))
-                }
-            }
-        }
-
-        if preloadStart <= preloadEnd {
-            for index in preloadStart...preloadEnd {
-                if index >= start && index <= end { continue }
-                let item = sortedItemsCache[index]
                 let distance = abs(index - selected)
-                let hasRealThumbnail = hasSufficientThumbnail(
-                    for: item.url,
-                    minPixelSize: thumbnailPixelSize
-                )
+                guard let maxSize = policy.maxRetainedPixelSize(distance: distance, sizes: sizes) else {
+                    removals.append(url)
+                    continue
+                }
+                guard let entry = state.ledger.entry(for: url), !entry.isFinal, entry.pixelSize > maxSize else { continue }
+                let item = items[index]
+                let version = item.contentVersion
+                if let smaller = thumbnailCache.cachedThumbnail(for: item, maxPixelSize: maxSize) {
+                    updates[url] = smaller
+                    state.ledger.replace(url, version: version, pixelSize: maxSize)
+                } else if maxSize > sizes.low, let low = thumbnailCache.cachedThumbnail(for: item, maxPixelSize: sizes.low) {
+                    updates[url] = low
+                    state.ledger.replace(url, version: version, pixelSize: sizes.low)
+                } else if distance > policy.highRadius {
+                    // Not on screen; it'll be reloaded if it comes back
+                    removals.append(url)
+                }
+            }
+            for url in removals {
+                state.ledger.remove(url)
+                state.pendingUpdates.removeValue(forKey: url)
+            }
+        }
 
-                if hasRealThumbnail || thumbnailCache.hasFailed(url: item.url) {
+        // 2. Load what each cover needs, nearest first
+        let scrolling = state.isScrolling
+        var highBudget = (scrolling ? 6 : maxConcurrentThumbnails) - state.ledger.activeRequestCount { $0 > sizes.low }
+        var lowBudget = (scrolling ? 4 : maxConcurrentPreloadThumbnails) - state.ledger.activeRequestCount { $0 <= sizes.low }
+        var requests: [(item: FileItem, pixelSize: CGFloat)] = []
+        var hasMore = false
+        let radius = rapid ? policy.highRadius : policy.preloadRadius
+
+        for distance in 0...radius {
+            let candidates = distance == 0 ? [selected] : [selected - distance, selected + distance]
+            for index in candidates where index >= 0 && index < count {
+                let item = items[index]
+                let url = item.url
+                guard let required = policy.requiredPixelSize(distance: distance, sizes: sizes, rapid: rapid) else { continue }
+                let version = item.contentVersion
+                let hasImage = updates[url] != nil || thumbnails[url] != nil || state.pendingUpdates[url] != nil
+                if hasImage && state.ledger.isSatisfied(url, version: version, pixelSize: required) {
                     continue
                 }
 
-                if let cachedLow = thumbnailCache.getCachedThumbnail(for: item.url, maxPixelSize: placeholderPixelSize) {
-                    if thumbnails[item.url] == nil || iconPlaceholders.contains(item.url) {
-                        thumbnailUpdates[item.url] = cachedLow
-                        placeholdersToAdd.insert(item.url)
-                    }
+                if item.isFromArchive {
+                    // Archive entries only ever get their type icon; settle them so passes stop
+                    updates[url] = item.placeholderIcon
+                    state.ledger.markFinal(url, version: version)
                     continue
                 }
 
-                if !thumbnailCache.isPending(url: item.url, maxPixelSize: placeholderPixelSize) {
-                    itemsToLoadLow.append((item, distance))
+                if state.ledger.isRequested(url, version: version, atLeast: required) {
+                    continue
                 }
-            }
-        }
 
-        itemsToLoadHigh.sort { $0.distance < $1.distance }
-        itemsToLoadLow.sort { $0.distance < $1.distance }
-        // Load fewer items during scroll to keep UI responsive
-        let highLimit = isScrolling ? 6 : maxConcurrentThumbnails
-        let lowLimit = isScrolling ? 4 : maxConcurrentPreloadThumbnails
-        let loadHighItems = Array(itemsToLoadHigh.prefix(highLimit))
-        let loadLowItems = Array(itemsToLoadLow.prefix(lowLimit))
-        let hasMoreToLoad = itemsToLoadHigh.count > highLimit || itemsToLoadLow.count > lowLimit
-
-        DispatchQueue.main.async { [self] in
-            // Evict old thumbnails
-            if !urlsToEvict.isEmpty && Self.debugEnabled {
-                Self.debugLog("[CoverFlow] EVICTING \(urlsToEvict.count) thumbnails, keeping window \(windowStart)...\(windowEnd) around selected \(selected)")
-            }
-            for url in urlsToEvict {
-                thumbnails.removeValue(forKey: url)
-                pendingThumbnailUpdates.removeValue(forKey: url)
-                iconPlaceholders.remove(url)
-            }
-
-            // Apply cached thumbnails directly (they're already ready)
-            if !thumbnailUpdates.isEmpty {
-                if Self.debugEnabled {
-                    Self.debugLog("[CoverFlow] APPLYING \(thumbnailUpdates.count) cached thumbnails")
+                // Memory cache only; disk-cache hits arrive through the request below
+                if let cached = thumbnailCache.cachedThumbnail(for: item, maxPixelSize: required) {
+                    updates[url] = cached
+                    state.ledger.markSettled(url, version: version, pixelSize: required)
+                    continue
                 }
-                for (url, image) in thumbnailUpdates {
-                    thumbnails[url] = image
+
+                // Show a cheap low-resolution copy while the full one loads
+                if !hasImage, required > sizes.low,
+                   let low = thumbnailCache.cachedThumbnail(for: item, maxPixelSize: sizes.low) {
+                    updates[url] = low
+                    state.ledger.markSettled(url, version: version, pixelSize: sizes.low)
                 }
-            }
 
-            for url in placeholdersToAdd {
-                iconPlaceholders.insert(url)
-            }
-            for url in placeholdersToRemove {
-                iconPlaceholders.remove(url)
-            }
-
-            // Start async thumbnail generation
-            for (item, _) in loadHighItems {
-                generateHighThumbnail(for: item)
-            }
-            for (item, _) in loadLowItems {
-                generatePlaceholderThumbnail(for: item, maxPixelSize: placeholderPixelSize)
-            }
-
-            // If there are more items to load and we're not scrolling, schedule another pass
-            // Use longer delay to prevent rapid cascading updates that cause UI flashing
-            deferredThumbnailReloadWorkItem?.cancel()
-            deferredThumbnailReloadWorkItem = nil
-            if hasMoreToLoad && !isCoverFlowScrolling {
-                let workItem = DispatchWorkItem { [self] in
-                    deferredThumbnailReloadWorkItem = nil
-                    if isCoverFlowActive {
-                        loadVisibleThumbnails()
-                    }
-                }
-                deferredThumbnailReloadWorkItem = workItem
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
-            }
-        }
-    }
-
-    private func generateHighThumbnail(for item: FileItem) {
-        generateThumbnail(for: item, maxPixelSize: coverFlowThumbnailPixelSize, placeholder: false, refreshAfter: true)
-    }
-
-    private func generatePlaceholderThumbnail(for item: FileItem, maxPixelSize: CGFloat) {
-        generateThumbnail(for: item, maxPixelSize: maxPixelSize, placeholder: true, refreshAfter: false)
-    }
-
-    private func generateThumbnail(
-        for item: FileItem,
-        maxPixelSize: CGFloat,
-        placeholder: Bool,
-        refreshAfter: Bool
-    ) {
-        // Skip archive items entirely - no closure creation, no dispatch
-        if item.isFromArchive {
-            let url = item.url
-            pendingThumbnailUpdates[url] = item.placeholderIcon
-            if placeholder {
-                iconPlaceholders.insert(url)
-            }
-            scheduleThumbnailBatch()
-            return
-        }
-
-        let currentGen = thumbnailLoadGeneration
-
-        thumbnailCache.generateThumbnail(for: item, maxPixelSize: maxPixelSize) { url, image in
-            DispatchQueue.main.async { [self] in
-                guard currentGen == thumbnailLoadGeneration, isCoverFlowActive else { return }
-
-                let finalImage = image ?? item.placeholderIcon
-
-                if placeholder {
-                    if thumbnails[url] != nil && !iconPlaceholders.contains(url) {
-                        return
-                    }
-                    pendingThumbnailUpdates[url] = finalImage
-                    iconPlaceholders.insert(url)
+                if required > sizes.low {
+                    guard highBudget > 0 else { hasMore = true; continue }
+                    highBudget -= 1
                 } else {
-                    pendingThumbnailUpdates[url] = finalImage
-                    iconPlaceholders.remove(url)
+                    guard lowBudget > 0 else { hasMore = true; continue }
+                    lowBudget -= 1
+                }
+                state.ledger.beginRequest(url, version: version, pixelSize: required, now: now)
+                requests.append((item, required))
+            }
+        }
+
+        if !rapid {
+            hydrateMetadata(around: selected, radius: policy.preloadRadius, items: items)
+        }
+
+        if !removals.isEmpty || !updates.isEmpty {
+            var newThumbnails = thumbnails
+            for url in removals {
+                newThumbnails.removeValue(forKey: url)
+            }
+            newThumbnails.merge(updates) { _, new in new }
+            thumbnails = newThumbnails
+        }
+
+        for request in requests {
+            requestThumbnail(for: request.item, pixelSize: request.pixelSize)
+        }
+
+        // Completions schedule the next pass; if every slot is taken, look again shortly
+        // (requests that never complete go stale in the ledger and are retried).
+        state.hasMoreWork = hasMore
+        if hasMore && requests.isEmpty {
+            scheduleRetryPass(after: 0.5)
+        }
+    }
+
+    private func requestThumbnail(for item: FileItem, pixelSize: CGFloat) {
+        let state = thumbState
+        let generation = state.generation
+        let version = item.contentVersion
+        let url = item.url
+
+        // The completion can run synchronously (memory hit, known failure); always handle it on
+        // the next turn so it never mutates state in the middle of a pass.
+        thumbnailCache.requestThumbnail(for: item, maxPixelSize: pixelSize, owner: state.requestOwner) { result in
+            DispatchQueue.main.async {
+                guard generation == state.generation, state.isActive else { return }
+                state.ledger.finishRequest(url, pixelSize: pixelSize)
+
+                // Drop results for content that changed (or left) since the request
+                guard let index = state.indexByURL[url], index < sortedItemsCache.count,
+                      CoverFlowThumbnailLedger.isSameContent(sortedItemsCache[index].contentVersion, version) else {
+                    scheduleThumbnailPass()
+                    return
                 }
 
-                // Schedule batch apply instead of immediate state update
-                scheduleThumbnailBatch()
-                _ = refreshAfter
+                let hasImage = thumbnails[url] != nil || state.pendingUpdates[url] != nil
+                switch result {
+                case .cancelled:
+                    // Not settled: the next pass asks again if the cover still needs it
+                    break
+                case .failed:
+                    // Keep any image we have rather than replacing it with a generic icon
+                    if !hasImage {
+                        state.pendingUpdates[url] = item.placeholderIcon
+                        scheduleThumbnailBatch()
+                    }
+                    state.ledger.markFinal(url, version: version)
+                case .loaded(let image):
+                    if let existing = state.ledger.entry(for: url),
+                       CoverFlowThumbnailLedger.isSameContent(existing.version, version),
+                       existing.isFinal || existing.pixelSize > pixelSize {
+                        // Something better arrived first
+                        break
+                    }
+                    state.pendingUpdates[url] = image
+                    state.ledger.markSettled(url, version: version, pixelSize: pixelSize)
+                    scheduleThumbnailBatch()
+                }
+
+                if state.hasMoreWork {
+                    scheduleThumbnailPass()
+                }
             }
+        }
+    }
+
+    /// Requests metadata for the items around the centre. The range is aligned to chunks so the
+    /// request only changes every few covers instead of on every step.
+    private func hydrateMetadata(around selected: Int, radius: Int, items: [FileItem]) {
+        let chunk = 32
+        let lower = max(0, selected - radius) / chunk * chunk
+        let upper = min(items.count, (min(items.count - 1, selected + radius) / chunk + 1) * chunk)
+        guard lower < upper else { return }
+        let range = lower..<upper
+        guard range != thumbState.lastHydrationRange else { return }
+        thumbState.lastHydrationRange = range
+
+        var urlsToHydrate: [URL] = []
+        for item in items[range] where viewModel.needsHydration(item) {
+            urlsToHydrate.append(item.url)
+        }
+        if !urlsToHydrate.isEmpty {
+            viewModel.hydrateMetadata(for: urlsToHydrate)
         }
     }
 
     private func scheduleThumbnailBatch() {
-        guard isCoverFlowActive else { return }
+        let state = thumbState
+        guard state.isActive else { return }
         // If timer already scheduled, let it handle the batch
-        guard thumbnailBatchTimer == nil else { return }
+        guard state.batchTimer == nil else { return }
 
-        thumbnailBatchTimer = Timer.scheduledTimer(withTimeInterval: thumbnailBatchInterval, repeats: false) { [self] _ in
+        state.batchTimer = Timer.scheduledTimer(withTimeInterval: thumbnailBatchInterval, repeats: false) { [self] _ in
             flushPendingThumbnails()
         }
     }
 
     private func flushPendingThumbnails() {
-        thumbnailBatchTimer?.invalidate()
-        thumbnailBatchTimer = nil
+        let state = thumbState
+        state.batchTimer?.invalidate()
+        state.batchTimer = nil
 
-        guard isCoverFlowActive, !pendingThumbnailUpdates.isEmpty else {
-            pendingThumbnailUpdates.removeAll()
+        guard state.isActive, !state.pendingUpdates.isEmpty else {
+            state.pendingUpdates.removeAll()
             return
         }
 
-        let count = pendingThumbnailUpdates.count
-        if Self.debugEnabled {
-            Self.debugLog("[CoverFlow] FLUSH \(count) pending thumbnails")
-        }
+        Self.debugLog("[CoverFlow] FLUSH \(state.pendingUpdates.count) pending thumbnails")
 
         // Apply all pending updates in one batch
-        for (url, image) in pendingThumbnailUpdates {
-            thumbnails[url] = image
-        }
-        pendingThumbnailUpdates.removeAll()
+        var newThumbnails = thumbnails
+        newThumbnails.merge(state.pendingUpdates) { _, new in new }
+        state.pendingUpdates.removeAll()
+        thumbnails = newThumbnails
     }
 
     private func updateCoverFlowHeight(
@@ -862,13 +918,6 @@ struct CoverFlowView: View {
         }
         liveCoverFlowHeight = clampedHeight
     }
-
-    private func hasSufficientThumbnail(for url: URL, minPixelSize: CGFloat) -> Bool {
-        guard let image = thumbnails[url] else { return false }
-        guard !iconPlaceholders.contains(url) else { return false }
-        let maxDimension = max(image.size.width, image.size.height)
-        return maxDimension >= minPixelSize * 0.9
-    }
 }
 
 // MARK: - Native AppKit Cover Flow Container
@@ -880,39 +929,68 @@ struct CoverFlowContainer: NSViewRepresentable {
     let thumbnails: [URL: NSImage]
     let thumbnailCount: Int  // Explicit count to force SwiftUI updates
     let navigationGeneration: Int  // Forces update on every navigation
-    let selectedItems: Set<FileItem>  // Multi-selection for drag
+    let selectedItems: Set<FileItem>  // Multi-selection for drag and context menus
     let cutItemURLs: Set<URL>  // URLs of items marked for cut (dimmed)
     let coverScale: CGFloat
     let scrollSensitivity: CGFloat
-    let onSelect: (Int) -> Void
+    let currentFolderURL: URL?  // Destination for drops onto the background (nil inside archives)
+    let canModifyFolder: Bool
+    let onSelect: (Int, CoverFlowSelectionIntent) -> Void
     let onOpen: (Int) -> Void
+    let onOpenItems: ([FileItem]) -> Void
     let onDeselect: () -> Void
-    let onRightClick: (Int) -> Void
-    let onDrop: ([URL]) -> Void
-    let onDropToFolder: ([URL], URL) -> Void  // Drop to specific folder
+    let onDrop: ([URL], FileDropOperation) -> Void
+    let onDropToFolder: ([URL], URL, FileDropOperation) -> Void  // Drop to specific folder
     let onScrollStateChange: (Bool) -> Void
     let onCopy: () -> Void
     let onCut: () -> Void
     let onPaste: () -> Void
     let onDelete: () -> Void
-    let onShowPackageContents: (Int) -> Void
+    let onShowPackageContents: (FileItem) -> Void
     let onQuickLook: (FileItem) -> Void
     let onExtendSelect: (Int) -> Void  // Shift+arrow range selection
     let onSelectAll: () -> Void
+    let onNewFolder: () -> Void
+    let onGetInfo: () -> Void  // Get Info for the current folder
     let onActivityStateChange: (Bool) -> Void
-
-    private static var viewInstanceCount = 0
+    let onCentreCoverPixelSizeChange: (CGFloat) -> Void
 
     func makeNSView(context: Context) -> CoverFlowNSView {
-        Self.viewInstanceCount += 1
-        CoverFlowView.debugLog("[Container] makeNSView called - instance #\(Self.viewInstanceCount)")
         let view = CoverFlowNSView()
+        view.applySwiftUIUpdate {
+            configure(view)
+            view.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
+        }
+        return view
+    }
+
+    func updateNSView(_ nsView: CoverFlowNSView, context: Context) {
+        // Preserve first responder status during updates
+        let wasFirstResponder = nsView.window?.firstResponder === nsView
+
+        let cutURLsChanged = nsView.cutItemURLs != cutItemURLs
+        nsView.applySwiftUIUpdate {
+            configure(nsView)
+            nsView.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
+            if cutURLsChanged {
+                nsView.updateCutItemOpacity()
+            }
+            nsView.updateActivityState()
+        }
+
+        // Restore first responder only if CoverFlowNSView was the first responder before update
+        // Don't steal focus from other views like the search field
+        if wasFirstResponder && nsView.window?.firstResponder !== nsView {
+            CoverFlowView.debugLog("[Container] Focus lost during updateNSView - restoring")
+            nsView.window?.makeFirstResponder(nsView)
+        }
+    }
+
+    private func configure(_ view: CoverFlowNSView) {
         view.onSelect = onSelect
         view.onOpen = onOpen
+        view.onOpenItems = onOpenItems
         view.onDeselect = onDeselect
-        view.onRightClick = { index, _ in
-            onRightClick(index)
-        }
         view.onDrop = onDrop
         view.onDropToFolder = onDropToFolder
         view.onScrollStateChange = onScrollStateChange
@@ -924,101 +1002,68 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.onQuickLook = onQuickLook
         view.onExtendSelect = onExtendSelect
         view.onSelectAll = onSelectAll
+        view.onNewFolder = onNewFolder
+        view.onGetInfo = onGetInfo
         view.onActivityStateChange = onActivityStateChange
+        view.onCentreCoverPixelSizeChange = onCentreCoverPixelSizeChange
         view.selectedItems = selectedItems
         view.cutItemURLs = cutItemURLs
         view.coverScale = coverScale
         view.scrollSensitivity = scrollSensitivity
-        view.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
-        return view
-    }
-
-    func updateNSView(_ nsView: CoverFlowNSView, context: Context) {
-        // Preserve first responder status during updates
-        let wasFirstResponder = nsView.window?.firstResponder === nsView
-
-        nsView.onSelect = onSelect
-        nsView.onOpen = onOpen
-        nsView.onDeselect = onDeselect
-        nsView.onRightClick = { index, _ in
-            onRightClick(index)
-        }
-        nsView.onDrop = onDrop
-        nsView.onDropToFolder = onDropToFolder
-        nsView.onScrollStateChange = onScrollStateChange
-        nsView.onCopy = onCopy
-        nsView.onCut = onCut
-        nsView.onPaste = onPaste
-        nsView.onDelete = onDelete
-        nsView.onShowPackageContents = onShowPackageContents
-        nsView.onQuickLook = onQuickLook
-        nsView.onExtendSelect = onExtendSelect
-        nsView.onSelectAll = onSelectAll
-        nsView.onActivityStateChange = onActivityStateChange
-        nsView.selectedItems = selectedItems
-        let cutURLsChanged = nsView.cutItemURLs != cutItemURLs
-        nsView.cutItemURLs = cutItemURLs
-        nsView.coverScale = coverScale
-        nsView.scrollSensitivity = scrollSensitivity
-        nsView.updateItems(items, itemsToken: itemsToken, thumbnails: thumbnails, selectedIndex: selectedIndex)
-        if cutURLsChanged {
-            nsView.updateCutItemOpacity()
-        }
-        nsView.updateActivityState()
-
-        // Restore first responder only if CoverFlowNSView was the first responder before update
-        // Don't steal focus from other views like the search field
-        if wasFirstResponder && nsView.window?.firstResponder !== nsView {
-            CoverFlowView.debugLog("[Container] Focus lost during updateNSView - restoring")
-            nsView.window?.makeFirstResponder(nsView)
-        }
+        view.currentFolderURL = currentFolderURL
+        view.canModifyFolder = canModifyFolder
     }
 }
 
 class CoverFlowNSView: NSView, OpenWithActionTarget {
-    var onSelect: ((Int) -> Void)?
+    var onSelect: ((Int, CoverFlowSelectionIntent) -> Void)?
     var onOpen: ((Int) -> Void)?
+    var onOpenItems: (([FileItem]) -> Void)?
     var onDeselect: (() -> Void)?
-    var onRightClick: ((Int, NSPoint) -> Void)?
     var onScrollStateChange: ((Bool) -> Void)?
     var onCopy: (() -> Void)?
     var onCut: (() -> Void)?
     var onPaste: (() -> Void)?
     var onDelete: (() -> Void)?
-    var onShowPackageContents: ((Int) -> Void)?
+    var onShowPackageContents: ((FileItem) -> Void)?
     var onQuickLook: ((FileItem) -> Void)?
     var onExtendSelect: ((Int) -> Void)?  // Shift+arrow range selection
     var onSelectAll: (() -> Void)?
+    var onNewFolder: (() -> Void)?
+    var onGetInfo: (() -> Void)?
     var onActivityStateChange: ((Bool) -> Void)?
+    var onCentreCoverPixelSizeChange: ((CGFloat) -> Void)?
     var selectedItems: Set<FileItem> = []  // Track multi-selection for drag
     var cutItemURLs: Set<URL> = []  // URLs of items marked for cut (dimmed)
+    var currentFolderURL: URL?
+    var canModifyFolder = true
 
     private var items: [FileItem] = []
     private var itemsToken: Int = 0
     private var thumbnails: [URL: NSImage] = [:]
-    private var selectedIndex: Int = 0
+    /// The centred cover
+    private(set) var selectedIndex: Int = 0
     private var coverLayers: [CALayer] = []
     private var layerPool: [CALayer] = []  // Reusable layer pool
+    private var backgroundLayer: CAGradientLayer?
     private var lastClickTime: Date = .distantPast
-
-    // Fast scroll detection
-    private var isScrolling = false
-    private var isViewActive = false
-    private var isExtendingSelection = false  // True during shift+arrow range selection
-    private var scrollSettleTimer: Timer?
     private var lastClickIndex: Int = -1
     private var lastClickLocation: CGPoint = .zero
+    /// A plain click on an item of a multi-selection keeps the selection (for dragging) and
+    /// collapses it to that item on mouse-up if no drag started
+    private var pendingCollapseIndex: Int?
 
-    // Momentum scrolling
-    private var scrollVelocity: CGFloat = 0
-    private var lastScrollTime: Date = .distantPast
-    private var momentumTimer: Timer?
-    private var accumulatedScroll: CGFloat = 0
+    // Scrolling
+    private var isScrolling = false
+    private var isViewActive = false
+    private var scrollSettleTimer: Timer?
+    private var scrollAccumulator = CoverFlowScrollAccumulator()
 
     // Type-ahead search
     private var typeAheadBuffer: String = ""
     private var typeAheadTimer: Timer?
     private let typeAheadTimeout: TimeInterval = 1.0
+    private let pageStep = 10
 
     // Dynamic sizing based on view bounds
     var coverScale: CGFloat = 1.0 {
@@ -1032,14 +1077,19 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     var scrollSensitivity: CGFloat = 1.0
 
     private var baseCoverSize: CGFloat {
-        let heightDriven = bounds.height * 0.7
-        let widthDriven = bounds.width * 0.28
-        return min(heightDriven, widthDriven, 480) * coverScale
+        CoverFlowGeometry.baseCoverSize(viewSize: bounds.size, coverScale: coverScale)
     }
-    private var coverSpacing: CGFloat { baseCoverSize * 0.22 }  // Space between side covers
-    private var sideOffset: CGFloat { baseCoverSize * 0.62 }    // Distance from center to first side cover
-    private let sideAngle: CGFloat = 60
+    private var coverSpacing: CGFloat { baseCoverSize * CoverFlowGeometry.spacingRatio }  // Space between side covers
     private let visibleRange = 12
+    private var lastReportedCentrePixels: CGFloat = 0
+
+    private var reduceMotion: Bool {
+        NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+    }
+
+    private var backingScale: CGFloat {
+        window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2
+    }
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -1051,47 +1101,58 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     }
 
     // Drag and drop
-    var onDrop: (([URL]) -> Void)?
-    var onDropToFolder: (([URL], URL) -> Void)?  // Drop to specific folder
+    var onDrop: (([URL], FileDropOperation) -> Void)?
+    var onDropToFolder: (([URL], URL, FileDropOperation) -> Void)?  // Drop to specific folder
     private var dragStartLocation: NSPoint?
     private var dragStartIndex: Int?
-    private var isDropTargeted = false
     private var dropTargetIndex: Int?  // Which folder cover is being hovered
     private var dropTargetHighlightLayer: CAShapeLayer?  // Visible hover ring
+    private var dragSessionInfo: DragSessionInfo?
+
+    /// Per-drag cache of what's being dragged, so the cursor badge can match the eventual operation
+    private struct DragSessionInfo {
+        let sequenceNumber: Int
+        let sourceURLs: [URL]
+        let sourceVolumes: [NSObject?]
+        var destinationVolumes: [URL: NSObject?] = [:]
+    }
 
     // Inline video preview (mirrors Finder's TDesktopInlinePreviewController)
     private var hoverTrackingArea: NSTrackingArea?
     private var hoveredCoverIndex: Int?
+    private var previewHost: InlinePreviewHostToken?
     private var videoPreviewLayer: AVPlayerLayer?
-    private var videoPreviewCoverIndex: Int?
+    private var videoPreviewURL: URL?
     private var skimProgressLayer: CALayer?
+
+    // Accessibility
+    private var accessibilityElementsByIndex: [Int: CoverFlowAccessibilityElement] = [:]
+
+    /// True while SwiftUI is pushing new state into the view (updateNSView)
+    private var isApplyingSwiftUIUpdate = false
+
+    private var emptyRebuildWorkItem: DispatchWorkItem?
+    /// How long the list must stay empty before the covers are cleared
+    let emptyRebuildDelay: TimeInterval = 0.3
 
     private func setupView() {
         wantsLayer = true
 
         // Background gradient
         let gradientLayer = CAGradientLayer()
-        gradientLayer.colors = [
-            NSColor.windowBackgroundColor.cgColor,
-            NSColor.windowBackgroundColor.blended(withFraction: 0.3, of: .black)?.cgColor ?? NSColor.black.cgColor
-        ]
         gradientLayer.startPoint = CGPoint(x: 0.5, y: 1)
         gradientLayer.endPoint = CGPoint(x: 0.5, y: 0)
         gradientLayer.frame = bounds
         gradientLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         layer?.addSublayer(gradientLayer)
-
-        // Add right-click gesture recognizer as backup
-        let rightClickGesture = NSClickGestureRecognizer(target: self, action: #selector(handleRightClick(_:)))
-        rightClickGesture.buttonMask = 0x2 // Right mouse button
-        addGestureRecognizer(rightClickGesture)
+        backgroundLayer = gradientLayer
+        updateAppearanceColors()
 
         // Register for drag and drop
         registerForDraggedTypes([.fileURL])
 
         // Setup hover tracking for inline video preview
         setupHoverTracking()
-        setupVideoPreviewCallbacks()
     }
 
     private func currentActivityState() -> Bool {
@@ -1125,15 +1186,20 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         onActivityStateChange?(newState)
     }
 
+    /// Applies state pushed by SwiftUI's updateNSView.
+    func applySwiftUIUpdate(_ body: () -> Void) {
+        let wasApplying = isApplyingSwiftUIUpdate
+        isApplyingSwiftUIUpdate = true
+        defer { isApplyingSwiftUIUpdate = wasApplying }
+        body()
+    }
+
     private func pauseTransientWork() {
-        momentumTimer?.invalidate()
-        momentumTimer = nil
         scrollSettleTimer?.invalidate()
         scrollSettleTimer = nil
         typeAheadTimer?.invalidate()
         typeAheadTimer = nil
-        scrollVelocity = 0
-        accumulatedScroll = 0
+        scrollAccumulator.reset()
         if isScrolling {
             isScrolling = false
             onScrollStateChange?(false)
@@ -1141,9 +1207,62 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         clearDropTargetHighlight()
         dropTargetIndex = nil
 
-        // Stop inline video preview
-        hoveredCoverIndex = nil
-        InlineVideoPreviewManager.shared.stopAllPreviews()
+        // Stop this view's inline video preview (not other windows')
+        stopOwnedVideoPreview()
+    }
+
+    // MARK: - Appearance
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateAppearanceColors()
+    }
+
+    private func updateAppearanceColors() {
+        // Dynamic colors resolve against the current drawing appearance
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            self.backgroundLayer?.colors = [
+                NSColor.windowBackgroundColor.cgColor,
+                NSColor.windowBackgroundColor.blended(withFraction: 0.3, of: .black)?.cgColor ?? NSColor.black.cgColor
+            ]
+            if let highlight = self.dropTargetHighlightLayer {
+                highlight.fillColor = NSColor.controlAccentColor.withAlphaComponent(0.18).cgColor
+                highlight.strokeColor = NSColor.controlAccentColor.cgColor
+            }
+            CATransaction.commit()
+        }
+    }
+
+    override func viewDidChangeBackingProperties() {
+        super.viewDidChangeBackingProperties()
+        let scale = backingScale
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for coverLayer in coverLayers {
+            applyContentsScale(scale, to: coverLayer)
+        }
+        CATransaction.commit()
+        reportCentreCoverPixelsIfNeeded()
+    }
+
+    private func applyContentsScale(_ scale: CGFloat, to coverLayer: CALayer) {
+        coverLayer.contentsScale = scale
+        if let imageLayer = imageSublayer(of: coverLayer) {
+            imageLayer.contentsScale = scale
+        }
+        if let reflectionImage = reflectionSublayer(of: coverLayer)?.sublayers?.first(where: { $0.name == "reflectionImage" }) {
+            reflectionImage.contentsScale = scale
+        }
+    }
+
+    /// Tells SwiftUI how many device pixels the centre cover spans, so it can request sharp thumbnails.
+    private func reportCentreCoverPixelsIfNeeded() {
+        let pixels = (baseCoverSize * backingScale).rounded()
+        guard pixels > 0, pixels != lastReportedCentrePixels else { return }
+        lastReportedCentrePixels = pixels
+        onCentreCoverPixelSizeChange?(pixels)
     }
 
     // MARK: - Inline Video Preview (Finder-style hover-to-play)
@@ -1175,119 +1294,96 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     }
 
     override func mouseMoved(with event: NSEvent) {
-        guard AppSettings.shared.inlineVideoPreview else { return }
+        guard AppSettings.shared.inlineVideoPreview, let host = previewHost else { return }
         guard !isScrolling else { return }
 
+        let manager = InlineVideoPreviewManager.shared
         let location = convert(event.locationInWindow, from: nil)
-        guard let index = hitTestCover(at: location), index < items.count else {
+        guard let hit = coverHit(at: location), hit.index < items.count else {
             // Mouse is over empty space
             if hoveredCoverIndex != nil {
-                hoveredCoverIndex = nil
-                InlineVideoPreviewManager.shared.endSkimming()
-                InlineVideoPreviewManager.shared.cancelPreview()
+                stopOwnedVideoPreview()
             }
             return
         }
 
+        let index = hit.index
+        let item = items[index]
         if hoveredCoverIndex != index {
             // New cover — request preview
-            InlineVideoPreviewManager.shared.endSkimming()
             hoveredCoverIndex = index
-
-            let item = items[index]
             if item.fileType == .video {
-                InlineVideoPreviewManager.shared.requestPreview(for: item)
+                manager.requestPreview(for: item, host: host)
             } else {
-                InlineVideoPreviewManager.shared.cancelPreview()
+                manager.stopPreviews(ownedBy: host)
             }
-        } else if AppSettings.shared.videoSkimming, items[index].fileType == .video {
-            // Same video cover — drive skimming from mouse X position
-            if let coverFrame = coverFrameForIndex(index), coverFrame.width > 0 {
-                let fraction = (location.x - coverFrame.minX) / coverFrame.width
-                let clampedFraction = min(max(fraction, 0), 1)
-                InlineVideoPreviewManager.shared.seekToFraction(clampedFraction, for: items[index].url)
-                updateSkimProgressLayer(fraction: clampedFraction)
-            }
+        } else if AppSettings.shared.videoSkimming, item.fileType == .video,
+                  manager.previewURL(ownedBy: host) == item.url,
+                  let fraction = hit.quad.horizontalFraction(at: location) {
+            // Same video cover — drive skimming from the mouse position across the cover
+            manager.seekToFraction(Double(fraction), for: item.url)
+            updateSkimProgressLayer(fraction: fraction)
         }
     }
 
     override func mouseExited(with event: NSEvent) {
-        hoveredCoverIndex = nil
-        InlineVideoPreviewManager.shared.endSkimming()
-        InlineVideoPreviewManager.shared.cancelPreview()
-    }
-
-    /// Returns the frame rect of the cover at the given item index, or nil if not found.
-    private func coverFrameForIndex(_ index: Int) -> CGRect? {
-        guard let coverLayer = coverLayers.first(where: {
-            ($0.value(forKey: "itemIndex") as? Int) == index
-        }) else { return nil }
-
-        let coverWidth = coverLayer.value(forKey: "coverWidth") as? CGFloat ?? baseCoverSize
-        let coverHeight = coverLayer.value(forKey: "coverHeight") as? CGFloat ?? baseCoverSize
-
-        return CGRect(
-            x: coverLayer.position.x - coverWidth / 2,
-            y: coverLayer.position.y - coverHeight / 2,
-            width: coverWidth,
-            height: coverHeight
-        )
+        stopOwnedVideoPreview()
     }
 
     /// Updates the skim progress bar layer width based on the current fraction.
-    private func updateSkimProgressLayer(fraction: Double) {
+    private func updateSkimProgressLayer(fraction: CGFloat) {
         guard let progressLayer = skimProgressLayer,
               let videoLayer = videoPreviewLayer else { return }
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        let width = videoLayer.bounds.width * CGFloat(fraction)
+        let width = videoLayer.bounds.width * fraction
         progressLayer.frame = CGRect(x: videoLayer.frame.minX, y: videoLayer.frame.minY, width: width, height: 3)
         CATransaction.commit()
     }
 
-    private func setupVideoPreviewCallbacks() {
-        InlineVideoPreviewManager.shared.onPlayerLayerReady = { [weak self] playerLayer, url in
-            self?.attachVideoPreviewLayer(playerLayer, for: url)
-        }
-        InlineVideoPreviewManager.shared.onPlayerLayerDetach = { [weak self] url in
-            self?.detachVideoPreviewLayer(for: url)
+    private func registerPreviewHostIfNeeded() {
+        guard previewHost == nil else { return }
+        previewHost = InlineVideoPreviewManager.shared.registerHost(
+            onLayerReady: { [weak self] playerLayer, url in
+                self?.attachVideoPreviewLayer(playerLayer, for: url)
+            },
+            onLayerDetach: { [weak self] url in
+                self?.detachVideoPreviewLayer(for: url)
+            }
+        )
+    }
+
+    private func unregisterPreviewHost() {
+        hoveredCoverIndex = nil
+        guard let host = previewHost else { return }
+        previewHost = nil
+        InlineVideoPreviewManager.shared.unregisterHost(host)
+        detachVideoPreviewLayer(for: nil)
+    }
+
+    /// Stops the preview this view requested; previews in other windows keep playing.
+    private func stopOwnedVideoPreview() {
+        hoveredCoverIndex = nil
+        guard let host = previewHost else { return }
+        if isApplyingSwiftUIUpdate {
+            // The manager publishes state; don't do that in the middle of a SwiftUI update
+            DispatchQueue.main.async {
+                InlineVideoPreviewManager.shared.stopPreviews(ownedBy: host)
+            }
+        } else {
+            InlineVideoPreviewManager.shared.stopPreviews(ownedBy: host)
         }
     }
 
     private func attachVideoPreviewLayer(_ playerLayer: AVPlayerLayer, for url: URL) {
-        // Find the cover layer for this URL
-        guard let coverIndex = items.firstIndex(where: { $0.url == url }) else { return }
-        guard let coverLayer = coverLayers.first(where: {
-            ($0.value(forKey: "itemIndex") as? Int) == coverIndex
-        }) else { return }
-
-        // Find the imageLayer sublayer
-        guard let imageLayer = coverLayer.sublayers?.first(where: { $0.name == "imageLayer" }) else { return }
-
         // Remove any existing video preview
-        detachVideoPreviewLayer(for: url)
+        detachVideoPreviewLayer(for: nil)
 
-        // Configure and attach
-        playerLayer.frame = imageLayer.bounds
         playerLayer.name = "videoPreviewLayer"
         playerLayer.videoGravity = .resizeAspect
-        playerLayer.cornerRadius = imageLayer.cornerRadius
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        coverLayer.insertSublayer(playerLayer, above: imageLayer)
-        CATransaction.commit()
-
-        // Fade in
-        let fadeIn = CABasicAnimation(keyPath: "opacity")
-        fadeIn.fromValue = 0.0
-        fadeIn.toValue = 1.0
-        fadeIn.duration = 0.2
-        playerLayer.add(fadeIn, forKey: "fadeIn")
-
         videoPreviewLayer = playerLayer
-        videoPreviewCoverIndex = coverIndex
+        videoPreviewURL = url
 
         // Add skim progress bar layer if skimming is enabled
         if AppSettings.shared.videoSkimming {
@@ -1296,88 +1392,116 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             progressBar.backgroundColor = NSColor.white.withAlphaComponent(0.9).cgColor
             progressBar.frame = CGRect(x: 0, y: 0, width: 0, height: 3)
             progressBar.cornerRadius = 1.5
-            coverLayer.addSublayer(progressBar)
             skimProgressLayer = progressBar
         }
+
+        reconcileVideoPreviewLayer(fadeIn: true)
     }
 
-    private func detachVideoPreviewLayer(for url: URL) {
-        guard let layer = videoPreviewLayer else { return }
-
-        // Remove skim progress layer
+    private func detachVideoPreviewLayer(for url: URL?) {
+        if let url, let current = videoPreviewURL, current != url { return }
         skimProgressLayer?.removeFromSuperlayer()
         skimProgressLayer = nil
+        videoPreviewLayer?.removeFromSuperlayer()
+        videoPreviewLayer = nil
+        videoPreviewURL = nil
+    }
 
-        // Fade out and remove
-        CATransaction.begin()
-        CATransaction.setCompletionBlock {
-            layer.removeFromSuperlayer()
+    /// Keeps the player layer on the cover that currently shows its item. Covers are recycled and
+    /// rebuilt, so the layer follows the item's URL rather than a layer instance; if the item is no
+    /// longer on screen the preview stops.
+    private func reconcileVideoPreviewLayer(fadeIn: Bool = false) {
+        guard let playerLayer = videoPreviewLayer, let url = videoPreviewURL else { return }
+        guard let coverLayer = cover(showing: url), let imageLayer = imageSublayer(of: coverLayer) else {
+            stopOwnedVideoPreview()
+            detachVideoPreviewLayer(for: nil)
+            return
         }
-        CATransaction.setAnimationDuration(0.15)
-        layer.opacity = 0
+
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        if playerLayer.superlayer !== coverLayer {
+            playerLayer.removeFromSuperlayer()
+            coverLayer.insertSublayer(playerLayer, above: imageLayer)
+        }
+        playerLayer.frame = imageLayer.frame
+        playerLayer.cornerRadius = imageLayer.cornerRadius
+        if let progressLayer = skimProgressLayer {
+            if progressLayer.superlayer !== coverLayer {
+                progressLayer.removeFromSuperlayer()
+                coverLayer.addSublayer(progressLayer)
+            }
+            progressLayer.frame = CGRect(x: imageLayer.frame.minX, y: imageLayer.frame.minY, width: progressLayer.frame.width, height: 3)
+        }
         CATransaction.commit()
 
-        videoPreviewLayer = nil
-        videoPreviewCoverIndex = nil
+        if fadeIn && !reduceMotion {
+            let fade = CABasicAnimation(keyPath: "opacity")
+            fade.fromValue = 0.0
+            fade.toValue = 1.0
+            fade.duration = 0.2
+            playerLayer.add(fade, forKey: "fadeIn")
+        }
     }
 
-    @objc private func handleRightClick(_ gesture: NSClickGestureRecognizer) {
-        let location = gesture.location(in: self)
-        let index = hitTestCover(at: location) ?? selectedIndex
-        onSelect?(index)
-        let menu = createContextMenu(for: index)
-        menu.popUp(positioning: nil, at: location, in: self)
+    /// Called whenever the centred cover changes.
+    private func centredIndexDidChange() {
+        // Stop a preview the selection has moved away from
+        if let host = previewHost,
+           let previewURL = InlineVideoPreviewManager.shared.previewURL(ownedBy: host),
+           selectedIndex < items.count, items[selectedIndex].url != previewURL {
+            stopOwnedVideoPreview()
+        }
+        NSAccessibility.post(element: self, notification: .valueChanged)
+        NSAccessibility.post(element: self, notification: .selectedChildrenChanged)
     }
 
-    private static var updateItemsCount = 0
-    private static var lastUpdateTime: Date = .distantPast
+    // MARK: - Items
 
     func updateItems(_ items: [FileItem], itemsToken: Int, thumbnails: [URL: NSImage], selectedIndex: Int) {
-        Self.updateItemsCount += 1
-        let now = Date()
-        let interval = now.timeIntervalSince(Self.lastUpdateTime)
-        Self.lastUpdateTime = now
-
-        let countChanged = self.items.count != items.count
-        let tokenChanged = self.itemsToken != itemsToken
-        let itemsChanged = countChanged || tokenChanged
-        let thumbnailsChanged = self.thumbnails.count != thumbnails.count
-
-        if interval < 0.5 {
-            if itemsChanged {
-                CoverFlowView.debugLog("[NSView] updateItems #\(Self.updateItemsCount) - \(String(format: "%.3f", interval))s | ITEMS CHANGED! countChanged:\(countChanged) tokenChanged:\(tokenChanged) oldToken:\(self.itemsToken) newToken:\(itemsToken) oldCount:\(self.items.count) newCount:\(items.count)")
-            } else {
-                CoverFlowView.debugLog("[NSView] updateItems #\(Self.updateItemsCount) - \(String(format: "%.3f", interval))s | thumbsChanged:\(thumbnailsChanged) thumbs:\(thumbnails.count)")
-            }
+        let itemsChanged = self.items.count != items.count || self.itemsToken != itemsToken
+        if itemsChanged {
+            CoverFlowView.debugLog("[NSView] updateItems - ITEMS CHANGED oldToken:\(self.itemsToken) newToken:\(itemsToken) oldCount:\(self.items.count) newCount:\(items.count)")
         }
 
         self.items = items
         self.itemsToken = itemsToken
         self.thumbnails = thumbnails
 
-        let shouldSyncSelection = (itemsChanged || !isScrolling) && !isExtendingSelection
+        // While the user scrolls, the strip leads and the incoming index lags behind
+        let shouldSyncSelection = itemsChanged || !isScrolling
         let indexChanged = self.selectedIndex != selectedIndex
-        CoverFlowView.debugLog("[NSView-SELECTION] updateItems: incoming selectedIndex=\(selectedIndex), current self.selectedIndex=\(self.selectedIndex), shouldSync=\(shouldSyncSelection), itemsChanged=\(itemsChanged), isExtending=\(isExtendingSelection), items.count=\(items.count)")
         if shouldSyncSelection {
-            CoverFlowView.debugLog("[NSView-SELECTION] updateItems: SYNCING self.selectedIndex from \(self.selectedIndex) to \(selectedIndex)")
             self.selectedIndex = selectedIndex
         }
 
         if itemsChanged {
-            // Don't rebuild when items become empty - this is a transient state during refresh
-            // Keep existing covers visible to avoid black flash
-            if !items.isEmpty {
-                CoverFlowView.debugLog("[NSView] REBUILD covers - items changed, selectedIndex=\(self.selectedIndex)")
+            emptyRebuildWorkItem?.cancel()
+            emptyRebuildWorkItem = nil
+            accessibilityElementsByIndex.removeAll()
+            if items.isEmpty && !coverLayers.isEmpty {
+                // A reload empties the list for a moment; clear the covers only if it stays
+                // empty, so a refresh doesn't flash but no ghost covers stay behind
+                let workItem = DispatchWorkItem { [weak self] in
+                    guard let self, self.items.isEmpty else { return }
+                    self.emptyRebuildWorkItem = nil
+                    self.rebuildCovers()
+                }
+                emptyRebuildWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + emptyRebuildDelay, execute: workItem)
+            } else {
                 rebuildCovers()
                 layer?.setNeedsLayout()
                 layer?.layoutIfNeeded()
-            } else {
-                CoverFlowView.debugLog("[NSView] SKIPPING rebuild - items empty (transient state)")
+            }
+            if shouldSyncSelection && indexChanged {
+                centredIndexDidChange()
             }
         } else if indexChanged && shouldSyncSelection {
             animateToSelection()
-            DispatchQueue.main.async {
-                self.updateCoverImages()
+            centredIndexDidChange()
+            DispatchQueue.main.async { [weak self] in
+                self?.updateCoverImages()
             }
         } else {
             updateCoverImages()
@@ -1390,6 +1514,13 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
                   index < items.count else { continue }
 
             let item = items[index]
+
+            // Items can be reordered without the count changing; refresh the whole cover then
+            if (coverLayer.value(forKey: "itemURL") as? URL) != item.url {
+                updateCoverLayer(coverLayer, for: item, at: index)
+                continue
+            }
+
             guard let thumbnail = thumbnails[item.url] else { continue }
 
             let token = thumbnailToken(for: item, thumbnail: thumbnail)
@@ -1406,43 +1537,41 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
                 imageContent = thumbnail
             }
 
-            // Find the image layer and reflection container
-            var imageLayer: CALayer?
-            var reflectionContainer: CALayer?
-
-            for sublayer in coverLayer.sublayers ?? [] {
-                if sublayer.name == "imageLayer" {
-                    imageLayer = sublayer
-                } else if sublayer.name == "reflectionContainer" {
-                    reflectionContainer = sublayer
-                }
+            // The real image can have a different aspect ratio than the placeholder;
+            // resize the cover so the reflection sits right under the image
+            let coverSize = getCoverSize(for: thumbnail)
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            if coverLayer.bounds.size != coverSize {
+                applyCoverGeometry(to: coverLayer, size: coverSize)
             }
 
             // Update main image
-            if let imageLayer = imageLayer {
+            if let imageLayer = imageSublayer(of: coverLayer) {
                 imageLayer.contents = imageContent
                 imageLayer.contentsGravity = .resizeAspect
             }
+            CATransaction.commit()
 
             // Update reflection and fade it in
-            if let reflectionContainer = reflectionContainer {
+            if let reflectionContainer = reflectionSublayer(of: coverLayer) {
                 // Find the reflection image layer
-                for sublayer in reflectionContainer.sublayers ?? [] {
-                    if sublayer.name == "reflectionImage" {
-                        sublayer.contents = imageContent
-                        sublayer.contentsGravity = .resizeAspect
-                    }
+                for sublayer in reflectionContainer.sublayers ?? [] where sublayer.name == "reflectionImage" {
+                    sublayer.contents = imageContent
+                    sublayer.contentsGravity = .resizeAspect
                 }
 
                 // Fade in the reflection smoothly if it was hidden
-                if reflectionContainer.opacity < 1.0 {
+                if reflectionContainer.opacity < 1.0 && !isScrolling {
                     CATransaction.begin()
                     CATransaction.setAnimationDuration(0.3)
+                    CATransaction.setDisableActions(reduceMotion)
                     reflectionContainer.opacity = 1.0
                     CATransaction.commit()
                 }
             }
         }
+        reconcileVideoPreviewLayer()
     }
 
     private func thumbnailToken(for item: FileItem, thumbnail: NSImage?) -> Int {
@@ -1453,31 +1582,47 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         return ObjectIdentifier(item.placeholderIcon).hashValue
     }
 
+    private func imageSublayer(of coverLayer: CALayer) -> CALayer? {
+        coverLayer.sublayers?.first(where: { $0.name == "imageLayer" })
+    }
+
+    private func reflectionSublayer(of coverLayer: CALayer) -> CALayer? {
+        coverLayer.sublayers?.first(where: { $0.name == "reflectionContainer" })
+    }
+
+    private func cover(showing url: URL) -> CALayer? {
+        coverLayers.first(where: {
+            guard let index = $0.value(forKey: "itemIndex") as? Int, index < items.count else { return false }
+            return items[index].url == url
+        })
+    }
+
     private func rebuildCovers() {
         CoverFlowView.debugLog("[NSView] rebuildCovers called - \(items.count) items")
         coverLayers.forEach { $0.removeFromSuperlayer() }
         coverLayers.removeAll()
+        clearDropTargetHighlight()
+        dropTargetIndex = nil
 
-        guard !items.isEmpty else { return }
+        if !items.isEmpty {
+            // Ensure selectedIndex is within bounds
+            let safeSelectedIndex = min(max(0, selectedIndex), items.count - 1)
+            let start = max(0, safeSelectedIndex - visibleRange)
+            let end = min(items.count - 1, safeSelectedIndex + visibleRange)
 
-        // Ensure selectedIndex is within bounds
-        let safeSelectedIndex = min(max(0, selectedIndex), items.count - 1)
-
-        let centerX = bounds.width / 2
-        let centerY = bounds.height / 2
-
-        let start = max(0, safeSelectedIndex - visibleRange)
-        let end = min(items.count - 1, safeSelectedIndex + visibleRange)
-
-        guard start <= end else { return }
-
-        for index in start...end {
-            let item = items[index]
-            let coverLayer = createCoverLayer(for: item, at: index)
-            positionCover(coverLayer, at: index, centerX: centerX, centerY: centerY, animated: false)
-            layer?.addSublayer(coverLayer)
-            coverLayers.append(coverLayer)
+            if start <= end {
+                for index in start...end {
+                    let item = items[index]
+                    let coverLayer = createCoverLayer(for: item, at: index)
+                    positionCover(coverLayer, at: index, animated: false)
+                    layer?.addSublayer(coverLayer)
+                    coverLayers.append(coverLayer)
+                }
+            }
         }
+
+        // The preview's cover was replaced: move the player layer to the new one (or stop it)
+        reconcileVideoPreviewLayer()
     }
 
     private func animateToSelection() {
@@ -1485,9 +1630,6 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         // Ensure selectedIndex is within bounds
         let safeSelectedIndex = min(max(0, selectedIndex), items.count - 1)
-
-        let centerX = bounds.width / 2
-        let centerY = bounds.height / 2
 
         // Determine visible range
         let start = max(0, safeSelectedIndex - visibleRange)
@@ -1536,21 +1678,24 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
                 layer?.addSublayer(coverLayer)
                 coverLayers.append(coverLayer)
             }
-            positionCover(coverLayer, at: index, centerX: centerX, centerY: centerY, animated: false)
+            positionCover(coverLayer, at: index, animated: false)
         }
 
-        // Return unused recycled layers to pool (hide them)
+        // Return unused recycled layers to pool, without their images (memory)
         for unusedLayer in layersToRecycle {
             unusedLayer.removeFromSuperlayer()
             coverLayers.removeAll { $0 === unusedLayer }
             if layerPool.count < visibleRange * 3 {
+                clearContents(of: unusedLayer)
                 layerPool.append(unusedLayer)
             }
         }
 
         // Animate all covers to new positions
         CATransaction.begin()
-        if isScrolling {
+        if reduceMotion {
+            CATransaction.setDisableActions(true)
+        } else if isScrolling {
             // During scroll: very fast, snappy animations
             CATransaction.setAnimationDuration(0.08)
             CATransaction.setAnimationTimingFunction(CAMediaTimingFunction(name: .linear))
@@ -1562,7 +1707,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         for coverLayer in coverLayers {
             if let index = coverLayer.value(forKey: "itemIndex") as? Int {
-                positionCover(coverLayer, at: index, centerX: centerX, centerY: centerY, animated: true)
+                positionCover(coverLayer, at: index, animated: true)
                 let isCut = index < items.count && cutItemURLs.contains(items[index].url)
                 coverLayer.opacity = isCut ? 0.5 : 1.0
             }
@@ -1570,10 +1715,18 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         CATransaction.commit()
 
-        // Ensure focus is maintained after animation updates
-        DispatchQueue.main.async { [weak self] in
-            self?.ensureFirstResponder()
-        }
+        // Recycled covers may have carried (or lost) the video preview
+        reconcileVideoPreviewLayer()
+    }
+
+    private func clearContents(of coverLayer: CALayer) {
+        coverLayer.setValue(nil, forKey: "itemURL")
+        coverLayer.setValue(nil, forKey: "thumbnailToken")
+        imageSublayer(of: coverLayer)?.contents = nil
+        reflectionSublayer(of: coverLayer)?.sublayers?.forEach { $0.contents = nil }
+        coverLayer.sublayers?
+            .filter { $0.name == "videoPreviewLayer" || $0.name == "skimProgressLayer" }
+            .forEach { $0.removeFromSuperlayer() }
     }
 
     // Update existing layer with new item data (for recycling)
@@ -1583,12 +1736,10 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         let coverSize = getCoverSize(for: thumbnail)
 
         coverLayer.setValue(index, forKey: "itemIndex")
-        coverLayer.setValue(coverSize.width, forKey: "coverWidth")
-        coverLayer.setValue(coverSize.height, forKey: "coverHeight")
+        coverLayer.setValue(item.url, forKey: "itemURL")
         coverLayer.setValue(thumbnailToken(for: item, thumbnail: thumbnail), forKey: "thumbnailToken")
         coverLayer.opacity = cutItemURLs.contains(item.url) ? 0.5 : 1.0
-        // Match createCoverLayer - bounds should NOT include reflection height
-        coverLayer.bounds = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
+        applyCoverGeometry(to: coverLayer, size: coverSize)
 
         // Get image content - use NSImage directly for icons to preserve transparency
         let imageContent: Any
@@ -1600,34 +1751,47 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             imageContent = item.placeholderIcon
         }
 
-        // Update image layer - match createCoverLayer (y: 0, not offset)
-        if let imageLayer = coverLayer.sublayers?.first(where: { $0.name == "imageLayer" }) {
-            imageLayer.frame = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
+        if let imageLayer = imageSublayer(of: coverLayer) {
             imageLayer.contents = imageContent
             imageLayer.contentsGravity = .resizeAspect
             imageLayer.isOpaque = false
         }
 
         // Update reflection (hide during scroll for performance)
-        // Match createCoverLayer - reflection is BELOW the image (negative y)
-        let reflectionHeight = coverSize.height * 0.4
-        if let reflectionContainer = coverLayer.sublayers?.first(where: { $0.name == "reflectionContainer" }) {
+        if let reflectionContainer = reflectionSublayer(of: coverLayer) {
             reflectionContainer.opacity = (hasThumbnail && !isScrolling) ? 1.0 : 0.0
+            if let reflectionImage = reflectionContainer.sublayers?.first(where: { $0.name == "reflectionImage" }) {
+                reflectionImage.contents = hasThumbnail ? imageContent : nil
+            }
+        }
+    }
+
+    /// Sizes the cover, its image and its reflection. The cover's bounds exclude the reflection,
+    /// which hangs below the image (negative y).
+    private func applyCoverGeometry(to coverLayer: CALayer, size coverSize: CGSize) {
+        coverLayer.bounds = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
+        if let imageLayer = imageSublayer(of: coverLayer) {
+            imageLayer.frame = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
+        }
+        let reflectionHeight = coverSize.height * 0.4
+        if let reflectionContainer = reflectionSublayer(of: coverLayer) {
             reflectionContainer.frame = CGRect(x: 0, y: -reflectionHeight - 4, width: coverSize.width, height: reflectionHeight)
             if let mask = reflectionContainer.mask as? CAGradientLayer {
                 mask.frame = reflectionContainer.bounds
             }
             if let reflectionImage = reflectionContainer.sublayers?.first(where: { $0.name == "reflectionImage" }) {
                 reflectionImage.frame = CGRect(x: 0, y: reflectionHeight - coverSize.height, width: coverSize.width, height: coverSize.height)
-                reflectionImage.contents = hasThumbnail ? imageContent : nil
             }
+        }
+        if let playerLayer = videoPreviewLayer, playerLayer.superlayer === coverLayer {
+            playerLayer.frame = CGRect(x: 0, y: 0, width: coverSize.width, height: coverSize.height)
         }
     }
 
     private func getCoverSize(for thumbnail: NSImage?) -> CGSize {
         let maxSize = baseCoverSize
 
-        guard let thumbnail = thumbnail else {
+        guard let thumbnail = thumbnail, thumbnail.size.width > 0, thumbnail.size.height > 0 else {
             // Default square for icons/folders
             return CGSize(width: maxSize, height: maxSize)
         }
@@ -1658,16 +1822,17 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         let coverSize = getCoverSize(for: thumbnail)
         let coverWidth = coverSize.width
         let coverHeight = coverSize.height
+        let scale = backingScale
 
         let container = CALayer()
         container.setValue(index, forKey: "itemIndex")
-        container.setValue(coverWidth, forKey: "coverWidth")
-        container.setValue(coverHeight, forKey: "coverHeight")
+        container.setValue(item.url, forKey: "itemURL")
         container.setValue(thumbnailToken(for: item, thumbnail: thumbnail), forKey: "thumbnailToken")
         container.backgroundColor = NSColor.clear.cgColor
         // CRITICAL: Set bounds so anchorPoint works correctly for rotation
         container.bounds = CGRect(x: 0, y: 0, width: coverWidth, height: coverHeight)
         container.anchorPoint = CGPoint(x: 0.5, y: 0.5)
+        container.contentsScale = scale
 
         // Image layer (no background box)
         let imageLayer = CALayer()
@@ -1676,6 +1841,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         imageLayer.masksToBounds = true
         imageLayer.backgroundColor = NSColor.clear.cgColor
         imageLayer.isOpaque = false  // Ensure transparency is rendered
+        imageLayer.contentsScale = scale
 
         if let thumbnail = thumbnail {
             // For thumbnails (actual images), CGImage conversion is fine
@@ -1707,6 +1873,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         reflectionImage.masksToBounds = true
         reflectionImage.backgroundColor = NSColor.clear.cgColor
         reflectionImage.transform = CATransform3DMakeScale(1, -1, 1)
+        reflectionImage.contentsScale = scale
 
         if let thumbnail = thumbnail {
             if let cgImage = thumbnail.cgImage(forProposedRect: nil, context: nil, hints: nil) {
@@ -1737,77 +1904,98 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         return container
     }
 
-    private func positionCover(_ coverLayer: CALayer, at index: Int, centerX: CGFloat, centerY: CGFloat, animated: Bool) {
-        let diff = index - selectedIndex
-        let isSelected = diff == 0
-
-        // Calculate center
-        let viewCenterX = bounds.width / 2
-        let viewCenterY = bounds.height / 2
-
-        var transform = CATransform3DIdentity
-        transform.m34 = -1.0 / 1000.0 // Perspective
-
-        let xPosition: CGFloat
-        let angle: CGFloat
-        let scale: CGFloat = isSelected ? 1.0 : 0.75
-        let zOffset: CGFloat = isSelected ? 50 : 0
-
-        if diff == 0 {
-            xPosition = viewCenterX
-            angle = 0
-        } else if diff < 0 {
-            // Position covers to the left
-            xPosition = viewCenterX - sideOffset + CGFloat(diff + 1) * coverSpacing
-            angle = sideAngle
-        } else {
-            // Position covers to the right
-            xPosition = viewCenterX + sideOffset + CGFloat(diff - 1) * coverSpacing
-            angle = -sideAngle
-        }
-
-        transform = CATransform3DTranslate(transform, 0, 0, zOffset)
-        transform = CATransform3DRotate(transform, angle * .pi / 180, 0, 1, 0)
-        transform = CATransform3DScale(transform, scale, scale, 1)
-
-        let zPosition = Double(1000 - abs(diff) * 10)
-
-        // Y position: adjusted up for better visual balance
-        let yPosition = viewCenterY
+    private func positionCover(_ coverLayer: CALayer, at index: Int, animated: Bool) {
+        let placement = CoverFlowGeometry.placement(
+            offsetFromCentre: index - selectedIndex,
+            viewSize: bounds.size,
+            baseCoverSize: baseCoverSize
+        )
 
         if animated {
-            coverLayer.transform = transform
-            coverLayer.position = CGPoint(x: xPosition, y: yPosition)
-            coverLayer.zPosition = CGFloat(zPosition)
+            coverLayer.transform = placement.transform
+            coverLayer.position = placement.position
+            coverLayer.zPosition = placement.zPosition
         } else {
             CATransaction.begin()
             CATransaction.setDisableActions(true)
-            coverLayer.transform = transform
-            coverLayer.position = CGPoint(x: xPosition, y: yPosition)
-            coverLayer.zPosition = CGFloat(zPosition)
+            coverLayer.transform = placement.transform
+            coverLayer.position = placement.position
+            coverLayer.zPosition = placement.zPosition
             CATransaction.commit()
         }
     }
 
     override func layout() {
         super.layout()
-        layer?.sublayers?.first?.frame = bounds // Update gradient
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        backgroundLayer?.frame = bounds
+        CATransaction.commit()
+        reportCentreCoverPixelsIfNeeded()
         guard !items.isEmpty else { return }
         if coverLayers.isEmpty {
             rebuildCovers()
             return
         }
-        let centerX = bounds.width / 2
-        let centerY = bounds.height / 2
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         for coverLayer in coverLayers {
             guard let index = coverLayer.value(forKey: "itemIndex") as? Int,
                   index < items.count else { continue }
-            updateCoverLayer(coverLayer, for: items[index], at: index)
-            positionCover(coverLayer, at: index, centerX: centerX, centerY: centerY, animated: false)
+            applyCoverGeometry(to: coverLayer, size: getCoverSize(for: thumbnails[items[index].url]))
+            positionCover(coverLayer, at: index, animated: false)
         }
         CATransaction.commit()
+        if let target = dropTargetIndex {
+            showDropTargetHighlight(for: target)
+        }
+    }
+
+    // MARK: - Hit Testing
+
+    /// Each visible cover's on-screen outline (its 3D transform applied), front to back.
+    private func coverCandidates() -> [CoverFlowGeometry.Candidate] {
+        let rootLayer = layer
+        let sublayerTransform = rootLayer?.sublayerTransform ?? CATransform3DIdentity
+        let rootAnchor: CGPoint
+        if let rootLayer {
+            rootAnchor = CGPoint(
+                x: rootLayer.bounds.minX + rootLayer.anchorPoint.x * rootLayer.bounds.width,
+                y: rootLayer.bounds.minY + rootLayer.anchorPoint.y * rootLayer.bounds.height
+            )
+        } else {
+            rootAnchor = .zero
+        }
+
+        return coverLayers.compactMap { coverLayer in
+            guard let index = coverLayer.value(forKey: "itemIndex") as? Int else { return nil }
+            // Use what's on screen mid-animation
+            let geometry = coverLayer.presentation() ?? coverLayer
+            guard let quad = CoverFlowGeometry.project(
+                bounds: geometry.bounds,
+                anchorPoint: geometry.anchorPoint,
+                position: geometry.position,
+                zPosition: geometry.zPosition,
+                transform: geometry.transform,
+                parentSublayerTransform: sublayerTransform,
+                parentAnchor: rootAnchor
+            ) else { return nil }
+            return CoverFlowGeometry.Candidate(index: index, zPosition: geometry.zPosition, quad: quad)
+        }
+    }
+
+    /// The cover under `point` (view coordinates) and its on-screen outline.
+    func coverHit(at point: NSPoint) -> CoverFlowGeometry.Candidate? {
+        let base = baseCoverSize
+        let centreY = bounds.height / 2
+        // The strip, including the reflections below the covers
+        let band = (centreY - base * 0.5 - base * 0.45)...(centreY + base * 0.5)
+        return CoverFlowGeometry.hitTest(point, candidates: coverCandidates(), stripBand: band, maxGap: coverSpacing)
+    }
+
+    /// The index of the cover under `point` (view coordinates). Used for clicks, hover, drop targets.
+    func coverIndex(at point: NSPoint) -> Int? {
+        coverHit(at: point)?.index
     }
 
     // MARK: - Event Handling
@@ -1821,20 +2009,12 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     }
 
     override func resignFirstResponder() -> Bool {
-        // Check what's taking focus
-        if let newResponder = window?.firstResponder {
-            let responderType = String(describing: type(of: newResponder))
-            let responderAddress = Unmanaged.passUnretained(newResponder).toOpaque()
-            let selfAddress = Unmanaged.passUnretained(self).toOpaque()
-            let isSameView = newResponder === self
-            CoverFlowView.debugLog("[NSView] resignFirstResponder - new responder: \(responderType) addr:\(responderAddress) self:\(selfAddress) isSame:\(isSameView)")
-            if !isSameView {
-                // Log stack trace when losing focus to a different view
+        if CoverFlowView.isDebugLoggingEnabled {
+            // Check what's taking focus
+            if let newResponder = window?.firstResponder, newResponder !== self {
                 let symbols = Thread.callStackSymbols.prefix(10).joined(separator: "\n")
-                CoverFlowView.debugLog("[NSView] resignFirstResponder stack:\n\(symbols)")
+                CoverFlowView.debugLog("[NSView] resignFirstResponder - new responder: \(type(of: newResponder))\n\(symbols)")
             }
-        } else {
-            CoverFlowView.debugLog("[NSView] resignFirstResponder - no new responder")
         }
         return super.resignFirstResponder()
     }
@@ -1845,21 +2025,22 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        pendingCollapseIndex = nil
 
         if event.modifierFlags.contains(.control) {
-            handleContextClick(with: event)
+            showContextMenu(for: event)
             return
         }
 
         let location = convert(event.locationInWindow, from: nil)
         let now = Date()
 
-        // Check for double-click: within time window AND within distance of last click
-        let isWithinDoubleClickTime = now.timeIntervalSince(lastClickTime) < 0.4
+        // Double-click: the clicked cover animates to the centre, so the second click lands on a
+        // different cover. Detect it by time and distance and open the item clicked first.
+        let isWithinDoubleClickTime = now.timeIntervalSince(lastClickTime) < NSEvent.doubleClickInterval
         let clickDistance = hypot(location.x - lastClickLocation.x, location.y - lastClickLocation.y)
-        let isNearLastClick = clickDistance < 50 // pixels
+        let isNearLastClick = clickDistance < 50 // points
 
-        // If this is a double-click (by location proximity), open the previously clicked item
         if isWithinDoubleClickTime && isNearLastClick && lastClickIndex >= 0 && lastClickIndex < items.count {
             onOpen?(lastClickIndex)
             lastClickTime = .distantPast
@@ -1872,20 +2053,22 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         // Track for potential drag
         dragStartLocation = location
-        dragStartIndex = hitTestCover(at: location)
+        dragStartIndex = coverIndex(at: location)
 
         if let index = dragStartIndex, index < items.count {
             let clickedItem = items[index]
+            let modifiers = event.modifierFlags.intersection([.shift, .command])
 
-            // If clicking on an already-selected item (part of multi-selection),
-            // preserve the selection for potential multi-file drag
-            let isAlreadySelected = selectedItems.contains(clickedItem)
-
-            if !isAlreadySelected {
-                // Not part of existing selection - select just this item
-                selectIndexLocally(index)
+            if !modifiers.isEmpty {
+                // Shift-click extends, Command-click toggles — from this click's modifiers
+                moveVisualIndex(to: index)
+                onSelect?(index, .click(modifierFlags: modifiers))
+            } else if selectedItems.contains(clickedItem) && selectedItems.count > 1 {
+                // Keep the multi-selection for a possible drag; collapse to this item on mouse-up
+                pendingCollapseIndex = index
+            } else {
+                selectIndexLocally(index, forceNotify: !selectedItems.contains(clickedItem))
             }
-            // If already selected, don't change selection - allows dragging multiple items
 
             lastClickTime = now
             lastClickIndex = index
@@ -1908,13 +2091,14 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         // Start drag if moved enough
         if distance > 5 {
+            pendingCollapseIndex = nil
             let clickedItem = items[index]
 
             // Determine items to drag - all selected items if the clicked item is selected,
             // otherwise just the clicked item
             let itemsToDrag: [FileItem]
             if selectedItems.contains(clickedItem) && selectedItems.count > 1 {
-                itemsToDrag = Array(selectedItems)
+                itemsToDrag = orderedSelectedItems()
             } else {
                 itemsToDrag = [clickedItem]
             }
@@ -1930,9 +2114,9 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
                 let draggingItem = NSDraggingItem(pasteboardWriter: pasteboardItem)
 
-                // Use the item's icon for the drag image
+                // Use a copy of the item's icon: the icon is shared and cached
                 let iconSize = NSSize(width: 64, height: 64)
-                let dragImage = item.icon
+                let dragImage = (item.icon.copy() as? NSImage) ?? NSImage(size: iconSize)
                 dragImage.size = iconSize
 
                 // Offset each subsequent item slightly for a stacked appearance
@@ -1955,84 +2139,76 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if let index = pendingCollapseIndex {
+            // Clicked an item of a multi-selection without dragging: select just it (Finder behavior)
+            pendingCollapseIndex = nil
+            selectIndexLocally(index, forceNotify: true)
+        }
         dragStartLocation = nil
         dragStartIndex = nil
     }
 
+    // MARK: - Context Menu
+
     override func rightMouseDown(with event: NSEvent) {
-        window?.makeFirstResponder(self)
-        handleContextClick(with: event)
+        showContextMenu(for: event)
     }
 
-    private func handleContextClick(with event: NSEvent) {
-        let location = convert(event.locationInWindow, from: nil)
-        let index = hitTestCover(at: location) ?? selectedIndex
-        onSelect?(index)
-        showContextMenu(for: index, with: event)
+    /// The one path for right-clicks and Control-clicks.
+    private func showContextMenu(for event: NSEvent) {
+        window?.makeFirstResponder(self)
+        guard let menu = menu(for: event) else { return }
+        NSMenu.popUpContextMenu(menu, with: event, for: self)
     }
 
     override func menu(for event: NSEvent) -> NSMenu? {
         let location = convert(event.locationInWindow, from: nil)
-        let index = hitTestCover(at: location) ?? selectedIndex
-        debugWriteToFile("[CoverFlow] menu(for:) called, index: \(index), items count: \(items.count)")
-        return createContextMenu(for: index)
-    }
-
-    private static let debugFileFormatter: ISO8601DateFormatter = {
-        let f = ISO8601DateFormatter()
-        return f
-    }()
-
-    private func debugWriteToFile(_ message: String) {
-        guard CoverFlowView.isDebugLoggingEnabled else { return }
-        let logPath = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Desktop/flowfinder_context_debug.log")
-        let timestamp = Self.debugFileFormatter.string(from: Date())
-        let line = "[\(timestamp)] \(message)\n"
-        if FileManager.default.fileExists(atPath: logPath.path) {
-            if let handle = try? FileHandle(forWritingTo: logPath) {
-                handle.seekToEndOfFile()
-                handle.write(line.data(using: .utf8)!)
-                handle.closeFile()
-            }
-        } else {
-            try? line.write(to: logPath, atomically: true, encoding: .utf8)
+        guard let index = coverIndex(at: location), index < items.count else {
+            return createBackgroundMenu()
         }
+
+        let clickedItem = items[index]
+        let targets: [FileItem]
+        if selectedItems.contains(clickedItem) {
+            // Finder acts on the whole selection when the clicked item is part of it
+            targets = orderedSelectedItems()
+        } else {
+            // Otherwise the clicked item becomes the selection
+            selectIndexLocally(index, forceNotify: true)
+            targets = [clickedItem]
+        }
+        return createContextMenu(for: targets.isEmpty ? [clickedItem] : targets)
     }
 
-    private func showContextMenu(for index: Int, with event: NSEvent) {
-        guard index < items.count else { return }
-
-        let menu = createContextMenu(for: index)
-        let location = convert(event.locationInWindow, from: nil)
-        menu.popUp(positioning: nil, at: location, in: self)
+    /// Selected items in display order.
+    private func orderedSelectedItems() -> [FileItem] {
+        guard selectedItems.count > 1 else { return Array(selectedItems) }
+        return items.filter { selectedItems.contains($0) }
     }
 
-    private func createContextMenu(for index: Int) -> NSMenu {
+    private func createContextMenu(for targets: [FileItem]) -> NSMenu {
         let menu = NSMenu()
-        let item = index < items.count ? items[index] : nil
+        let singleItem = targets.count == 1 ? targets.first : nil
 
         let openItem = NSMenuItem(title: "Open", action: #selector(menuOpen(_:)), keyEquivalent: "")
         openItem.target = self
-        openItem.representedObject = index
+        openItem.representedObject = targets
         menu.addItem(openItem)
 
         // Show Package Contents for bundles like .app
-        if let item = item {
-            let isPkg = isPackage(item)
-            debugWriteToFile("[CoverFlow] Context menu for: \(item.name), ext: \(item.url.pathExtension), isPackage: \(isPkg)")
-            if isPkg {
-                let packageItem = NSMenuItem(title: "Show Package Contents", action: #selector(menuShowPackageContents(_:)), keyEquivalent: "")
-                packageItem.target = self
-                packageItem.representedObject = index
-                menu.addItem(packageItem)
-            }
+        if let item = singleItem, !item.isFromArchive, isPackage(item) {
+            let packageItem = NSMenuItem(title: "Show Package Contents", action: #selector(menuShowPackageContents(_:)), keyEquivalent: "")
+            packageItem.target = self
+            packageItem.representedObject = item
+            menu.addItem(packageItem)
+        }
 
-            // Open With submenu (only for non-archive, non-directory files)
-            if !item.isFromArchive && !item.isDirectory {
-                let openWithItem = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
-                openWithItem.submenu = OpenWithMenuBuilder.buildNSMenu(for: [item.url], target: self)
-                menu.addItem(openWithItem)
-            }
+        // Open With submenu (only for non-archive files)
+        let openWithURLs = targets.filter { !$0.isFromArchive && !$0.isDirectory }.map(\.url)
+        if !openWithURLs.isEmpty && openWithURLs.count == targets.count {
+            let openWithItem = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
+            openWithItem.submenu = OpenWithMenuBuilder.buildNSMenu(for: openWithURLs, target: self)
+            menu.addItem(openWithItem)
         }
 
         menu.addItem(NSMenuItem.separator())
@@ -2049,25 +2225,51 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         let trashItem = NSMenuItem(title: "Move to Trash", action: #selector(menuTrash(_:)), keyEquivalent: "")
         trashItem.target = self
-        if let item, item.isFromArchive {
+        if targets.contains(where: { $0.isFromArchive }) {
             trashItem.isEnabled = false
         }
         menu.addItem(trashItem)
 
         let finderItem = NSMenuItem(title: "Show in Finder", action: #selector(menuShowInFinder(_:)), keyEquivalent: "")
         finderItem.target = self
-        if let item, item.isFromArchive, item.archiveURL == nil {
+        finderItem.representedObject = targets
+        if targets.contains(where: { $0.isFromArchive && $0.archiveURL == nil }) {
             finderItem.isEnabled = false
         }
         menu.addItem(finderItem)
+
+        menu.autoenablesItems = false
+        return menu
+    }
+
+    /// Menu for a right-click on the background (no cover under the mouse).
+    private func createBackgroundMenu() -> NSMenu {
+        let menu = NSMenu()
+        menu.autoenablesItems = false
+
+        let newFolderItem = NSMenuItem(title: "New Folder", action: #selector(menuNewFolder(_:)), keyEquivalent: "")
+        newFolderItem.target = self
+        newFolderItem.isEnabled = canModifyFolder
+        menu.addItem(newFolderItem)
+
+        let pasteItem = NSMenuItem(title: "Paste", action: #selector(menuPaste(_:)), keyEquivalent: "")
+        pasteItem.target = self
+        pasteItem.isEnabled = canModifyFolder
+        menu.addItem(pasteItem)
+
+        menu.addItem(NSMenuItem.separator())
+
+        let infoItem = NSMenuItem(title: "Get Info", action: #selector(menuGetInfo(_:)), keyEquivalent: "")
+        infoItem.target = self
+        infoItem.isEnabled = canModifyFolder
+        menu.addItem(infoItem)
 
         return menu
     }
 
     @objc private func menuOpen(_ sender: NSMenuItem) {
-        if selectedIndex >= 0 && selectedIndex < items.count {
-            onOpen?(selectedIndex)
-        }
+        guard let targets = sender.representedObject as? [FileItem] else { return }
+        onOpenItems?(targets)
     }
 
     @objc private func menuCopy(_ sender: NSMenuItem) {
@@ -2083,24 +2285,32 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     }
 
     @objc private func menuShowInFinder(_ sender: NSMenuItem) {
-        if selectedIndex < items.count {
-            let item = items[selectedIndex]
-            if item.isFromArchive {
-                if let archiveURL = item.archiveURL {
-                    NSWorkspace.shared.activateFileViewerSelecting([archiveURL])
-                } else {
-                    NSSound.beep()
-                }
-            } else {
-                NSWorkspace.shared.activateFileViewerSelecting([item.url])
-            }
+        guard let targets = sender.representedObject as? [FileItem] else { return }
+        let urls = targets.compactMap { item -> URL? in
+            item.isFromArchive ? item.archiveURL : item.url
         }
+        guard !urls.isEmpty else {
+            NSSound.beep()
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
     }
 
     @objc private func menuShowPackageContents(_ sender: NSMenuItem) {
-        if selectedIndex >= 0 && selectedIndex < items.count {
-            onShowPackageContents?(selectedIndex)
-        }
+        guard let item = sender.representedObject as? FileItem else { return }
+        onShowPackageContents?(item)
+    }
+
+    @objc private func menuNewFolder(_ sender: NSMenuItem) {
+        onNewFolder?()
+    }
+
+    @objc private func menuPaste(_ sender: NSMenuItem) {
+        onPaste?()
+    }
+
+    @objc private func menuGetInfo(_ sender: NSMenuItem) {
+        onGetInfo?()
     }
 
     @objc func openWithApp(_ sender: NSMenuItem) {
@@ -2116,59 +2326,64 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     private func isPackage(_ item: FileItem) -> Bool {
         let packageExtensions = ["app", "bundle", "framework", "plugin", "kext", "prefPane", "qlgenerator", "saver", "wdgt", "xpc"]
         let ext = item.url.pathExtension.lowercased()
-        let byExt = packageExtensions.contains(ext)
-        let byWorkspace = NSWorkspace.shared.isFilePackage(atPath: item.url.path)
-        debugWriteToFile("[CoverFlow] isPackage: \(item.name), ext: '\(ext)', byExt: \(byExt), byWorkspace: \(byWorkspace)")
-        return byExt || byWorkspace
+        return packageExtensions.contains(ext) || NSWorkspace.shared.isFilePackage(atPath: item.url.path)
     }
 
-    // Make sure we become first responder when view appears and on any click
+    // MARK: - Window & Focus
+
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
         NotificationCenter.default.removeObserver(self)
-        requestFocus()
+
+        guard let window = window else {
+            // Leaving the window: stop and release our inline preview
+            unregisterPreviewHost()
+            updateActivityState()
+            return
+        }
+
+        registerPreviewHostIfNeeded()
+        requestFocus(onlyIfNothingFocused: false)
 
         // Observe first responder changes to debug focus loss
-        if let window = window {
-            if CoverFlowView.isDebugLoggingEnabled {
-                NotificationCenter.default.addObserver(
-                    self,
-                    selector: #selector(windowDidUpdate(_:)),
-                    name: NSWindow.didUpdateNotification,
-                    object: window
-                )
-            }
+        if CoverFlowView.isDebugLoggingEnabled {
             NotificationCenter.default.addObserver(
                 self,
-                selector: #selector(windowDidBecomeKey(_:)),
-                name: NSWindow.didBecomeKeyNotification,
-                object: window
-            )
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(windowDidResignKey(_:)),
-                name: NSWindow.didResignKeyNotification,
-                object: window
-            )
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(windowDidMiniaturize(_:)),
-                name: NSWindow.didMiniaturizeNotification,
-                object: window
-            )
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(windowDidDeminiaturize(_:)),
-                name: NSWindow.didDeminiaturizeNotification,
-                object: window
-            )
-            NotificationCenter.default.addObserver(
-                self,
-                selector: #selector(windowDidChangeOcclusionState(_:)),
-                name: NSWindow.didChangeOcclusionStateNotification,
+                selector: #selector(windowDidUpdate(_:)),
+                name: NSWindow.didUpdateNotification,
                 object: window
             )
         }
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidBecomeKey(_:)),
+            name: NSWindow.didBecomeKeyNotification,
+            object: window
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidResignKey(_:)),
+            name: NSWindow.didResignKeyNotification,
+            object: window
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidMiniaturize(_:)),
+            name: NSWindow.didMiniaturizeNotification,
+            object: window
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidDeminiaturize(_:)),
+            name: NSWindow.didDeminiaturizeNotification,
+            object: window
+        )
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(windowDidChangeOcclusionState(_:)),
+            name: NSWindow.didChangeOcclusionStateNotification,
+            object: window
+        )
 
         NotificationCenter.default.addObserver(
             self,
@@ -2191,12 +2406,14 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             object: nil
         )
         updateActivityState()
+        reportCentreCoverPixelsIfNeeded()
     }
 
     @objc private func handleFocusFileList(_ notification: Notification) {
         // Focus this view when requested (e.g., after pressing Escape in search field)
-        // Only take focus if we're actually visible in the window
+        // Only take focus if we're actually visible in the key window
         guard let window = window,
+              window.isKeyWindow,
               visibleRect.size.height > 0,
               currentActivityState() else { return }
         window.makeFirstResponder(self)
@@ -2207,8 +2424,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         if let window = window, window.firstResponder !== self {
             if hadFocus {
                 hadFocus = false
-                let responderType = String(describing: type(of: window.firstResponder))
-                CoverFlowView.debugLog("[NSView] FOCUS LOST via windowDidUpdate! New responder: \(responderType)")
+                CoverFlowView.debugLog("[NSView] FOCUS LOST via windowDidUpdate! New responder: \(String(describing: type(of: window.firstResponder)))")
             }
         } else if window?.firstResponder === self && !hadFocus {
             hadFocus = true
@@ -2220,18 +2436,14 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
     @objc private func windowDidBecomeKey(_ notification: Notification) {
         updateActivityState()
-        let isFirst = window?.firstResponder === self
-        CoverFlowView.debugLog("[NSView] WINDOW became key - isFirstResponder: \(isFirst)")
-        // Proactively restore focus when window becomes key
-        if !isFirst {
-            CoverFlowView.debugLog("[NSView] Re-requesting focus after window became key")
-            requestFocus()
+        // Only claim focus if nothing in the window has it (don't take it from the list or search)
+        if window?.firstResponder !== self {
+            requestFocus(onlyIfNothingFocused: true)
         }
     }
 
     @objc private func windowDidResignKey(_ notification: Notification) {
         updateActivityState()
-        CoverFlowView.debugLog("[NSView] WINDOW resigned key")
     }
 
     @objc private func windowDidMiniaturize(_ notification: Notification) {
@@ -2254,38 +2466,38 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         updateActivityState()
     }
 
-    /// Ensure we maintain first responder status - called periodically during scroll and after updates
-    /// Only takes focus if no text field or search field currently has focus
+    /// Never take focus from text input (search, rename) or from another window.
+    private func canTakeFocus(in window: NSWindow) -> Bool {
+        if let responder = window.firstResponder,
+           responder is NSText || responder is NSTextField {
+            return false
+        }
+        if let keyWindow = NSApp.keyWindow, keyWindow !== window {
+            return false
+        }
+        return true
+    }
+
+    /// Take focus after the user scrolled the strip. Only takes focus if no text field has it.
     func ensureFirstResponder() {
         guard let window = window else { return }
-        guard window.isKeyWindow else { return }
-
-        // Don't steal focus from text fields, search fields, or other text input views
-        if let currentResponder = window.firstResponder {
-            if currentResponder is NSTextView ||
-               currentResponder is NSTextField ||
-               currentResponder is NSSearchField {
-                return
-            }
-        }
+        guard window.isKeyWindow, canTakeFocus(in: window) else { return }
 
         if window.firstResponder !== self {
-            if CoverFlowView.isDebugLoggingEnabled {
-                let currentResponder = String(describing: type(of: window.firstResponder))
-                CoverFlowView.debugLog("[NSView] ensureFirstResponder - lost to \(currentResponder), reclaiming")
-            }
+            CoverFlowView.debugLog("[NSView] ensureFirstResponder - reclaiming from \(String(describing: type(of: window.firstResponder)))")
             window.makeFirstResponder(self)
         }
     }
 
-    func requestFocus() {
-        guard let window = window else { return }
-        // Only request focus if we're not already the first responder
-        if window.firstResponder !== self {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
-                guard let self = self, let window = self.window else { return }
-                window.makeFirstResponder(self)
+    func requestFocus(onlyIfNothingFocused: Bool) {
+        guard let window = window, window.firstResponder !== self else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self] in
+            guard let self = self, let window = self.window, window.firstResponder !== self else { return }
+            guard self.canTakeFocus(in: window) else { return }
+            if onlyIfNothingFocused, let responder = window.firstResponder, responder !== window {
+                return
             }
+            window.makeFirstResponder(self)
         }
     }
 
@@ -2298,60 +2510,10 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         return result
     }
 
-    private func hitTestCover(at point: NSPoint) -> Int? {
-        // First pass: check with expanded hit areas, sorted by z-order (front to back)
-        let sortedLayers = coverLayers.sorted { $0.zPosition > $1.zPosition }
-
-        for coverLayer in sortedLayers {
-            let coverWidth = coverLayer.value(forKey: "coverWidth") as? CGFloat ?? baseCoverSize
-            let coverHeight = coverLayer.value(forKey: "coverHeight") as? CGFloat ?? baseCoverSize
-
-            let coverFrame = CGRect(
-                x: coverLayer.position.x - coverWidth / 2,
-                y: coverLayer.position.y - coverHeight / 2,
-                width: coverWidth,
-                height: coverHeight
-            )
-
-            // Generous hit area expansion
-            let hitFrame = coverFrame.insetBy(dx: -20, dy: -20)
-            if hitFrame.contains(point) {
-                let idx = coverLayer.value(forKey: "itemIndex") as? Int
-                return idx
-            }
-        }
-
-        // Second pass: find nearest cover if click was in the cover flow area
-        let coverFlowY = bounds.height * 0.5
-        if point.y > coverFlowY - baseCoverSize && point.y < coverFlowY + baseCoverSize {
-            var nearestIndex: Int?
-            var nearestDistance: CGFloat = .infinity
-
-            for coverLayer in coverLayers {
-                if let index = coverLayer.value(forKey: "itemIndex") as? Int {
-                    let distance = abs(coverLayer.position.x - point.x)
-                    if distance < nearestDistance {
-                        nearestDistance = distance
-                        nearestIndex = index
-                    }
-                }
-            }
-
-            // Only return if reasonably close
-            if nearestDistance < coverSpacing * 2 {
-                return nearestIndex
-            }
-        }
-
-        return nil
-    }
+    // MARK: - Scrolling
 
     override func scrollWheel(with event: NSEvent) {
-        // Cancel any existing momentum
-        momentumTimer?.invalidate()
-
-        // Mark as scrolling and reset settle timer
-        setScrolling(true)
+        guard !items.isEmpty else { return }
 
         // Determine scroll delta (horizontal preferred, vertical as fallback)
         let delta: CGFloat
@@ -2361,66 +2523,52 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             delta = -event.scrollingDeltaY
         }
 
-        let adjustedDelta = delta * scrollSensitivity
-
-        // Accumulate scroll for smooth single-item advancement
-        accumulatedScroll += adjustedDelta
-
-        // Track velocity for momentum
-        let now = Date()
-        let timeDelta = now.timeIntervalSince(lastScrollTime)
-        if timeDelta > 0 && timeDelta < 0.1 {
-            scrollVelocity = adjustedDelta / CGFloat(timeDelta)
-        } else {
-            scrollVelocity = adjustedDelta * 10
+        if event.phase == .began {
+            scrollAccumulator.reset()
         }
-        lastScrollTime = now
-
-        // Threshold for changing selection (lower = more responsive)
-        let threshold: CGFloat = 20
-
-        if accumulatedScroll > threshold {
-            let steps = Int(accumulatedScroll / threshold)
-            let newIndex = max(0, selectedIndex - steps)
-            if newIndex != selectedIndex {
-                selectIndexLocally(newIndex)
-            }
-            accumulatedScroll = accumulatedScroll.truncatingRemainder(dividingBy: threshold)
-        } else if accumulatedScroll < -threshold {
-            let steps = Int(-accumulatedScroll / threshold)
-            let newIndex = min(items.count - 1, selectedIndex + steps)
-            if newIndex != selectedIndex {
-                selectIndexLocally(newIndex)
-            }
-            accumulatedScroll = accumulatedScroll.truncatingRemainder(dividingBy: threshold)
+        if delta != 0 || event.phase == .began {
+            // Mark as scrolling and reset settle timer
+            setScrolling(true)
         }
 
-        // Start momentum if this is the end of a scroll gesture
-        if event.phase == .ended || event.momentumPhase == .began {
-            startMomentumScroll()
+        // Trackpads report points (and the system adds momentum); wheels report lines, one per notch
+        let steps = scrollAccumulator.coverSteps(
+            for: delta,
+            isPrecise: event.hasPreciseScrollingDeltas,
+            sensitivity: scrollSensitivity,
+            now: event.timestamp
+        )
+        if steps != 0 {
+            selectIndexLocally(min(max(0, selectedIndex + steps), items.count - 1))
+        }
+
+        // The system's momentum ended (or the gesture was cancelled): settle now
+        if event.momentumPhase == .ended || event.momentumPhase == .cancelled || event.phase == .cancelled {
+            finishScrolling()
         }
     }
 
     // Move visual position without triggering onSelect (used for shift+arrow extend)
     private func moveVisualIndex(to newIndex: Int) {
-        guard newIndex >= 0 && newIndex < items.count else { return }
+        guard newIndex >= 0 && newIndex < items.count, newIndex != selectedIndex else { return }
         selectedIndex = newIndex
         animateToSelection()
+        centredIndexDidChange()
     }
 
-    // Local-first selection: animate immediately, defer SwiftUI notification until scroll stops
-    private func selectIndexLocally(_ newIndex: Int) {
-        guard newIndex != selectedIndex && newIndex >= 0 && newIndex < items.count else { return }
-        isExtendingSelection = false
-        selectedIndex = newIndex
-        animateToSelection()
+    /// Local-first selection: animate immediately; SwiftUI hears about it right away, or once a
+    /// scroll settles. Always a plain selection unless the caller passes the click's intent.
+    private func selectIndexLocally(_ newIndex: Int, intent: CoverFlowSelectionIntent = .plain, forceNotify: Bool = false) {
+        guard newIndex >= 0 && newIndex < items.count else { return }
+        guard newIndex != selectedIndex || forceNotify else { return }
+        if newIndex != selectedIndex {
+            selectedIndex = newIndex
+            animateToSelection()
+            centredIndexDidChange()
+        }
 
-        // Only notify SwiftUI immediately if NOT scrolling
-        // If scrolling, we'll notify when scroll settles
-        if !isScrolling {
-            DispatchQueue.main.async { [weak self] in
-                self?.onSelect?(newIndex)
-            }
+        if !isScrolling || forceNotify {
+            onSelect?(newIndex, intent)
         }
     }
 
@@ -2432,162 +2580,114 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         if scrolling != wasScrolling {
             onScrollStateChange?(scrolling)
+            if scrolling {
+                // Covers are about to move under the mouse: stop the hover preview
+                stopOwnedVideoPreview()
+            }
         }
 
         if scrolling {
-            // Reset settle timer (100ms after last scroll event)
+            // Settle 100ms after the last scroll event (momentum events keep it alive)
             scrollSettleTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: false) { [weak self] _ in
-                self?.onScrollSettled()
+                MainActor.assumeIsolated {
+                    self?.finishScrolling()
+                }
             }
         }
+    }
+
+    private func finishScrolling() {
+        guard isScrolling else { return }
+        scrollSettleTimer?.invalidate()
+        scrollSettleTimer = nil
+        scrollAccumulator.reset()
+        onScrollSettled()
     }
 
     private func onScrollSettled() {
         // Notify SwiftUI before flipping scroll state to avoid selection snap-back
-        // Skip if we're in a shift+arrow extend operation (selection already handled by onExtendSelect)
-        if isExtendingSelection {
-            isExtendingSelection = false
-        } else {
-            onSelect?(selectedIndex)
-        }
+        onSelect?(selectedIndex, .plain)
         setScrolling(false)
 
-        // Ensure we maintain focus after scroll completes
+        // The user scrolled the strip: take focus (unless typing somewhere)
         ensureFirstResponder()
 
         // Re-enable reflections on all visible covers
+        CATransaction.begin()
+        CATransaction.setAnimationDuration(0.3)
+        CATransaction.setDisableActions(reduceMotion)
         for coverLayer in coverLayers {
-            if let reflectionContainer = coverLayer.sublayers?.first(where: { $0.name == "reflectionContainer" }),
+            if let reflectionContainer = reflectionSublayer(of: coverLayer),
                let index = coverLayer.value(forKey: "itemIndex") as? Int,
                index < items.count {
-                let item = items[index]
-                let hasThumbnail = thumbnails[item.url] != nil
-                CATransaction.begin()
-                CATransaction.setAnimationDuration(0.3)
+                let hasThumbnail = thumbnails[items[index].url] != nil
                 reflectionContainer.opacity = hasThumbnail ? 1.0 : 0.0
-                CATransaction.commit()
             }
         }
+        CATransaction.commit()
     }
 
-    private func startMomentumScroll() {
-        guard abs(scrollVelocity) > 100 else {
-            accumulatedScroll = 0
-            onScrollSettled()
-            return
-        }
-
-        // Cancel settle timer — momentum handles its own termination via onScrollSettled()
-        scrollSettleTimer?.invalidate()
-        scrollSettleTimer = nil
-
-        // Ensure scroll state is active without recreating the settle timer
-        if !isScrolling {
-            isScrolling = true
-            onScrollStateChange?(true)
-            // Stop video preview during scroll
-            hoveredCoverIndex = nil
-            InlineVideoPreviewManager.shared.stopAllPreviews()
-        }
-
-        momentumTimer?.invalidate()
-        momentumTimer = Timer.scheduledTimer(withTimeInterval: 1.0/60.0, repeats: true) { [weak self] timer in
-            guard let self = self else {
-                timer.invalidate()
-                return
-            }
-
-            // Apply friction (lower = longer momentum)
-            self.scrollVelocity *= 0.94
-
-            // Accumulate based on velocity
-            let delta = self.scrollVelocity / 60.0
-            self.accumulatedScroll += delta
-
-            let threshold: CGFloat = 20
-
-            if self.accumulatedScroll > threshold {
-                let newIndex = max(0, self.selectedIndex - 1)
-                if newIndex != self.selectedIndex {
-                    self.selectIndexLocally(newIndex)
-                }
-                self.accumulatedScroll -= threshold
-            } else if self.accumulatedScroll < -threshold {
-                let newIndex = min(self.items.count - 1, self.selectedIndex + 1)
-                if newIndex != self.selectedIndex {
-                    self.selectIndexLocally(newIndex)
-                }
-                self.accumulatedScroll += threshold
-            }
-
-            // Stop when velocity is low enough
-            if abs(self.scrollVelocity) < 50 {
-                timer.invalidate()
-                self.accumulatedScroll = 0
-                self.onScrollSettled()
-            }
-        }
-    }
+    // MARK: - Keyboard
 
     override func keyDown(with event: NSEvent) {
-        let hasCommand = event.modifierFlags.contains(.command)
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        let hasCommand = modifiers.contains(.command)
+        let hasShift = modifiers.contains(.shift)
 
-        // Handle Command key shortcuts first
+        // Command shortcuts by character, so they follow the keyboard layout (Dvorak etc.)
         if hasCommand {
             switch event.keyCode {
-            case 8: // Cmd+C - Copy
-                onCopy?()
+            case 125: // Cmd+Down - Open
+                openCentredItem()
                 return
-            case 7: // Cmd+X - Cut
-                onCut?()
-                return
-            case 9: // Cmd+V - Paste
-                onPaste?()
-                return
-            case 51: // Cmd+Backspace - Delete/Move to Trash
+            case 51: // Cmd+Backspace - Move to Trash
                 onDelete?()
-                return
-            case 0: // Cmd+A - Select All
-                onSelectAll?()
                 return
             default:
                 break
             }
+            if !modifiers.contains(.option) && !modifiers.contains(.control) && !hasShift {
+                switch event.charactersIgnoringModifiers?.lowercased() {
+                case "c":
+                    onCopy?()
+                    return
+                case "x":
+                    onCut?()
+                    return
+                case "v":
+                    onPaste?()
+                    return
+                case "a":
+                    onSelectAll?()
+                    return
+                default:
+                    break
+                }
+            }
+            // Everything else (e.g. Cmd+Up for Enclosing Folder) belongs to the menus
+            super.keyDown(with: event)
+            return
         }
-
-        let hasShift = event.modifierFlags.contains(.shift)
 
         switch event.keyCode {
         case 123, 126: // Left arrow, Up arrow - previous
-            if selectedIndex > 0 {
-                let newIndex = selectedIndex - 1
-                if hasShift {
-                    isExtendingSelection = true
-                    moveVisualIndex(to: newIndex)
-                    onExtendSelect?(newIndex)
-                } else {
-                    isExtendingSelection = false
-                    selectIndexLocally(newIndex)
-                }
-            }
+            moveSelection(to: selectedIndex - 1, extend: hasShift)
         case 124, 125: // Right arrow, Down arrow - next
-            if selectedIndex < items.count - 1 {
-                let newIndex = selectedIndex + 1
-                if hasShift {
-                    isExtendingSelection = true
-                    moveVisualIndex(to: newIndex)
-                    onExtendSelect?(newIndex)
-                } else {
-                    isExtendingSelection = false
-                    selectIndexLocally(newIndex)
-                }
-            }
-        case 36: // Return
-            if selectedIndex >= 0 && selectedIndex < items.count {
-                onOpen?(selectedIndex)
-            }
-        case 49: // Space - Quick Look
-            if selectedIndex >= 0 && selectedIndex < items.count {
+            moveSelection(to: selectedIndex + 1, extend: hasShift)
+        case 115: // Home
+            moveSelection(to: 0, extend: false)
+        case 119: // End
+            moveSelection(to: items.count - 1, extend: false)
+        case 116: // Page Up
+            moveSelection(to: selectedIndex - pageStep, extend: false)
+        case 121: // Page Down
+            moveSelection(to: selectedIndex + pageStep, extend: false)
+        case 36, 76: // Return, keypad Enter
+            openCentredItem()
+        case 49: // Space - Quick Look, or part of a type-ahead in progress
+            if isTypeAheadActive {
+                appendTypeAhead(" ")
+            } else if selectedIndex >= 0 && selectedIndex < items.count {
                 onQuickLook?(items[selectedIndex])
             }
         case 51: // Delete/Backspace - remove last character from type-ahead buffer (without Cmd)
@@ -2602,24 +2702,51 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             typeAheadBuffer = ""
             typeAheadTimer?.invalidate()
         default:
-            // Handle type-ahead search for printable characters (only without Command modifier)
-            if !hasCommand, let characters = event.characters, !characters.isEmpty {
-                let char = characters.first!
-                if char.isLetter || char.isNumber || char == " " || char == "." || char == "-" || char == "_" {
-                    typeAheadBuffer.append(char)
-                    resetTypeAheadTimer()
-                    jumpToMatch()
-                    return
-                }
+            // Handle type-ahead search for printable characters
+            if !modifiers.contains(.control), let characters = event.characters, let char = characters.first,
+               char.isLetter || char.isNumber || char == "." || char == "-" || char == "_" {
+                appendTypeAhead(char)
+                return
             }
             super.keyDown(with: event)
         }
     }
 
+    private func openCentredItem() {
+        if selectedIndex >= 0 && selectedIndex < items.count {
+            onOpen?(selectedIndex)
+        }
+    }
+
+    /// Keyboard navigation. Plain moves select just the new item; Shift extends the range.
+    private func moveSelection(to target: Int, extend: Bool) {
+        guard !items.isEmpty else { return }
+        let newIndex = min(max(0, target), items.count - 1)
+        guard newIndex != selectedIndex else { return }
+        if extend {
+            moveVisualIndex(to: newIndex)
+            onExtendSelect?(newIndex)
+        } else {
+            selectIndexLocally(newIndex)
+        }
+    }
+
+    private var isTypeAheadActive: Bool {
+        !typeAheadBuffer.isEmpty && (typeAheadTimer?.isValid ?? false)
+    }
+
+    private func appendTypeAhead(_ char: Character) {
+        typeAheadBuffer.append(char)
+        resetTypeAheadTimer()
+        jumpToMatch()
+    }
+
     private func resetTypeAheadTimer() {
         typeAheadTimer?.invalidate()
         typeAheadTimer = Timer.scheduledTimer(withTimeInterval: typeAheadTimeout, repeats: false) { [weak self] _ in
-            self?.typeAheadBuffer = ""
+            MainActor.assumeIsolated {
+                self?.typeAheadBuffer = ""
+            }
         }
     }
 
@@ -2628,24 +2755,72 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         let searchString = typeAheadBuffer.lowercased()
 
-        // Find the first item that starts with the typed string
+        // Find the first item that starts with the typed string. Shift may have been held to type
+        // a capital; this is still a plain selection.
         if let matchIndex = items.firstIndex(where: { $0.name.lowercased().hasPrefix(searchString) }) {
-            onSelect?(matchIndex)
+            selectIndexLocally(matchIndex)
         }
     }
 
     deinit {
-        momentumTimer?.invalidate()
         typeAheadTimer?.invalidate()
         scrollSettleTimer?.invalidate()
         NotificationCenter.default.removeObserver(self)
     }
 
+    // MARK: - Accessibility
+
+    override func isAccessibilityElement() -> Bool { true }
+
+    override func accessibilityRole() -> NSAccessibility.Role? { .list }
+
+    override func accessibilityRoleDescription() -> String? { "cover flow" }
+
+    override func accessibilityLabel() -> String? { "Cover Flow" }
+
+    override func accessibilityValue() -> Any? {
+        guard selectedIndex >= 0 && selectedIndex < items.count else { return nil }
+        return items[selectedIndex].name
+    }
+
+    override func accessibilityChildren() -> [Any]? {
+        let indices = coverLayers.compactMap { $0.value(forKey: "itemIndex") as? Int }.sorted()
+        var elements: [CoverFlowAccessibilityElement] = []
+        var kept: [Int: CoverFlowAccessibilityElement] = [:]
+        for index in indices where index < items.count {
+            let element = accessibilityElementsByIndex[index] ?? CoverFlowAccessibilityElement(index: index, owner: self)
+            element.setAccessibilityLabel(items[index].name)
+            kept[index] = element
+            elements.append(element)
+        }
+        accessibilityElementsByIndex = kept
+        return elements
+    }
+
+    override func accessibilitySelectedChildren() -> [Any]? {
+        (accessibilityChildren() as? [CoverFlowAccessibilityElement])?.filter { isCoverSelected($0.index) }
+    }
+
+    fileprivate func isCoverSelected(_ index: Int) -> Bool {
+        index < items.count && selectedItems.contains(items[index])
+    }
+
+    fileprivate func accessibilityScreenFrame(forCover index: Int) -> NSRect {
+        guard let candidate = coverCandidates().first(where: { $0.index == index }), let window else { return .zero }
+        return window.convertToScreen(convert(candidate.quad.boundingBox, to: nil))
+    }
+
+    fileprivate func accessibilitySelectCover(_ index: Int) -> Bool {
+        guard index >= 0 && index < items.count else { return false }
+        selectIndexLocally(index, forceNotify: true)
+        return true
+    }
+
     // MARK: - NSDraggingSource
 
     func draggingSession(_ session: NSDraggingSession, sourceOperationMaskFor context: NSDraggingContext) -> NSDragOperation {
-        // Allow both move and copy - the actual operation depends on Option key
-        return [.move, .copy]
+        // Move, copy (Option) and generic (Command = force move); the destination picks
+        return [.move, .copy, .generic]
     }
 
     // MARK: - NSDraggingDestination
@@ -2656,9 +2831,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     }
 
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
-        isDropTargeted = true
         updateDropTarget(from: sender)
-        return currentDragOperation()
+        return proposedDragOperation(for: sender)
     }
 
     override func draggingUpdated(_ sender: NSDraggingInfo) -> NSDragOperation {
@@ -2667,7 +2841,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         // Auto-scroll when dragging near edges (Finder-style)
         performAutoScroll(for: sender)
 
-        return currentDragOperation()
+        return proposedDragOperation(for: sender)
     }
 
     // MARK: - Auto-Scroll During Drag
@@ -2677,39 +2851,97 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     private let autoScrollInterval: TimeInterval = 0.15  // Interval between auto-scroll steps
 
     private func performAutoScroll(for sender: NSDraggingInfo) {
-        let location = convert(sender.draggingLocation, from: nil)
+        let location = normalizedDragLocation(from: sender)
         let viewWidth = bounds.width
 
         // Throttle auto-scroll to prevent too-fast scrolling
         let now = Date()
         guard now.timeIntervalSince(lastAutoScrollTime) >= autoScrollInterval else { return }
 
-        // Check if near left or right edges
+        // Check if near left or right edges; scrolling is a plain selection whatever keys are held
         if location.x < autoScrollEdgeThreshold && selectedIndex > 0 {
-            // Near left edge - scroll left (previous item)
             lastAutoScrollTime = now
-            selectedIndex -= 1
-            animateToSelection()
-            onSelect?(selectedIndex)
+            selectIndexLocally(selectedIndex - 1, forceNotify: true)
         } else if location.x > viewWidth - autoScrollEdgeThreshold && selectedIndex < items.count - 1 {
-            // Near right edge - scroll right (next item)
             lastAutoScrollTime = now
-            selectedIndex += 1
-            animateToSelection()
-            onSelect?(selectedIndex)
+            selectIndexLocally(selectedIndex + 1, forceNotify: true)
         }
     }
 
-    private func currentDragOperation() -> NSDragOperation {
-        guard dropTargetIndex != nil else { return .generic }
-        // Option key = copy (shows + icon), otherwise move (no icon)
-        return NSEvent.modifierFlags.contains(.option) ? .copy : .move
+    /// The cursor badge for the current drag, matching what a drop here would do.
+    private func proposedDragOperation(for sender: NSDraggingInfo) -> NSDragOperation {
+        let destination: URL
+        if let target = dropTargetIndex, target < items.count {
+            destination = items[target].url
+        } else if canModifyFolder, let folder = currentFolderURL {
+            destination = folder
+        } else {
+            return []
+        }
+
+        var info = dragSessionInfo(for: sender)
+        defer { dragSessionInfo = info }
+
+        // Dropping items back into the folder they're in does nothing
+        if dropTargetIndex == nil, !info.sourceURLs.isEmpty,
+           info.sourceURLs.allSatisfy({ $0.deletingLastPathComponent().standardizedFileURL == destination.standardizedFileURL }) {
+            return []
+        }
+
+        let operation = CoverFlowDropPolicy.operation(
+            modifierFlags: NSEvent.modifierFlags,
+            sourceMask: sender.draggingSourceOperationMask
+        )
+        return CoverFlowDropPolicy.dragOperation(
+            for: operation,
+            sourceMask: sender.draggingSourceOperationMask,
+            sameVolume: isSameVolume(&info, destination: destination)
+        )
+    }
+
+    private func dragSessionInfo(for sender: NSDraggingInfo) -> DragSessionInfo {
+        if let info = dragSessionInfo, info.sequenceNumber == sender.draggingSequenceNumber {
+            return info
+        }
+        let urls = draggedURLs(from: sender.draggingPasteboard)
+        let info = DragSessionInfo(
+            sequenceNumber: sender.draggingSequenceNumber,
+            sourceURLs: urls,
+            sourceVolumes: urls.map { volumeIdentifier(for: $0) }
+        )
+        dragSessionInfo = info
+        return info
+    }
+
+    private func volumeIdentifier(for url: URL) -> NSObject? {
+        (try? url.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as? NSObject
+    }
+
+    /// true/false if every dragged item is/isn't on the destination's volume; nil if unknown or mixed.
+    private func isSameVolume(_ info: inout DragSessionInfo, destination: URL) -> Bool? {
+        let destinationVolume: NSObject?
+        if let cached = info.destinationVolumes[destination] {
+            destinationVolume = cached
+        } else {
+            destinationVolume = volumeIdentifier(for: destination)
+            info.destinationVolumes[destination] = destinationVolume
+        }
+        guard let destinationVolume, !info.sourceVolumes.isEmpty else { return nil }
+        let matches = info.sourceVolumes.map { $0?.isEqual(destinationVolume) }
+        if matches.allSatisfy({ $0 == true }) { return true }
+        if matches.allSatisfy({ $0 == false }) { return false }
+        return nil
     }
 
     override func draggingExited(_ sender: NSDraggingInfo?) {
-        isDropTargeted = false
         clearDropTargetHighlight()
         dropTargetIndex = nil
+    }
+
+    override func draggingEnded(_ sender: NSDraggingInfo) {
+        clearDropTargetHighlight()
+        dropTargetIndex = nil
+        dragSessionInfo = nil
     }
 
     override func prepareForDragOperation(_ sender: NSDraggingInfo) -> Bool {
@@ -2717,40 +2949,23 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     }
 
     override func performDragOperation(_ sender: NSDraggingInfo) -> Bool {
+        // Resolve copy/move now, from the keys held at the moment of the drop
+        let operation = CoverFlowDropPolicy.operation(
+            modifierFlags: NSEvent.modifierFlags,
+            sourceMask: sender.draggingSourceOperationMask
+        )
+
         // Re-evaluate the drop target at the final location so hovering glitches don't lose the folder target
-        let windowPoint = sender.draggingLocation
-        let viewPoint = convert(windowPoint, from: nil)
-        if dropTargetIndex == nil,
-           let hoveredIndex = hitTestCover(at: viewPoint),
-           hoveredIndex < items.count,
-           items[hoveredIndex].isDirectory,
-           !items[hoveredIndex].isFromArchive {
-            dropTargetIndex = hoveredIndex
+        if dropTargetIndex == nil {
+            updateDropTarget(from: sender)
         }
 
         let targetIndex = dropTargetIndex
-        isDropTargeted = false
         clearDropTargetHighlight()
         dropTargetIndex = nil
+        dragSessionInfo = nil
 
-        // Collect URLs from pasteboard
-        var urls: [URL] = []
-        // Prefer reading as file URLs directly for reliability (Finder and internal drags)
-        if let objectURLs = sender.draggingPasteboard.readObjects(forClasses: [NSURL.self], options: nil) as? [URL] {
-            urls.append(contentsOf: objectURLs)
-        }
-        // Fallback to raw pasteboard items if needed
-        if urls.isEmpty, let items = sender.draggingPasteboard.pasteboardItems {
-            for item in items {
-                if let urlString = item.string(forType: .fileURL) {
-                    // fileURL comes percent-encoded; URL(string:) keeps it intact
-                    if let url = URL(string: urlString) {
-                        urls.append(url)
-                    }
-                }
-            }
-        }
-
+        let urls = draggedURLs(from: sender.draggingPasteboard)
         guard !urls.isEmpty else {
             return false
         }
@@ -2760,75 +2975,65 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
            targetIndex < items.count,
            items[targetIndex].isDirectory,
            !items[targetIndex].isFromArchive {
-            onDropToFolder?(urls, items[targetIndex].url)
+            onDropToFolder?(urls, items[targetIndex].url, operation)
             return true
         }
 
         // Otherwise drop to current directory
-        onDrop?(urls)
+        guard canModifyFolder else { return false }
+        onDrop?(urls, operation)
         return true
     }
 
-    private func updateDropTarget(from draggingInfo: NSDraggingInfo) {
-        // Try both interpretations of the drag location to be resilient to external drag sources
-        var candidateLocations: [NSPoint] = []
-        candidateLocations.append(normalizedDragLocation(from: draggingInfo))
-
-        if let window {
-            let screenPoint = draggingInfo.draggingLocation
-            let correctedWindowPoint = window.convertPoint(fromScreen: screenPoint)
-            candidateLocations.append(convert(correctedWindowPoint, from: nil))
+    private func draggedURLs(from pasteboard: NSPasteboard) -> [URL] {
+        var urls: [URL] = []
+        // Prefer reading as file URLs directly for reliability (Finder and internal drags)
+        if let objectURLs = pasteboard.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            urls.append(contentsOf: objectURLs)
         }
-
-        updateDropTarget(at: candidateLocations)
+        // Fallback to raw pasteboard items if needed
+        if urls.isEmpty, let items = pasteboard.pasteboardItems {
+            for item in items {
+                // fileURL comes percent-encoded; URL(string:) keeps it intact
+                if let urlString = item.string(forType: .fileURL), let url = URL(string: urlString) {
+                    urls.append(url)
+                }
+            }
+        }
+        return urls
     }
 
-    private func updateDropTarget(at location: NSPoint) {
-        updateDropTarget(at: [location])
-    }
-
-    private func updateDropTarget(at locations: [NSPoint]) {
+    private func updateDropTarget(from draggingInfo: NSDraggingInfo) {
+        let location = normalizedDragLocation(from: draggingInfo)
+        let sourceURLs = Set(dragSessionInfo(for: draggingInfo).sourceURLs.map(\.standardizedFileURL))
         let oldTargetIndex = dropTargetIndex
         var newTarget: Int?
 
-        // Hit test to find which cover we're over (first matching location wins)
-        for location in locations {
-            if let index = hitTestCover(at: location),
-               index < items.count,
-               items[index].isDirectory,
-               !items[index].isFromArchive {
-                newTarget = index
-                break
-            }
+        if let index = coverIndex(at: location),
+           index < items.count,
+           items[index].isDirectory,
+           !items[index].isFromArchive,
+           !sourceURLs.contains(items[index].url.standardizedFileURL) {  // not into itself
+            newTarget = index
         }
 
         dropTargetIndex = newTarget
 
         // Update highlighting if target changed
         if oldTargetIndex != dropTargetIndex {
-            if let oldIndex = oldTargetIndex {
-                updateCoverHighlight(at: oldIndex, highlighted: false)
-            }
             if let newIndex = dropTargetIndex {
-                updateCoverHighlight(at: newIndex, highlighted: true)
+                showDropTargetHighlight(for: newIndex)
+            } else {
+                hideDropTargetHighlight()
             }
         } else if let current = dropTargetIndex {
-            // Re-apply every update so highlight survives layer refreshes
-            updateCoverHighlight(at: current, highlighted: true)
+            // Re-apply every update so the highlight follows the animating covers
+            showDropTargetHighlight(for: current)
         }
     }
 
     private func clearDropTargetHighlight() {
         hideDropTargetHighlight()
-    }
-
-    private func updateCoverHighlight(at index: Int, highlighted: Bool) {
-        // Use a single overlay drawn above everything. This avoids 3D transform / z-order issues.
-        if highlighted {
-            showDropTargetHighlight(for: index)
-        } else {
-            hideDropTargetHighlight()
-        }
     }
 
     private func ensureDropTargetHighlightLayer() -> CAShapeLayer? {
@@ -2840,8 +3045,6 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         let highlight = CAShapeLayer()
         highlight.name = "dropTargetHighlightLayer"
-        highlight.fillColor = NSColor.controlAccentColor.withAlphaComponent(0.18).cgColor
-        highlight.strokeColor = NSColor.controlAccentColor.cgColor
         highlight.lineWidth = 5
         highlight.lineJoin = .round
         highlight.lineCap = .round
@@ -2859,34 +3062,28 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         rootLayer.addSublayer(highlight)
         dropTargetHighlightLayer = highlight
+        updateAppearanceColors()
         return highlight
     }
 
     private func showDropTargetHighlight(for index: Int) {
         guard let highlight = ensureDropTargetHighlightLayer() else { return }
 
-        // Find the visible cover layer for this index
-        guard let coverLayer = coverLayers.first(where: { ($0.value(forKey: "itemIndex") as? Int) == index }) else {
+        // Outline the cover as drawn (rotated side covers included), drawn above everything
+        guard let candidate = coverCandidates().first(where: { $0.index == index }) else {
             highlight.isHidden = true
             return
         }
 
-        let coverWidth = coverLayer.value(forKey: "coverWidth") as? CGFloat ?? coverLayer.bounds.width
-        let coverHeight = coverLayer.value(forKey: "coverHeight") as? CGFloat ?? coverLayer.bounds.height
-
-        // NOTE: This is an axis-aligned box in view coordinates. It’s intentionally simple and reliable.
-        var frame = CGRect(
-            x: coverLayer.position.x - coverWidth / 2,
-            y: coverLayer.position.y - coverHeight / 2,
-            width: coverWidth,
-            height: coverHeight
-        )
-        frame = frame.insetBy(dx: -8, dy: -8)
+        let outline = candidate.quad.outset(by: 8)
+        let path = CGMutablePath()
+        path.addLines(between: outline.corners)
+        path.closeSubpath()
 
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        highlight.frame = frame
-        highlight.path = CGPath(roundedRect: highlight.bounds, cornerWidth: 12, cornerHeight: 12, transform: nil)
+        highlight.frame = bounds
+        highlight.path = path
         highlight.isHidden = false
         highlight.opacity = 1
         CATransaction.commit()
@@ -2918,68 +3115,41 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 }
 
 extension CoverFlowNSView: NSDraggingSource {
-    func draggingSession(_ session: NSDraggingSession, movedTo screenPoint: NSPoint) {
-        // Convert screen point to view coordinates
-        guard let window = window else { return }
-        let windowPoint = window.convertPoint(fromScreen: screenPoint)
-        let viewPoint = convert(windowPoint, from: nil)
-
-        // Check if we're still within this view
-        if bounds.contains(viewPoint) {
-            updateDropTarget(at: viewPoint)
-        } else {
-            // Clear highlight when dragging outside
-            if dropTargetIndex != nil {
-                clearDropTargetHighlight()
-                dropTargetIndex = nil
-            }
-        }
-    }
-
     func draggingSession(_ session: NSDraggingSession, endedAt screenPoint: NSPoint, operation: NSDragOperation) {
-
-        guard let window = window else {
-            clearDropTargetHighlight()
-            dropTargetIndex = nil
-            InternalDragState.shared.isDragging = false
-            return
-        }
-
-        let windowPoint = window.convertPoint(fromScreen: screenPoint)
-        let viewPoint = convert(windowPoint, from: nil)
-
-        // Ensure we have the final hovered folder when the drag ends (for drags we originate)
-        if dropTargetIndex == nil,
-           let hoveredIndex = hitTestCover(at: viewPoint),
-           hoveredIndex < items.count,
-           items[hoveredIndex].isDirectory,
-           !items[hoveredIndex].isFromArchive {
-            dropTargetIndex = hoveredIndex
-        }
-
-        // Check if dropped within this view on a folder
-        if bounds.contains(viewPoint), let targetIndex = dropTargetIndex {
-
-            // Get the dragged URLs from the session
-            var urls: [URL] = []
-            session.enumerateDraggingItems(options: [], for: nil, classes: [NSPasteboardItem.self], searchOptions: [:]) { draggingItem, _, _ in
-                if let pasteboardItem = draggingItem.item as? NSPasteboardItem,
-                   let urlString = pasteboardItem.string(forType: .fileURL),
-                   let url = URL(string: urlString) {
-                    urls.append(url)
-                }
-            }
-
-            if !urls.isEmpty && targetIndex < items.count && items[targetIndex].isDirectory && !items[targetIndex].isFromArchive {
-                onDropToFolder?(urls, items[targetIndex].url)
-            }
-        }
-
+        // The destination (this view's performDragOperation, Finder, ...) has already handled the
+        // drop, or the drag was cancelled. Only clean up here.
         clearDropTargetHighlight()
         dropTargetIndex = nil
+        dragSessionInfo = nil
 
         // Clear internal drag state
         InternalDragState.shared.isDragging = false
+    }
+}
+
+/// VoiceOver element for one visible cover.
+private final class CoverFlowAccessibilityElement: NSAccessibilityElement {
+    let index: Int
+    private weak var owner: CoverFlowNSView?
+
+    init(index: Int, owner: CoverFlowNSView) {
+        self.index = index
+        self.owner = owner
+        super.init()
+        setAccessibilityRole(.image)
+        setAccessibilityParent(owner)
+    }
+
+    override func accessibilityFrame() -> NSRect {
+        owner?.accessibilityScreenFrame(forCover: index) ?? .zero
+    }
+
+    override func isAccessibilitySelected() -> Bool {
+        owner?.isCoverSelected(index) ?? false
+    }
+
+    override func accessibilityPerformPress() -> Bool {
+        owner?.accessibilitySelectCover(index) ?? false
     }
 }
 
@@ -2999,6 +3169,7 @@ struct CoverFlowResizeHandle: View {
         }
         .frame(height: height)
         .contentShape(Rectangle())
+        .pointerStyle(.rowResize)
         .gesture(
             DragGesture(minimumDistance: 0, coordinateSpace: .global)
                 .onChanged { value in
@@ -3023,9 +3194,6 @@ struct CoverFlowInfoHeightKey: PreferenceKey {
 
 struct FileListSection: View {
     let items: [FileItem]  // Already sorted by parent
-    let selectedItems: Set<FileItem>
-    let onSelect: (FileItem, Int) -> Void
-    let onOpen: (FileItem) -> Void
     @ObservedObject var viewModel: FileBrowserViewModel
     var onEmptySpaceClick: (() -> Void)? = nil
     @EnvironmentObject private var appSettings: AppSettings
@@ -3042,7 +3210,12 @@ struct FileListSection: View {
             onEmptySpaceClick: onEmptySpaceClick
         )
         .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
-            handleDrop(providers: providers)
+            // Resolve copy/move now, while the drop's modifier keys are still down
+            let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
+            DropHelper.processDroppedItems(providers) { urls in
+                guard !urls.isEmpty else { return }
+                viewModel.handleDrop(urls: urls, operation: operation)
+            }
             return true
         }
         .overlay(
@@ -3051,16 +3224,539 @@ struct FileListSection: View {
                 .allowsHitTesting(false)
         )
     }
+}
 
-    private func handleDrop(providers: [NSItemProvider]) {
-        for provider in providers {
-            provider.loadItem(forTypeIdentifier: "public.file-url", options: nil) { data, _ in
-                guard let data = data as? Data,
-                      let sourceURL = URL(dataRepresentation: data, relativeTo: nil) else { return }
-                DispatchQueue.main.async {
-                    viewModel.handleDrop(urls: [sourceURL])
+// MARK: - Selection Intent
+
+/// How a Cover Flow selection combines with the existing selection. Always derived from the
+/// event that caused it, never from the live keyboard state: keyboard navigation, type-ahead,
+/// scrolling and drag auto-scroll are plain selections even while Shift or Command is held.
+struct CoverFlowSelectionIntent: Equatable {
+    /// Shift-click: select the range from the anchor
+    var extendsRange: Bool
+    /// Command-click: toggle the item
+    var toggles: Bool
+
+    static let plain = CoverFlowSelectionIntent(extendsRange: false, toggles: false)
+
+    static func click(modifierFlags: NSEvent.ModifierFlags) -> CoverFlowSelectionIntent {
+        CoverFlowSelectionIntent(
+            extendsRange: modifierFlags.contains(.shift),
+            toggles: modifierFlags.contains(.command)
+        )
+    }
+}
+
+// MARK: - Geometry
+
+/// Cover placement and transform-aware hit-testing. Side covers are rotated ~60° and scaled, so
+/// hit-testing projects each cover's outline through its full 3D transform instead of treating
+/// it as a flat rectangle.
+enum CoverFlowGeometry {
+    static let perspective: CGFloat = -1.0 / 1000.0
+    static let sideAngle: CGFloat = 60  // degrees
+    static let sideScale: CGFloat = 0.75
+    static let centreZOffset: CGFloat = 50
+    static let spacingRatio: CGFloat = 0.22      // Space between side covers
+    static let sideOffsetRatio: CGFloat = 0.62   // Distance from center to first side cover
+
+    static func baseCoverSize(viewSize: CGSize, coverScale: CGFloat) -> CGFloat {
+        let heightDriven = viewSize.height * 0.7
+        let widthDriven = viewSize.width * 0.28
+        return min(heightDriven, widthDriven, 480) * coverScale
+    }
+
+    struct Placement {
+        let position: CGPoint
+        let transform: CATransform3D
+        let zPosition: CGFloat
+    }
+
+    /// Where the cover `offset` places from the centre goes. Negative offsets are on the left.
+    static func placement(offsetFromCentre diff: Int, viewSize: CGSize, baseCoverSize: CGFloat) -> Placement {
+        let centreX = viewSize.width / 2
+        let centreY = viewSize.height / 2
+        let spacing = baseCoverSize * spacingRatio
+        let sideOffset = baseCoverSize * sideOffsetRatio
+
+        let xPosition: CGFloat
+        let angle: CGFloat
+        if diff == 0 {
+            xPosition = centreX
+            angle = 0
+        } else if diff < 0 {
+            // Position covers to the left
+            xPosition = centreX - sideOffset + CGFloat(diff + 1) * spacing
+            angle = sideAngle
+        } else {
+            // Position covers to the right
+            xPosition = centreX + sideOffset + CGFloat(diff - 1) * spacing
+            angle = -sideAngle
+        }
+
+        let scale: CGFloat = diff == 0 ? 1.0 : sideScale
+        var transform = CATransform3DIdentity
+        transform.m34 = perspective
+        transform = CATransform3DTranslate(transform, 0, 0, diff == 0 ? centreZOffset : 0)
+        transform = CATransform3DRotate(transform, angle * .pi / 180, 0, 1, 0)
+        transform = CATransform3DScale(transform, scale, scale, 1)
+
+        return Placement(
+            position: CGPoint(x: xPosition, y: centreY),
+            transform: transform,
+            zPosition: CGFloat(1000 - abs(diff) * 10)
+        )
+    }
+
+    /// A cover's outline as drawn, in its superlayer's coordinates.
+    struct Quad: Equatable {
+        /// Corners in the layer's own order: bottom-left, bottom-right, top-right, top-left.
+        let corners: [CGPoint]
+        /// Perspective depth (homogeneous w) of each corner, for perspective-correct mapping.
+        let depths: [CGFloat]
+
+        var boundingBox: CGRect {
+            let xs = corners.map(\.x)
+            let ys = corners.map(\.y)
+            guard let minX = xs.min(), let maxX = xs.max(), let minY = ys.min(), let maxY = ys.max() else { return .null }
+            return CGRect(x: minX, y: minY, width: maxX - minX, height: maxY - minY)
+        }
+
+        /// Point-in-convex-polygon test (a projected rectangle is convex).
+        func contains(_ point: CGPoint) -> Bool {
+            guard corners.count == 4 else { return false }
+            var sign: CGFloat = 0
+            for i in 0..<4 {
+                let a = corners[i]
+                let b = corners[(i + 1) % 4]
+                let cross = (b.x - a.x) * (point.y - a.y) - (b.y - a.y) * (point.x - a.x)
+                if cross == 0 { continue }
+                if sign == 0 {
+                    sign = cross
+                } else if (cross > 0) != (sign > 0) {
+                    return false
                 }
             }
+            return sign != 0
+        }
+
+        /// Where `point` falls across the cover's image: 0 at its left edge, 1 at its right edge,
+        /// corrected for perspective.
+        func horizontalFraction(at point: CGPoint) -> CGFloat? {
+            guard corners.count == 4, depths.count == 4,
+                  let left = Self.x(onEdgeFrom: corners[0], to: corners[3], atY: point.y),
+                  let right = Self.x(onEdgeFrom: corners[1], to: corners[2], atY: point.y),
+                  abs(right - left) > .ulpOfOne else { return nil }
+            let leftDepth = (depths[0] + depths[3]) / 2
+            let rightDepth = (depths[1] + depths[2]) / 2
+            let denominator = leftDepth * (point.x - left) + rightDepth * (right - point.x)
+            guard abs(denominator) > .ulpOfOne else { return nil }
+            let fraction = leftDepth * (point.x - left) / denominator
+            return min(max(fraction, 0), 1)
+        }
+
+        /// The outline pushed out from its centre by `distance` points.
+        func outset(by distance: CGFloat) -> Quad {
+            let centre = CGPoint(
+                x: corners.map(\.x).reduce(0, +) / CGFloat(max(corners.count, 1)),
+                y: corners.map(\.y).reduce(0, +) / CGFloat(max(corners.count, 1))
+            )
+            let moved = corners.map { corner -> CGPoint in
+                let dx = corner.x - centre.x
+                let dy = corner.y - centre.y
+                let length = max(hypot(dx, dy), .ulpOfOne)
+                return CGPoint(x: corner.x + dx / length * distance, y: corner.y + dy / length * distance)
+            }
+            return Quad(corners: moved, depths: depths)
+        }
+
+        private static func x(onEdgeFrom a: CGPoint, to b: CGPoint, atY y: CGFloat) -> CGFloat? {
+            guard a.x.isFinite, b.x.isFinite else { return nil }
+            if abs(b.y - a.y) < .ulpOfOne { return (a.x + b.x) / 2 }
+            let t = (y - a.y) / (b.y - a.y)
+            return a.x + (b.x - a.x) * t
+        }
+    }
+
+    /// Projects a layer's bounds into its superlayer the way Core Animation draws it: relative to
+    /// the anchor point, through `transform` (including its perspective), offset by position, then
+    /// through the superlayer's `sublayerTransform`. Returns nil if a corner is behind the viewer.
+    static func project(
+        bounds: CGRect,
+        anchorPoint: CGPoint,
+        position: CGPoint,
+        zPosition: CGFloat = 0,
+        transform: CATransform3D,
+        parentSublayerTransform: CATransform3D = CATransform3DIdentity,
+        parentAnchor: CGPoint = .zero
+    ) -> Quad? {
+        let anchor = CGPoint(
+            x: bounds.minX + anchorPoint.x * bounds.width,
+            y: bounds.minY + anchorPoint.y * bounds.height
+        )
+        // Row-vector convention: CATransform3DConcat(a, b) applies a, then b
+        var matrix = CATransform3DMakeTranslation(-anchor.x, -anchor.y, 0)
+        matrix = CATransform3DConcat(matrix, transform)
+        matrix = CATransform3DConcat(matrix, CATransform3DMakeTranslation(position.x, position.y, zPosition))
+        if !CATransform3DIsIdentity(parentSublayerTransform) {
+            matrix = CATransform3DConcat(matrix, CATransform3DMakeTranslation(-parentAnchor.x, -parentAnchor.y, 0))
+            matrix = CATransform3DConcat(matrix, parentSublayerTransform)
+            matrix = CATransform3DConcat(matrix, CATransform3DMakeTranslation(parentAnchor.x, parentAnchor.y, 0))
+        }
+
+        let localCorners = [
+            CGPoint(x: bounds.minX, y: bounds.minY),
+            CGPoint(x: bounds.maxX, y: bounds.minY),
+            CGPoint(x: bounds.maxX, y: bounds.maxY),
+            CGPoint(x: bounds.minX, y: bounds.maxY)
+        ]
+        var corners: [CGPoint] = []
+        var depths: [CGFloat] = []
+        for p in localCorners {
+            let x = p.x * matrix.m11 + p.y * matrix.m21 + matrix.m41
+            let y = p.x * matrix.m12 + p.y * matrix.m22 + matrix.m42
+            let w = p.x * matrix.m14 + p.y * matrix.m24 + matrix.m44
+            guard w > 0.0001 else { return nil }
+            corners.append(CGPoint(x: x / w, y: y / w))
+            depths.append(w)
+        }
+        return Quad(corners: corners, depths: depths)
+    }
+
+    struct Candidate {
+        let index: Int
+        let zPosition: CGFloat
+        let quad: Quad
+    }
+
+    /// The cover drawn under `point`, testing covers front to back. If no cover is under it but the
+    /// point is in the strip (e.g. between two covers or on a reflection), the nearest cover within
+    /// `maxGap` points horizontally is used; this never overrides an actual hit.
+    static func hitTest(_ point: CGPoint, candidates: [Candidate], stripBand: ClosedRange<CGFloat>?, maxGap: CGFloat) -> Candidate? {
+        let frontToBack = candidates.sorted { $0.zPosition > $1.zPosition }
+        if let hit = frontToBack.first(where: { $0.quad.contains(point) }) {
+            return hit
+        }
+
+        guard let band = stripBand, band.contains(point.y) else { return nil }
+        var best: (candidate: Candidate, distance: CGFloat)?
+        for candidate in frontToBack {
+            let box = candidate.quad.boundingBox
+            let distance: CGFloat
+            if point.x < box.minX {
+                distance = box.minX - point.x
+            } else if point.x > box.maxX {
+                distance = point.x - box.maxX
+            } else {
+                distance = 0
+            }
+            // Strictly closer wins, so ties go to the frontmost cover
+            if distance <= maxGap, best == nil || distance < best!.distance {
+                best = (candidate, distance)
+            }
+        }
+        return best?.candidate
+    }
+}
+
+// MARK: - Scrolling
+
+/// Turns scroll-wheel and trackpad deltas into cover steps.
+struct CoverFlowScrollAccumulator {
+    /// Trackpad / Magic Mouse travel (points, after sensitivity) per cover
+    static let pointsPerCover: CGFloat = 20
+    /// A wheel notch after this long a pause starts a new burst
+    static let wheelBurstGap: TimeInterval = 0.3
+
+    private(set) var accumulated: CGFloat = 0
+    private var lastWheelTime: TimeInterval = -.infinity
+
+    mutating func reset() {
+        accumulated = 0
+        lastWheelTime = -.infinity
+    }
+
+    /// Covers to move for one scroll event: negative towards the start of the list.
+    /// Precise (pixel) deltas accumulate; line-based mouse wheels move one cover per notch,
+    /// and a single notch always moves.
+    mutating func coverSteps(for delta: CGFloat, isPrecise: Bool, sensitivity: CGFloat, now: TimeInterval) -> Int {
+        guard delta != 0, delta.isFinite else { return 0 }
+
+        // Reversing direction starts over instead of first undoing the leftover
+        if accumulated != 0 && (accumulated > 0) != (delta > 0) {
+            accumulated = 0
+        }
+
+        if isPrecise {
+            accumulated += delta * sensitivity
+            let steps = Int(accumulated / Self.pointsPerCover)
+            accumulated -= CGFloat(steps) * Self.pointsPerCover
+            return -steps
+        }
+
+        let startsBurst = now - lastWheelTime > Self.wheelBurstGap
+        lastWheelTime = now
+        if startsBurst {
+            accumulated = 0
+        }
+        accumulated += delta
+        var steps = Int(accumulated)
+        if steps == 0 && startsBurst {
+            steps = delta > 0 ? 1 : -1
+            accumulated = 0
+        } else {
+            accumulated -= CGFloat(steps)
+        }
+        return -steps
+    }
+}
+
+// MARK: - Thumbnail Sizing & Bookkeeping
+
+enum CoverFlowThumbnailSizing {
+    struct Sizes: Equatable {
+        /// Centre covers: the real on-screen pixel size
+        var hero: CGFloat
+        /// Side covers (scaled down and rotated)
+        var high: CGFloat
+        /// Preloaded covers further out
+        var low: CGFloat
+    }
+
+    static func sidePixelSize(coverScale: CGFloat, qualityValue: CGFloat) -> CGFloat {
+        let base = 192 * coverScale * qualityValue
+        let bucket = (base / 64).rounded() * 64
+        return min(1024, max(128, bucket))
+    }
+
+    static func placeholderPixelSize(sidePixelSize: CGFloat) -> CGFloat {
+        let base = sidePixelSize * 0.5
+        let bucket = (base / 32).rounded() * 32
+        return min(256, max(96, bucket))
+    }
+
+    /// The centre cover's device-pixel size (points × backing scale), so it's sharp on Retina.
+    /// The quality setting can lower it, never raise it above what's on screen.
+    static func heroPixelSize(centreCoverPixels: CGFloat, quality: CGFloat, sidePixelSize: CGFloat) -> CGFloat {
+        guard centreCoverPixels.isFinite, centreCoverPixels > 0 else { return sidePixelSize }
+        let target = centreCoverPixels * min(max(quality, 0.25), 1)
+        let bucket = (target / 64).rounded(.up) * 64
+        return min(1536, max(sidePixelSize, bucket))
+    }
+
+    static func sizes(coverScale: CGFloat, qualityValue: CGFloat, quality: CGFloat, centreCoverPixels: CGFloat) -> Sizes {
+        let high = sidePixelSize(coverScale: coverScale, qualityValue: qualityValue)
+        return Sizes(
+            hero: heroPixelSize(centreCoverPixels: centreCoverPixels, quality: quality, sidePixelSize: high),
+            high: high,
+            low: placeholderPixelSize(sidePixelSize: high)
+        )
+    }
+}
+
+/// Which resolution each cover needs at a given distance from the centre, and how much may be kept.
+struct CoverFlowThumbnailPolicy {
+    var heroRadius = 2
+    var heroRetainRadius = 6
+    /// Covers on screen
+    var highRadius = 12
+    var fullResRetainRadius = 24
+    var preloadRadius = 96
+    var windowRadius = 100
+
+    /// The pixel size to load at `distance`, or nil if nothing should be loaded.
+    /// While navigating rapidly, nothing above side-cover resolution is requested.
+    func requiredPixelSize(distance: Int, sizes: CoverFlowThumbnailSizing.Sizes, rapid: Bool = false) -> CGFloat? {
+        let required: CGFloat
+        if distance <= heroRadius {
+            required = sizes.hero
+        } else if distance <= highRadius {
+            required = sizes.high
+        } else if distance <= preloadRadius {
+            required = sizes.low
+        } else {
+            return nil
+        }
+        return rapid ? min(required, sizes.high) : required
+    }
+
+    /// The largest image worth keeping at `distance`, or nil to release it.
+    func maxRetainedPixelSize(distance: Int, sizes: CoverFlowThumbnailSizing.Sizes) -> CGFloat? {
+        if distance <= heroRetainRadius { return sizes.hero }
+        if distance <= fullResRetainRadius { return sizes.high }
+        if distance <= windowRadius { return sizes.low }
+        return nil
+    }
+}
+
+/// Per-URL record of how good the displayed thumbnail is, keyed by the item's content version,
+/// so items already satisfied are skipped without asking the thumbnail cache (and edited files
+/// are reloaded).
+struct CoverFlowThumbnailLedger {
+    struct Entry: Equatable {
+        var version: FileItem.ContentVersion
+        var pixelSize: CGFloat
+        /// Nothing better will come for this version (archive entries, failed thumbnails)
+        var isFinal: Bool
+    }
+
+    private struct Request {
+        var version: FileItem.ContentVersion
+        var pixelSize: CGFloat
+        var startedAt: TimeInterval
+    }
+
+    /// Requests that haven't completed after this long are assumed lost (the cache can drop them)
+    static let requestTimeout: TimeInterval = 4
+
+    private(set) var entries: [URL: Entry] = [:]
+    private var requests: [URL: [Request]] = [:]
+
+    /// Whether two versions describe the same file content. Fields that weren't loaded yet
+    /// (metadata before hydration, cloud status) don't count as changes.
+    static func isSameContent(_ a: FileItem.ContentVersion, _ b: FileItem.ContentVersion) -> Bool {
+        if a.hasMetadata && b.hasMetadata {
+            if a.modificationDate != b.modificationDate || a.size != b.size { return false }
+        }
+        if let statusA = a.cloudStatus, let statusB = b.cloudStatus, statusA != statusB {
+            return false
+        }
+        return true
+    }
+
+    func entry(for url: URL) -> Entry? {
+        entries[url]
+    }
+
+    /// Combines what's known about the same content: newly loaded fields fill in, known ones stay.
+    static func merged(_ known: FileItem.ContentVersion, with newer: FileItem.ContentVersion) -> FileItem.ContentVersion {
+        let metadata = newer.hasMetadata ? newer : known
+        return FileItem.ContentVersion(
+            modificationDate: metadata.modificationDate,
+            size: metadata.size,
+            hasMetadata: metadata.hasMetadata,
+            cloudStatus: newer.cloudStatus ?? known.cloudStatus
+        )
+    }
+
+    /// Whether the image held for `url` is good enough for this content and size.
+    mutating func isSatisfied(_ url: URL, version: FileItem.ContentVersion, pixelSize: CGFloat) -> Bool {
+        guard var entry = entries[url], Self.isSameContent(entry.version, version) else { return false }
+        let merged = Self.merged(entry.version, with: version)
+        if entry.version != merged {
+            // Same content, more is known now
+            entry.version = merged
+            entries[url] = entry
+        }
+        return entry.isFinal || entry.pixelSize >= pixelSize
+    }
+
+    /// Records an image of `pixelSize`. A late, smaller result never downgrades a better entry.
+    mutating func markSettled(_ url: URL, version: FileItem.ContentVersion, pixelSize: CGFloat) {
+        if let existing = entries[url], Self.isSameContent(existing.version, version),
+           existing.isFinal || existing.pixelSize >= pixelSize {
+            return
+        }
+        entries[url] = Entry(version: version, pixelSize: pixelSize, isFinal: false)
+    }
+
+    /// Records a deliberate swap to a smaller image (memory).
+    mutating func replace(_ url: URL, version: FileItem.ContentVersion, pixelSize: CGFloat) {
+        entries[url] = Entry(version: version, pixelSize: pixelSize, isFinal: false)
+    }
+
+    mutating func markFinal(_ url: URL, version: FileItem.ContentVersion) {
+        entries[url] = Entry(version: version, pixelSize: 0, isFinal: true)
+    }
+
+    mutating func remove(_ url: URL) {
+        entries.removeValue(forKey: url)
+        requests.removeValue(forKey: url)
+    }
+
+    mutating func retain(where keep: (URL) -> Bool) {
+        entries = entries.filter { keep($0.key) }
+        requests = requests.filter { keep($0.key) }
+    }
+
+    mutating func removeAll() {
+        entries.removeAll()
+        requests.removeAll()
+    }
+
+    // MARK: Requests
+
+    mutating func beginRequest(_ url: URL, version: FileItem.ContentVersion, pixelSize: CGFloat, now: TimeInterval) {
+        var list = requests[url] ?? []
+        list.removeAll { $0.pixelSize == pixelSize }
+        list.append(Request(version: version, pixelSize: pixelSize, startedAt: now))
+        requests[url] = list
+    }
+
+    mutating func finishRequest(_ url: URL, pixelSize: CGFloat) {
+        guard var list = requests[url] else { return }
+        list.removeAll { $0.pixelSize == pixelSize }
+        requests[url] = list.isEmpty ? nil : list
+    }
+
+    /// Whether a request for this content at `pixelSize` or more is in flight.
+    func isRequested(_ url: URL, version: FileItem.ContentVersion, atLeast pixelSize: CGFloat) -> Bool {
+        requests[url]?.contains { $0.pixelSize >= pixelSize && Self.isSameContent($0.version, version) } ?? false
+    }
+
+    func activeRequestCount(where matches: (CGFloat) -> Bool) -> Int {
+        requests.values.reduce(0) { count, list in
+            count + list.filter { matches($0.pixelSize) }.count
+        }
+    }
+
+    mutating func pruneStaleRequests(now: TimeInterval) {
+        guard !requests.isEmpty else { return }
+        requests = requests.compactMapValues { list in
+            let live = list.filter { now - $0.startedAt < Self.requestTimeout }
+            return live.isEmpty ? nil : live
+        }
+    }
+
+    mutating func cancelAllRequests() {
+        requests.removeAll()
+    }
+}
+
+// MARK: - Drop Operations
+
+enum CoverFlowDropPolicy {
+    /// What a drop should do, from the modifier keys held at the moment of the drop and what the
+    /// drag source allows. Option copies, Command moves, otherwise Finder's automatic rule.
+    static func operation(modifierFlags: NSEvent.ModifierFlags, sourceMask: NSDragOperation) -> FileDropOperation {
+        let requested = FileDropOperation(modifierFlags: modifierFlags)
+        if requested != .automatic {
+            return requested
+        }
+        // The source only allows copying (e.g. a read-only location)
+        if !sourceMask.contains(.move) && !sourceMask.contains(.generic) && sourceMask.contains(.copy) {
+            return .copy
+        }
+        return .automatic
+    }
+
+    /// The drag operation (cursor badge) that matches what `operation` will do.
+    /// `sameVolume` is nil when unknown.
+    static func dragOperation(for operation: FileDropOperation, sourceMask: NSDragOperation, sameVolume: Bool?) -> NSDragOperation {
+        switch operation {
+        case .copy:
+            return sourceMask.contains(.copy) ? .copy : []
+        case .move:
+            if sourceMask.contains(.move) { return .move }
+            return sourceMask.contains(.generic) ? .generic : []
+        case .automatic:
+            if sameVolume == false {
+                // Finder copies across volumes
+                return sourceMask.contains(.copy) ? .copy : []
+            }
+            if sourceMask.contains(.move) { return .move }
+            if sourceMask.contains(.generic) { return .generic }
+            return sourceMask.contains(.copy) ? .copy : []
         }
     }
 }

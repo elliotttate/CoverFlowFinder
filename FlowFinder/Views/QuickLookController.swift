@@ -2,18 +2,44 @@ import AppKit
 import SwiftUI
 import Quartz
 
+/// Arrow-key navigation for the Quick Look panel, shared by the controller's keyDown and the
+/// panel delegate's event handler.
+enum QuickLookKeyAction: Equatable {
+    case navigate(Int)
+    case close
+
+    /// The action for a key event, or nil if Quick Look shouldn't handle it.
+    /// Events with Command, Option, Control or Shift are never handled (menus and text editing get them).
+    init?(keyCode: UInt16, modifierFlags: NSEvent.ModifierFlags) {
+        guard modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty else { return nil }
+        switch keyCode {
+        case 125, 124: // Down, Right
+            self = .navigate(1)
+        case 126, 123: // Up, Left
+            self = .navigate(-1)
+        case 49, 53: // Space, Escape
+            self = .close
+        default:
+            return nil
+        }
+    }
+}
+
 /// A window-level Quick Look controller that handles preview for all SwiftUI views.
-/// This NSView is added to the main window and stays in the responder chain.
+///
+/// QLPreviewPanel looks for its controller in the key window's responder chain, so while the panel
+/// is open this hidden view is installed in the window that opened it and made first responder
+/// there. It works from any window: showing the panel moves the view into the current window.
+/// Key handling is done through the responder chain (`keyDown`) and the panel delegate
+/// (`previewPanel(_:handle:)`), never through event monitors.
 class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
     static let shared = QuickLookControllerView(frame: .zero)
 
     /// The URL currently being previewed
     var previewURL: URL?
 
-    /// Keyboard monitor for arrow navigation while Quick Look is open
-    private var keyboardMonitor: Any?
-    private var localKeyboardMonitor: Any?
     private weak var previousFirstResponder: NSResponder?
+    private var panelCloseObserver: NSObjectProtocol?
 
     /// Callback for navigation
     var onNavigate: ((Int) -> Void)?
@@ -33,17 +59,25 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
     // MARK: - Quick Look Panel Control
 
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
-        return true
+        // Only the window we're installed in can control the panel through us
+        return window != nil
     }
 
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
         panel.dataSource = self
         panel.delegate = self
+        observePanelClose(panel)
     }
 
     override func endPreviewPanelControl(_ panel: QLPreviewPanel!) {
-        panel.dataSource = nil
-        panel.delegate = nil
+        if panel.dataSource as? QuickLookControllerView === self {
+            panel.dataSource = nil
+        }
+        if panel.delegate as? QuickLookControllerView === self {
+            panel.delegate = nil
+        }
+        // The panel closed (e.g. via its close button) or another controller took over
+        finishPreviewSession()
     }
 
     // MARK: - QLPreviewPanelDataSource
@@ -59,21 +93,78 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
 
     // MARK: - QLPreviewPanelDelegate
 
+    /// Keys pressed while the panel itself is key (after the user clicked it).
+    func previewPanel(_ panel: QLPreviewPanel!, handle event: NSEvent!) -> Bool {
+        guard let event, event.type == .keyDown,
+              let action = QuickLookKeyAction(keyCode: event.keyCode, modifierFlags: event.modifierFlags) else {
+            return false
+        }
+        switch action {
+        case .navigate(let offset):
+            onNavigate?(offset)
+            return true
+        case .close:
+            // Let the panel close itself; endPreviewPanelControl cleans up
+            return false
+        }
+    }
+
     func previewPanel(_ panel: QLPreviewPanel!, transitionImageFor item: QLPreviewItem!, contentRect: UnsafeMutablePointer<NSRect>!) -> Any! {
         // Provide the file icon as transition image
         guard let url = item.previewItemURL else { return nil }
         return NSWorkspace.shared.icon(forFile: url.path)
     }
 
+    // MARK: - Keyboard (while we're first responder in the browser window)
+
+    override func keyDown(with event: NSEvent) {
+        guard isPanelVisible,
+              let action = QuickLookKeyAction(keyCode: event.keyCode, modifierFlags: event.modifierFlags) else {
+            super.keyDown(with: event)
+            return
+        }
+        switch action {
+        case .navigate(let offset):
+            onNavigate?(offset)
+        case .close:
+            hidePreview()
+        }
+    }
+
     // MARK: - Public API
 
     fileprivate func installIfNeeded(in window: NSWindow?) {
-        guard let window, superview == nil else { return }
+        guard let window, self.window !== window else { return }
+        moveToWindow(window)
+    }
+
+    private func moveToWindow(_ window: NSWindow) {
+        // Leaving another window: give its focus back first
+        if let oldWindow = self.window, oldWindow !== window {
+            if oldWindow.firstResponder === self {
+                restorePreviousFirstResponder()
+            }
+            previousFirstResponder = nil
+        }
+        removeFromSuperview()
         if let themeFrame = window.contentView?.superview {
             themeFrame.addSubview(self)
         } else {
             window.contentView?.addSubview(self)
         }
+    }
+
+    /// The browser window that should own the panel: the key window, unless that's the panel itself.
+    private var targetWindow: NSWindow? {
+        if let key = NSApp.keyWindow, !(key is QLPreviewPanel) {
+            return key
+        }
+        return NSApp.mainWindow
+    }
+
+    private var isPanelVisible: Bool {
+        guard QLPreviewPanel.sharedPreviewPanelExists() else { return false }
+        return QLPreviewPanel.shared()?.isVisible == true
     }
 
     func showPreview(for url: URL, navigate: @escaping (Int) -> Void) {
@@ -82,11 +173,13 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
 
         guard let panel = QLPreviewPanel.shared() else { return }
 
-        // Make sure we're added to the window (above the hosting view, not as subview)
-        installIfNeeded(in: NSApp.mainWindow)
+        // Install in the window that asked for the preview
+        if let target = targetWindow {
+            installIfNeeded(in: target)
+        }
 
-        // Only need to set up responder chain if we're not already controlling
-        if panel.dataSource as? QuickLookControllerView !== self {
+        // Become the panel's controller through the responder chain
+        if panel.dataSource as? QuickLookControllerView !== self || window?.firstResponder !== self {
             storePreviousFirstResponder()
             window?.makeFirstResponder(self)
             panel.updateController()
@@ -95,8 +188,6 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
         // Show panel and reload data
         panel.orderFront(nil)
         panel.reloadData()
-
-        startKeyboardMonitor()
     }
 
     func updatePreview(for url: URL) {
@@ -106,101 +197,50 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
     func updatePreview(for url: URL?) {
         previewURL = url
 
-        if let panel = QLPreviewPanel.shared(), panel.isVisible {
-            if url == nil {
-                panel.orderOut(nil)
-                stopKeyboardMonitor()
-                restorePreviousFirstResponder()
-            } else {
-                panel.reloadData()
-            }
+        guard isPanelVisible, let panel = QLPreviewPanel.shared() else { return }
+        if url == nil {
+            panel.orderOut(nil)
+            finishPreviewSession()
+        } else {
+            panel.reloadData()
         }
     }
 
     func hidePreview() {
-        if let panel = QLPreviewPanel.shared(), panel.isVisible {
-            panel.orderOut(nil)
+        if isPanelVisible {
+            QLPreviewPanel.shared()?.orderOut(nil)
         }
-        stopKeyboardMonitor()
-        restorePreviousFirstResponder()
+        finishPreviewSession()
     }
 
     func togglePreview(for url: URL, navigate: @escaping (Int) -> Void) {
-        if let panel = QLPreviewPanel.shared(), panel.isVisible {
+        if isPanelVisible {
             hidePreview()
         } else {
             showPreview(for: url, navigate: navigate)
         }
     }
 
-    // MARK: - Keyboard Monitor
+    // MARK: - Session Cleanup
 
-    private func startKeyboardMonitor() {
-        stopKeyboardMonitor()
-
-        // Use global monitor to catch events even when QuickLook panel has focus
-        keyboardMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self = self,
-                  let panel = QLPreviewPanel.shared(),
-                  panel.isVisible else {
-                return
-            }
-
-            switch event.keyCode {
-            case 125: // Down arrow
-                DispatchQueue.main.async { self.onNavigate?(1) }
-            case 126: // Up arrow
-                DispatchQueue.main.async { self.onNavigate?(-1) }
-            case 123: // Left arrow
-                DispatchQueue.main.async { self.onNavigate?(-1) }
-            case 124: // Right arrow
-                DispatchQueue.main.async { self.onNavigate?(1) }
-            case 49, 53: // Space or Escape
-                DispatchQueue.main.async { self.hidePreview() }
-            default:
-                break
-            }
-        }
-
-        // Also add local monitor for when our app has focus
-        localKeyboardMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self = self,
-                  let panel = QLPreviewPanel.shared(),
-                  panel.isVisible else {
-                return event
-            }
-
-            switch event.keyCode {
-            case 125: // Down arrow
-                self.onNavigate?(1)
-                return nil
-            case 126: // Up arrow
-                self.onNavigate?(-1)
-                return nil
-            case 123: // Left arrow
-                self.onNavigate?(-1)
-                return nil
-            case 124: // Right arrow
-                self.onNavigate?(1)
-                return nil
-            case 49, 53: // Space or Escape
-                self.hidePreview()
-                return nil
-            default:
-                return event
+    private func observePanelClose(_ panel: QLPreviewPanel) {
+        guard panelCloseObserver == nil else { return }
+        panelCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: panel,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.finishPreviewSession()
             }
         }
     }
 
-    private func stopKeyboardMonitor() {
-        if let monitor = keyboardMonitor {
-            NSEvent.removeMonitor(monitor)
-            keyboardMonitor = nil
-        }
-        if let monitor = localKeyboardMonitor {
-            NSEvent.removeMonitor(monitor)
-            localKeyboardMonitor = nil
-        }
+    /// Give focus back to whatever had it before the panel opened — but only if we still hold it.
+    /// If the user has since clicked into a text field (e.g. typed a search that emptied the
+    /// selection), focus stays there.
+    private func finishPreviewSession() {
+        restorePreviousFirstResponder()
     }
 
     private func storePreviousFirstResponder() {
@@ -211,33 +251,26 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
     }
 
     private func restorePreviousFirstResponder() {
-        guard let window else {
-            previousFirstResponder = nil
-            return
-        }
+        defer { previousFirstResponder = nil }
+        guard let window, window.firstResponder === self else { return }
         if let previous = previousFirstResponder, previous !== self {
             window.makeFirstResponder(previous)
         } else {
             window.makeFirstResponder(window.contentView)
         }
-        previousFirstResponder = nil
-    }
-
-    func previewPanelWillClose(_ panel: QLPreviewPanel!) {
-        stopKeyboardMonitor()
-        restorePreviousFirstResponder()
     }
 }
 
-/// SwiftUI view that ensures QuickLookControllerView is installed in the window
+/// SwiftUI view that ensures QuickLookControllerView is installed in a window
 struct QuickLookWindowController: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let view = NSView(frame: .zero)
 
-        // Install the shared controller in the window after a delay
+        // Install the shared controller in the first window; showing the panel moves it
+        // into whichever window asks for a preview.
         DispatchQueue.main.async {
             if let window = view.window,
-               QuickLookControllerView.shared.superview == nil {
+               QuickLookControllerView.shared.window == nil {
                 QuickLookControllerView.shared.installIfNeeded(in: window)
             }
         }
