@@ -18,6 +18,8 @@ final class AppSettings: ObservableObject {
         static let sidebarShowLocations = "settings.sidebarShowLocations"
         static let sidebarShowTags = "settings.sidebarShowTags"
         static let sidebarFavorites = "settings.sidebarFavorites"
+        /// Holds a favorites blob this version couldn't read (e.g. written by a newer version), saved before it's replaced.
+        static let sidebarFavoritesUnreadableBackup = "settings.sidebarFavorites.unreadableBackup"
         static let thumbnailQuality = "settings.thumbnailQuality"
         static let masonryShowFilenames = "settings.masonryShowFilenames"
 
@@ -66,9 +68,6 @@ final class AppSettings: ObservableObject {
             .system(.music),
             .system(.pictures)
         ]
-        static let sidebarFavoritesData: Data = {
-            (try? JSONEncoder().encode(sidebarFavorites)) ?? Data()
-        }()
         static let thumbnailQuality: Double = 1.0
         static let masonryShowFilenames = false
 
@@ -132,12 +131,12 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(sidebarShowTags, forKey: Keys.sidebarShowTags) }
     }
     @Published var sidebarFavorites: [SidebarFavorite] {
-        didSet {
-            if let data = try? JSONEncoder().encode(sidebarFavorites) {
-                defaults.set(data, forKey: Keys.sidebarFavorites)
-            }
-        }
+        didSet { persistSidebarFavorites() }
     }
+    /// Stored favorites this version can't decode (e.g. a newer `Kind`); written back so a downgrade doesn't lose them.
+    private var preservedUnknownFavorites: [SidebarFavoritesCoding.UnknownElement] = []
+    /// The stored favorites blob when it couldn't be decoded at all; backed up before the first write replaces it.
+    private var unreadableFavoritesData: Data?
     @Published var thumbnailQuality: Double {
         didSet { defaults.set(thumbnailQuality, forKey: Keys.thumbnailQuality) }
     }
@@ -206,7 +205,12 @@ final class AppSettings: ObservableObject {
         didSet { defaults.set(videoSkimming, forKey: Keys.videoSkimming) }
     }
 
-    private init(defaults: UserDefaults = .standard) {
+    private convenience init() {
+        self.init(defaults: .standard)
+    }
+
+    /// Use `AppSettings.shared` in the app; this initializer exists so tests can supply their own defaults.
+    init(defaults: UserDefaults) {
         self.defaults = defaults
 
         defaults.register(defaults: [
@@ -221,7 +225,6 @@ final class AppSettings: ObservableObject {
             Keys.sidebarShowICloud: Defaults.sidebarShowICloud,
             Keys.sidebarShowLocations: Defaults.sidebarShowLocations,
             Keys.sidebarShowTags: Defaults.sidebarShowTags,
-            Keys.sidebarFavorites: Defaults.sidebarFavoritesData,
             Keys.thumbnailQuality: Defaults.thumbnailQuality,
             Keys.masonryShowFilenames: Defaults.masonryShowFilenames,
             Keys.listFontSize: Defaults.listFontSize,
@@ -256,14 +259,19 @@ final class AppSettings: ObservableObject {
         sidebarShowICloud = defaults.bool(forKey: Keys.sidebarShowICloud)
         sidebarShowLocations = defaults.bool(forKey: Keys.sidebarShowLocations)
         sidebarShowTags = defaults.bool(forKey: Keys.sidebarShowTags)
-        sidebarFavorites = {
-            if let data = defaults.data(forKey: Keys.sidebarFavorites),
-               let favorites = try? JSONDecoder().decode([SidebarFavorite].self, from: data),
-               !favorites.isEmpty {
-                return favorites
-            }
-            return Defaults.sidebarFavorites
-        }()
+        // Favorites are deliberately not registered as a default: "never set" (use the defaults) must stay
+        // distinguishable from an empty list the user chose.
+        let storedFavorites = defaults.data(forKey: Keys.sidebarFavorites)
+        switch SidebarFavoritesCoding.decode(storedFavorites) {
+        case .notSet:
+            sidebarFavorites = Defaults.sidebarFavorites
+        case .decoded(let favorites, let unknown):
+            sidebarFavorites = favorites
+            preservedUnknownFavorites = unknown
+        case .unreadable:
+            sidebarFavorites = Defaults.sidebarFavorites
+            unreadableFavoritesData = storedFavorites
+        }
         thumbnailQuality = defaults.double(forKey: Keys.thumbnailQuality)
         masonryShowFilenames = defaults.bool(forKey: Keys.masonryShowFilenames)
 
@@ -303,6 +311,7 @@ final class AppSettings: ObservableObject {
         sidebarShowICloud = Defaults.sidebarShowICloud
         sidebarShowLocations = Defaults.sidebarShowLocations
         sidebarShowTags = Defaults.sidebarShowTags
+        preservedUnknownFavorites = []
         sidebarFavorites = Defaults.sidebarFavorites
         thumbnailQuality = Defaults.thumbnailQuality
         masonryShowFilenames = Defaults.masonryShowFilenames
@@ -434,10 +443,27 @@ final class AppSettings: ObservableObject {
     var thumbnailQualityValue: CGFloat {
         CGFloat(thumbnailQuality * 1.6)
     }
+
+    /// Number of user-added (non-system) favorites, e.g. for the reset confirmation.
+    var customFavoritesCount: Int {
+        sidebarFavorites.filter { $0.kind == .custom }.count
+    }
+
+    private func persistSidebarFavorites() {
+        if let unreadable = unreadableFavoritesData {
+            // Never silently replace data we couldn't read: keep a copy before the first overwrite.
+            if defaults.data(forKey: Keys.sidebarFavoritesUnreadableBackup) == nil {
+                defaults.set(unreadable, forKey: Keys.sidebarFavoritesUnreadableBackup)
+            }
+            unreadableFavoritesData = nil
+        }
+        guard let data = SidebarFavoritesCoding.encode(sidebarFavorites, preserving: preservedUnknownFavorites) else { return }
+        defaults.set(data, forKey: Keys.sidebarFavorites)
+    }
 }
 
-struct SidebarFavorite: Identifiable, Codable, Equatable {
-    enum Kind: String, Codable {
+struct SidebarFavorite: Identifiable, Codable, Equatable, Sendable {
+    enum Kind: String, Codable, Sendable {
         case documents
         case applications
         case desktop
@@ -450,11 +476,16 @@ struct SidebarFavorite: Identifiable, Codable, Equatable {
 
     let id: String
     let kind: Kind
+    /// Last known path of a custom favorite.
     let path: String?
+    /// Bookmark to a custom favorite's folder, so renaming or moving the folder doesn't break the favorite.
+    /// Favorites saved by older versions only have `path`; they get a bookmark the first time they resolve.
+    let bookmark: Data?
 
-    init(kind: Kind, id: String? = nil, path: String? = nil) {
+    init(kind: Kind, id: String? = nil, path: String? = nil, bookmark: Data? = nil) {
         self.kind = kind
         self.path = path
+        self.bookmark = bookmark
         if let id {
             self.id = id
         } else if kind == .custom {
@@ -468,7 +499,200 @@ struct SidebarFavorite: Identifiable, Codable, Equatable {
         SidebarFavorite(kind: kind, id: kind.rawValue)
     }
 
+    /// Creates a path-only custom favorite without touching the file system; the sidebar adds the bookmark when
+    /// it next resolves favorites in the background.
     static func custom(path: String) -> SidebarFavorite {
         SidebarFavorite(kind: .custom, id: UUID().uuidString, path: path)
+    }
+
+    /// Creates a custom favorite for a folder, including a bookmark (touches the file system).
+    static func custom(url: URL) -> SidebarFavorite {
+        let standardized = url.standardizedFileURL
+        return SidebarFavorite(kind: .custom, id: UUID().uuidString, path: standardized.path, bookmark: makeBookmark(for: standardized))
+    }
+
+    func withLocation(path: String, bookmark: Data?) -> SidebarFavorite {
+        SidebarFavorite(kind: kind, id: id, path: path, bookmark: bookmark)
+    }
+
+    /// Resolves where the favorite points now. Touches the file system (bookmark resolution, existence checks),
+    /// so call it off the main thread.
+    func resolve(fileManager: FileManager = .default) -> SidebarFavoriteResolution {
+        guard kind == .custom else {
+            let location = kind.systemLocation
+            let url = location?.url
+            let isAvailable = url.map { fileManager.fileExists(atPath: $0.path) } ?? false
+            return SidebarFavoriteResolution(
+                favorite: self,
+                url: url,
+                name: location?.name ?? kind.rawValue.capitalized,
+                isAvailable: isAvailable,
+                updatedFavorite: nil
+            )
+        }
+
+        let storedURL = path.flatMap { $0.isEmpty ? nil : URL(fileURLWithPath: $0, isDirectory: true) }
+
+        if let bookmark,
+           let resolved = Self.resolveBookmark(bookmark),
+           !Self.isInTrash(resolved.url),
+           fileManager.fileExists(atPath: resolved.url.path) {
+            let resolvedURL = resolved.url
+            if let storedURL, Self.isSameLocation(storedURL, resolvedURL) {
+                // Still where we left it (possibly spelled differently, e.g. /var vs /private/var): keep the stored path.
+                let refreshed = resolved.isStale ? Self.makeBookmark(for: storedURL) : nil
+                return SidebarFavoriteResolution(
+                    favorite: self,
+                    url: storedURL,
+                    name: storedURL.lastPathComponent,
+                    isAvailable: true,
+                    updatedFavorite: refreshed.map { withLocation(path: storedURL.path, bookmark: $0) }
+                )
+            }
+            // The folder was renamed or moved: follow it.
+            return SidebarFavoriteResolution(
+                favorite: self,
+                url: resolvedURL,
+                name: resolvedURL.lastPathComponent,
+                isAvailable: true,
+                updatedFavorite: withLocation(path: resolvedURL.path, bookmark: Self.makeBookmark(for: resolvedURL) ?? bookmark)
+            )
+        }
+
+        guard let storedURL else {
+            return SidebarFavoriteResolution(favorite: self, url: nil, name: "Missing Folder", isAvailable: false, updatedFavorite: nil)
+        }
+
+        let isAvailable = fileManager.fileExists(atPath: storedURL.path)
+        // A path-only favorite from an older version, or a bookmark that no longer resolves while the path is
+        // valid (the folder was replaced): bookmark whatever is at the path now.
+        let newBookmark = isAvailable ? Self.makeBookmark(for: storedURL) : nil
+        return SidebarFavoriteResolution(
+            favorite: self,
+            url: storedURL,
+            name: storedURL.lastPathComponent,
+            isAvailable: isAvailable,
+            updatedFavorite: newBookmark.map { withLocation(path: storedURL.path, bookmark: $0) }
+        )
+    }
+
+    static func makeBookmark(for url: URL) -> Data? {
+        try? url.bookmarkData(options: [.withoutImplicitSecurityScope], includingResourceValuesForKeys: nil, relativeTo: nil)
+    }
+
+    private static func resolveBookmark(_ data: Data) -> (url: URL, isStale: Bool)? {
+        var isStale = false
+        guard let url = try? URL(
+            resolvingBookmarkData: data,
+            options: [.withoutUI, .withoutMounting, .withoutImplicitStartAccessing],
+            relativeTo: nil,
+            bookmarkDataIsStale: &isStale
+        ) else { return nil }
+        return (url.standardizedFileURL, isStale)
+    }
+
+    /// A bookmark follows a folder into the Trash; a trashed favorite should read as missing instead.
+    private static func isInTrash(_ url: URL) -> Bool {
+        let components = url.pathComponents
+        return components.contains(".Trash") || components.contains(".Trashes")
+    }
+
+    private static func isSameLocation(_ lhs: URL, _ rhs: URL) -> Bool {
+        lhs.standardizedFileURL.resolvingSymlinksInPath().path == rhs.standardizedFileURL.resolvingSymlinksInPath().path
+    }
+}
+
+extension SidebarFavorite.Kind {
+    /// Display name and folder of a built-in favorite; nil for `.custom`.
+    var systemLocation: (name: String, url: URL?)? {
+        let fm = FileManager.default
+        switch self {
+        case .documents:
+            return ("Documents", fm.urls(for: .documentDirectory, in: .userDomainMask).first)
+        case .applications:
+            return ("Applications", fm.urls(for: .applicationDirectory, in: .localDomainMask).first)
+        case .desktop:
+            return ("Desktop", fm.urls(for: .desktopDirectory, in: .userDomainMask).first)
+        case .downloads:
+            return ("Downloads", fm.urls(for: .downloadsDirectory, in: .userDomainMask).first)
+        case .movies:
+            return ("Movies", fm.urls(for: .moviesDirectory, in: .userDomainMask).first)
+        case .music:
+            return ("Music", fm.urls(for: .musicDirectory, in: .userDomainMask).first)
+        case .pictures:
+            return ("Pictures", fm.urls(for: .picturesDirectory, in: .userDomainMask).first)
+        case .custom:
+            return nil
+        }
+    }
+}
+
+/// Where a favorite points right now, from `SidebarFavorite.resolve()`.
+struct SidebarFavoriteResolution: Equatable, Sendable {
+    /// The favorite that was resolved.
+    let favorite: SidebarFavorite
+    let url: URL?
+    let name: String
+    let isAvailable: Bool
+    /// Set when the stored favorite should be replaced: the folder moved, or its bookmark was created or refreshed.
+    let updatedFavorite: SidebarFavorite?
+
+    /// The folder was renamed or moved (as opposed to only getting a new bookmark).
+    var didMove: Bool {
+        guard let updatedFavorite else { return false }
+        return updatedFavorite.path != favorite.path
+    }
+}
+
+/// Element-wise coding of the stored favorites list, so one entry this version doesn't understand (e.g. a `Kind`
+/// added by a newer version) doesn't throw away the whole list.
+enum SidebarFavoritesCoding {
+    /// A stored element that didn't decode, kept verbatim (with its position) so it's written back unchanged.
+    struct UnknownElement: Equatable {
+        let index: Int
+        let json: Data
+    }
+
+    enum DecodeResult: Equatable {
+        /// Nothing stored yet: use the default favorites.
+        case notSet
+        /// Every element that could be decoded (possibly none: an empty list is a valid user choice).
+        case decoded([SidebarFavorite], unknown: [UnknownElement])
+        /// The stored value isn't a list at all.
+        case unreadable
+    }
+
+    static func decode(_ data: Data?) -> DecodeResult {
+        guard let data else { return .notSet }
+        guard let elements = (try? JSONSerialization.jsonObject(with: data, options: [.fragmentsAllowed])) as? [Any] else {
+            return .unreadable
+        }
+
+        let decoder = JSONDecoder()
+        var favorites: [SidebarFavorite] = []
+        var unknown: [UnknownElement] = []
+        for (index, element) in elements.enumerated() {
+            guard let elementData = try? JSONSerialization.data(withJSONObject: element, options: [.fragmentsAllowed]) else {
+                continue
+            }
+            if let favorite = try? decoder.decode(SidebarFavorite.self, from: elementData) {
+                favorites.append(favorite)
+            } else {
+                unknown.append(UnknownElement(index: index, json: elementData))
+            }
+        }
+        return .decoded(favorites, unknown: unknown)
+    }
+
+    static func encode(_ favorites: [SidebarFavorite], preserving unknown: [UnknownElement]) -> Data? {
+        guard let data = try? JSONEncoder().encode(favorites) else { return nil }
+        guard !unknown.isEmpty,
+              var elements = (try? JSONSerialization.jsonObject(with: data)) as? [Any] else { return data }
+
+        for element in unknown.sorted(by: { $0.index < $1.index }) {
+            guard let object = try? JSONSerialization.jsonObject(with: element.json, options: [.fragmentsAllowed]) else { continue }
+            elements.insert(object, at: min(element.index, elements.count))
+        }
+        return (try? JSONSerialization.data(withJSONObject: elements)) ?? data
     }
 }

@@ -24,36 +24,50 @@
 #
 # USAGE:
 #   ./scripts/notarize.sh              # Build, sign, notarize, create DMG
-#   ./scripts/notarize.sh --release    # Same as above + create GitHub release
+#   ./scripts/notarize.sh --release    # Same as above + appcast + GitHub release (run on an up-to-date main)
 #   ./scripts/notarize.sh --skip-build # Skip build, just notarize existing app
 #   ./scripts/notarize.sh --dmg-only   # Create DMG from existing notarized app
 #   ./scripts/notarize.sh --check      # Check notarization history
 
-set -e
+set -euo pipefail
 
 # Configuration
 APP_NAME="FlowFinder"
 SCHEME="FlowFinder"
-BUNDLE_ID="com.flowfinder.app"
 TEAM_ID="RH4U5VJHM6"
 KEYCHAIN_PROFILE="FlowFinder-Notarization"
 SIGNING_IDENTITY="Developer ID Application: Brian Tate (RH4U5VJHM6)"
+RELEASE_BRANCH="main"
 
 # Paths
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
+PBXPROJ="$PROJECT_DIR/$APP_NAME.xcodeproj/project.pbxproj"
 BUILD_DIR="$PROJECT_DIR/build"
 ARCHIVE_PATH="$BUILD_DIR/$APP_NAME.xcarchive"
 EXPORT_PATH="$BUILD_DIR/export"
 APP_PATH="$EXPORT_PATH/$APP_NAME.app"
 EXPORT_OPTIONS="$BUILD_DIR/ExportOptions.plist"
+DOCS_DIR="$PROJECT_DIR/docs"
+APPCAST="$DOCS_DIR/appcast.xml"
 
-# Sparkle tools
+# Sparkle tools. These get access to the EdDSA private key in the Keychain, so the download is pinned to a
+# version and verified against its SHA-256 before use. To update: change both values (the digest is listed
+# for each asset on the GitHub release, or run: curl -fL <url> | shasum -a 256).
 SPARKLE_VERSION="2.9.0"
+SPARKLE_SHA256="01e0f0ebf6614061ea816d414de50f937d64ffa6822ad572243031ca3676fe19"
+SPARKLE_URL="https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
 SPARKLE_TOOLS_DIR="$BUILD_DIR/sparkle-tools"
+SPARKLE_STAMP="$SPARKLE_TOOLS_DIR/.flowfinder-sparkle-sha256"
 SPARKLE_SIGN="$SPARKLE_TOOLS_DIR/bin/sign_update"
 SPARKLE_APPCAST="$SPARKLE_TOOLS_DIR/bin/generate_appcast"
-DOCS_DIR="$PROJECT_DIR/docs"
+
+# Private scratch space for this run (removed on exit)
+WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/flowfinder-release.XXXXXX")"
+cleanup() {
+    rm -rf "$WORK_DIR"
+}
+trap cleanup EXIT
 
 # Colors for output
 RED='\033[0;31m'
@@ -79,8 +93,80 @@ print_error() {
     echo -e "${RED}✗${NC} $1"
 }
 
+# Value of a build setting from the project file; fails if Debug and Release disagree.
+get_build_setting() {
+    local name="$1" values count
+    values=$(grep -E "^[[:space:]]*$name = " "$PBXPROJ" | sed 's/.*= //; s/;.*//; s/"//g' | tr -d ' ' | sort -u || true)
+    count=$(printf '%s' "$values" | grep -c . || true)
+    if [ "$count" -ne 1 ]; then
+        print_error "Expected exactly one value for $name in project.pbxproj, found: ${values:-none}" >&2
+        exit 1
+    fi
+    printf '%s\n' "$values"
+}
+
+# MARKETING_VERSION (CFBundleShortVersionString), e.g. 1.38.0
 get_version() {
-    grep -m1 'MARKETING_VERSION' "$PROJECT_DIR/$APP_NAME.xcodeproj/project.pbxproj" | sed 's/.*= //' | sed 's/;.*//' | tr -d ' '
+    get_build_setting MARKETING_VERSION
+}
+
+# CURRENT_PROJECT_VERSION (CFBundleVersion), e.g. 138. Sparkle compares this number.
+get_build_number() {
+    get_build_setting CURRENT_PROJECT_VERSION
+}
+
+# Highest sparkle:version already published in the appcast (0 if none).
+latest_appcast_build_number() {
+    local latest=""
+    if [ -f "$APPCAST" ]; then
+        latest=$(grep -o '<sparkle:version>[0-9]*</sparkle:version>' "$APPCAST" | sed 's/[^0-9]//g' | sort -n | tail -1 || true)
+    fi
+    echo "${latest:-0}"
+}
+
+check_versions() {
+    print_step "Checking version numbers..."
+    local version build latest
+    version=$(get_version)
+    build=$(get_build_number)
+    latest=$(latest_appcast_build_number)
+
+    if ! [[ "$build" =~ ^[0-9]+$ ]]; then
+        print_error "CURRENT_PROJECT_VERSION must be a plain integer (got '$build')"
+        exit 1
+    fi
+    if [ "$build" -le "$latest" ]; then
+        print_error "CURRENT_PROJECT_VERSION ($build) must be greater than the newest sparkle:version in docs/appcast.xml ($latest)."
+        echo "Sparkle compares CFBundleVersion: bump CURRENT_PROJECT_VERSION (and MARKETING_VERSION) in both build configurations."
+        exit 1
+    fi
+    if [ -f "$APPCAST" ] && grep -q "<sparkle:shortVersionString>$version</sparkle:shortVersionString>" "$APPCAST"; then
+        print_error "Version $version is already in docs/appcast.xml. Bump MARKETING_VERSION."
+        exit 1
+    fi
+    print_success "Version $version (build $build) > latest published build $latest"
+}
+
+# A release must be built from the commit GitHub Pages and the release tag will point at.
+check_release_branch() {
+    print_step "Checking git state..."
+    cd "$PROJECT_DIR"
+    local branch
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$branch" != "$RELEASE_BRANCH" ]; then
+        print_error "Releases are published from '$RELEASE_BRANCH' (GitHub Pages serves the appcast from it); you're on '$branch'."
+        exit 1
+    fi
+    git fetch --quiet origin "$RELEASE_BRANCH"
+    if [ "$(git rev-parse HEAD)" != "$(git rev-parse "origin/$RELEASE_BRANCH")" ]; then
+        print_error "Local $RELEASE_BRANCH differs from origin/$RELEASE_BRANCH. Push (or pull) first so the release tag matches what you build."
+        exit 1
+    fi
+    if ! git diff --quiet || ! git diff --cached --quiet; then
+        print_error "Uncommitted changes. Commit them (e.g. the version bump) and push before releasing."
+        exit 1
+    fi
+    print_success "On $RELEASE_BRANCH, in sync with origin"
 }
 
 check_credentials() {
@@ -103,7 +189,9 @@ check_credentials() {
 
 check_certificate() {
     print_step "Checking Developer ID certificate..."
-    if ! security find-identity -v -p codesigning | grep -q "Developer ID Application"; then
+    local identities
+    identities=$(security find-identity -v -p codesigning 2>/dev/null || true)
+    if ! grep -q "Developer ID Application" <<<"$identities"; then
         print_error "Developer ID Application certificate not found!"
         echo "Please install your Developer ID certificate from the Apple Developer portal."
         exit 1
@@ -112,43 +200,67 @@ check_certificate() {
 }
 
 ensure_sparkle_tools() {
-    if [ ! -f "$SPARKLE_SIGN" ]; then
-        print_step "Downloading Sparkle tools v${SPARKLE_VERSION}..."
-        mkdir -p "$SPARKLE_TOOLS_DIR"
-        curl -L -o "/tmp/Sparkle-${SPARKLE_VERSION}.tar.xz" \
-            "https://github.com/sparkle-project/Sparkle/releases/download/${SPARKLE_VERSION}/Sparkle-${SPARKLE_VERSION}.tar.xz"
-        tar -xf "/tmp/Sparkle-${SPARKLE_VERSION}.tar.xz" -C "$SPARKLE_TOOLS_DIR"
-        rm -f "/tmp/Sparkle-${SPARKLE_VERSION}.tar.xz"
-        print_success "Sparkle tools downloaded"
-    else
-        print_success "Sparkle tools found"
+    if [ -x "$SPARKLE_SIGN" ] && [ -x "$SPARKLE_APPCAST" ] && [ -f "$SPARKLE_STAMP" ] \
+        && [ "$(cat "$SPARKLE_STAMP")" = "$SPARKLE_SHA256" ]; then
+        print_success "Sparkle tools v${SPARKLE_VERSION} found"
+        return
     fi
+
+    print_step "Downloading Sparkle tools v${SPARKLE_VERSION}..."
+    local download_dir="$WORK_DIR/sparkle-download"
+    local archive="$download_dir/Sparkle-${SPARKLE_VERSION}.tar.xz"
+    mkdir -p "$download_dir/extracted"
+
+    curl --fail --location --silent --show-error --proto '=https' --tlsv1.2 -o "$archive" "$SPARKLE_URL"
+
+    local actual
+    actual=$(shasum -a 256 "$archive" | awk '{print $1}')
+    if [ "$actual" != "$SPARKLE_SHA256" ]; then
+        print_error "Sparkle download checksum mismatch!"
+        echo "  expected: $SPARKLE_SHA256"
+        echo "  actual:   $actual"
+        exit 1
+    fi
+
+    tar -xf "$archive" -C "$download_dir/extracted"
+    rm -rf "$SPARKLE_TOOLS_DIR"
+    mkdir -p "$BUILD_DIR"
+    mv "$download_dir/extracted" "$SPARKLE_TOOLS_DIR"
+    echo "$SPARKLE_SHA256" > "$SPARKLE_STAMP"
+    print_success "Sparkle tools downloaded and verified"
 }
 
 clean_build() {
     print_step "Cleaning previous build..."
-    # Preserve sparkle-tools across builds
+    # Preserve sparkle-tools across builds (moved into this run's private scratch dir meanwhile)
+    local backup="$WORK_DIR/sparkle-tools-backup"
     if [ -d "$SPARKLE_TOOLS_DIR" ]; then
-        mv "$SPARKLE_TOOLS_DIR" /tmp/sparkle-tools-backup
+        mv "$SPARKLE_TOOLS_DIR" "$backup"
     fi
     rm -rf "$BUILD_DIR"
     mkdir -p "$BUILD_DIR"
-    if [ -d /tmp/sparkle-tools-backup ]; then
-        mv /tmp/sparkle-tools-backup "$SPARKLE_TOOLS_DIR"
+    if [ -d "$backup" ]; then
+        mv "$backup" "$SPARKLE_TOOLS_DIR"
     fi
     print_success "Build directory cleaned"
 }
 
 build_archive() {
     print_step "Building archive (this may take a minute)..."
+    local log="$BUILD_DIR/archive.log"
 
-    xcodebuild -project "$PROJECT_DIR/$APP_NAME.xcodeproj" \
+    if ! xcodebuild -project "$PROJECT_DIR/$APP_NAME.xcodeproj" \
         -scheme "$SCHEME" \
         -configuration Release \
         -archivePath "$ARCHIVE_PATH" \
         archive \
         DEVELOPMENT_TEAM="$TEAM_ID" \
-        2>&1 | tail -5
+        > "$log" 2>&1; then
+        tail -30 "$log"
+        print_error "Archive failed! Full log: $log"
+        exit 1
+    fi
+    tail -5 "$log"
 
     if [ ! -d "$ARCHIVE_PATH" ]; then
         print_error "Archive failed!"
@@ -159,6 +271,7 @@ build_archive() {
 
 export_app() {
     print_step "Exporting app with Developer ID signing..."
+    local log="$BUILD_DIR/export.log"
 
     # Create export options plist
     cat > "$EXPORT_OPTIONS" << EOF
@@ -176,11 +289,16 @@ export_app() {
 </plist>
 EOF
 
-    xcodebuild -exportArchive \
+    if ! xcodebuild -exportArchive \
         -archivePath "$ARCHIVE_PATH" \
         -exportPath "$EXPORT_PATH" \
         -exportOptionsPlist "$EXPORT_OPTIONS" \
-        2>&1 | tail -3
+        > "$log" 2>&1; then
+        tail -30 "$log"
+        print_error "Export failed! Full log: $log"
+        exit 1
+    fi
+    tail -3 "$log"
 
     if [ ! -d "$APP_PATH" ]; then
         print_error "Export failed!"
@@ -189,11 +307,26 @@ EOF
     print_success "App exported"
 }
 
+# The exported app must carry the versions Sparkle will see in the appcast.
+verify_bundle_versions() {
+    print_step "Verifying bundle versions..."
+    local plist="$APP_PATH/Contents/Info.plist" short build
+    short=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$plist")
+    build=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" "$plist")
+    if [ "$short" != "$(get_version)" ] || [ "$build" != "$(get_build_number)" ]; then
+        print_error "Built app is $short ($build), expected $(get_version) ($(get_build_number))"
+        exit 1
+    fi
+    print_success "CFBundleShortVersionString $short, CFBundleVersion $build"
+}
+
 verify_signature() {
     print_step "Verifying code signature..."
+    local details entitlements
+    details=$(codesign -dvv "$APP_PATH" 2>&1 || true)
 
     # Check signature
-    if codesign -dvv "$APP_PATH" 2>&1 | grep -q "Developer ID Application"; then
+    if grep -q "Developer ID Application" <<<"$details"; then
         print_success "Signed with Developer ID"
     else
         print_error "Not properly signed!"
@@ -201,14 +334,15 @@ verify_signature() {
     fi
 
     # Check timestamp
-    if codesign -dv "$APP_PATH" 2>&1 | grep -q "Timestamp="; then
+    if grep -q "Timestamp=" <<<"$details"; then
         print_success "Secure timestamp present"
     else
         print_warning "No secure timestamp (may fail notarization)"
     fi
 
     # Check for debug entitlement
-    if codesign -d --entitlements :- "$APP_PATH" 2>/dev/null | grep -q "get-task-allow"; then
+    entitlements=$(codesign -d --entitlements :- "$APP_PATH" 2>/dev/null || true)
+    if grep -q "get-task-allow" <<<"$entitlements"; then
         print_error "Debug entitlement present (will fail notarization)!"
         exit 1
     else
@@ -216,18 +350,29 @@ verify_signature() {
     fi
 }
 
+# Submits a file and waits; fails unless Apple reports "Accepted".
+notarize_file() {
+    local file="$1"
+    local log
+    log="$WORK_DIR/notarize-$(basename "$file").log"
+    if ! xcrun notarytool submit "$file" --keychain-profile "$KEYCHAIN_PROFILE" --wait 2>&1 | tee "$log"; then
+        print_error "Notarization submission failed"
+        exit 1
+    fi
+    if ! grep -q "status: Accepted" "$log"; then
+        print_error "Notarization was not accepted (see: xcrun notarytool log <submission-id> --keychain-profile \"$KEYCHAIN_PROFILE\")"
+        exit 1
+    fi
+}
+
 submit_notarization() {
     print_step "Submitting for notarization (this may take 2-5 minutes)..."
 
     # Create a temporary zip for notarization
-    local NOTARIZE_ZIP="$BUILD_DIR/notarize-temp.zip"
-    ditto -c -k --keepParent "$APP_PATH" "$NOTARIZE_ZIP"
-
-    xcrun notarytool submit "$NOTARIZE_ZIP" \
-        --keychain-profile "$KEYCHAIN_PROFILE" \
-        --wait
-
-    rm -f "$NOTARIZE_ZIP"
+    local notarize_zip="$WORK_DIR/notarize.zip"
+    ditto -c -k --keepParent "$APP_PATH" "$notarize_zip"
+    notarize_file "$notarize_zip"
+    rm -f "$notarize_zip"
     print_success "Notarization accepted"
 }
 
@@ -240,153 +385,179 @@ staple_app() {
 verify_notarization() {
     print_step "Verifying notarization..."
 
-    local RESULT=$(spctl -a -t open --context context:primary-signature -v "$APP_PATH" 2>&1)
-    if echo "$RESULT" | grep -q "accepted"; then
+    local result
+    result=$(spctl -a -t open --context context:primary-signature -v "$APP_PATH" 2>&1 || true)
+    if grep -q "accepted" <<<"$result"; then
         print_success "App is notarized and ready for distribution"
-        echo "  $RESULT"
+        echo "  $result"
     else
         print_warning "Verification returned unexpected result:"
-        echo "  $RESULT"
+        echo "  $result"
     fi
 }
 
 create_dmg() {
-    VERSION=$(get_version)
-    DMG_NAME="$APP_NAME-$VERSION.dmg"
-    DMG_PATH="$PROJECT_DIR/$DMG_NAME"
-    TMP_DMG="/tmp/$APP_NAME-temp.dmg"
+    local version dmg_name dmg_path staging tmp_dmg
+    version=$(get_version)
+    dmg_name="$APP_NAME-$version.dmg"
+    dmg_path="$PROJECT_DIR/$dmg_name"
+    staging="$WORK_DIR/dmg_contents"
+    tmp_dmg="$WORK_DIR/$APP_NAME-temp.dmg"
 
     print_step "Creating DMG installer..."
 
     # Clean up
-    rm -f "$DMG_PATH" "$TMP_DMG"
-    rm -rf /tmp/dmg_contents
-    mkdir -p /tmp/dmg_contents
+    rm -f "$dmg_path"
+    rm -rf "$staging"
+    mkdir -p "$staging"
 
     # Copy app and create Applications symlink
-    cp -R "$APP_PATH" /tmp/dmg_contents/
-    ln -sf /Applications /tmp/dmg_contents/Applications
+    cp -R "$APP_PATH" "$staging/"
+    ln -s /Applications "$staging/Applications"
 
     # Create DMG
-    hdiutil create -volname "$APP_NAME" -srcfolder /tmp/dmg_contents -ov -format UDRW "$TMP_DMG" >/dev/null
-    hdiutil convert "$TMP_DMG" -format UDZO -o "$DMG_PATH" >/dev/null
+    hdiutil create -volname "$APP_NAME" -srcfolder "$staging" -ov -format UDRW "$tmp_dmg" >/dev/null
+    hdiutil convert "$tmp_dmg" -format UDZO -o "$dmg_path" >/dev/null
 
     # Sign DMG
-    codesign --force --sign "$SIGNING_IDENTITY" "$DMG_PATH"
+    codesign --force --sign "$SIGNING_IDENTITY" "$dmg_path"
 
     # Clean up
-    rm -f "$TMP_DMG"
-    rm -rf /tmp/dmg_contents
+    rm -f "$tmp_dmg"
+    rm -rf "$staging"
 
-    print_success "DMG created: $DMG_NAME"
-    echo "$DMG_PATH"
+    print_success "DMG created: $dmg_name"
+    echo "$dmg_path"
 }
 
 notarize_dmg() {
-    VERSION=$(get_version)
-    DMG_PATH="$PROJECT_DIR/$APP_NAME-$VERSION.dmg"
+    local dmg_path
+    dmg_path="$PROJECT_DIR/$APP_NAME-$(get_version).dmg"
 
-    if [ ! -f "$DMG_PATH" ]; then
-        print_error "DMG not found at $DMG_PATH"
+    if [ ! -f "$dmg_path" ]; then
+        print_error "DMG not found at $dmg_path"
         exit 1
     fi
 
     print_step "Notarizing DMG..."
-    xcrun notarytool submit "$DMG_PATH" \
-        --keychain-profile "$KEYCHAIN_PROFILE" \
-        --wait
+    notarize_file "$dmg_path"
 
     print_step "Stapling DMG..."
-    xcrun stapler staple "$DMG_PATH"
+    xcrun stapler staple "$dmg_path"
 
     print_success "DMG notarized and stapled"
 }
 
 verify_dmg() {
-    VERSION=$(get_version)
-    DMG_PATH="$PROJECT_DIR/$APP_NAME-$VERSION.dmg"
+    local dmg_path result
+    dmg_path="$PROJECT_DIR/$APP_NAME-$(get_version).dmg"
 
     print_step "Verifying DMG..."
-    local RESULT=$(spctl -a -t open --context context:primary-signature -v "$DMG_PATH" 2>&1)
-    if echo "$RESULT" | grep -q "accepted"; then
-        print_success "DMG verified: $RESULT"
+    result=$(spctl -a -t open --context context:primary-signature -v "$dmg_path" 2>&1 || true)
+    if grep -q "accepted" <<<"$result"; then
+        print_success "DMG verified: $result"
     else
-        print_warning "DMG verification: $RESULT"
+        print_warning "DMG verification: $result"
     fi
 }
 
 sparkle_sign_dmg() {
-    VERSION=$(get_version)
-    DMG_PATH="$PROJECT_DIR/$APP_NAME-$VERSION.dmg"
+    local dmg_path signature
+    dmg_path="$PROJECT_DIR/$APP_NAME-$(get_version).dmg"
 
     print_step "Signing DMG with Sparkle EdDSA key..."
 
     # sign_update reads the private key from the Keychain automatically
-    SPARKLE_SIG=$("$SPARKLE_SIGN" "$DMG_PATH")
+    signature=$("$SPARKLE_SIGN" "$dmg_path" || true)
 
-    if [ -z "$SPARKLE_SIG" ]; then
+    if [ -z "$signature" ]; then
         print_error "Sparkle signing failed! Make sure EdDSA key is in Keychain."
         print_warning "Run: $SPARKLE_TOOLS_DIR/bin/generate_keys  (if not done)"
         exit 1
     fi
 
     print_success "DMG signed with Sparkle EdDSA"
-    echo "  $SPARKLE_SIG"
+    echo "  $signature"
 }
 
 update_appcast() {
-    VERSION=$(get_version)
-    DMG_PATH="$PROJECT_DIR/$APP_NAME-$VERSION.dmg"
+    local version dmg_path releases_dir
+    version=$(get_version)
+    dmg_path="$PROJECT_DIR/$APP_NAME-$version.dmg"
 
     print_step "Generating appcast.xml..."
 
     mkdir -p "$DOCS_DIR"
 
     # Create a releases directory with the current DMG
-    local RELEASES_DIR="$BUILD_DIR/releases"
-    mkdir -p "$RELEASES_DIR"
-    cp "$DMG_PATH" "$RELEASES_DIR/"
+    releases_dir="$BUILD_DIR/releases"
+    rm -rf "$releases_dir"
+    mkdir -p "$releases_dir"
+    cp "$dmg_path" "$releases_dir/"
+
+    # Release notes: an HTML file next to the DMG with the same base name is picked up by generate_appcast.
+    if [ -f "$PROJECT_DIR/release-notes/$version.html" ]; then
+        cp "$PROJECT_DIR/release-notes/$version.html" "$releases_dir/$APP_NAME-$version.html"
+    fi
 
     # If an existing appcast exists, copy it so generate_appcast can append
-    if [ -f "$DOCS_DIR/appcast.xml" ]; then
-        cp "$DOCS_DIR/appcast.xml" "$RELEASES_DIR/"
+    if [ -f "$APPCAST" ]; then
+        cp "$APPCAST" "$releases_dir/"
     fi
 
     # generate_appcast reads the EdDSA key from Keychain
     "$SPARKLE_APPCAST" \
-        --download-url-prefix "https://github.com/elliotttate/CoverFlowFinder/releases/download/v$VERSION/" \
-        "$RELEASES_DIR"
+        --download-url-prefix "https://github.com/elliotttate/CoverFlowFinder/releases/download/v$version/" \
+        "$releases_dir"
 
     # Copy generated appcast to docs/
-    cp "$RELEASES_DIR/appcast.xml" "$DOCS_DIR/appcast.xml"
+    cp "$releases_dir/appcast.xml" "$APPCAST"
 
+    if ! grep -q "<sparkle:version>$(get_build_number)</sparkle:version>" "$APPCAST"; then
+        print_error "docs/appcast.xml has no entry for build $(get_build_number)"
+        exit 1
+    fi
     print_success "Appcast updated at docs/appcast.xml"
 }
 
 commit_appcast() {
-    VERSION=$(get_version)
+    local version branch
+    version=$(get_version)
 
     print_step "Committing appcast.xml..."
 
     cd "$PROJECT_DIR"
-    git add docs/appcast.xml
-    git commit -m "Update appcast.xml for v$VERSION"
-    git push origin main
+    branch=$(git rev-parse --abbrev-ref HEAD)
+    if [ "$branch" != "$RELEASE_BRANCH" ]; then
+        print_error "Not pushing the appcast from '$branch' (GitHub Pages serves $RELEASE_BRANCH)."
+        echo "Commit and push it from $RELEASE_BRANCH: git commit -m \"Update appcast.xml for v$version\" -- docs/appcast.xml && git push origin $RELEASE_BRANCH"
+        exit 1
+    fi
+
+    git add -- docs/appcast.xml
+    if git diff --cached --quiet -- docs/appcast.xml; then
+        print_warning "docs/appcast.xml unchanged; nothing to commit"
+        return
+    fi
+    # Commit only the appcast, even if other changes happen to be staged.
+    git commit -m "Update appcast.xml for v$version" -- docs/appcast.xml
+    git push origin "$RELEASE_BRANCH"
 
     print_success "Appcast committed and pushed"
 }
 
 create_github_release() {
-    VERSION=$(get_version)
-    DMG_PATH="$PROJECT_DIR/$APP_NAME-$VERSION.dmg"
-    TAG="v$VERSION"
+    local version dmg_path tag commit_msg
+    version=$(get_version)
+    dmg_path="$PROJECT_DIR/$APP_NAME-$version.dmg"
+    tag="v$version"
 
-    if [ ! -f "$DMG_PATH" ]; then
-        print_error "DMG not found at $DMG_PATH"
+    if [ ! -f "$dmg_path" ]; then
+        print_error "DMG not found at $dmg_path"
         exit 1
     fi
 
-    print_step "Creating GitHub release $TAG..."
+    print_step "Creating GitHub release $tag..."
 
     # Check if gh is installed
     if ! command -v gh &>/dev/null; then
@@ -401,21 +572,24 @@ create_github_release() {
     fi
 
     # Get the last commit message for release notes
-    COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
+    commit_msg=$(git log -1 --pretty=%s)
 
-    # Create release
-    gh release create "$TAG" "$DMG_PATH" \
-        --title "$APP_NAME $VERSION" \
+    # Create release (tagging the commit that was built)
+    gh release create "$tag" "$dmg_path" \
+        --target "$(git rev-parse HEAD)" \
+        --title "$APP_NAME $version" \
         --notes "## What's New
 
-$COMMIT_MSG"
+$commit_msg"
 
-    print_success "Release created: $TAG"
+    print_success "Release created: $tag"
 }
 
 show_history() {
     print_step "Recent notarization submissions..."
-    xcrun notarytool history --keychain-profile "$KEYCHAIN_PROFILE" 2>/dev/null | head -20
+    local history
+    history=$(xcrun notarytool history --keychain-profile "$KEYCHAIN_PROFILE" 2>/dev/null || true)
+    printf '%s\n' "$history" | head -20
 }
 
 show_help() {
@@ -426,7 +600,8 @@ show_help() {
     echo ""
     echo "Options:"
     echo "  (none)        Build, sign, notarize app, create DMG"
-    echo "  --release     Same as above + create GitHub release + update appcast"
+    echo "  --release     Same as above + Sparkle-sign, update appcast, create GitHub release"
+    echo "                (must run on an up-to-date main with CURRENT_PROJECT_VERSION bumped)"
     echo "  --skip-build  Skip build, notarize existing app"
     echo "  --dmg-only    Create DMG from existing notarized app"
     echo "  --check       Show notarization history"
@@ -453,8 +628,9 @@ main() {
     echo "╚════════════════════════════════════════════════╝"
 
     cd "$PROJECT_DIR"
-    VERSION=$(get_version)
-    echo -e "Version: ${CYAN}$VERSION${NC}"
+    local version
+    version=$(get_version)
+    echo -e "Version: ${CYAN}$version${NC} (build $(get_build_number))"
 
     case "${1:-}" in
         --help|-h)
@@ -491,12 +667,15 @@ main() {
             verify_dmg
             ;;
         --release)
+            check_release_branch
+            check_versions
             check_credentials
             check_certificate
             ensure_sparkle_tools
             clean_build
             build_archive
             export_app
+            verify_bundle_versions
             verify_signature
             submit_notarization
             staple_app
@@ -515,6 +694,7 @@ main() {
             clean_build
             build_archive
             export_app
+            verify_bundle_versions
             verify_signature
             submit_notarization
             staple_app
@@ -532,7 +712,7 @@ main() {
 
     echo ""
     echo -e "${GREEN}════════════════════════════════════════════════${NC}"
-    echo -e "${GREEN}  Done! DMG ready: $APP_NAME-$VERSION.dmg${NC}"
+    echo -e "${GREEN}  Done! DMG ready: $APP_NAME-$version.dmg${NC}"
     echo -e "${GREEN}════════════════════════════════════════════════${NC}"
     echo ""
 }

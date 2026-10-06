@@ -1,5 +1,7 @@
 import AppKit
+import Combine
 import SwiftUI
+import SystemConfiguration
 
 struct SidebarView: View {
     @EnvironmentObject private var appSettings: AppSettings
@@ -16,6 +18,10 @@ struct SidebarOutlineView: NSViewRepresentable {
     @ObservedObject var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
     var isDualPane: Bool = false
+
+    /// Pasteboard type of a favorite being reordered in the sidebar. A favorite drag carries only this type (no file
+    /// URL), so dropping it anywhere else does nothing; it never moves or copies the folder itself.
+    static let favoriteDragType = NSPasteboard.PasteboardType("com.coverflowfinder.sidebar.favorite")
 
     func makeCoordinator() -> Coordinator {
         Coordinator(appSettings: appSettings, viewModel: viewModel)
@@ -46,12 +52,16 @@ struct SidebarOutlineView: NSViewRepresentable {
 
         outlineView.dataSource = context.coordinator
         outlineView.delegate = context.coordinator
+        // Clicks go through the action (not selection changes) so clicking the highlighted row still acts.
+        outlineView.target = context.coordinator
+        outlineView.action = #selector(Coordinator.outlineViewClicked(_:))
 
-        var draggedTypes: [NSPasteboard.PasteboardType] = [.fileURL, context.coordinator.internalDragType]
+        var draggedTypes: [NSPasteboard.PasteboardType] = [.fileURL, Self.favoriteDragType]
         draggedTypes.append(contentsOf: NSFilePromiseReceiver.readableDraggedTypes.map { NSPasteboard.PasteboardType($0) })
         outlineView.registerForDraggedTypes(draggedTypes)
+        // Favorites are only reordered inside the sidebar; nothing is offered to other apps.
         outlineView.setDraggingSourceOperationMask(.move, forLocal: true)
-        outlineView.setDraggingSourceOperationMask(.copy, forLocal: false)
+        outlineView.setDraggingSourceOperationMask([], forLocal: false)
 
         let menu = NSMenu(title: "Sidebar")
         menu.delegate = context.coordinator
@@ -59,14 +69,17 @@ struct SidebarOutlineView: NSViewRepresentable {
 
         scrollView.documentView = outlineView
         context.coordinator.outlineView = outlineView
+        context.coordinator.isDualPane = isDualPane
         context.coordinator.refreshIfNeeded(force: true)
 
         return scrollView
     }
 
     func updateNSView(_ nsView: NSScrollView, context: Context) {
+        // Runs on every change the active view model publishes: this must stay cheap (no file-system access).
         context.coordinator.appSettings = appSettings
         context.coordinator.viewModel = viewModel
+        context.coordinator.isDualPane = isDualPane
         context.coordinator.refreshIfNeeded(force: false)
     }
 
@@ -74,38 +87,67 @@ struct SidebarOutlineView: NSViewRepresentable {
     final class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate, NSMenuDelegate {
         var appSettings: AppSettings
         var viewModel: FileBrowserViewModel
+        var isDualPane = false
         weak var outlineView: NSOutlineView?
-        let internalDragType = NSPasteboard.PasteboardType("com.coverflowfinder.sidebar.favorite")
+        let internalDragType = SidebarOutlineView.favoriteDragType
 
+        private let store = SidebarEnvironmentStore.shared
+        private var storeSubscription: AnyCancellable?
+        private var requestedFavorites: [SidebarFavorite]?
         private var sections: [SidebarSection] = []
         private var snapshot: SidebarSnapshot?
+        private var environment: SidebarEnvironment
         private var isUpdatingSelection = false
-        private let insertZoneHeight: CGFloat = 6
+        private var volumeComparisonCache: (sequence: Int, destination: URL, sameVolume: Bool)?
+        /// File promises are written on this queue so large files don't block the UI.
+        private let filePromiseQueue: OperationQueue = {
+            let queue = OperationQueue()
+            queue.name = "com.flowfinder.sidebar.filePromises"
+            queue.qualityOfService = .userInitiated
+            return queue
+        }()
 
         init(appSettings: AppSettings, viewModel: FileBrowserViewModel) {
             self.appSettings = appSettings
             self.viewModel = viewModel
+            self.environment = SidebarEnvironmentStore.shared.environment
+            super.init()
+            storeSubscription = store.environmentDidChange.sink { [weak self] in
+                MainActor.assumeIsolated {
+                    self?.refreshIfNeeded(force: false)
+                }
+            }
         }
 
+        /// Rebuilds the rows only when something they show changed. File-system state comes from
+        /// `SidebarEnvironmentStore`, which refreshes in the background.
         func refreshIfNeeded(force: Bool) {
-            let context = buildContext()
+            let favorites = appSettings.sidebarFavorites
+            if favorites != requestedFavorites {
+                requestedFavorites = favorites
+                store.requestRefresh(favorites: favorites, settings: appSettings)
+            }
+
+            let nextEnvironment = store.environment
             let nextSnapshot = SidebarSnapshot(
                 showFavorites: appSettings.sidebarShowFavorites,
                 showICloud: appSettings.sidebarShowICloud,
                 showLocations: appSettings.sidebarShowLocations,
                 showTags: appSettings.sidebarShowTags,
-                favorites: appSettings.sidebarFavorites,
+                favorites: favorites,
                 filterTag: viewModel.filterTag,
-                iCloudURL: context.iCloudURL,
-                photosLibraryInfo: context.photosLibraryInfo,
-                locations: context.locations
+                environment: nextEnvironment
             )
 
             if force || snapshot != nextSnapshot {
                 snapshot = nextSnapshot
-                sections = buildSections(context: context)
+                environment = nextEnvironment
+                sections = buildSections()
+                // Reloading can change the selected row; that must not count as a user selection.
+                isUpdatingSelection = true
                 outlineView?.reloadData()
                 expandAllSections()
+                isUpdatingSelection = false
             }
 
             updateSelection()
@@ -144,14 +186,20 @@ struct SidebarOutlineView: NSViewRepresentable {
 
         func outlineView(_ outlineView: NSOutlineView, pasteboardWriterForItem item: Any) -> NSPasteboardWriting? {
             guard let sidebarItem = item as? SidebarItem else { return nil }
-            guard case let .favorite(resolvedFavorite) = sidebarItem.kind else { return nil }
+            guard case let .favorite(resolution) = sidebarItem.kind else { return nil }
 
+            // Reorder data only: no file URL, so the drag can't move or copy the folder anywhere.
             let pbItem = NSPasteboardItem()
-            pbItem.setString(resolvedFavorite.favorite.id, forType: internalDragType)
-            if let url = resolvedFavorite.url {
-                pbItem.setString(url.absoluteString, forType: .fileURL)
-            }
+            pbItem.setString(resolution.favorite.id, forType: internalDragType)
             return pbItem
+        }
+
+        func outlineView(_ outlineView: NSOutlineView,
+                         draggingSession session: NSDraggingSession,
+                         endedAt screenPoint: NSPoint,
+                         operation: NSDragOperation) {
+            // Pressing on a row to drag it selected it without navigating; put the highlight back.
+            updateSelection()
         }
 
         func outlineView(_ outlineView: NSOutlineView,
@@ -184,11 +232,11 @@ struct SidebarOutlineView: NSViewRepresentable {
                 outlineView.setDropItem(favoritesSection, dropChildIndex: sectionIndex)
                 return isInternal ? .move : .copy
             case .onFavorite(let favoriteItem):
+                guard !isInternal,
+                      case let .favorite(resolution) = favoriteItem.kind,
+                      let destination = resolution.url else { return [] }
                 outlineView.setDropItem(favoriteItem, dropChildIndex: NSOutlineViewDropOnItemIndex)
-                if isInternal {
-                    return .move
-                }
-                return NSEvent.modifierFlags.contains(.option) ? .copy : .move
+                return fileDragOperation(for: info, destination: destination, hasURLs: hasURLs)
             case .airDrop(let airDropItem):
                 outlineView.setDropItem(airDropItem, dropChildIndex: NSOutlineViewDropOnItemIndex)
                 return isExternal ? .copy : []
@@ -200,6 +248,8 @@ struct SidebarOutlineView: NSViewRepresentable {
                          item: Any?,
                          childIndex index: Int) -> Bool {
             guard let favoritesSection = favoritesSection() else { return false }
+            // Resolve copy/move now, while the modifier keys still reflect the drop.
+            let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
             let isInternal = isInternalDrag(info)
             let hasURLs = hasFileURLs(info)
             let hasPromises = hasFilePromises(info)
@@ -238,9 +288,9 @@ struct SidebarOutlineView: NSViewRepresentable {
                     insertFavorites(urls: urls, at: favoritesIndex)
                     return true
                 case .onFavorite(let favoriteItem):
-                    guard case let .favorite(resolvedFavorite) = favoriteItem.kind,
-                          let destination = resolvedFavorite.url else { return false }
-                    viewModel.handleDrop(urls: urls, to: destination)
+                    guard case let .favorite(resolution) = favoriteItem.kind,
+                          let destination = resolution.url else { return false }
+                    viewModel.handleDrop(urls: urls, to: destination, operation: operation)
                     return true
                 case .airDrop:
                     performAirDrop(urls: urls)
@@ -254,11 +304,18 @@ struct SidebarOutlineView: NSViewRepresentable {
             case .between:
                 return false
             case .onFavorite(let favoriteItem):
-                guard case let .favorite(resolvedFavorite) = favoriteItem.kind,
-                      let destination = resolvedFavorite.url else { return false }
-                receiveFilePromises(from: info) { [weak self] urls, tempDirectory in
-                    guard let self, !urls.isEmpty else { return }
-                    self.viewModel.handleDrop(urls: urls, to: destination) {
+                guard case let .favorite(resolution) = favoriteItem.kind,
+                      let destination = resolution.url else { return false }
+                let viewModel = self.viewModel
+                receiveFilePromises(from: info) { urls, tempDirectory in
+                    guard !urls.isEmpty else {
+                        if let tempDirectory {
+                            try? FileManager.default.removeItem(at: tempDirectory)
+                        }
+                        return
+                    }
+                    // Promised files are new files in our temp folder: always copy them out.
+                    viewModel.handleDrop(urls: urls, to: destination, operation: .copy) {
                         if let tempDirectory {
                             try? FileManager.default.removeItem(at: tempDirectory)
                         }
@@ -267,8 +324,9 @@ struct SidebarOutlineView: NSViewRepresentable {
                 return true
             case .airDrop:
                 receiveFilePromises(from: info) { [weak self] urls, tempDirectory in
-                    guard let self, !urls.isEmpty else { return }
-                    self.performAirDrop(urls: urls)
+                    if let self, !urls.isEmpty {
+                        self.performAirDrop(urls: urls)
+                    }
                     if let tempDirectory {
                         try? FileManager.default.removeItem(at: tempDirectory)
                     }
@@ -310,9 +368,27 @@ struct SidebarOutlineView: NSViewRepresentable {
             guard !isUpdatingSelection else { return }
             guard let outlineView = outlineView else { return }
 
+            // Mouse clicks are handled by `outlineViewClicked`, which (unlike selection changes) also fires when
+            // the clicked row is already highlighted. Selection changes here come from the keyboard.
+            if let eventType = NSApp.currentEvent?.type,
+               eventType == .leftMouseDown || eventType == .leftMouseUp || eventType == .leftMouseDragged {
+                return
+            }
+
             let row = outlineView.selectedRow
             guard row >= 0, let item = outlineView.item(atRow: row) as? SidebarItem else { return }
             handleSelection(for: item)
+        }
+
+        @objc func outlineViewClicked(_ sender: Any?) {
+            guard let outlineView = outlineView else { return }
+            let row = outlineView.clickedRow
+            guard row >= 0, let item = outlineView.item(atRow: row) as? SidebarItem else { return }
+            if item.isEnabled {
+                handleSelection(for: item)
+            }
+            // Re-highlight the row matching where we are (e.g. after AirDrop, or a click on a disabled row).
+            updateSelection()
         }
 
         // MARK: - NSMenuDelegate
@@ -324,16 +400,15 @@ struct SidebarOutlineView: NSViewRepresentable {
             guard row >= 0, let item = outlineView.item(atRow: row) as? SidebarItem else { return }
 
             switch item.kind {
-            case .favorite(let resolvedFavorite):
+            case .favorite(let resolution):
                 let removeItem = NSMenuItem(title: "Remove from Favorites", action: #selector(removeFavoriteFromMenu(_:)), keyEquivalent: "")
-                removeItem.representedObject = resolvedFavorite.favorite.id
+                removeItem.representedObject = resolution.favorite.id
                 removeItem.target = self
                 menu.addItem(removeItem)
 
             case .location(let location):
-                // Check if this is an ejectable volume
-                if isEjectableVolume(at: location.url) {
-                    let ejectItem = NSMenuItem(title: "Eject \"\(location.name)\"", action: #selector(ejectVolumeFromMenu(_:)), keyEquivalent: "")
+                if location.isEjectable {
+                    let ejectItem = NSMenuItem(title: "Eject “\(location.name)”", action: #selector(ejectVolumeFromMenu(_:)), keyEquivalent: "")
                     ejectItem.representedObject = location.url
                     ejectItem.target = self
                     menu.addItem(ejectItem)
@@ -344,50 +419,10 @@ struct SidebarOutlineView: NSViewRepresentable {
             }
         }
 
-        private func isEjectableVolume(at url: URL) -> Bool {
-            // Check if this is a mounted volume that can be ejected
-            let path = url.path
-
-            // Must be in /Volumes to be ejectable (except root volume)
-            guard path.hasPrefix("/Volumes/") else { return false }
-
-            // Check if it's actually mounted
-            let fileManager = FileManager.default
-            guard fileManager.fileExists(atPath: path) else { return false }
-
-            // Try to get volume info to see if it's ejectable
-            do {
-                let resourceValues = try url.resourceValues(forKeys: [.volumeIsEjectableKey, .volumeIsRemovableKey])
-                let isEjectable = resourceValues.volumeIsEjectable ?? false
-                let isRemovable = resourceValues.volumeIsRemovable ?? false
-                return isEjectable || isRemovable
-            } catch {
-                // If we can't determine, assume volumes in /Volumes/ are ejectable (except system volumes)
-                // This covers DMGs and most external drives
-                return true
-            }
-        }
-
         @objc private func ejectVolumeFromMenu(_ sender: NSMenuItem) {
-            guard let url = sender.representedObject as? URL else { return }
-
-            // Play eject sound
-            FinderSoundEffects.shared.play(.volumeUnmount)
-
-            // Eject the volume
-            do {
-                try NSWorkspace.shared.unmountAndEjectDevice(at: url)
-                // Refresh sidebar immediately to remove the ejected volume
-                refreshIfNeeded(force: true)
-            } catch {
-                NSSound.beep()
-                let alert = NSAlert()
-                alert.messageText = "Failed to Eject"
-                alert.informativeText = error.localizedDescription
-                alert.alertStyle = .warning
-                alert.addButton(withTitle: "OK")
-                alert.runModal()
-            }
+            guard let url = sender.representedObject as? URL,
+                  let location = environment.locations.first(where: { $0.url == url }) else { return }
+            SidebarVolumeEjector.eject(location, window: outlineView?.window)
         }
 
         @objc private func removeFavoriteFromMenu(_ sender: NSMenuItem) {
@@ -405,12 +440,12 @@ struct SidebarOutlineView: NSViewRepresentable {
             switch item.kind {
             case .airDrop:
                 triggerAirDropFromSelection()
-            case .favorite(let resolvedFavorite):
-                guard resolvedFavorite.isAvailable, let url = resolvedFavorite.url else { return }
+            case .favorite(let resolution):
+                guard resolution.isAvailable, let url = resolution.url else { return }
                 viewModel.navigateTo(url)
             case .photosLibrary(let info, let isAvailable):
                 guard isAvailable, let info else { return }
-                viewModel.viewMode = .masonry
+                requestViewMode(.masonry)
                 viewModel.navigateToPhotosLibrary(info)
             case .iCloud(let url, let isAvailable):
                 guard isAvailable, let url else { return }
@@ -428,6 +463,20 @@ struct SidebarOutlineView: NSViewRepresentable {
             }
         }
 
+        /// The window shell owns the view mode (and which pane layout is showing), so ask it via
+        /// `.requestViewModeChange`. In a single pane the mode is also applied directly, as before; in Dual/Quad
+        /// changing a pane's view model would desynchronize the shell, so only the request is sent.
+        private func requestViewMode(_ mode: ViewMode) {
+            if !isDualPane {
+                viewModel.viewMode = mode
+            }
+            NotificationCenter.default.post(
+                name: .requestViewModeChange,
+                object: viewModel,
+                userInfo: [AppNotificationKey.viewMode: mode]
+            )
+        }
+
         private func updateSelection() {
             guard let outlineView = outlineView else { return }
             let itemToSelect: SidebarItem?
@@ -438,14 +487,12 @@ struct SidebarOutlineView: NSViewRepresentable {
                 itemToSelect = bestMatchingLocationItem(for: viewModel.currentPath)
             }
 
+            let targetRow = itemToSelect.map { outlineView.row(forItem: $0) } ?? -1
+            guard targetRow != outlineView.selectedRow else { return }
+
             isUpdatingSelection = true
-            if let itemToSelect {
-                let row = outlineView.row(forItem: itemToSelect)
-                if row >= 0 {
-                    outlineView.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
-                } else {
-                    outlineView.deselectAll(nil)
-                }
+            if targetRow >= 0 {
+                outlineView.selectRowIndexes(IndexSet(integer: targetRow), byExtendingSelection: false)
             } else {
                 outlineView.deselectAll(nil)
             }
@@ -512,11 +559,51 @@ struct SidebarOutlineView: NSViewRepresentable {
             )
         }
 
+        /// The cursor badge for dropping files onto a favorite folder, following Finder: Option copies, Command
+        /// moves, otherwise move on the same volume and copy across volumes.
+        private func fileDragOperation(for info: NSDraggingInfo, destination: URL, hasURLs: Bool) -> NSDragOperation {
+            switch FileDropOperation(modifierFlags: NSEvent.modifierFlags) {
+            case .copy:
+                return .copy
+            case .move:
+                return hasURLs ? .move : .copy
+            case .automatic:
+                guard hasURLs else { return .copy }
+                return isSameVolume(info, destination: destination) ? .move : .copy
+            }
+        }
+
+        private func isSameVolume(_ info: NSDraggingInfo, destination: URL) -> Bool {
+            if let cached = volumeComparisonCache,
+               cached.sequence == info.draggingSequenceNumber,
+               cached.destination == destination {
+                return cached.sameVolume
+            }
+            guard let source = (info.draggingPasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+            ) as? [URL])?.first else { return true }
+
+            func volumeID(_ url: URL) -> NSObject? {
+                (try? url.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as? NSObject
+            }
+            let sameVolume: Bool
+            if let sourceVolume = volumeID(source), let destinationVolume = volumeID(destination) {
+                sameVolume = sourceVolume.isEqual(destinationVolume)
+            } else {
+                sameVolume = true
+            }
+            volumeComparisonCache = (info.draggingSequenceNumber, destination, sameVolume)
+            return sameVolume
+        }
+
         private func filePromiseReceivers(from pasteboard: NSPasteboard) -> [NSFilePromiseReceiver] {
             (pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver]) ?? []
         }
 
-        private func receiveFilePromises(from info: NSDraggingInfo, completion: @escaping ([URL], URL?) -> Void) {
+        /// Receives promised files into a temporary folder. The files are written on `filePromiseQueue`;
+        /// `completion` runs on the main queue once all of them have arrived.
+        private func receiveFilePromises(from info: NSDraggingInfo, completion: @escaping @MainActor ([URL], URL?) -> Void) {
             let receivers = filePromiseReceivers(from: info.draggingPasteboard)
             guard !receivers.isEmpty else {
                 completion([], nil)
@@ -533,7 +620,7 @@ struct SidebarOutlineView: NSViewRepresentable {
 
             for receiver in receivers {
                 group.enter()
-                receiver.receivePromisedFiles(atDestination: tempDirectory, options: [:], operationQueue: .main) { url, error in
+                receiver.receivePromisedFiles(atDestination: tempDirectory, options: [:], operationQueue: filePromiseQueue) { url, error in
                     if error == nil {
                         lock.lock()
                         receivedURLs.append(url)
@@ -544,7 +631,12 @@ struct SidebarOutlineView: NSViewRepresentable {
             }
 
             group.notify(queue: .main) {
-                completion(receivedURLs, tempDirectory)
+                lock.lock()
+                let urls = receivedURLs
+                lock.unlock()
+                MainActor.assumeIsolated {
+                    completion(urls, tempDirectory)
+                }
             }
         }
 
@@ -553,75 +645,82 @@ struct SidebarOutlineView: NSViewRepresentable {
             return items.compactMap { $0.string(forType: internalDragType) }
         }
 
+        /// Where a drag over the sidebar would land. The Favorites header inserts at the start; the strip below the
+        /// last favorite, through the next section's header, appends; over a row, the upper half inserts before it
+        /// and the lower half after it, except that external files dropped on the middle of a favorite go into that
+        /// folder. Between rows, the nearest row decides.
         private func dropTarget(for info: NSDraggingInfo,
                                 in favoritesSection: SidebarSection,
                                 isInternal: Bool,
                                 isExternal: Bool) -> DropTarget? {
             guard let outlineView = outlineView else { return nil }
             let location = outlineView.convert(info.draggingLocation, from: nil)
-            let row = outlineView.row(at: location)
+
+            let headerRow = outlineView.row(forItem: favoritesSection)
+            guard headerRow >= 0 else { return nil }
+            let headerRect = outlineView.rect(ofRow: headerRow)
 
             let minSectionIndex = firstFavoriteSectionIndex(in: favoritesSection)
             let maxSectionIndex = favoritesSection.items.count
 
-            if row >= 0 {
-                if let section = outlineView.item(atRow: row) as? SidebarSection {
-                    guard section.kind == .favorites else { return nil }
-                    let sectionIndex = maxSectionIndex
-                    let favoritesIndex = favoritesIndex(forSectionIndex: sectionIndex, in: favoritesSection)
-                    return .between(sectionIndex: sectionIndex, favoritesIndex: favoritesIndex)
-                }
-
-                guard let item = outlineView.item(atRow: row) as? SidebarItem else { return nil }
-                guard item.sectionKind == .favorites else { return nil }
-
-                if case .airDrop = item.kind, isExternal {
-                    return .airDrop(item)
-                }
-
-                let rowRect = outlineView.rect(ofRow: row)
-                let yInRow = location.y - rowRect.minY
-                let inTopZone = yInRow <= insertZoneHeight
-                let inBottomZone = yInRow >= (rowRect.height - insertZoneHeight)
-
-                let sectionIndex = favoritesSection.items.firstIndex(where: { $0 === item }) ?? 0
-
-                if !isInternal,
-                   case let .favorite(resolvedFavorite) = item.kind,
-                   resolvedFavorite.isAvailable,
-                   resolvedFavorite.url != nil,
-                   !inTopZone,
-                   !inBottomZone {
-                    return .onFavorite(item)
-                }
-
-                let insertionIndex = (inBottomZone ? sectionIndex + 1 : sectionIndex)
-                let clampedSectionIndex = min(max(insertionIndex, minSectionIndex), maxSectionIndex)
-                let favoritesIndex = favoritesIndex(forSectionIndex: clampedSectionIndex, in: favoritesSection)
-                return .between(sectionIndex: clampedSectionIndex, favoritesIndex: favoritesIndex)
+            func insertion(at sectionIndex: Int) -> DropTarget {
+                let clamped = min(max(sectionIndex, minSectionIndex), maxSectionIndex)
+                return .between(sectionIndex: clamped, favoritesIndex: favoritesIndex(forSectionIndex: clamped, in: favoritesSection))
             }
 
-            guard favoritesSection.kind == .favorites else { return nil }
+            let itemRows = favoritesSection.items.map { outlineView.row(forItem: $0) }
+            let itemRects: [NSRect] = itemRows.map { $0 >= 0 ? outlineView.rect(ofRow: $0) : .null }
+            let sectionBottom = itemRects.last(where: { !$0.isNull })?.maxY ?? headerRect.maxY
 
-            if let firstRow = firstRowIndex(for: favoritesSection),
-               let lastRow = lastRowIndex(for: favoritesSection) {
-                let firstRect = outlineView.rect(ofRow: firstRow)
-                let lastRect = outlineView.rect(ofRow: lastRow)
+            // Below the last favorite, the gap and the next section's header still append to Favorites.
+            let lastRow = itemRows.last(where: { $0 >= 0 }) ?? headerRow
+            let appendZoneBottom = lastRow + 1 < outlineView.numberOfRows
+                ? outlineView.rect(ofRow: lastRow + 1).maxY
+                : sectionBottom + headerRect.height
 
-                if location.y < firstRect.minY {
-                    let sectionIndex = minSectionIndex
-                    let favoritesIndex = favoritesIndex(forSectionIndex: sectionIndex, in: favoritesSection)
-                    return .between(sectionIndex: sectionIndex, favoritesIndex: favoritesIndex)
-                }
-
-                if location.y > lastRect.maxY {
-                    let sectionIndex = maxSectionIndex
-                    let favoritesIndex = favoritesIndex(forSectionIndex: sectionIndex, in: favoritesSection)
-                    return .between(sectionIndex: sectionIndex, favoritesIndex: favoritesIndex)
-                }
+            // The outline view is flipped: y grows downwards. Favorites is the first section, so anything
+            // above its header inserts at the start.
+            guard location.y < appendZoneBottom else { return nil }
+            if location.y < headerRect.maxY {
+                return insertion(at: minSectionIndex)
+            }
+            if location.y >= sectionBottom {
+                return insertion(at: maxSectionIndex)
             }
 
-            return nil
+            var sectionIndex: Int?
+            var bestDistance = CGFloat.greatestFiniteMagnitude
+            for (index, rect) in itemRects.enumerated() where !rect.isNull {
+                if location.y >= rect.minY && location.y < rect.maxY {
+                    sectionIndex = index
+                    break
+                }
+                let distance = abs(rect.midY - location.y)
+                if distance < bestDistance {
+                    bestDistance = distance
+                    sectionIndex = index
+                }
+            }
+            guard let sectionIndex else { return insertion(at: maxSectionIndex) }
+
+            let item = favoritesSection.items[sectionIndex]
+            let rowRect = itemRects[sectionIndex]
+            let fraction = (location.y - rowRect.minY) / max(rowRect.height, 1)
+
+            if case .airDrop = item.kind, isExternal {
+                return .airDrop(item)
+            }
+
+            if !isInternal,
+               case let .favorite(resolution) = item.kind,
+               resolution.isAvailable,
+               resolution.url != nil {
+                if fraction < 0.25 { return insertion(at: sectionIndex) }
+                if fraction >= 0.75 { return insertion(at: sectionIndex + 1) }
+                return .onFavorite(item)
+            }
+
+            return insertion(at: fraction < 0.5 ? sectionIndex : sectionIndex + 1)
         }
 
         private func firstFavoriteSectionIndex(in section: SidebarSection) -> Int {
@@ -643,24 +742,6 @@ struct SidebarOutlineView: NSViewRepresentable {
             }
         }
 
-        private func firstRowIndex(for section: SidebarSection) -> Int? {
-            guard let outlineView = outlineView else { return nil }
-            let rows = section.items.compactMap { item -> Int? in
-                let row = outlineView.row(forItem: item)
-                return row >= 0 ? row : nil
-            }
-            return rows.min()
-        }
-
-        private func lastRowIndex(for section: SidebarSection) -> Int? {
-            guard let outlineView = outlineView else { return nil }
-            let rows = section.items.compactMap { item -> Int? in
-                let row = outlineView.row(forItem: item)
-                return row >= 0 ? row : nil
-            }
-            return rows.max()
-        }
-
         private func moveFavorites(ids: [String], to destinationIndex: Int) {
             let favorites = appSettings.sidebarFavorites
             let moving = favorites.filter { ids.contains($0.id) }
@@ -676,14 +757,19 @@ struct SidebarOutlineView: NSViewRepresentable {
         }
 
         private func insertFavorites(urls: [URL], at index: Int) {
-            var insertIndex = min(max(0, index), appSettings.sidebarFavorites.count)
+            var favorites = appSettings.sidebarFavorites
+            var insertIndex = min(max(0, index), favorites.count)
 
             for url in urls {
                 guard let favorite = favoriteFromURL(url) else { continue }
-                if isDuplicateFavorite(favorite) { continue }
+                if isDuplicateFavorite(favorite, in: favorites) { continue }
 
-                appSettings.sidebarFavorites.insert(favorite, at: insertIndex)
+                favorites.insert(favorite, at: insertIndex)
                 insertIndex += 1
+            }
+
+            if favorites != appSettings.sidebarFavorites {
+                appSettings.sidebarFavorites = favorites
             }
         }
 
@@ -692,87 +778,30 @@ struct SidebarOutlineView: NSViewRepresentable {
             var isDirectory: ObjCBool = false
             guard FileManager.default.fileExists(atPath: standardizedURL.path, isDirectory: &isDirectory),
                   isDirectory.boolValue else { return nil }
+            // Path only; the bookmark is added by the next background refresh.
             return SidebarFavorite.custom(path: standardizedURL.path)
         }
 
-        private func isDuplicateFavorite(_ favorite: SidebarFavorite) -> Bool {
-            guard let newURL = resolvedURL(for: favorite) else { return false }
+        private func isDuplicateFavorite(_ favorite: SidebarFavorite, in favorites: [SidebarFavorite]) -> Bool {
+            guard let newURL = currentURL(for: favorite) else { return false }
             let newPath = newURL.standardizedFileURL.path
-            return appSettings.sidebarFavorites.contains { existing in
-                guard let existingURL = resolvedURL(for: existing) else { return false }
+            return favorites.contains { existing in
+                guard let existingURL = currentURL(for: existing) else { return false }
                 return existingURL.standardizedFileURL.path == newPath
             }
         }
 
+        /// Where a favorite points, from the last background resolution (no file-system access).
+        private func currentURL(for favorite: SidebarFavorite) -> URL? {
+            if let resolution = environment.favoriteResolutions[favorite.id] {
+                return resolution.url
+            }
+            return SidebarFavoriteResolution.provisional(for: favorite).url
+        }
+
         // MARK: - Data Building
 
-        private func buildContext() -> SidebarBuildContext {
-            let iCloudURL = iCloudDriveURL()
-            let locations = volumeLocations()
-            let photosLibraryInfo = photosLibraryInfo()
-            return SidebarBuildContext(iCloudURL: iCloudURL, photosLibraryInfo: photosLibraryInfo, locations: locations)
-        }
-
-        private func iCloudDriveURL() -> URL? {
-            guard FileManager.default.ubiquityIdentityToken != nil else { return nil }
-
-            let homeURL = FileManager.default.homeDirectoryForCurrentUser
-            let cloudStorageURL = homeURL
-                .appendingPathComponent("Library", isDirectory: true)
-                .appendingPathComponent("CloudStorage", isDirectory: true)
-                .appendingPathComponent("iCloud Drive", isDirectory: true)
-
-            if FileManager.default.fileExists(atPath: cloudStorageURL.path) {
-                return cloudStorageURL
-            }
-
-            let mobileDocsURL = homeURL
-                .appendingPathComponent("Library", isDirectory: true)
-                .appendingPathComponent("Mobile Documents", isDirectory: true)
-                .appendingPathComponent("com~apple~CloudDocs", isDirectory: true)
-
-            if FileManager.default.fileExists(atPath: mobileDocsURL.path) {
-                return mobileDocsURL
-            }
-
-            return nil
-        }
-
-        private func photosLibraryInfo() -> PhotosLibraryInfo? {
-            let fm = FileManager.default
-            let picturesURL = fm.urls(for: .picturesDirectory, in: .userDomainMask).first
-                ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Pictures", isDirectory: true)
-
-            guard let contents = try? fm.contentsOfDirectory(
-                at: picturesURL,
-                includingPropertiesForKeys: [.contentModificationDateKey],
-                options: .skipsHiddenFiles
-            ) else { return nil }
-
-            let libraries = contents.filter { $0.pathExtension == "photoslibrary" }
-            guard !libraries.isEmpty else { return nil }
-
-            let preferred = libraries.first { $0.lastPathComponent == "Photos Library.photoslibrary" }
-                ?? libraries.sorted(by: { lhs, rhs in
-                    let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                    let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-                    return lhsDate > rhsDate
-                }).first
-
-            guard let libraryURL = preferred else { return nil }
-
-            let imageFolderNames = ["originals", "Originals", "Masters"]
-            for folderName in imageFolderNames {
-                let candidate = libraryURL.appendingPathComponent(folderName, isDirectory: true)
-                if fm.fileExists(atPath: candidate.path) {
-                    return PhotosLibraryInfo(libraryURL: libraryURL, imagesURL: candidate)
-                }
-            }
-
-            return nil
-        }
-
-        private func buildSections(context: SidebarBuildContext) -> [SidebarSection] {
+        private func buildSections() -> [SidebarSection] {
             var sections: [SidebarSection] = []
 
             if appSettings.sidebarShowFavorites {
@@ -780,21 +809,23 @@ struct SidebarOutlineView: NSViewRepresentable {
                 var items: [SidebarItem] = []
                 items.append(SidebarItem(kind: .airDrop, id: "airdrop", title: "AirDrop"))
 
-                let photosAvailable = context.photosLibraryInfo != nil
+                let photosAvailable = environment.photosLibraryInfo != nil
                 items.append(SidebarItem(
-                    kind: .photosLibrary(context.photosLibraryInfo, photosAvailable),
+                    kind: .photosLibrary(environment.photosLibraryInfo, photosAvailable),
                     id: "photosLibrary",
                     title: "Photos Library",
                     isEnabled: photosAvailable
                 ))
 
                 for favorite in appSettings.sidebarFavorites {
-                    let resolved = resolveFavorite(favorite)
+                    // Until the background refresh has resolved a new favorite, show it as stored.
+                    let resolution = environment.favoriteResolutions[favorite.id]
+                        ?? SidebarFavoriteResolution.provisional(for: favorite)
                     let item = SidebarItem(
-                        kind: .favorite(resolved),
-                        id: resolved.favorite.id,
-                        title: resolved.name,
-                        isEnabled: resolved.isAvailable
+                        kind: .favorite(resolution),
+                        id: favorite.id,
+                        title: resolution.name,
+                        isEnabled: resolution.isAvailable
                     )
                     items.append(item)
                 }
@@ -804,9 +835,9 @@ struct SidebarOutlineView: NSViewRepresentable {
 
             if appSettings.sidebarShowICloud {
                 let section = SidebarSection(kind: .icloud, title: "iCloud")
-                let isAvailable = context.iCloudURL != nil
+                let isAvailable = environment.iCloudURL != nil
                 let item = SidebarItem(
-                    kind: .iCloud(context.iCloudURL, isAvailable),
+                    kind: .iCloud(environment.iCloudURL, isAvailable),
                     id: "icloud",
                     title: "iCloud Drive",
                     isEnabled: isAvailable
@@ -817,7 +848,7 @@ struct SidebarOutlineView: NSViewRepresentable {
 
             if appSettings.sidebarShowLocations {
                 let section = SidebarSection(kind: .locations, title: "Locations")
-                section.items = context.locations.map { location in
+                section.items = environment.locations.map { location in
                     SidebarItem(
                         kind: .location(location),
                         id: "location:\(location.url.path)",
@@ -842,102 +873,8 @@ struct SidebarOutlineView: NSViewRepresentable {
             return sections
         }
 
-        private func resolveFavorite(_ favorite: SidebarFavorite) -> ResolvedFavorite {
-            switch favorite.kind {
-            case .custom:
-                let path = favorite.path ?? ""
-                let url = path.isEmpty ? nil : URL(fileURLWithPath: path)
-                let name = path.isEmpty ? "Missing Folder" : url?.lastPathComponent ?? "Missing Folder"
-                let isAvailable = url.map { FileManager.default.fileExists(atPath: $0.path) } ?? false
-                return ResolvedFavorite(favorite: favorite, name: name, url: url, isAvailable: isAvailable)
-            default:
-                let info = systemFavoriteInfo(for: favorite.kind)
-                let isAvailable = info?.url != nil
-                return ResolvedFavorite(favorite: favorite, name: info?.name ?? favorite.kind.rawValue.capitalized, url: info?.url, isAvailable: isAvailable)
-            }
-        }
-
-        private func systemFavoriteInfo(for kind: SidebarFavorite.Kind) -> SystemFavoriteInfo? {
-            let fm = FileManager.default
-            switch kind {
-            case .documents:
-                return SystemFavoriteInfo(name: "Documents", url: fm.urls(for: .documentDirectory, in: .userDomainMask).first)
-            case .applications:
-                return SystemFavoriteInfo(name: "Applications", url: fm.urls(for: .applicationDirectory, in: .localDomainMask).first)
-            case .desktop:
-                return SystemFavoriteInfo(name: "Desktop", url: fm.urls(for: .desktopDirectory, in: .userDomainMask).first)
-            case .downloads:
-                return SystemFavoriteInfo(name: "Downloads", url: fm.urls(for: .downloadsDirectory, in: .userDomainMask).first)
-            case .movies:
-                return SystemFavoriteInfo(name: "Movies", url: fm.urls(for: .moviesDirectory, in: .userDomainMask).first)
-            case .music:
-                return SystemFavoriteInfo(name: "Music", url: fm.urls(for: .musicDirectory, in: .userDomainMask).first)
-            case .pictures:
-                return SystemFavoriteInfo(name: "Pictures", url: fm.urls(for: .picturesDirectory, in: .userDomainMask).first)
-            case .custom:
-                return nil
-            }
-        }
-
-        private func resolvedURL(for favorite: SidebarFavorite) -> URL? {
-            switch favorite.kind {
-            case .custom:
-                guard let path = favorite.path else { return nil }
-                return URL(fileURLWithPath: path)
-            default:
-                return systemFavoriteInfo(for: favorite.kind)?.url
-            }
-        }
-
         private func favoritesSection() -> SidebarSection? {
             sections.first { $0.kind == .favorites }
-        }
-
-        private func volumeLocations() -> [SidebarLocation] {
-            var locations: [SidebarLocation] = []
-            let fm = FileManager.default
-
-            // Add the computer itself, pointing to root
-            let computerName = Host.current().localizedName ?? ProcessInfo.processInfo.hostName
-            locations.append(SidebarLocation(name: computerName, url: URL(fileURLWithPath: "/")))
-
-            // Get the boot volume name (the volume that "/" is on)
-            let bootVolumePath = (try? fm.destinationOfSymbolicLink(atPath: "/Volumes/Macintosh HD")) ?? "/"
-            let bootVolumeRealPath = URL(fileURLWithPath: "/").standardizedFileURL.path
-
-            // Add mounted volumes, excluding the boot volume (which is already "/" via the computer name)
-            let volumesURL = URL(fileURLWithPath: "/Volumes")
-            if let volumes = try? fm.contentsOfDirectory(
-                at: volumesURL,
-                includingPropertiesForKeys: [.isSymbolicLinkKey, .volumeIsLocalKey],
-                options: .skipsHiddenFiles
-            ) {
-                for volume in volumes {
-                    // Skip symlinks that point to root (like "Macintosh HD" -> "/")
-                    let isSymlink = (try? volume.resourceValues(forKeys: [.isSymbolicLinkKey]).isSymbolicLink) ?? false
-                    if isSymlink {
-                        if let destination = try? fm.destinationOfSymbolicLink(atPath: volume.path) {
-                            let resolvedPath = URL(fileURLWithPath: destination, relativeTo: volumesURL).standardizedFileURL.path
-                            if resolvedPath == bootVolumeRealPath || resolvedPath == "/" {
-                                continue
-                            }
-                        }
-                    }
-
-                    // Also check if this volume resolves to the same device as root
-                    let volumeRealPath = volume.standardizedFileURL.resolvingSymlinksInPath().path
-                    if volumeRealPath == bootVolumeRealPath || volumeRealPath == "/" {
-                        continue
-                    }
-
-                    let name = volume.lastPathComponent
-                    locations.append(SidebarLocation(name: name, url: volume))
-                }
-            }
-
-            // Add Network location
-            locations.append(SidebarLocation(name: "Network", url: URL(fileURLWithPath: "/Network")))
-            return locations
         }
 
         private func presentation(for item: SidebarItem) -> SidebarItemPresentation {
@@ -950,14 +887,14 @@ struct SidebarOutlineView: NSViewRepresentable {
                     accessory: nil,
                     isEnabled: true
                 )
-            case .favorite(let resolvedFavorite):
-                let icon = resolvedFavorite.url.map { NSWorkspace.shared.icon(forFile: $0.path) } ?? symbolIcon(name: "folder")
+            case .favorite(let resolution):
+                let icon = resolution.url.flatMap { environment.icons.icon(forPath: $0.path) } ?? symbolIcon(name: "folder")
                 return SidebarItemPresentation(
-                    title: resolvedFavorite.name,
+                    title: resolution.name,
                     icon: icon,
                     iconTint: nil,
                     accessory: nil,
-                    isEnabled: resolvedFavorite.isAvailable
+                    isEnabled: resolution.isAvailable
                 )
             case .photosLibrary:
                 return SidebarItemPresentation(
@@ -988,7 +925,8 @@ struct SidebarOutlineView: NSViewRepresentable {
                         isEnabled: true
                     )
                 }
-                let icon = NSWorkspace.shared.icon(forFile: location.url.path)
+                let fallbackSymbol = location.url.path == "/" ? "desktopcomputer" : "externaldrive"
+                let icon = environment.icons.icon(forPath: location.url.path) ?? symbolIcon(name: fallbackSymbol)
                 return SidebarItemPresentation(
                     title: location.name,
                     icon: icon,
@@ -1042,7 +980,7 @@ struct SidebarOutlineView: NSViewRepresentable {
         }
 
         private func airDropURLsFromSelection() -> [URL] {
-            viewModel.selectedItems.compactMap { item in
+            viewModel.orderedSelectedItems.compactMap { item in
                 guard !item.isFromArchive else { return nil }
                 return item.url
             }
@@ -1093,6 +1031,412 @@ struct SidebarOutlineView: NSViewRepresentable {
     }
 }
 
+// MARK: - Sidebar environment (file-system state, loaded off the main thread)
+
+/// Everything the sidebar shows that needs file-system access. Built by `load(favorites:)` on a background queue.
+struct SidebarEnvironment: Equatable {
+    var computerName: String
+    var iCloudURL: URL?
+    var photosLibraryInfo: PhotosLibraryInfo?
+    var locations: [SidebarLocation]
+    /// Keyed by favorite id.
+    var favoriteResolutions: [String: SidebarFavoriteResolution]
+    /// Icons by path. Not compared: they only change together with the paths above.
+    var icons: SidebarIconSet
+
+    /// Before the first background load: nothing that needs I/O.
+    static let initial = SidebarEnvironment(
+        computerName: "",
+        iCloudURL: nil,
+        photosLibraryInfo: nil,
+        locations: [SidebarLocation.network],
+        favoriteResolutions: [:],
+        icons: SidebarIconSet([:])
+    )
+
+    static func == (lhs: SidebarEnvironment, rhs: SidebarEnvironment) -> Bool {
+        lhs.computerName == rhs.computerName
+            && lhs.iCloudURL == rhs.iCloudURL
+            && lhs.photosLibraryInfo == rhs.photosLibraryInfo
+            && lhs.locations == rhs.locations
+            && lhs.favoriteResolutions == rhs.favoriteResolutions
+    }
+
+    /// Gathers the sidebar's file-system state. Blocking (volume and bookmark lookups can hang on a dead network
+    /// mount): never call on the main thread.
+    static func load(favorites: [SidebarFavorite], fileManager: FileManager = .default) -> SidebarEnvironment {
+        let computerName = currentComputerName()
+        let locations = volumeLocations(computerName: computerName, fileManager: fileManager)
+
+        var resolutions: [String: SidebarFavoriteResolution] = [:]
+        for favorite in favorites {
+            resolutions[favorite.id] = favorite.resolve(fileManager: fileManager)
+        }
+
+        var icons: [String: NSImage] = [:]
+        for location in locations where location != .network {
+            icons[location.url.path] = NSWorkspace.shared.icon(forFile: location.url.path)
+        }
+        for resolution in resolutions.values where resolution.isAvailable {
+            if let url = resolution.url {
+                icons[url.path] = NSWorkspace.shared.icon(forFile: url.path)
+            }
+        }
+
+        return SidebarEnvironment(
+            computerName: computerName,
+            iCloudURL: iCloudDriveURL(fileManager: fileManager),
+            photosLibraryInfo: photosLibraryInfo(fileManager: fileManager),
+            locations: locations,
+            favoriteResolutions: resolutions,
+            icons: SidebarIconSet(icons)
+        )
+    }
+
+    /// The "Computer Name" from Sharing settings. Unlike `Host.current().localizedName` or
+    /// `ProcessInfo.hostName`, this never does a DNS lookup.
+    static func currentComputerName() -> String {
+        if let name = SCDynamicStoreCopyComputerName(nil, nil) as String?, !name.isEmpty {
+            return name
+        }
+        if let name = SCDynamicStoreCopyLocalHostName(nil) as String?, !name.isEmpty {
+            return name
+        }
+        return "Computer"
+    }
+
+    static func volumeLocations(computerName: String, fileManager: FileManager = .default) -> [SidebarLocation] {
+        var locations = [SidebarLocation(name: computerName, url: URL(fileURLWithPath: "/", isDirectory: true), isEjectable: false, isNetwork: false)]
+
+        let keys: [URLResourceKey] = [
+            .volumeIsRootFileSystemKey,
+            .volumeIsLocalKey,
+            .volumeIsEjectableKey,
+            .volumeIsRemovableKey,
+            .volumeIsInternalKey
+        ]
+        // Browsable volumes only, like Finder: no system/hidden volumes or `-nobrowse` mounts.
+        let volumes = fileManager.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) ?? []
+        var mounted: [SidebarLocation] = []
+        for volume in volumes {
+            let values = try? volume.resourceValues(forKeys: Set(keys))
+            // The boot volume is already listed as the computer.
+            if values?.volumeIsRootFileSystem == true || volume.standardizedFileURL.path == "/" { continue }
+
+            let isNetwork = values?.volumeIsLocal == false
+            let isEjectable = isNetwork
+                || values?.volumeIsEjectable == true
+                || values?.volumeIsRemovable == true
+                || values?.volumeIsInternal == false
+            mounted.append(SidebarLocation(name: volume.lastPathComponent, url: volume, isEjectable: isEjectable, isNetwork: isNetwork))
+        }
+        mounted.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+
+        locations += mounted
+        locations.append(.network)
+        return locations
+    }
+
+    static func iCloudDriveURL(fileManager: FileManager = .default) -> URL? {
+        guard fileManager.ubiquityIdentityToken != nil else { return nil }
+
+        let homeURL = fileManager.homeDirectoryForCurrentUser
+        let cloudStorageURL = homeURL
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("CloudStorage", isDirectory: true)
+            .appendingPathComponent("iCloud Drive", isDirectory: true)
+
+        if fileManager.fileExists(atPath: cloudStorageURL.path) {
+            return cloudStorageURL
+        }
+
+        let mobileDocsURL = homeURL
+            .appendingPathComponent("Library", isDirectory: true)
+            .appendingPathComponent("Mobile Documents", isDirectory: true)
+            .appendingPathComponent("com~apple~CloudDocs", isDirectory: true)
+
+        if fileManager.fileExists(atPath: mobileDocsURL.path) {
+            return mobileDocsURL
+        }
+
+        return nil
+    }
+
+    static func photosLibraryInfo(fileManager fm: FileManager = .default) -> PhotosLibraryInfo? {
+        let picturesURL = fm.urls(for: .picturesDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Pictures", isDirectory: true)
+
+        guard let contents = try? fm.contentsOfDirectory(
+            at: picturesURL,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: .skipsHiddenFiles
+        ) else { return nil }
+
+        let libraries = contents.filter { $0.pathExtension == "photoslibrary" }
+        guard !libraries.isEmpty else { return nil }
+
+        let preferred = libraries.first { $0.lastPathComponent == "Photos Library.photoslibrary" }
+            ?? libraries.max(by: { lhs, rhs in
+                let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                return lhsDate < rhsDate
+            })
+
+        guard let libraryURL = preferred else { return nil }
+
+        let imageFolderNames = ["originals", "Originals", "Masters"]
+        for folderName in imageFolderNames {
+            let candidate = libraryURL.appendingPathComponent(folderName, isDirectory: true)
+            if fm.fileExists(atPath: candidate.path) {
+                return PhotosLibraryInfo(libraryURL: libraryURL, imagesURL: candidate)
+            }
+        }
+
+        return nil
+    }
+}
+
+/// Immutable icon lookup shared between the background loader and the sidebar.
+final class SidebarIconSet: @unchecked Sendable {
+    private let icons: [String: NSImage]
+
+    init(_ icons: [String: NSImage]) {
+        self.icons = icons
+    }
+
+    func icon(forPath path: String) -> NSImage? {
+        icons[path]
+    }
+}
+
+struct SidebarLocation: Equatable {
+    let name: String
+    let url: URL
+    /// Offer "Eject": removable or external media, disk images and network shares.
+    let isEjectable: Bool
+    let isNetwork: Bool
+
+    static let network = SidebarLocation(name: "Network", url: URL(fileURLWithPath: "/Network", isDirectory: true), isEjectable: false, isNetwork: false)
+}
+
+extension SidebarFavoriteResolution {
+    /// What to show for a favorite before it has been resolved in the background (no file-system access).
+    static func provisional(for favorite: SidebarFavorite) -> SidebarFavoriteResolution {
+        if let location = favorite.kind.systemLocation {
+            return SidebarFavoriteResolution(favorite: favorite, url: location.url, name: location.name, isAvailable: location.url != nil, updatedFavorite: nil)
+        }
+        guard let path = favorite.path, !path.isEmpty else {
+            return SidebarFavoriteResolution(favorite: favorite, url: nil, name: "Missing Folder", isAvailable: false, updatedFavorite: nil)
+        }
+        // isDirectory avoids the file-system check URL(fileURLWithPath:) would otherwise make.
+        let url = URL(fileURLWithPath: path, isDirectory: true)
+        return SidebarFavoriteResolution(favorite: favorite, url: url, name: url.lastPathComponent, isAvailable: true, updatedFavorite: nil)
+    }
+}
+
+/// Keeps one `SidebarEnvironment` for all sidebars and refreshes it in the background: when volumes mount, unmount
+/// or are renamed, when favorites change, when the app becomes active, and on a slow timer.
+@MainActor
+final class SidebarEnvironmentStore {
+    static let shared = SidebarEnvironmentStore()
+
+    private(set) var environment = SidebarEnvironment.initial
+    /// Sent on the main queue whenever `environment` changes.
+    let environmentDidChange = PassthroughSubject<Void, Never>()
+
+    private static let timerInterval: TimeInterval = 60
+    private static let activationRefreshInterval: TimeInterval = 5
+
+    private let loadQueue = DispatchQueue(label: "com.flowfinder.sidebar.environment", qos: .utility)
+    private var isLoading = false
+    private var needsAnotherLoad = false
+    private var lastLoadStart = Date.distantPast
+    private var favorites: [SidebarFavorite] = []
+    private weak var settings: AppSettings?
+    /// Favorites whose bookmark was created or refreshed this session. That happens at most once per favorite, so
+    /// a bookmark that keeps failing can't cause endless rewrites. (Moves always apply; they converge.)
+    private var rebookmarkedFavoriteIDs: Set<String> = []
+    private var timer: Timer?
+
+    private init() {
+        observeSystemChanges()
+    }
+
+    func requestRefresh(favorites: [SidebarFavorite], settings: AppSettings) {
+        self.favorites = favorites
+        self.settings = settings
+        requestRefresh()
+    }
+
+    /// Reloads in the background. Requests made while a load is running are coalesced into one more load.
+    func requestRefresh() {
+        guard !isLoading else {
+            needsAnotherLoad = true
+            return
+        }
+        isLoading = true
+        lastLoadStart = Date()
+        let favorites = self.favorites
+        loadQueue.async {
+            let loaded = SidebarEnvironment.load(favorites: favorites)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    SidebarEnvironmentStore.shared.finishLoad(loaded)
+                }
+            }
+        }
+    }
+
+    private func finishLoad(_ loaded: SidebarEnvironment) {
+        isLoading = false
+        if loaded != environment {
+            environment = loaded
+            environmentDidChange.send()
+        }
+        applyFavoriteUpdates(from: loaded)
+
+        if needsAnotherLoad {
+            needsAnotherLoad = false
+            requestRefresh()
+        }
+    }
+
+    /// Stores moved paths and new bookmarks back into the settings.
+    private func applyFavoriteUpdates(from loaded: SidebarEnvironment) {
+        guard let settings else { return }
+        var favorites = settings.sidebarFavorites
+        var changed = false
+
+        for (index, favorite) in favorites.enumerated() {
+            // Only if the favorite hasn't been edited since it was resolved.
+            guard let resolution = loaded.favoriteResolutions[favorite.id],
+                  resolution.favorite == favorite,
+                  let updated = resolution.updatedFavorite else { continue }
+            if !resolution.didMove {
+                guard rebookmarkedFavoriteIDs.insert(favorite.id).inserted else { continue }
+            }
+            favorites[index] = updated
+            changed = true
+        }
+
+        if changed {
+            settings.sidebarFavorites = favorites
+        }
+    }
+
+    private func observeSystemChanges() {
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+
+        _ = workspaceCenter.addObserver(forName: NSWorkspace.willUnmountNotification, object: nil, queue: .main) { notification in
+            let volumeURL = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
+            MainActor.assumeIsolated {
+                SidebarEnvironmentStore.postVolumeNotification(.volumeWillUnmount, volumeURL: volumeURL)
+            }
+        }
+
+        _ = workspaceCenter.addObserver(forName: NSWorkspace.didUnmountNotification, object: nil, queue: .main) { notification in
+            let volumeURL = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL
+            MainActor.assumeIsolated {
+                SidebarEnvironmentStore.postVolumeNotification(.volumeDidUnmount, volumeURL: volumeURL)
+                SidebarEnvironmentStore.shared.requestRefresh()
+            }
+        }
+
+        for name in [NSWorkspace.didMountNotification, NSWorkspace.didRenameVolumeNotification] {
+            _ = workspaceCenter.addObserver(forName: name, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated {
+                    SidebarEnvironmentStore.shared.requestRefresh()
+                }
+            }
+        }
+
+        // Pick up folders renamed, moved or deleted (e.g. in Finder) while we were in the background.
+        _ = NotificationCenter.default.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { _ in
+            MainActor.assumeIsolated {
+                let store = SidebarEnvironmentStore.shared
+                if Date().timeIntervalSince(store.lastLoadStart) >= Self.activationRefreshInterval {
+                    store.requestRefresh()
+                }
+            }
+        }
+
+        let timer = Timer(timeInterval: Self.timerInterval, repeats: true) { _ in
+            MainActor.assumeIsolated {
+                if NSApp?.isActive == true {
+                    SidebarEnvironmentStore.shared.requestRefresh()
+                }
+            }
+        }
+        timer.tolerance = 10
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
+    }
+
+    static func postVolumeNotification(_ name: Notification.Name, volumeURL: URL?) {
+        guard let volumeURL else { return }
+        NotificationCenter.default.post(name: name, object: nil, userInfo: [AppNotificationKey.url: volumeURL])
+    }
+}
+
+/// Ejects volumes from the sidebar without blocking the main thread.
+@MainActor
+enum SidebarVolumeEjector {
+    static func eject(_ location: SidebarLocation, window: NSWindow?) {
+        let url = location.url
+        let name = location.name
+        // Let panes showing this volume move away and stop watching it first, so we don't block our own eject.
+        SidebarEnvironmentStore.postVolumeNotification(.volumeWillUnmount, volumeURL: url)
+
+        // Network shares have no disk to eject; everything else is unmounted with all its partitions and ejected.
+        let options: FileManager.UnmountOptions = location.isNetwork
+            ? [.withoutUI]
+            : [.allPartitionsAndEjectDisk, .withoutUI]
+
+        DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.2) { [weak window] in
+            FileManager.default.unmountVolume(at: url, options: options) { error in
+                let failure = error.map { $0 as NSError }
+                DispatchQueue.main.async {
+                    MainActor.assumeIsolated {
+                        if let failure {
+                            presentEjectError(failure, volumeName: name, window: window)
+                        } else {
+                            // The eject sound comes from FinderSoundEffectsMonitor's didUnmount observer.
+                            SidebarEnvironmentStore.shared.requestRefresh()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    static func presentEjectError(_ error: NSError, volumeName: String, window: NSWindow?) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "The volume “\(volumeName)” wasn’t ejected."
+
+        if error.domain == NSCocoaErrorDomain, error.code == CocoaError.fileManagerUnmountBusy.rawValue {
+            var reason = "It’s in use"
+            if let pid = error.userInfo[NSFileManagerUnmountDissentingProcessIdentifierErrorKey] as? NSNumber,
+               let app = NSRunningApplication(processIdentifier: pid.int32Value),
+               let appName = app.localizedName {
+                reason += " by “\(appName)”"
+            }
+            alert.informativeText = reason + ". Quit apps or close files that are using it, then try again."
+        } else {
+            alert.informativeText = error.localizedDescription
+        }
+        alert.addButton(withTitle: "OK")
+
+        if let window {
+            alert.beginSheetModal(for: window, completionHandler: nil)
+        } else {
+            alert.runModal()
+        }
+    }
+}
+
+// MARK: - Rows
+
 private struct SidebarSnapshot: Equatable {
     let showFavorites: Bool
     let showICloud: Bool
@@ -1100,32 +1444,7 @@ private struct SidebarSnapshot: Equatable {
     let showTags: Bool
     let favorites: [SidebarFavorite]
     let filterTag: String?
-    let iCloudURL: URL?
-    let photosLibraryInfo: PhotosLibraryInfo?
-    let locations: [SidebarLocation]
-}
-
-private struct SidebarBuildContext {
-    let iCloudURL: URL?
-    let photosLibraryInfo: PhotosLibraryInfo?
-    let locations: [SidebarLocation]
-}
-
-private struct SidebarLocation: Equatable {
-    let name: String
-    let url: URL
-}
-
-private struct ResolvedFavorite {
-    let favorite: SidebarFavorite
-    let name: String
-    let url: URL?
-    let isAvailable: Bool
-}
-
-private struct SystemFavoriteInfo {
-    let name: String
-    let url: URL?
+    let environment: SidebarEnvironment
 }
 
 private struct SidebarItemPresentation {
@@ -1158,7 +1477,7 @@ private final class SidebarSection: NSObject {
 private final class SidebarItem: NSObject {
     enum Kind {
         case airDrop
-        case favorite(ResolvedFavorite)
+        case favorite(SidebarFavoriteResolution)
         case photosLibrary(PhotosLibraryInfo?, Bool)
         case iCloud(URL?, Bool)
         case location(SidebarLocation)
@@ -1180,8 +1499,8 @@ private final class SidebarItem: NSObject {
 
     var url: URL? {
         switch kind {
-        case .favorite(let resolved):
-            return resolved.url
+        case .favorite(let resolution):
+            return resolution.url
         case .photosLibrary(let info, _):
             return info?.libraryURL
         case .iCloud(let url, _):
@@ -1190,19 +1509,6 @@ private final class SidebarItem: NSObject {
             return location.url
         default:
             return nil
-        }
-    }
-
-    var sectionKind: SidebarSection.Kind? {
-        switch kind {
-        case .airDrop, .favorite, .photosLibrary:
-            return .favorites
-        case .iCloud:
-            return .icloud
-        case .location:
-            return .locations
-        case .tag, .clearTagFilter:
-            return .tags
         }
     }
 }

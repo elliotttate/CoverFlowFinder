@@ -1,5 +1,9 @@
 # Auto-Update Implementation Report for CoverFlowFinder
 
+> **Status (October 2026):** implemented. FlowFinder ships with Sparkle 2 (pinned to 2.9.x via Swift Package
+> Manager), Developer ID signing and notarization. This report is kept as background; for the actual release steps
+> see `RELEASING.md`.
+
 ## Executive Summary
 
 The best approach for adding auto-update functionality to CoverFlowFinder is **Sparkle 2** - the de-facto standard framework used by thousands of macOS apps including VLC, OBS Studio, Wireshark, and SourceTree. It integrates seamlessly with SwiftUI, supports GitHub-hosted releases, and provides a polished user experience.
@@ -50,7 +54,9 @@ The best approach for adding auto-update functionality to CoverFlowFinder is **S
 - Notarization (required since macOS 10.14.5)
 - Hardened Runtime entitlements
 
-**Current status:** Your app is NOT currently code signed or notarized. This is the biggest prerequisite.
+**Current status (October 2026):** Done. Releases are signed with a Developer ID Application certificate (team
+RH4U5VJHM6), notarized and stapled (app and DMG) by `scripts/notarize.sh`, and delivered through Sparkle 2 with an
+EdDSA-signed appcast at `docs/appcast.xml`. See `RELEASING.md` for the current process.
 
 ### 2. Code Signing Setup
 

@@ -16,6 +16,9 @@ struct FileInfoView: View {
     @State private var isLoadingAttributes = true
     @State private var attributesTask: Task<Void, Never>?
     @State private var metadataTask: Task<Void, Never>?
+    @State private var folderTotals: FolderSizeTotals?
+    @State private var isCalculatingFolderSize = false
+    @State private var folderSizeTask: Task<Void, Never>?
 
     private var hasMediaInfo: Bool {
         mediaMetadata != nil && !(mediaMetadata?.isEmpty ?? true)
@@ -36,10 +39,12 @@ struct FileInfoView: View {
                 .buttonStyle(.plain)
                 .keyboardShortcut(.escape, modifiers: [])
                 .focusable(false)
+                .help("Close (Esc)")
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 12)
             .background(Color(nsColor: .windowBackgroundColor))
+            .background(closeShortcuts)
 
             Divider()
 
@@ -73,7 +78,7 @@ struct FileInfoView: View {
                                 .padding(.vertical, 12)
 
                             // Extended Attributes
-                            infoSection(title: "Extended Attributes", items: attrs.extendedAttributes.map { ($0.key, $0.value) })
+                            infoSection(title: "Extended Attributes", items: attrs.extendedAttributes.map { ($0.name, $0.value) })
                         }
 
                         Divider()
@@ -97,11 +102,27 @@ struct FileInfoView: View {
             loadThumbnail()
             loadFileAttributes()
             loadMediaMetadata()
+            loadFolderSize()
         }
         .onDisappear {
             attributesTask?.cancel()
             metadataTask?.cancel()
+            folderSizeTask?.cancel()
         }
+    }
+
+    /// ⌘W and ⌘. close the sheet like Esc does (Finder's Get Info window closes with ⌘W).
+    private var closeShortcuts: some View {
+        ZStack {
+            Button("Close") { dismiss() }
+                .keyboardShortcut("w", modifiers: .command)
+            Button("Cancel") { dismiss() }
+                .keyboardShortcut(".", modifiers: .command)
+        }
+        .opacity(0)
+        .frame(width: 0, height: 0)
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 
     @ViewBuilder
@@ -202,7 +223,9 @@ struct FileInfoView: View {
                 .font(.headline)
                 .padding(.bottom, 4)
 
-            ForEach(items, id: \.0) { label, value in
+            // Labels can repeat (e.g. "Title" from both ID3 and iTunes metadata), so identify rows by position.
+            ForEach(Array(items.enumerated()), id: \.offset) { _, row in
+                let (label, value) = row
                 HStack(alignment: .top) {
                     Text(label + ":")
                         .foregroundColor(.secondary)
@@ -226,10 +249,17 @@ struct FileInfoView: View {
         var info: [(String, String)] = []
 
         info.append(("Kind", attrs.kind))
-        info.append(("Size", attrs.formattedSize))
 
-        if let itemCount = attrs.itemCount {
-            info.append(("Contains", "\(itemCount) items"))
+        if attrs.isDirectory {
+            let suffix = isCalculatingFolderSize ? " so far…" : ""
+            if let totals = folderTotals {
+                info.append(("Size", FileAttributes.formatSize(logical: totals.logicalSize, allocated: totals.allocatedSize) + suffix))
+                info.append(("Contains", FileAttributes.formatItemCount(totals.itemCount) + suffix))
+            } else {
+                info.append(("Size", isCalculatingFolderSize ? "Calculating…" : "Unknown"))
+            }
+        } else {
+            info.append(("Size", attrs.formattedSize))
         }
 
         info.append(("Location", attrs.location))
@@ -306,14 +336,45 @@ struct FileInfoView: View {
             }
         }
     }
+
+    /// Totals a folder's contents in the background, showing running totals; cancelled when the sheet closes.
+    private func loadFolderSize() {
+        folderSizeTask?.cancel()
+        folderTotals = nil
+        guard !item.isFromArchive else { return }
+        isCalculatingFolderSize = true
+        folderSizeTask = Task.detached(priority: .utility) { [url = item.url] in
+            let isDirectory = (try? url.resourceValues(forKeys: [.isDirectoryKey]))?.isDirectory ?? false
+            guard isDirectory else {
+                await MainActor.run { self.isCalculatingFolderSize = false }
+                return
+            }
+            let totals = FolderSizeCalculator.calculate(url: url, progress: { partial in
+                guard !Task.isCancelled else { return }
+                Task { @MainActor in
+                    if self.isCalculatingFolderSize {
+                        self.folderTotals = partial
+                    }
+                }
+            })
+            guard let totals, !Task.isCancelled else { return }
+            await MainActor.run {
+                self.folderTotals = totals
+                self.isCalculatingFolderSize = false
+            }
+        }
+    }
 }
 
 struct FileAttributes {
     let url: URL
     let kind: String
+    let isDirectory: Bool
+    /// Logical size of a file (folders are totalled separately by `FolderSizeCalculator`).
     let size: Int64
+    /// Space the file takes on disk, when known.
+    let allocatedSize: Int64?
     let formattedSize: String
-    let itemCount: Int?
     let location: String
     let creationDate: Date?
     let modificationDate: Date?
@@ -332,7 +393,10 @@ struct FileAttributes {
     let isHidden: Bool
     let version: String?
     let copyright: String?
-    let extendedAttributes: [(key: String, value: String)]
+    let extendedAttributes: [(name: String, value: String)]
+
+    /// Extended attribute values larger than this are summarized by size instead of being read and shown.
+    private static let maxDisplayedAttributeSize = 4096
 
     init(url: URL) {
         self.url = url
@@ -361,21 +425,17 @@ struct FileAttributes {
         // Kind
         self.kind = resourceValues?.localizedTypeDescription ?? "Unknown"
 
-        // Size
-        let isDirectory = resourceValues?.isDirectory ?? false
+        // Size (a folder's size is calculated separately, in the background)
+        self.isDirectory = resourceValues?.isDirectory ?? false
         if isDirectory {
-            // Calculate folder size
-            let (totalSize, count) = FileAttributes.calculateFolderSize(url: url)
-            self.size = totalSize
-            self.itemCount = count
+            self.size = 0
+            self.allocatedSize = nil
+            self.formattedSize = ""
         } else {
             self.size = Int64(resourceValues?.totalFileSize ?? resourceValues?.fileSize ?? 0)
-            self.itemCount = nil
+            self.allocatedSize = (resourceValues?.totalFileAllocatedSize ?? resourceValues?.fileAllocatedSize).map(Int64.init)
+            self.formattedSize = FileAttributes.formatSize(logical: size, allocated: allocatedSize)
         }
-
-        let byteFormatter = ByteCountFormatter()
-        byteFormatter.countStyle = .file
-        self.formattedSize = byteFormatter.string(fromByteCount: size)
 
         // Location
         self.location = url.deletingLastPathComponent().path
@@ -401,7 +461,7 @@ struct FileAttributes {
         self.groupName = attributes?[.groupOwnerAccountName] as? String ?? "Unknown"
 
         // Permissions
-        self.permissions = (attributes?[.posixPermissions] as? Int16) ?? 0
+        self.permissions = (attributes?[.posixPermissions] as? NSNumber)?.int16Value ?? 0
         self.permissionsString = FileAttributes.formatPermissions(permissions)
 
         // Access flags
@@ -411,14 +471,17 @@ struct FileAttributes {
         self.isHidden = resourceValues?.isHidden ?? false
 
         // Extended attributes
-        var extAttrs: [(String, String)] = []
-        if let xattrNames = try? fileManager.listExtendedAttributes(atPath: url.path) {
-            for name in xattrNames {
-                if let data = try? fileManager.extendedAttribute(name, atPath: url.path) {
-                    let value = String(data: data, encoding: .utf8) ?? "\(data.count) bytes"
-                    extAttrs.append((name, value))
-                }
+        var extAttrs: [(name: String, value: String)] = []
+        for name in fileManager.listExtendedAttributes(atPath: url.path) {
+            guard let length = fileManager.extendedAttributeLength(name, atPath: url.path) else { continue }
+            if length > FileAttributes.maxDisplayedAttributeSize {
+                extAttrs.append((name, ByteCountFormatter.string(fromByteCount: Int64(length), countStyle: .file)))
+                continue
             }
+            let data = fileManager.extendedAttribute(name, atPath: url.path) ?? Data()
+            let value = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .controlCharacters)
+                ?? "\(data.count) bytes"
+            extAttrs.append((name, value))
         }
         self.extendedAttributes = extAttrs
 
@@ -432,30 +495,17 @@ struct FileAttributes {
         }
     }
 
-    private static func calculateFolderSize(url: URL) -> (Int64, Int) {
-        let fileManager = FileManager.default
-        var totalSize: Int64 = 0
-        var itemCount = 0
+    /// "12 KB (16 KB on disk)", like Finder's Get Info.
+    static func formatSize(logical: Int64, allocated: Int64?) -> String {
+        let logicalString = ByteCountFormatter.string(fromByteCount: logical, countStyle: .file)
+        guard let allocated else { return logicalString }
+        let allocatedString = ByteCountFormatter.string(fromByteCount: allocated, countStyle: .file)
+        return "\(logicalString) (\(allocatedString) on disk)"
+    }
 
-        guard let enumerator = fileManager.enumerator(
-            at: url,
-            includingPropertiesForKeys: [.fileSizeKey, .isDirectoryKey],
-            options: [.skipsHiddenFiles],
-            errorHandler: nil
-        ) else {
-            return (0, 0)
-        }
-
-        for case let fileURL as URL in enumerator {
-            if let resourceValues = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .isDirectoryKey]) {
-                if resourceValues.isDirectory == false {
-                    totalSize += Int64(resourceValues.fileSize ?? 0)
-                }
-                itemCount += 1
-            }
-        }
-
-        return (totalSize, itemCount)
+    static func formatItemCount(_ count: Int) -> String {
+        let number = NumberFormatter.localizedString(from: NSNumber(value: count), number: .decimal)
+        return count == 1 ? "1 item" : "\(number) items"
     }
 
     private static func formatPermissions(_ permissions: Int16) -> String {
@@ -473,40 +523,122 @@ struct FileAttributes {
     }
 }
 
-// Extension to read extended attributes
+/// Running or final totals of a folder's contents.
+struct FolderSizeTotals: Equatable, Sendable {
+    var logicalSize: Int64 = 0
+    var allocatedSize: Int64 = 0
+    /// Files, folders and links inside the folder (not counting the folder itself).
+    var itemCount = 0
+}
+
+enum FolderSizeCalculator {
+    private static let resourceKeys: [URLResourceKey] = [
+        .isDirectoryKey,
+        .isRegularFileKey,
+        .fileSizeKey,
+        .totalFileSizeKey,
+        .fileAllocatedSizeKey,
+        .totalFileAllocatedSizeKey,
+        .linkCountKey,
+        .fileResourceIdentifierKey
+    ]
+
+    /// Totals everything inside `url`, including hidden files and package contents. Symbolic links aren't
+    /// followed and hard-linked files are counted once. Returns nil as soon as `isCancelled` reports true.
+    /// `progress` receives running totals (on the calling thread) at most every `progressInterval` seconds.
+    static func calculate(url: URL,
+                          isCancelled: () -> Bool = { Task.isCancelled },
+                          progressInterval: TimeInterval = 0.25,
+                          progress: ((FolderSizeTotals) -> Void)? = nil) -> FolderSizeTotals? {
+        guard let enumerator = FileManager.default.enumerator(
+            at: url,
+            includingPropertiesForKeys: resourceKeys,
+            options: [],
+            errorHandler: { _, _ in true } // skip unreadable folders, keep going
+        ) else {
+            return FolderSizeTotals()
+        }
+
+        let keySet = Set(resourceKeys)
+        var totals = FolderSizeTotals()
+        var seenHardLinkedFiles = Set<NSObject>()
+        var lastReport = Date()
+
+        while let next = enumerator.nextObject() {
+            if isCancelled() { return nil }
+            guard let fileURL = next as? URL,
+                  let values = try? fileURL.resourceValues(forKeys: keySet) else { continue }
+
+            totals.itemCount += 1
+            guard values.isDirectory != true else { continue }
+
+            if values.isRegularFile == true,
+               let linkCount = values.linkCount, linkCount > 1,
+               let identifier = values.fileResourceIdentifier as? NSObject,
+               !seenHardLinkedFiles.insert(identifier).inserted {
+                continue
+            }
+
+            totals.logicalSize += Int64(values.totalFileSize ?? values.fileSize ?? 0)
+            totals.allocatedSize += Int64(values.totalFileAllocatedSize ?? values.fileAllocatedSize ?? 0)
+
+            if let progress, Date().timeIntervalSince(lastReport) >= progressInterval {
+                lastReport = Date()
+                progress(totals)
+            }
+        }
+        return isCancelled() ? nil : totals
+    }
+}
+
+// Extended attribute access. Names are UTF-8 (listxattr(2)).
 extension FileManager {
-    func listExtendedAttributes(atPath path: String) throws -> [String] {
+    func listExtendedAttributes(atPath path: String) -> [String] {
         let length = listxattr(path, nil, 0, 0)
         guard length > 0 else { return [] }
 
         var buffer = [CChar](repeating: 0, count: length)
         let result = listxattr(path, &buffer, length, 0)
         guard result > 0 else { return [] }
+        return Self.parseExtendedAttributeNames(buffer.prefix(min(result, length)))
+    }
 
+    /// Splits listxattr's NUL-separated list of UTF-8 names.
+    static func parseExtendedAttributeNames<Bytes: Sequence>(_ bytes: Bytes) -> [String] where Bytes.Element == CChar {
         var names: [String] = []
-        var current = ""
-        for char in buffer {
-            if char == 0 {
+        var current: [UInt8] = []
+        for byte in bytes {
+            if byte == 0 {
                 if !current.isEmpty {
-                    names.append(current)
-                    current = ""
+                    names.append(String(decoding: current, as: UTF8.self))
+                    current.removeAll(keepingCapacity: true)
                 }
             } else {
-                current.append(Character(UnicodeScalar(UInt8(bitPattern: char))))
+                current.append(UInt8(bitPattern: byte))
             }
+        }
+        if !current.isEmpty {
+            names.append(String(decoding: current, as: UTF8.self))
         }
         return names
     }
 
-    func extendedAttribute(_ name: String, atPath path: String) throws -> Data {
+    /// The size of an extended attribute's value, or nil if it can't be read.
+    func extendedAttributeLength(_ name: String, atPath path: String) -> Int? {
         let length = getxattr(path, name, nil, 0, 0, 0)
+        return length >= 0 ? length : nil
+    }
+
+    /// An extended attribute's value, or nil if it can't be read.
+    func extendedAttribute(_ name: String, atPath path: String) -> Data? {
+        let length = getxattr(path, name, nil, 0, 0, 0)
+        guard length >= 0 else { return nil }
         guard length > 0 else { return Data() }
 
         var buffer = [UInt8](repeating: 0, count: length)
         let result = getxattr(path, name, &buffer, length, 0, 0)
-        guard result > 0 else { return Data() }
-
-        return Data(buffer)
+        guard result >= 0 else { return nil }
+        return Data(buffer.prefix(min(result, length)))
     }
 }
 
@@ -566,7 +698,7 @@ struct MediaMetadata {
         }
 
         // Aspect ratio
-        if let w = width, let h = height, h > 0 {
+        if let w = width, let h = height, w > 0, h > 0 {
             let ratio = Double(w) / Double(h)
             let aspectRatio = simplifyAspectRatio(width: w, height: h)
             imageInfo.append(("Aspect Ratio", "\(aspectRatio) (\(String(format: "%.3f", ratio)))"))
@@ -637,13 +769,9 @@ struct MediaMetadata {
         }
 
         // Exposure info
-        if let exposureTime = exif[kCGImagePropertyExifExposureTime as String] as? Double {
-            if exposureTime < 1 {
-                let denominator = Int(round(1.0 / exposureTime))
-                exposureInfo.append(("Shutter Speed", "1/\(denominator) s"))
-            } else {
-                exposureInfo.append(("Shutter Speed", String(format: "%.1f s", exposureTime)))
-            }
+        if let exposureTime = exif[kCGImagePropertyExifExposureTime as String] as? Double,
+           let shutterSpeed = MediaInfoFormatting.shutterSpeed(exposureTime) {
+            exposureInfo.append(("Shutter Speed", shutterSpeed))
         }
         if let fNumber = exif[kCGImagePropertyExifFNumber as String] as? Double {
             exposureInfo.append(("Aperture", String(format: "f/%.1f", fNumber)))
@@ -731,7 +859,9 @@ struct MediaMetadata {
             lonRef = ref
         }
 
-        if let lat = latitude, let lon = longitude {
+        // Corrupt EXIF can produce NaN/infinite or out-of-range values; skip those rather than show (or trap on) them.
+        if let lat = latitude, let lon = longitude,
+           lat.isFinite, lon.isFinite, abs(lat) <= 90, abs(lon) <= 180 {
             let latSign = (latRef == "S") ? -1.0 : 1.0
             let lonSign = (lonRef == "W") ? -1.0 : 1.0
             let finalLat = lat * latSign
@@ -744,9 +874,10 @@ struct MediaMetadata {
                 abs(finalLat), latDir, abs(finalLon), lonDir)))
 
             // DMS format
-            let latDMS = toDMS(abs(finalLat))
-            let lonDMS = toDMS(abs(finalLon))
-            locationInfo.append(("Position", "\(latDMS)\(latDir) \(lonDMS)\(lonDir)"))
+            if let latDMS = MediaInfoFormatting.degreesMinutesSeconds(abs(finalLat)),
+               let lonDMS = MediaInfoFormatting.degreesMinutesSeconds(abs(finalLon)) {
+                locationInfo.append(("Position", "\(latDMS)\(latDir) \(lonDMS)\(lonDir)"))
+            }
         }
 
         if let altitude = gps[kCGImagePropertyGPSAltitude as String] as? Double {
@@ -793,18 +924,20 @@ struct MediaMetadata {
 
         // Duration
         if let duration = try? await asset.load(.duration),
-           duration.seconds > 0 {
-            videoInfo.append(("Duration", formatDuration(duration.seconds)))
+           let formatted = MediaInfoFormatting.duration(duration.seconds) {
+            videoInfo.append(("Duration", formatted))
         }
 
         // Video track info
         if let videoTrack = (try? await asset.loadTracks(withMediaType: .video))?.first {
             let size = (try? await videoTrack.load(.naturalSize)) ?? .zero
             let transform = (try? await videoTrack.load(.preferredTransform)) ?? .identity
-            if size != .zero {
+            if size != .zero,
+               let naturalWidth = MediaInfoFormatting.integer(Double(size.width)),
+               let naturalHeight = MediaInfoFormatting.integer(Double(size.height)) {
                 let isPortrait = transform.a == 0 && abs(transform.b) == 1
-                let width = isPortrait ? Int(size.height) : Int(size.width)
-                let height = isPortrait ? Int(size.width) : Int(size.height)
+                let width = abs(isPortrait ? naturalHeight : naturalWidth)
+                let height = abs(isPortrait ? naturalWidth : naturalHeight)
                 videoInfo.append(("Resolution", "\(width) × \(height)"))
             }
 
@@ -832,8 +965,9 @@ struct MediaMetadata {
             if let formatDescriptions = try? await audioTrack.load(.formatDescriptions),
                let formatDesc = formatDescriptions.first {
                 if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
-                    let sampleRate = asbd.pointee.mSampleRate
-                    audioInfo.append(("Sample Rate", "\(Int(sampleRate)) Hz"))
+                    if let sampleRate = MediaInfoFormatting.sampleRate(asbd.pointee.mSampleRate) {
+                        audioInfo.append(("Sample Rate", sampleRate))
+                    }
 
                     let channels = asbd.pointee.mChannelsPerFrame
                     let channelString = channels == 1 ? "Mono" : (channels == 2 ? "Stereo" : "\(channels) channels")
@@ -860,8 +994,8 @@ struct MediaMetadata {
 
         // Duration
         if let duration = try? await asset.load(.duration),
-           duration.seconds > 0 {
-            audioInfo.append(("Duration", formatDuration(duration.seconds)))
+           let formatted = MediaInfoFormatting.duration(duration.seconds) {
+            audioInfo.append(("Duration", formatted))
         }
 
         // Audio track info
@@ -869,8 +1003,9 @@ struct MediaMetadata {
             if let formatDescriptions = try? await audioTrack.load(.formatDescriptions),
                let formatDesc = formatDescriptions.first {
                 if let asbd = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) {
-                    let sampleRate = asbd.pointee.mSampleRate
-                    audioInfo.append(("Sample Rate", "\(Int(sampleRate)) Hz"))
+                    if let sampleRate = MediaInfoFormatting.sampleRate(asbd.pointee.mSampleRate) {
+                        audioInfo.append(("Sample Rate", sampleRate))
+                    }
 
                     let channels = asbd.pointee.mChannelsPerFrame
                     let channelString = channels == 1 ? "Mono" : (channels == 2 ? "Stereo" : "\(channels) channels")
@@ -938,9 +1073,10 @@ struct MediaMetadata {
         // Get first page dimensions
         if let page = pdfDoc.page(at: 1) {
             let mediaBox = page.getBoxRect(.mediaBox)
-            let width = Int(mediaBox.width)
-            let height = Int(mediaBox.height)
-            pdfInfo.append(("Page Size", "\(width) × \(height) pts"))
+            if let width = MediaInfoFormatting.integer(Double(mediaBox.width)),
+               let height = MediaInfoFormatting.integer(Double(mediaBox.height)) {
+                pdfInfo.append(("Page Size", "\(width) × \(height) pts"))
+            }
 
             // Convert to inches (72 pts per inch)
             let widthInches = mediaBox.width / 72.0
@@ -1129,26 +1265,6 @@ struct MediaMetadata {
         return formatter.string(fromByteCount: bytes)
     }
 
-    private func toDMS(_ decimal: Double) -> String {
-        let degrees = Int(decimal)
-        let minutesDecimal = (decimal - Double(degrees)) * 60
-        let minutes = Int(minutesDecimal)
-        let seconds = (minutesDecimal - Double(minutes)) * 60
-        return String(format: "%d°%02d'%.2f\"", degrees, minutes, seconds)
-    }
-
-    private func formatDuration(_ seconds: Double) -> String {
-        let hours = Int(seconds) / 3600
-        let minutes = (Int(seconds) % 3600) / 60
-        let secs = Int(seconds) % 60
-
-        if hours > 0 {
-            return String(format: "%d:%02d:%02d", hours, minutes, secs)
-        } else {
-            return String(format: "%d:%02d", minutes, secs)
-        }
-    }
-
     private func formatBitrate(_ bitrate: Float) -> String {
         if bitrate >= 1_000_000 {
             return String(format: "%.1f Mbps", bitrate / 1_000_000)
@@ -1168,31 +1284,53 @@ struct MediaMetadata {
     }
 }
 
-struct FileInfoWindow: View {
-    @EnvironmentObject private var appSettings: AppSettings
-    let item: FileItem
-    @Binding var isPresented: Bool
+/// Formatting for Get Info's media rows. Metadata comes from arbitrary files, so every conversion tolerates zero,
+/// negative, NaN and infinite input (`Int(_:)` traps on non-finite or out-of-range values).
+enum MediaInfoFormatting {
+    /// Converts to Int, or nil when the value isn't finite or doesn't fit.
+    static func integer(_ value: Double) -> Int? {
+        guard value.isFinite else { return nil }
+        return Int(exactly: value.rounded(.towardZero))
+    }
 
-    var body: some View {
-        VStack(spacing: 0) {
-            // Title bar
-            HStack {
-                Text("Info - \(item.displayName(showFileExtensions: appSettings.showFileExtensions))")
-                    .font(.headline)
-                    .lineLimit(1)
-                Spacer()
-                Button(action: { isPresented = false }) {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundColor(.secondary)
-                }
-                .buttonStyle(.plain)
+    /// EXIF ExposureTime (seconds) as a shutter speed: "1/250 s", "0.8 s", "2.5 s". Nil for unusable values.
+    static func shutterSpeed(_ exposureTime: Double) -> String? {
+        guard exposureTime.isFinite, exposureTime > 0 else { return nil }
+        if exposureTime < 1 {
+            let reciprocal = (1.0 / exposureTime).rounded()
+            // Faster than 1/1,000,000 s isn't a real shutter speed.
+            guard reciprocal <= 1_000_000, let denominator = integer(reciprocal) else { return nil }
+            if denominator >= 2 {
+                return "1/\(denominator) s"
             }
-            .padding()
-            .background(Color(nsColor: .windowBackgroundColor))
-
-            Divider()
-
-            FileInfoView(item: item)
         }
+        return String(format: "%.1f s", exposureTime)
+    }
+
+    /// "1:02:03" / "2:03". Nil for durations that aren't positive and finite.
+    static func duration(_ seconds: Double) -> String? {
+        guard seconds.isFinite, seconds > 0, let total = integer(seconds) else { return nil }
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let secs = total % 60
+        if hours > 0 {
+            return String(format: "%d:%02d:%02d", hours, minutes, secs)
+        }
+        return String(format: "%d:%02d", minutes, secs)
+    }
+
+    /// Degrees/minutes/seconds for a coordinate magnitude, e.g. 37°46'29.64".
+    static func degreesMinutesSeconds(_ decimal: Double) -> String? {
+        guard decimal.isFinite, decimal >= 0, decimal <= 360, let degrees = integer(decimal) else { return nil }
+        let minutesDecimal = (decimal - Double(degrees)) * 60
+        let minutes = integer(minutesDecimal) ?? 0
+        let seconds = (minutesDecimal - Double(minutes)) * 60
+        return String(format: "%d°%02d'%.2f\"", degrees, minutes, seconds)
+    }
+
+    static func sampleRate(_ hertz: Double) -> String? {
+        guard hertz > 0, let value = integer(hertz) else { return nil }
+        return "\(value) Hz"
     }
 }
+
