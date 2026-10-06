@@ -87,7 +87,18 @@ final class KeyboardTableView: NSTableView {
         super.keyDown(with: event)
     }
 
+    /// Identity of the last mouse-down handled, to drop a re-delivery of the same click.
+    private var lastMouseDown: (timestamp: TimeInterval, eventNumber: Int)?
+
     override func mouseDown(with event: NSEvent) {
+        // AppKit's gesture-recognizer machinery can deliver the same mouse-down a second time
+        // ("delayed event") after it was already handled. Handling it twice turned a row click
+        // into a row click followed by an empty-space click, which cleared the selection.
+        if let last = lastMouseDown, last.timestamp == event.timestamp, last.eventNumber == event.eventNumber {
+            return
+        }
+        lastMouseDown = (event.timestamp, event.eventNumber)
+
         let point = convert(event.locationInWindow, from: nil)
         var clickedRow = row(at: point)
         let modifiers = event.modifierFlags
@@ -106,6 +117,12 @@ final class KeyboardTableView: NSTableView {
         }
 
         if clickedRow < 0 {
+            // A point outside the table isn't a click on its empty space (e.g. a stray re-delivered
+            // event); never clear the selection for it.
+            guard visibleRect.contains(point) else {
+                super.mouseDown(with: event)
+                return
+            }
             // Empty space below the rows
             if modifiers.contains(.command) || modifiers.contains(.shift) {
                 // ⌘/⇧-click on empty space keeps the selection (Finder)
