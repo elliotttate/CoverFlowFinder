@@ -1,6 +1,27 @@
 import SwiftUI
 import AppKit
 
+// MARK: - Drop operation
+
+/// What a file drop should do. Resolve it at drop time from the drop event's modifiers.
+enum FileDropOperation: Equatable {
+    /// Finder semantics: move within the same volume, copy across volumes.
+    case automatic
+    case copy
+    case move
+
+    /// Option forces copy, Command forces move, otherwise automatic.
+    init(modifierFlags: NSEvent.ModifierFlags) {
+        if modifierFlags.contains(.option) {
+            self = .copy
+        } else if modifierFlags.contains(.command) {
+            self = .move
+        } else {
+            self = .automatic
+        }
+    }
+}
+
 // MARK: - Drop Helper
 // Shared utilities for drag and drop operations
 

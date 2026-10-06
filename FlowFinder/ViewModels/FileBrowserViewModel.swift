@@ -1040,7 +1040,7 @@ class FileBrowserViewModel: ObservableObject {
                 if didUpdate {
                     self.items = updatedItems
                     // Post notification so table view can force reload of visible rows
-                    NotificationCenter.default.post(name: .metadataHydrationCompleted, object: nil)
+                    NotificationCenter.default.post(name: .metadataHydrationCompleted, object: self)
                 }
             }
         }
@@ -1091,7 +1091,7 @@ class FileBrowserViewModel: ObservableObject {
 
                 if didUpdate {
                     self.items = updatedItems
-                    NotificationCenter.default.post(name: .cloudStatusHydrationCompleted, object: nil)
+                    NotificationCenter.default.post(name: .cloudStatusHydrationCompleted, object: self)
                 }
             }
         }
@@ -2217,6 +2217,26 @@ class FileBrowserViewModel: ObservableObject {
         completion(previewURL(for: item))
     }
 
+    /// The lead ("focused") item of the selection: the most recently clicked or navigated item
+    /// if it is still selected, otherwise the first selected item in display order.
+    /// Use this instead of `selectedItems.first` — a Set has no order.
+    var primarySelectedItem: FileItem? {
+        guard !selectedItems.isEmpty else { return nil }
+        if selectedItems.count == 1 { return selectedItems.first }
+        let items = filteredItems
+        if items.indices.contains(lastSelectedIndex), selectedItems.contains(items[lastSelectedIndex]) {
+            return items[lastSelectedIndex]
+        }
+        return items.first(where: { selectedItems.contains($0) }) ?? selectedItems.first
+    }
+
+    /// Selected items in display order.
+    var orderedSelectedItems: [FileItem] {
+        guard !selectedItems.isEmpty else { return [] }
+        if selectedItems.count == 1 { return Array(selectedItems) }
+        return filteredItems.filter { selectedItems.contains($0) }
+    }
+
     // Track anchor index for Shift+click range selection
     var lastSelectedIndex: Int = 0
     // Anchor index stays fixed during shift+arrow extend operations
@@ -2891,15 +2911,19 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
-    func handleDrop(urls: [URL], to destPath: URL? = nil, completion: (() -> Void)? = nil) {
+    /// - Parameter operation: The drop operation resolved by the caller at drop time
+    ///   (use `FileDropOperation(modifierFlags:)` with the drop event's modifiers).
+    ///   `nil` falls back to the current keyboard modifiers.
+    func handleDrop(urls: [URL], to destPath: URL? = nil, operation: FileDropOperation? = nil, completion: (() -> Void)? = nil) {
         guard !isInsideArchive else {
             NSSound.beep()
             return
         }
 
         let destination = destPath ?? currentPath
+        let resolvedOperation = operation ?? FileDropOperation(modifierFlags: NSEvent.modifierFlags)
         // Finder behavior: Drag = Move, Option+Drag = Copy
-        let shouldCopy = NSEvent.modifierFlags.contains(.option)
+        let shouldCopy = resolvedOperation == .copy
         let destinationPath = destination
         let filteredURLs = urls.filter { $0.deletingLastPathComponent() != destinationPath }
         guard !filteredURLs.isEmpty else {

@@ -5,6 +5,16 @@ import os.log
 
 private let previewLog = OSLog(subsystem: "com.flowfinder", category: "InlineVideoPreview")
 
+/// Single entry point for stopping every inline media preview (video and audio).
+/// Call on navigation, refresh, view-mode changes and when a view disappears.
+@MainActor
+enum InlinePreviews {
+    static func stopAll() {
+        InlineVideoPreviewManager.shared.stopAllPreviews()
+        InlineAudioPreviewManager.shared.stopAllPreviews()
+    }
+}
+
 /// Manages inline video preview playback within file thumbnails.
 /// Mirrors Finder's QLInlinePreviewController architecture using public AVFoundation APIs.
 ///

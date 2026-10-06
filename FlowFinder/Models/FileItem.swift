@@ -452,6 +452,20 @@ struct FileItem: Identifiable, Hashable, Transferable {
         }
     }
 
+    /// Snapshot of the displayed metadata. Changes whenever size, dates, metadata hydration
+    /// or cloud status change, while `==`/`hash` stay URL-based (identity).
+    /// Use this (not `==`) for change detection and cache keys.
+    struct ContentVersion: Hashable {
+        let modificationDate: Date?
+        let size: Int64
+        let hasMetadata: Bool
+        let cloudStatus: CloudSyncStatus?
+    }
+
+    var contentVersion: ContentVersion {
+        ContentVersion(modificationDate: modificationDate, size: size, hasMetadata: hasMetadata, cloudStatus: cloudStatus)
+    }
+
     func hash(into hasher: inout Hasher) {
         hasher.combine(url)
     }
