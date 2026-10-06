@@ -4,6 +4,8 @@
 <dict>
     <key>CFBundleDevelopmentRegion</key>
     <string>$(DEVELOPMENT_LANGUAGE)</string>
+    <key>CFBundleDisplayName</key>
+    <string>Flow Finder</string>
     <key>CFBundleExecutable</key>
     <string>$(EXECUTABLE_NAME)</string>
     <key>CFBundleIconFile</key>
@@ -26,10 +28,12 @@
     <string>https://elliotttate.github.io/CoverFlowFinder/appcast.xml</string>
     <key>SUPublicEDKey</key>
     <string>6Mnotk0Hz2FeDtGWEkUOtlSl+O9EctXXjH0xtRMaoas=</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.utilities</string>
     <key>LSMinimumSystemVersion</key>
     <string>$(MACOSX_DEPLOYMENT_TARGET)</string>
     <key>NSHumanReadableCopyright</key>
-    <string>Copyright 2024. All rights reserved.</string>
+    <string>Copyright © 2024–2026 Brian Tate. All rights reserved.</string>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
     <key>NSPhotoLibraryUsageDescription</key>
