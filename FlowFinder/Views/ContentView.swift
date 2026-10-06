@@ -107,6 +107,7 @@ private struct BrowserWindowNotifications: ViewModifier {
     let onNextTab: () -> Void
     let onPreviousTab: () -> Void
     let onSetViewMode: (ViewMode) -> Void
+    let onViewModeRequest: (FileBrowserViewModel, ViewMode) -> Void
     let onShowInfo: (FileItem) -> Void
     let onVolumeUnmount: (URL) -> Void
 
@@ -136,14 +137,21 @@ private struct BrowserWindowNotifications: ViewModifier {
                       let mode = ViewMode(rawValue: rawValue) else { return }
                 onSetViewMode(mode)
             }
-            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.willUnmountNotification)) { notification in
-                // Leave the volume before it goes away so open folders don't block the unmount.
-                if let volumeURL = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL {
+            .onReceive(NotificationCenter.default.publisher(for: .requestViewModeChange)) { notification in
+                // Posted with the view model it applies to (e.g. the sidebar's Photos Library).
+                guard let viewModel = notification.object as? FileBrowserViewModel,
+                      let mode = notification.userInfo?[AppNotificationKey.viewMode] as? ViewMode else { return }
+                onViewModeRequest(viewModel, mode)
+            }
+            // The sidebar forwards NSWorkspace's (un)mount notifications and posts these before its own
+            // ejects. Leave the volume synchronously on "will" so our folder watchers don't block the eject.
+            .onReceive(NotificationCenter.default.publisher(for: .volumeWillUnmount)) { notification in
+                if let volumeURL = notification.userInfo?[AppNotificationKey.url] as? URL {
                     onVolumeUnmount(volumeURL)
                 }
             }
-            .onReceive(NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didUnmountNotification)) { notification in
-                if let volumeURL = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL {
+            .onReceive(NotificationCenter.default.publisher(for: .volumeDidUnmount)) { notification in
+                if let volumeURL = notification.userInfo?[AppNotificationKey.url] as? URL {
                     onVolumeUnmount(volumeURL)
                 }
             }
@@ -253,6 +261,7 @@ struct ContentView: View {
                 onNextTab: { tabStore.selectNextTab() },
                 onPreviousTab: { tabStore.selectPreviousTab() },
                 onSetViewMode: setViewMode,
+                onViewModeRequest: handleViewModeRequest,
                 onShowInfo: showInfoIfOwned,
                 onVolumeUnmount: leaveUnmountedVolume
             ))
@@ -335,7 +344,7 @@ struct ContentView: View {
 
     private var splitView: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
-            SidebarView(viewModel: activeViewModel)
+            SidebarView(viewModel: activeViewModel, isDualPane: currentViewMode == .dualPane || currentViewMode == .quadPane)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 300)
         } detail: {
             detailContent
@@ -392,6 +401,9 @@ struct ContentView: View {
         hostWindow.window = window
         if let window {
             KeyboardManager.shared.registerBrowserWindow(window)
+            DispatchQueue.main.async {
+                MenuValidationState.shared.refresh()
+            }
         }
     }
 
@@ -413,24 +425,38 @@ struct ContentView: View {
         }
     }
 
+    /// A view-mode request for one of this window's view models (e.g. the sidebar's Photos Library
+    /// asks for Masonry). Applies to the current tab in single-pane layouts; Dual/Quad keep their layout.
+    private func handleViewModeRequest(for requester: FileBrowserViewModel, mode: ViewMode) {
+        guard requester === viewModel,
+              currentViewMode != .dualPane,
+              currentViewMode != .quadPane,
+              mode != .dualPane,
+              mode != .quadPane else { return }
+        if viewModel.viewMode != mode {
+            viewModel.viewMode = mode
+        }
+        currentViewMode = mode
+    }
+
     private func showInfoIfOwned(_ item: FileItem) {
         guard let owner = managedViewModels.first(where: { $0.infoItem == item }) else { return }
         owner.infoItem = nil
         showingInfoItem = item
     }
 
-    /// Sends every pane showing a folder on an unmounting volume back to the home folder.
+    /// Sends every tab/pane of this window showing a folder on an unmounting volume to the home
+    /// folder. Runs synchronously: the folder watcher on the volume is stopped before returning, and
+    /// nothing on the volume is listed again (leaving a ZIP would otherwise list its folder first).
+    /// Safe to call repeatedly for the same volume.
     private func leaveUnmountedVolume(_ volumeURL: URL) {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        for viewModel in managedViewModels {
-            let showsVolume = VolumePaths.isURL(viewModel.currentPath, onVolumeAt: volumeURL)
-                || (viewModel.currentArchiveURL.map { VolumePaths.isURL($0, onVolumeAt: volumeURL) } ?? false)
-            guard showsVolume else { continue }
-            PendingSelection.cancel(for: viewModel)
-            if viewModel.isInsideArchive {
-                viewModel.exitArchive()
-            }
-            viewModel.navigateTo(home)
+        var leftVolume = false
+        for viewModel in managedViewModels where VolumePaths.leaveVolume(at: volumeURL, in: viewModel) {
+            leftVolume = true
+        }
+        if leftVolume {
+            // Resume per the usual visibility rules; resumed panes load the home folder.
+            updateViewModelActivity()
         }
     }
 
@@ -1407,6 +1433,25 @@ enum VolumePaths {
         guard volumePath != "/" else { return false }
         let path = url.standardizedFileURL.path
         return path == volumePath || path.hasPrefix(volumePath + "/")
+    }
+
+    /// If `viewModel` shows a folder (or ZIP) on the volume at `volumeURL`, stops its folder watcher
+    /// and moves it to the home folder, leaving its background work suspended: the caller resumes it
+    /// (which loads the home folder). Returns whether it was on the volume.
+    @MainActor
+    static func leaveVolume(at volumeURL: URL, in viewModel: FileBrowserViewModel) -> Bool {
+        let showsVolume = isURL(viewModel.currentPath, onVolumeAt: volumeURL)
+            || (viewModel.currentArchiveURL.map { isURL($0, onVolumeAt: volumeURL) } ?? false)
+        guard showsVolume else { return false }
+        PendingSelection.cancel(for: viewModel)
+        // Suspending stops the watcher now; the loads below are deferred until work resumes, so
+        // nothing on the volume is listed again (leaving a ZIP would otherwise list its folder).
+        viewModel.setBackgroundWorkActive(false)
+        if viewModel.isInsideArchive {
+            viewModel.exitArchive()
+        }
+        viewModel.navigateTo(FileManager.default.homeDirectoryForCurrentUser)
+        return true
     }
 }
 

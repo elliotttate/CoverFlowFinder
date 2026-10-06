@@ -550,15 +550,88 @@ enum BrowserWindowCommand {
     }
 
     /// ⌘W: closes the current tab of a browser window with several tabs; otherwise closes the key
-    /// window itself (a browser window with one tab, Settings, Quick Look, ...).
+    /// window itself (a browser window with one tab, Settings, Quick Look, ...). A sheet keeps its
+    /// own ⌘W (Get Info's Close button).
     static func closeTabOrWindow() {
-        if let keyWindow = NSApp.keyWindow,
-           KeyboardManager.shared.isBrowserWindow(keyWindow),
-           keyWindow.attachedSheet == nil {
+        guard let keyWindow = NSApp.keyWindow else { return }
+        if keyWindow.sheetParent != nil || keyWindow.attachedSheet != nil {
+            if let event = NSApp.currentEvent, event.type == .keyDown,
+               let sheet = keyWindow.attachedSheet ?? (keyWindow.sheetParent != nil ? keyWindow : nil),
+               sheet.performKeyEquivalent(with: event) {
+                return
+            }
+            NSSound.beep()
+            return
+        }
+        if KeyboardManager.shared.isBrowserWindow(keyWindow) {
             NotificationCenter.default.post(name: .closeTab, object: keyWindow)
         } else {
-            NSApp.keyWindow?.performClose(nil)
+            keyWindow.performClose(nil)
         }
+    }
+}
+
+/// Key-window state the menu bar's enabled states depend on but SwiftUI can't observe: whether a
+/// text field is being edited (or a non-browser window is key), and whether a sheet is up.
+/// Updated from key-window changes and KVO on the key window's first responder.
+@MainActor
+final class MenuValidationState: ObservableObject {
+    static let shared = MenuValidationState()
+
+    /// Edit commands should act as standard text/edit commands (text field focused, or the key
+    /// window is Settings, a sheet, an alert, the update window, ...).
+    @Published private(set) var usesStandardEditing = true
+    /// A sheet is attached to, or is, the key window.
+    @Published private(set) var isSheetActive = false
+    /// Bumped when the app becomes active, so pasteboard-dependent states are re-read.
+    @Published private(set) var pasteboardGeneration = 0
+
+    private var firstResponderObservation: NSKeyValueObservation?
+    private var observers: [NSObjectProtocol] = []
+
+    private init() {
+        let center = NotificationCenter.default
+        for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
+                     NSWindow.willBeginSheetNotification, NSWindow.didEndSheetNotification] {
+            observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.keyWindowChanged()
+                }
+            })
+        }
+        observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.pasteboardGeneration &+= 1
+                self?.update()
+            }
+        })
+        keyWindowChanged()
+    }
+
+    private func keyWindowChanged() {
+        firstResponderObservation = NSApp.keyWindow?.observe(\.firstResponder, options: []) { [weak self] _, _ in
+            // Deferred: first-responder changes can happen inside a SwiftUI update.
+            DispatchQueue.main.async {
+                self?.update()
+            }
+        }
+        update()
+    }
+
+    /// Re-reads the state (e.g. after a window registered as a browser window).
+    func refresh() {
+        keyWindowChanged()
+    }
+
+    private func update() {
+        let keyWindow = NSApp.keyWindow
+        let manager = KeyboardManager.shared
+        let sheetActive = keyWindow.map { $0.sheetParent != nil || $0.attachedSheet != nil } ?? false
+        let standardEditing = !manager.isBrowserWindow(keyWindow)
+            || sheetActive
+            || KeyboardResponderKind.classify(keyWindow?.firstResponder) == .textEditing
+        if usesStandardEditing != standardEditing { usesStandardEditing = standardEditing }
+        if isSheetActive != sheetActive { isSheetActive = sheetActive }
     }
 }
 
@@ -952,13 +1025,24 @@ struct InlineRenameField: View {
         hasCommitted = true
         removeMonitors()
 
-        let trimmed = editText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !trimmed.isEmpty && trimmed != item.nameWithoutExtension {
-            let ext = item.url.pathExtension
-            let newName = ext.isEmpty ? trimmed : "\(trimmed).\(ext)"
+        if let newName = Self.newName(forEditedText: editText, of: item) {
             viewModel.renameItem(item, to: newName)
         }
         viewModel.renamingURL = nil
+    }
+
+    /// The full new name for the text typed in the field, or nil when nothing should change.
+    /// Files are edited without their extension, which is re-appended unless the user typed it;
+    /// folders and packages are edited with their full name, so nothing is appended ("my.folder"
+    /// → "x" stays "x", "Foo.app" stays "Foo.app"). Whitespace is kept, as in Finder.
+    static func newName(forEditedText text: String, of item: FileItem) -> String? {
+        guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
+        let hiddenExtension = item.isDirectory ? "" : item.url.pathExtension
+        var name = text
+        if !hiddenExtension.isEmpty && !text.lowercased().hasSuffix("." + hiddenExtension.lowercased()) {
+            name += "." + hiddenExtension
+        }
+        return name == item.name ? nil : name
     }
 
     private func commitRenameAndNext() {

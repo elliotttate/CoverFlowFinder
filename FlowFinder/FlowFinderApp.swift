@@ -33,7 +33,7 @@ struct FlowFinderApp: App {
             SidebarCommands()
             ToolbarCommands()
 
-            BrowserCommands(settings: settings)
+            BrowserCommands(settings: settings, menuState: .shared)
         }
         Settings {
             SettingsView()
@@ -48,9 +48,20 @@ struct FlowFinderApp: App {
 struct BrowserCommands: Commands {
     @FocusedObject private var viewModel: FileBrowserViewModel?
     @ObservedObject var settings: AppSettings
+    @ObservedObject var menuState: MenuValidationState
 
     private var hasSelection: Bool {
         !(viewModel?.selectedItems.isEmpty ?? true)
+    }
+
+    /// Text fields and non-browser windows get the standard Copy/Cut/Paste, so those stay enabled.
+    private var standardEditing: Bool {
+        menuState.usesStandardEditing || viewModel == nil
+    }
+
+    private var canPasteFiles: Bool {
+        _ = menuState.pasteboardGeneration  // re-read after another app changed the pasteboard
+        return viewModel?.canPaste ?? false
     }
 
     var body: some Commands {
@@ -61,10 +72,12 @@ struct BrowserCommands: Commands {
             }
             .keyboardShortcut("t", modifiers: .command)
 
+            // Disabled while a sheet is up so ⌘W reaches the sheet (Get Info's Close).
             Button("Close Tab") {
                 BrowserWindowCommand.closeTabOrWindow()
             }
             .keyboardShortcut("w", modifiers: .command)
+            .disabled(menuState.isSheetActive)
 
             Divider()
 
@@ -96,23 +109,26 @@ struct BrowserCommands: Commands {
             .keyboardShortcut("[", modifiers: [.command, .shift])
         }
 
-        // Edit menu commands. Copy/Cut/Paste/Select All stay enabled: when a text field is being
-        // edited they must reach it, and the menu can't observe text focus.
+        // Edit menu commands. While a text field is edited (or a non-browser window is key) they
+        // act as the standard text commands, so the file-based enabled states don't apply.
         CommandGroup(replacing: .pasteboard) {
             Button("Copy") {
                 perform(.copy)
             }
             .keyboardShortcut("c", modifiers: .command)
+            .disabled(!standardEditing && !hasSelection)
 
             Button("Cut") {
                 perform(.cut)
             }
             .keyboardShortcut("x", modifiers: .command)
+            .disabled(!standardEditing && !hasSelection)
 
             Button("Paste") {
                 perform(.paste)
             }
             .keyboardShortcut("v", modifiers: .command)
+            .disabled(!standardEditing && !canPasteFiles)
 
             Divider()
 
@@ -123,18 +139,19 @@ struct BrowserCommands: Commands {
 
             Divider()
 
-            // Disabled without a selection, so ⌘D / ⌘⌫ then go straight to a focused text field.
+            // Disabled while editing text so ⌘⌫ reaches the field (delete to start of line). If that
+            // state is ever stale, the action still forwards to the field instead of trashing.
             Button("Duplicate") {
                 perform(.duplicate)
             }
             .keyboardShortcut("d", modifiers: .command)
-            .disabled(!hasSelection)
+            .disabled(!hasSelection || menuState.usesStandardEditing)
 
             Button("Move to Trash") {
                 perform(.moveToTrash)
             }
             .keyboardShortcut(.delete, modifiers: .command)
-            .disabled(!hasSelection)
+            .disabled(!hasSelection || menuState.usesStandardEditing)
         }
 
         // View menu commands

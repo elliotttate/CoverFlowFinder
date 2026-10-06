@@ -175,6 +175,12 @@ enum DropHelper {
 
     // MARK: Drag source
 
+    /// Sidebar favorite reorder drags carry only an internal type; never treat them as file drops.
+    @MainActor
+    static func isSidebarFavoriteDrag() -> Bool {
+        NSPasteboard(name: .drag).types?.contains(SidebarOutlineView.favoriteDragType) ?? false
+    }
+
     private static var dragPasteboardCache: (changeCount: Int, urls: [URL])?
 
     /// The file URLs being dragged, available synchronously during a drag: from `InternalDragState`
@@ -292,7 +298,7 @@ struct UnifiedFolderDropDelegate: DropDelegate {
     @Binding var dropTargetedItemID: UUID?
 
     private var acceptsDrops: Bool {
-        item.isDirectory && !item.isFromArchive && !viewModel.isPhotosItem(item)
+        item.isDirectory && !item.isFromArchive && !viewModel.isPhotosItem(item) && !DropHelper.isSidebarFavoriteDrag()
     }
 
     /// Internal drags are allowed (e.g. onto a folder in the other pane); only dropping a folder
@@ -392,6 +398,7 @@ struct ContainerDropDelegate: DropDelegate {
             && !viewModel.isPhotosLibraryActive
             && viewModel.currentPath.isFileURL
             && viewModel.currentPath.path != "/Network"
+            && !DropHelper.isSidebarFavoriteDrag()
     }
 
     /// A drag of items that already live in this folder (e.g. from this very view) would do nothing.

@@ -414,10 +414,49 @@ struct PaneListView: View {
     }
 }
 
-/// Grid cells the pane icon views have shown recently; plain reference storage so cell
-/// appear/disappear doesn't re-render the grid.
-final class VisibleItemTracker {
-    var urls: Set<URL> = []
+/// Per-pane thumbnail bookkeeping for the pane icon views: which cells are on screen and which
+/// requests are in flight. Plain reference storage so cell appear/disappear doesn't re-render the
+/// grid. Owns the pane's thumbnail requests (cancelled on folder change and when the pane goes away).
+final class PaneThumbnailState {
+    let owner = ThumbnailRequestOwner()
+    var visibleURLs: Set<URL> = []
+    var requestedURLs: Set<URL> = []
+
+    func cancelAll() {
+        ThumbnailCacheManager.shared.cancelRequests(for: owner)
+        requestedURLs.removeAll()
+    }
+
+    /// Shared loader for the dual and quad pane icon views. `store` receives the image (or the
+    /// item's placeholder when it has no thumbnail) on the main queue.
+    func load(_ item: FileItem, maxPixelSize: CGFloat, current: NSImage?, store: @escaping (NSImage, URL) -> Void) {
+        let url = item.url
+        if let current, PaneThumbnailState.image(current, satisfies: maxPixelSize) { return }
+        let cache = ThumbnailCacheManager.shared
+        if let cached = cache.cachedThumbnail(for: item, maxPixelSize: maxPixelSize) {
+            DispatchQueue.main.async { store(cached, url) }
+            return
+        }
+        guard !requestedURLs.contains(url) else { return }
+        requestedURLs.insert(url)
+        cache.requestThumbnail(for: item, maxPixelSize: maxPixelSize, owner: owner) { [weak self] result in
+            DispatchQueue.main.async {
+                self?.requestedURLs.remove(url)
+                switch result {
+                case .loaded(let image):
+                    store(image, url)
+                case .failed:
+                    store(item.placeholderIcon, url)
+                case .cancelled:
+                    break
+                }
+            }
+        }
+    }
+
+    static func image(_ image: NSImage, satisfies minPixelSize: CGFloat) -> Bool {
+        max(image.size.width, image.size.height) >= minPixelSize * 0.9
+    }
 }
 
 struct PaneIconView: View {
@@ -428,9 +467,8 @@ struct PaneIconView: View {
 
     // Display copies of on-screen thumbnails; ThumbnailCacheManager holds the real cache.
     @State private var thumbnails: [URL: NSImage] = [:]
-    @State private var visibleItems = VisibleItemTracker()
+    @State private var thumbnailState = PaneThumbnailState()
     @State private var dropTargetedItemID: UUID?
-    private let thumbnailCache = ThumbnailCacheManager.shared
     private static let maxDisplayedThumbnails = 300
 
     private var cellWidth: CGFloat {
@@ -457,28 +495,8 @@ struct PaneIconView: View {
     }
 
     private func loadThumbnail(for item: FileItem) {
-        let url = item.url
-        let targetPixelSize = thumbnailPixelSize
-        if let existing = thumbnails[url],
-           imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
-            return
-        }
-        if thumbnailCache.isPending(url: url, maxPixelSize: targetPixelSize) { return }
-
-        if thumbnailCache.hasFailed(url: url) {
-            DispatchQueue.main.async { storeThumbnail(item.icon, for: url) }
-            return
-        }
-
-        if let cached = thumbnailCache.getCachedThumbnail(for: url, maxPixelSize: targetPixelSize) {
-            DispatchQueue.main.async { storeThumbnail(cached, for: url) }
-            return
-        }
-
-        thumbnailCache.generateThumbnail(for: item, maxPixelSize: targetPixelSize) { url, image in
-            DispatchQueue.main.async {
-                storeThumbnail(image ?? item.icon, for: url)
-            }
+        thumbnailState.load(item, maxPixelSize: thumbnailPixelSize, current: thumbnails[item.url]) { image, url in
+            storeThumbnail(image, for: url)
         }
     }
 
@@ -487,27 +505,17 @@ struct PaneIconView: View {
     private func storeThumbnail(_ image: NSImage, for url: URL) {
         thumbnails[url] = image
         if thumbnails.count > Self.maxDisplayedThumbnails {
-            let visible = visibleItems.urls
+            let visible = thumbnailState.visibleURLs
             thumbnails = thumbnails.filter { visible.contains($0.key) }
         }
     }
 
     private func refreshThumbnails() {
-        let targetPixelSize = thumbnailPixelSize
         DispatchQueue.main.async {
-            for item in viewModel.filteredItems where visibleItems.urls.contains(item.url) {
-                if let existing = thumbnails[item.url],
-                   imageSatisfiesMinimum(existing, minPixelSize: targetPixelSize) {
-                    continue
-                }
+            for item in viewModel.filteredItems where thumbnailState.visibleURLs.contains(item.url) {
                 loadThumbnail(for: item)
             }
         }
-    }
-
-    private func imageSatisfiesMinimum(_ image: NSImage, minPixelSize: CGFloat) -> Bool {
-        let maxDimension = max(image.size.width, image.size.height)
-        return maxDimension >= minPixelSize * 0.9
     }
 
     var body: some View {
@@ -532,11 +540,11 @@ struct PaneIconView: View {
                             }
                             .id(item.id)
                             .onAppear {
-                                visibleItems.urls.insert(item.url)
+                                thumbnailState.visibleURLs.insert(item.url)
                                 loadThumbnail(for: item)
                             }
                             .onDisappear {
-                                visibleItems.urls.remove(item.url)
+                                thumbnailState.visibleURLs.remove(item.url)
                             }
                             .padding(8)
                             .background(
@@ -611,7 +619,8 @@ struct PaneIconView: View {
                     refreshThumbnails()
                 }
                 .onChange(of: viewModel.currentPath) { _, _ in
-                    // A new folder: drop the previous folder's thumbnails.
+                    // A new folder: cancel this pane's requests and drop its thumbnails.
+                    thumbnailState.cancelAll()
                     thumbnails.removeAll()
                 }
                 .onChange(of: viewModel.selectedItems) { _, _ in
@@ -620,6 +629,9 @@ struct PaneIconView: View {
                             scrollProxy.scrollTo(lead.id)
                         }
                     }
+                }
+                .onDisappear {
+                    thumbnailState.cancelAll()
                 }
             }
         }
