@@ -35,6 +35,7 @@ struct MasonryView: View {
     @State private var isScrolling = false
     @State private var scrollEndTimer: Timer?
     @State private var needsScrollToSelection = true  // Scroll to selected item when view appears
+    @State private var suppressNextSelectionScroll = false
 
     private var columnSpacing: CGFloat {
         max(12, settings.iconGridSpacingValue * 0.6)
@@ -169,18 +170,19 @@ struct MasonryView: View {
     }
 
     /// Calculate layout synchronously - called from computed property
-    private func calculateLayout() -> MasonryLayout {
-        guard !items.isEmpty else {
+    private func calculateLayout(for sourceItems: [FileItem]? = nil) -> MasonryLayout {
+        let sourceItems = sourceItems ?? items
+
+        guard !sourceItems.isEmpty else {
             return MasonryLayout(columns: [], positions: [:])
         }
 
         let currentColumnCount = columnCount
-        let currentColumnWidth = columnWidth
 
         // SIMPLE DETERMINISTIC assignment: index % columnCount
         var buckets = Array(repeating: [FileItem](), count: currentColumnCount)
 
-        for (index, item) in items.enumerated() {
+        for (index, item) in sourceItems.enumerated() {
             let columnIndex = index % currentColumnCount
             buckets[columnIndex].append(item)
         }
@@ -208,8 +210,8 @@ struct MasonryView: View {
     }
 
     /// Recalculate and cache the layout - called when items or dimensions change
-    private func recalculateLayout() {
-        let layout = calculateLayout()
+    private func recalculateLayout(for sourceItems: [FileItem]? = nil) {
+        let layout = calculateLayout(for: sourceItems)
         cachedLayout = layout
         cachedColumnCount = columnCount
         cachedColumnWidth = columnWidth
@@ -338,8 +340,12 @@ struct MasonryView: View {
                 }
                 .onChange(of: viewModel.selectedItems) { newSelection in
                     if let firstSelected = newSelection.first {
-                        withAnimation {
-                            scrollProxy.scrollTo(firstSelected.id)
+                        if suppressNextSelectionScroll {
+                            suppressNextSelectionScroll = false
+                        } else {
+                            withAnimation {
+                                scrollProxy.scrollTo(firstSelected.id)
+                            }
                         }
                         updateQuickLook(for: firstSelected)
                     } else {
@@ -437,47 +443,69 @@ struct MasonryView: View {
         ))
         .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging, padding: UI.Spacing.medium)
         .onChange(of: items) { newItems in
+            let oldCount = items.count
+            let newCount = newItems.count
             let oldToken = itemsToken
             let newToken = itemsTokenFor(newItems)
+            let isItemRemoval = newCount < oldCount && newCount > 0
 
-            os_log(.info, log: masonryLog, "onChange(items): count=%d, oldToken=%d, newToken=%d", newItems.count, oldToken, newToken)
+            os_log(
+                .info,
+                log: masonryLog,
+                "onChange(items): oldCount=%d, newCount=%d, oldToken=%d, newToken=%d, isItemRemoval=%{public}@",
+                oldCount,
+                newCount,
+                oldToken,
+                newToken,
+                isItemRemoval.description
+            )
 
             // Only clear thumbnails if items actually changed
             if oldToken != newToken {
-                os_log(.info, log: masonryLog, "  -> ITEMS CHANGED, clearing all caches")
                 itemsToken = newToken
-                thumbnails.removeAll()
-                aspectRatios.removeAll()
-                dimensionsFetched.removeAll()
-                cachedLayout = nil  // Clear cached layout
-                thumbnailCache.clearForNewFolder()
-                thumbnailCache.clearDimensionsCache()
-                visibleItemIDs.removeAll()
                 lastHydratedRange = nil
                 hydrationWorkItem?.cancel()
                 hydrationWorkItem = nil
 
-                // Get list of media files that need dimensions
-                let mediaURLs = newItems.compactMap { item -> URL? in
-                    guard !item.isDirectory && (item.fileType == .image || item.fileType == .video) else { return nil }
-                    return item.url
-                }
-
-                // IMPORTANT: Prefetch dimensions FIRST, then calculate layout
-                // This ensures we have real aspect ratios for the initial layout
-                // Layout is calculated ONCE and cached - never recalculated during scroll
-                if !mediaURLs.isEmpty {
-                    os_log(.info, log: masonryLog, "  -> PREFETCHING dimensions for %d media files BEFORE layout", mediaURLs.count)
-                    thumbnailCache.prefetchImageDimensions(for: mediaURLs) { [self] results in
-                        os_log(.info, log: masonryLog, "  -> PREFETCH complete: got %d dimensions, NOW calculating layout", results.count)
-                        // Calculate layout ONCE with real aspect ratios
-                        layoutNeedsUpdate = true
-                        recalculateLayout()
-                    }
-                } else {
-                    // No media files, calculate layout immediately
+                if isItemRemoval {
+                    os_log(.info, log: masonryLog, "  -> item removal detected, trimming caches and preserving layout state")
+                    suppressNextSelectionScroll = true
+                    trimCachesForRemovedItems(comparedTo: newItems)
                     layoutNeedsUpdate = true
-                    recalculateLayout()
+                    recalculateLayout(for: newItems)
+                    scheduleHydration()
+                } else {
+                    os_log(.info, log: masonryLog, "  -> structural change detected, clearing all caches")
+                    thumbnails.removeAll()
+                    aspectRatios.removeAll()
+                    dimensionsFetched.removeAll()
+                    cachedLayout = nil
+                    thumbnailCache.clearForNewFolder()
+                    thumbnailCache.clearDimensionsCache()
+                    visibleItemIDs.removeAll()
+
+                    // Get list of media files that need dimensions
+                    let mediaURLs = newItems.compactMap { item -> URL? in
+                        guard !item.isDirectory && (item.fileType == .image || item.fileType == .video) else { return nil }
+                        return item.url
+                    }
+
+                    // IMPORTANT: Prefetch dimensions FIRST, then calculate layout
+                    // This ensures we have real aspect ratios for the initial layout
+                    // Layout is calculated ONCE and cached - never recalculated during scroll
+                    if !mediaURLs.isEmpty {
+                        os_log(.info, log: masonryLog, "  -> PREFETCHING dimensions for %d media files BEFORE layout", mediaURLs.count)
+                        thumbnailCache.prefetchImageDimensions(for: mediaURLs) { [self] results in
+                            os_log(.info, log: masonryLog, "  -> PREFETCH complete: got %d dimensions, NOW calculating layout", results.count)
+                            // Calculate layout ONCE with real aspect ratios
+                            layoutNeedsUpdate = true
+                            recalculateLayout(for: newItems)
+                        }
+                    } else {
+                        // No media files, calculate layout immediately
+                        layoutNeedsUpdate = true
+                        recalculateLayout(for: newItems)
+                    }
                 }
             } else {
                 os_log(.debug, log: masonryLog, "  -> token unchanged, keeping caches")
@@ -920,6 +948,16 @@ struct MasonryView: View {
             hasher.combine(item.id)
         }
         return hasher.finalize()
+    }
+
+    private func trimCachesForRemovedItems(comparedTo newItems: [FileItem]) {
+        let remainingURLs = Set(newItems.map(\.url))
+        let remainingIDs = Set(newItems.map(\.id))
+
+        thumbnails = thumbnails.filter { remainingURLs.contains($0.key) }
+        aspectRatios = aspectRatios.filter { remainingURLs.contains($0.key) }
+        dimensionsFetched = dimensionsFetched.filter { remainingURLs.contains($0) }
+        visibleItemIDs = visibleItemIDs.filter { remainingIDs.contains($0) }
     }
 
     private var magnificationGesture: some Gesture {
