@@ -150,22 +150,40 @@ final class FinderSoundEffects {
     }
 }
 
+/// Plays the mount/unmount sounds — but only for volumes the user can actually see (the ones the
+/// sidebar shows). NSWorkspace reports every mount on the system: hidden disk images mounted by
+/// installers, updaters and developer tools, Time Machine snapshots, simulator runtimes. Playing a
+/// sound for those made the app chime "for no reason".
+@MainActor
 final class FinderSoundEffectsMonitor: ObservableObject {
     private let notificationCenter: NotificationCenter
     private var observers: [NSObjectProtocol] = []
+    /// Standardized paths of mounted, user-visible volumes (captured at mount time, since an
+    /// unmounted volume can no longer be asked whether it was visible).
+    private var visibleVolumePaths: Set<String> = []
+    private var lastSoundDate = Date.distantPast
+    /// Mounting a multi-partition disk or reconnecting several shares posts a burst of notifications
+    private let minimumSoundInterval: TimeInterval = 1.0
 
     init(workspace: NSWorkspace = .shared) {
         notificationCenter = workspace.notificationCenter
+        visibleVolumePaths = Set(
+            (FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: [.volumeIsBrowsableKey], options: [.skipHiddenVolumes]) ?? [])
+                .filter { Self.isUserVisibleVolume($0) }
+                .map { $0.standardizedFileURL.path }
+        )
 
         observers.append(
             notificationCenter.addObserver(
                 forName: NSWorkspace.didMountNotification,
                 object: nil,
                 queue: .main
-            ) { _ in
+            ) { [weak self] notification in
                 // Delivered on the main queue.
                 MainActor.assumeIsolated {
-                    FinderSoundEffects.shared.play(.volumeMount)
+                    guard let self, let url = Self.volumeURL(from: notification), Self.isUserVisibleVolume(url) else { return }
+                    self.visibleVolumePaths.insert(url.standardizedFileURL.path)
+                    self.playThrottled(.volumeMount)
                 }
             }
         )
@@ -175,14 +193,45 @@ final class FinderSoundEffectsMonitor: ObservableObject {
                 forName: NSWorkspace.didUnmountNotification,
                 object: nil,
                 queue: .main
-            ) { _ in
+            ) { [weak self] notification in
                 // Delivered on the main queue. This is also the eject sound for the sidebar's Eject command:
                 // it only fires once the unmount has succeeded.
                 MainActor.assumeIsolated {
-                    FinderSoundEffects.shared.play(.volumeUnmount)
+                    guard let self, let url = Self.volumeURL(from: notification),
+                          self.visibleVolumePaths.remove(url.standardizedFileURL.path) != nil else { return }
+                    self.playThrottled(.volumeUnmount)
                 }
             }
         )
+    }
+
+    private func playThrottled(_ effect: FinderSoundEffect) {
+        let now = Date()
+        guard now.timeIntervalSince(lastSoundDate) >= minimumSoundInterval else { return }
+        lastSoundDate = now
+        FinderSoundEffects.shared.play(effect)
+    }
+
+    nonisolated private static func volumeURL(from notification: Notification) -> URL? {
+        if let url = notification.userInfo?[NSWorkspace.volumeURLUserInfoKey] as? URL {
+            return url
+        }
+        if let path = notification.userInfo?["NSDevicePath"] as? String {
+            return URL(fileURLWithPath: path, isDirectory: true)
+        }
+        return nil
+    }
+
+    /// A volume Finder would show: browsable (not mounted with nobrowse) and not one of the
+    /// system's own internal or Time Machine snapshot mounts.
+    nonisolated static func isUserVisibleVolume(_ url: URL) -> Bool {
+        let path = url.standardizedFileURL.path
+        if path == "/" { return true }
+        let hiddenPrefixes = ["/System/Volumes/", "/private/var/", "/Library/Developer/", "/Volumes/com.apple.TimeMachine", "/Volumes/.timemachine"]
+        if hiddenPrefixes.contains(where: { path.hasPrefix($0) }) { return false }
+        if url.pathComponents.contains(where: { $0.hasPrefix(".") }) { return false }
+        let values = try? url.resourceValues(forKeys: [.volumeIsBrowsableKey])
+        return values?.volumeIsBrowsable ?? false
     }
 
     deinit {
