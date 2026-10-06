@@ -176,7 +176,13 @@ final class ZipArchiveManager: @unchecked Sendable {
     /// Paths are confined to that directory; Unix permissions (minus setuid/setgid/sticky), dates, safe
     /// relative symlinks and the archive's quarantine attribute are carried over. A folder extraction
     /// continues past per-entry errors and reports them in `failures`; anything else throws.
-    func extractItemForCopy(archivePath: String, from archiveURL: URL, limits: ZipExtractionLimits = .standard) throws -> ZipExtractionResult {
+    ///
+    /// `progress` (optional) gets the number of bytes to write as its total and advances as they're
+    /// written. Cancelling it stops the extraction with `CocoaError.userCancelled` and removes
+    /// everything written so far.
+    func extractItemForCopy(archivePath: String, from archiveURL: URL, limits: ZipExtractionLimits = .standard,
+                            progress: Progress? = nil) throws -> ZipExtractionResult {
+        try Self.checkCancellation(progress)
         let reader = try ArchiveReader(url: archiveURL)
         let archive = try cachedArchive(for: archiveURL, reader: reader)
 
@@ -198,25 +204,55 @@ final class ZipArchiveManager: @unchecked Sendable {
             let quarantine = Self.quarantineAttribute(of: archiveURL)
             if entry.isDirectory {
                 let failures = try extractDirectory(entry, archive: archive, reader: reader, to: destination,
-                                                    quarantine: quarantine, limits: limits)
+                                                    quarantine: quarantine, limits: limits, progress: progress)
+                Self.finish(progress)
                 return ZipExtractionResult(url: destination, failures: failures)
             }
 
+            progress?.totalUnitCount = Int64(clamping: max(1, entry.uncompressedSize))
             if entry.isSymbolicLink {
                 try writeSymbolicLink(entry, reader: reader, offsetAdjustment: archive.offsetAdjustment,
                                       components: [entry.name], symlinkKeys: [], to: destination,
-                                      quarantine: quarantine, limits: limits)
+                                      quarantine: quarantine, limits: limits, progress: progress)
             } else {
                 try writeFile(entry, reader: reader, offsetAdjustment: archive.offsetAdjustment, to: destination,
                               attributes: Self.fileAttributes(for: entry, quarantine: quarantine, restoreDate: true),
-                              limits: limits)
+                              limits: limits, progress: progress)
             }
+            Self.finish(progress)
             return ZipExtractionResult(url: destination, failures: [])
         } catch {
             // Only our own fresh, uniquely named directory is removed
             try? FileManager.default.removeItem(at: operationDirectory)
             throw error
         }
+    }
+
+    /// Removes the temporary folder an `extractItemForCopy` result lives in (e.g. after the copy
+    /// it was made for was cancelled). Does nothing for paths outside the copy-out folder.
+    func discardCopyExtraction(_ extractedURL: URL) {
+        let operationDirectory = extractedURL.deletingLastPathComponent()
+        guard operationDirectory.deletingLastPathComponent().standardizedFileURL.path == copyRoot.standardizedFileURL.path,
+              Self.isContained(extractedURL, in: operationDirectory) else { return }
+        try? FileManager.default.removeItem(at: operationDirectory)
+    }
+
+    private static func checkCancellation(_ progress: Progress?) throws {
+        if progress?.isCancelled == true {
+            throw CocoaError(.userCancelled)
+        }
+    }
+
+    private static func isCancellation(_ error: Error) -> Bool {
+        (error as? CocoaError)?.code == .userCancelled
+    }
+
+    private static func finish(_ progress: Progress?) {
+        guard let progress else { return }
+        if progress.totalUnitCount <= 0 {
+            progress.totalUnitCount = 1
+        }
+        progress.completedUnitCount = progress.totalUnitCount
     }
 
     // MARK: - Path Safety
@@ -746,7 +782,8 @@ final class ZipArchiveManager: @unchecked Sendable {
         reader: ArchiveReader,
         to root: URL,
         quarantine: Data?,
-        limits: ZipExtractionLimits
+        limits: ZipExtractionLimits,
+        progress: Progress? = nil
     ) throws -> [ZipExtractionFailure] {
         let base = directoryEntry.path.hasSuffix("/") ? directoryEntry.path : directoryEntry.path + "/"
         var failures: [ZipExtractionFailure] = []
@@ -770,6 +807,7 @@ final class ZipArchiveManager: @unchecked Sendable {
             }
             totalSize = sum
         }
+        progress?.totalUnitCount = Int64(clamping: max(1, totalSize))
 
         let symlinkKeys = Set(members.filter { $0.entry.isSymbolicLink && !$0.entry.isDirectory }.map { Self.pathKey($0.components) })
 
@@ -782,6 +820,7 @@ final class ZipArchiveManager: @unchecked Sendable {
 
         var directories: [(components: [String], entry: ZipEntry)] = [([], directoryEntry)]
         for (entry, components) in members {
+            try Self.checkCancellation(progress)
             let relativePath = components.joined(separator: "/")
             do {
                 if entry.isDirectory {
@@ -799,12 +838,14 @@ final class ZipArchiveManager: @unchecked Sendable {
                 if entry.isSymbolicLink {
                     try writeSymbolicLink(entry, reader: reader, offsetAdjustment: archive.offsetAdjustment,
                                           components: components, symlinkKeys: symlinkKeys, to: destination,
-                                          quarantine: quarantine, limits: limits)
+                                          quarantine: quarantine, limits: limits, progress: progress)
                 } else {
                     try writeFile(entry, reader: reader, offsetAdjustment: archive.offsetAdjustment, to: destination,
                                   attributes: Self.fileAttributes(for: entry, quarantine: quarantine, restoreDate: true),
-                                  limits: limits)
+                                  limits: limits, progress: progress)
                 }
+            } catch let error where Self.isCancellation(error) {
+                throw error
             } catch {
                 failures.append(ZipExtractionFailure(path: relativePath, error: error))
             }
@@ -885,7 +926,8 @@ final class ZipArchiveManager: @unchecked Sendable {
         offsetAdjustment: Int64,
         to destination: URL,
         attributes: OutputAttributes,
-        limits: ZipExtractionLimits
+        limits: ZipExtractionLimits,
+        progress: Progress? = nil
     ) throws {
         let temporary = destination.deletingLastPathComponent()
             .appendingPathComponent(".flowfinder-\(UUID().uuidString).part", isDirectory: false)
@@ -896,7 +938,7 @@ final class ZipArchiveManager: @unchecked Sendable {
 
         var isOpen = true
         do {
-            try streamEntryData(entry, reader: reader, offsetAdjustment: offsetAdjustment, limits: limits) { chunk in
+            try streamEntryData(entry, reader: reader, offsetAdjustment: offsetAdjustment, limits: limits, progress: progress) { chunk in
                 try Self.writeAll(fd, chunk)
             }
             if let quarantine = attributes.quarantine {
@@ -935,7 +977,8 @@ final class ZipArchiveManager: @unchecked Sendable {
         symlinkKeys: Set<String>,
         to destination: URL,
         quarantine: Data?,
-        limits: ZipExtractionLimits
+        limits: ZipExtractionLimits,
+        progress: Progress? = nil
     ) throws {
         var target: String?
         if entry.uncompressedSize <= UInt64(PATH_MAX) {
@@ -949,7 +992,7 @@ final class ZipArchiveManager: @unchecked Sendable {
         guard let target, Self.isSafeSymlinkTarget(target, linkComponents: components, symlinkKeys: symlinkKeys) else {
             try writeFile(entry, reader: reader, offsetAdjustment: offsetAdjustment, to: destination,
                           attributes: Self.fileAttributes(for: entry, quarantine: quarantine, restoreDate: true),
-                          limits: limits)
+                          limits: limits, progress: progress)
             return
         }
 
@@ -963,15 +1006,18 @@ final class ZipArchiveManager: @unchecked Sendable {
             unlink(temporary.path)
             throw failure
         }
+        progress?.completedUnitCount += Int64(clamping: entry.uncompressedSize)
     }
 
     /// Stream an entry's uncompressed bytes to `sink` in bounded chunks, verifying size and CRC-32.
-    /// Throws (after the sink may have received some data) if the entry is unsupported, too large or corrupt.
+    /// Throws (after the sink may have received some data) if the entry is unsupported, too large or corrupt,
+    /// or `CocoaError.userCancelled` once `progress` is cancelled; each chunk advances `progress`.
     private func streamEntryData(
         _ entry: ZipEntry,
         reader: ArchiveReader,
         offsetAdjustment: Int64,
         limits: ZipExtractionLimits,
+        progress: Progress? = nil,
         sink: (UnsafeRawBufferPointer) throws -> Void
     ) throws {
         guard !entry.isEncrypted else {
@@ -989,12 +1035,14 @@ final class ZipArchiveManager: @unchecked Sendable {
         var crc = CRC32()
         var written: UInt64 = 0
         func emit(_ chunk: UnsafeRawBufferPointer) throws {
+            try Self.checkCancellation(progress)
             guard UInt64(chunk.count) <= entry.uncompressedSize - written else {
                 throw ZipError.corruptData("Entry expands beyond its declared size")
             }
             crc.update(chunk)
             try sink(chunk)
             written += UInt64(chunk.count)
+            progress?.completedUnitCount += Int64(chunk.count)
         }
 
         let chunkSize = 256 * 1024

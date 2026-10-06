@@ -170,6 +170,7 @@ struct CoverFlowView: View {
                     scrollSensitivity: settings.coverFlowSwipeSpeedValue,
                     currentFolderURL: viewModel.isInsideArchive ? nil : viewModel.currentPath,
                     canModifyFolder: !viewModel.isInsideArchive,
+                    focusViewModel: viewModel,
                     onSelect: { index, intent in
                         applySelection(at: index, intent: intent)
                     },
@@ -935,6 +936,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let scrollSensitivity: CGFloat
     let currentFolderURL: URL?  // Destination for drops onto the background (nil inside archives)
     let canModifyFolder: Bool
+    let focusViewModel: FileBrowserViewModel  // Identifies this view to `.focusFileList` posters
     let onSelect: (Int, CoverFlowSelectionIntent) -> Void
     let onOpen: (Int) -> Void
     let onOpenItems: ([FileItem]) -> Void
@@ -1012,6 +1014,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.scrollSensitivity = scrollSensitivity
         view.currentFolderURL = currentFolderURL
         view.canModifyFolder = canModifyFolder
+        view.focusViewModel = focusViewModel
     }
 }
 
@@ -1037,6 +1040,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     var cutItemURLs: Set<URL> = []  // URLs of items marked for cut (dimmed)
     var currentFolderURL: URL?
     var canModifyFolder = true
+    /// The view model this view shows; a `.focusFileList` notification may name it (or a window).
+    weak var focusViewModel: FileBrowserViewModel?
 
     private var items: [FileItem] = []
     private var itemsToken: Int = 0
@@ -2128,8 +2133,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
                 draggingItems.append(draggingItem)
             }
 
-            // Mark internal drag as active to suppress drop overlays
-            InternalDragState.shared.isDragging = true
+            // Mark the drag as internal (suppresses drop overlays; drop targets validate the URLs)
+            InternalDragState.shared.beginDrag(urls: draggableItems.map(\.url))
 
             _ = beginDraggingSession(with: draggingItems, event: event, source: self)
 
@@ -2411,11 +2416,14 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
     @objc private func handleFocusFileList(_ notification: Notification) {
         // Focus this view when requested (e.g., after pressing Escape in search field)
-        // Only take focus if we're actually visible in the key window
+        // Only take focus if we're actually visible in the key window, and only when the poster
+        // names this view's window or view model (not another pane's or window's).
         guard let window = window,
               window.isKeyWindow,
               visibleRect.size.height > 0,
               currentActivityState() else { return }
+        if let targetWindow = notification.object as? NSWindow, targetWindow !== window { return }
+        if let targetViewModel = notification.object as? FileBrowserViewModel, targetViewModel !== focusViewModel { return }
         window.makeFirstResponder(self)
     }
 
@@ -2640,7 +2648,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             case 125: // Cmd+Down - Open
                 openCentredItem()
                 return
-            case 51: // Cmd+Backspace - Move to Trash
+            // ⌥⌘⌫ belongs to the menus (Delete Immediately)
+            case 51 where !modifiers.contains(.option): // Cmd+Backspace - Move to Trash
                 onDelete?()
                 return
             default:
@@ -2757,7 +2766,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         // Find the first item that starts with the typed string. Shift may have been held to type
         // a capital; this is still a plain selection.
-        if let matchIndex = items.firstIndex(where: { $0.name.lowercased().hasPrefix(searchString) }) {
+        if let matchIndex = items.firstIndex(where: { $0.displayName.lowercased().hasPrefix(searchString) }) {
             selectIndexLocally(matchIndex)
         }
     }
@@ -2780,7 +2789,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
     override func accessibilityValue() -> Any? {
         guard selectedIndex >= 0 && selectedIndex < items.count else { return nil }
-        return items[selectedIndex].name
+        return items[selectedIndex].displayName
     }
 
     override func accessibilityChildren() -> [Any]? {
@@ -2789,7 +2798,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         var kept: [Int: CoverFlowAccessibilityElement] = [:]
         for index in indices where index < items.count {
             let element = accessibilityElementsByIndex[index] ?? CoverFlowAccessibilityElement(index: index, owner: self)
-            element.setAccessibilityLabel(items[index].name)
+            element.setAccessibilityLabel(items[index].displayName)
             kept[index] = element
             elements.append(element)
         }
@@ -3123,7 +3132,7 @@ extension CoverFlowNSView: NSDraggingSource {
         dragSessionInfo = nil
 
         // Clear internal drag state
-        InternalDragState.shared.isDragging = false
+        InternalDragState.shared.endDrag()
     }
 }
 
@@ -3209,15 +3218,15 @@ struct FileListSection: View {
             tagRefreshToken: viewModel.tagRefreshToken,
             onEmptySpaceClick: onEmptySpaceClick
         )
-        .onDrop(of: DropHelper.acceptedDropTypes, isTargeted: $isDropTargeted) { providers in
-            // Resolve copy/move now, while the drop's modifier keys are still down
-            DropHelper.performDrop(
-                providers: providers,
-                into: viewModel.currentPath,
-                viewModel: viewModel,
-                operation: FileDropOperation(modifierFlags: NSEvent.modifierFlags)
-            )
-        }
+        // The table takes file drops itself; this catches what it doesn't (file promises) and
+        // shows the badge of the operation that will happen.
+        .onDrop(of: DropHelper.acceptedDropTypes, delegate: ContainerDropDelegate(
+            viewModel: viewModel,
+            isDropTargeted: $isDropTargeted,
+            containerHeight: 0,
+            items: items,
+            autoScroll: false
+        ))
         .overlay(
             RoundedRectangle(cornerRadius: 4)
                 .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 2)

@@ -408,7 +408,7 @@ struct SidebarOutlineView: NSViewRepresentable {
 
             case .location(let location):
                 if location.isEjectable {
-                    let ejectItem = NSMenuItem(title: "Eject “\(location.name)”", action: #selector(ejectVolumeFromMenu(_:)), keyEquivalent: "")
+                    let ejectItem = NSMenuItem(title: "Eject “\(location.name.finderDisplayName)”", action: #selector(ejectVolumeFromMenu(_:)), keyEquivalent: "")
                     ejectItem.representedObject = location.url
                     ejectItem.target = self
                     menu.addItem(ejectItem)
@@ -890,7 +890,7 @@ struct SidebarOutlineView: NSViewRepresentable {
             case .favorite(let resolution):
                 let icon = resolution.url.flatMap { environment.icons.icon(forPath: $0.path) } ?? symbolIcon(name: "folder")
                 return SidebarItemPresentation(
-                    title: resolution.name,
+                    title: resolution.name.finderDisplayName,
                     icon: icon,
                     iconTint: nil,
                     accessory: nil,
@@ -928,7 +928,7 @@ struct SidebarOutlineView: NSViewRepresentable {
                 let fallbackSymbol = location.url.path == "/" ? "desktopcomputer" : "externaldrive"
                 let icon = environment.icons.icon(forPath: location.url.path) ?? symbolIcon(name: fallbackSymbol)
                 return SidebarItemPresentation(
-                    title: location.name,
+                    title: location.name.finderDisplayName,
                     icon: icon,
                     iconTint: nil,
                     accessory: nil,

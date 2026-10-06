@@ -266,7 +266,7 @@ struct ContentView: View {
                 onVolumeUnmount: leaveUnmountedVolume
             ))
             .onReceive(activeViewModel.$currentPath) { path in
-                windowTitle = path.lastPathComponent
+                windowTitle = path.finderDisplayName
             }
             .onReceive(viewModel.$viewMode) { mode in
                 // Keep the layout in sync when something else changes the mode (e.g. the sidebar's
@@ -413,7 +413,7 @@ struct ContentView: View {
     }
 
     private func syncWindowTitle() {
-        windowTitle = activeViewModel.currentPath.lastPathComponent
+        windowTitle = activeViewModel.currentPath.finderDisplayName
     }
 
     private func setViewMode(_ mode: ViewMode) {
@@ -1017,7 +1017,7 @@ struct PathBarView: View {
                             Image(systemName: "folder.fill")
                                 .font(.caption)
                         }
-                        Text(component.name)
+                        Text(component.name.finderDisplayName)
                             .lineLimit(1)
                     }
                     .foregroundColor(index == viewModel.pathComponents.count - 1 ? .primary : .secondary)
@@ -1180,6 +1180,12 @@ struct StatusBarView: View {
 
             Spacer()
 
+            if let activity = viewModel.archiveCopyProgress {
+                ArchiveCopyProgressView(activity: activity) {
+                    viewModel.cancelArchiveCopy()
+                }
+            }
+
             if let totalSize = model.totalSizeText {
                 Text(totalSize)
                     .font(settings.listDetailFont)
@@ -1200,6 +1206,37 @@ struct StatusBarView: View {
         }
         .onChange(of: ObjectIdentifier(viewModel)) { _, _ in
             model.bind(to: viewModel)
+        }
+    }
+}
+
+/// A slow copy out of an archive: what's being copied, how far it got, and Cancel.
+struct ArchiveCopyProgressView: View {
+    @EnvironmentObject private var settings: AppSettings
+    let activity: FileBrowserViewModel.ArchiveCopyActivity
+    let onCancel: () -> Void
+
+    var body: some View {
+        HStack(spacing: 6) {
+            Text(activity.title)
+                .font(settings.listDetailFont)
+                .foregroundColor(.secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            // The extraction updates `progress` off the main thread; sample it for display
+            TimelineView(.periodic(from: .now, by: 0.1)) { _ in
+                ProgressView(value: min(1, max(0, activity.progress.fractionCompleted)))
+                    .progressViewStyle(.linear)
+                    .controlSize(.small)
+                    .frame(width: 120)
+            }
+            Button(action: onCancel) {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundColor(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .help("Stop copying")
+            .accessibilityLabel("Stop copying")
         }
     }
 }
@@ -1359,9 +1396,19 @@ struct TabContentWrapper: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
 
-            // Status bar
+            // Status bar (an archive copy-out in progress shows even when it's hidden)
             if settings.showStatusBar {
                 StatusBarView(viewModel: viewModel)
+            } else if let activity = viewModel.archiveCopyProgress {
+                HStack {
+                    Spacer()
+                    ArchiveCopyProgressView(activity: activity) {
+                        viewModel.cancelArchiveCopy()
+                    }
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 4)
+                .background(Color(nsColor: .windowBackgroundColor))
             }
         }
     }
