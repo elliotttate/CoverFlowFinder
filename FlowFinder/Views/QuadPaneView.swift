@@ -134,6 +134,7 @@ struct QuadPaneView: View {
                 viewModel.selectItem(first)
             }
         }
+        .background(PaneFocusRequestHandler(activeViewModel: activeViewModel))
         // Same guarded, per-window handling as the single-pane views; keys go to the active pane.
         // The closures read the active pane, its mode and column count when the key is pressed.
         .keyboardNavigable(
@@ -161,22 +162,6 @@ struct QuadPaneCell: View {
     let onActivate: () -> Void
     let onColumnsCalculated: (Int) -> Void
     @State private var isDropTargeted = false
-    @State private var isEditingPath = false
-    @State private var editPathText = ""
-    @FocusState private var isPathFieldFocused: Bool
-
-    private var pathComponents: [URL] {
-        var components: [URL] = []
-        var current = viewModel.currentPath
-
-        while current.path != "/" {
-            components.insert(current, at: 0)
-            current = current.deletingLastPathComponent()
-        }
-        components.insert(URL(fileURLWithPath: "/"), at: 0)
-
-        return components
-    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -195,7 +180,7 @@ struct QuadPaneCell: View {
                 .disabled(viewModel.historyIndex >= viewModel.navigationHistory.count - 1)
                 .buttonStyle(.borderless)
 
-                Text(viewModel.currentPath.finderDisplayName)
+                Text(viewModel.locationTitle)
                     .font(.caption.bold())
                     .lineLimit(1)
                     .truncationMode(.middle)
@@ -220,64 +205,7 @@ struct QuadPaneCell: View {
             Divider()
 
             if appSettings.showPathBar {
-                HStack(spacing: 2) {
-                    if isEditingPath {
-                        TextField("Path", text: $editPathText)
-                            .textFieldStyle(.plain)
-                            .font(.caption2)
-                            .focused($isPathFieldFocused)
-                            .onSubmit { navigateToEditedPath() }
-                            .onExitCommand { cancelPathEditing() }
-                            .onAppear {
-                                editPathText = viewModel.currentPath.path
-                                isPathFieldFocused = true
-                            }
-
-                        Button(action: { navigateToEditedPath() }) {
-                            Image(systemName: "arrow.right.circle.fill")
-                                .font(.caption2)
-                                .foregroundColor(.accentColor)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: { cancelPathEditing() }) {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption2)
-                                .foregroundColor(.secondary)
-                        }
-                        .buttonStyle(.plain)
-                    } else {
-                        HStack(spacing: 2) {
-                            ForEach(pathComponents, id: \.self) { component in
-                                Text(component.lastPathComponent.isEmpty ? "/" : component.finderDisplayName)
-                                    .font(.caption2)
-                                    .padding(.horizontal, 4)
-                                    .padding(.vertical, 1)
-                                    .contentShape(Rectangle())
-                                    .onTapGesture {
-                                        viewModel.navigateToAndSelectCurrent(component)
-                                        onActivate()
-                                    }
-
-                                if component != viewModel.currentPath {
-                                    Image(systemName: "chevron.right")
-                                        .font(.system(size: 8))
-                                        .foregroundColor(.secondary)
-                                }
-                            }
-                        }
-
-                        Rectangle()
-                            .fill(Color.primary.opacity(0.001))
-                            .contentShape(Rectangle())
-                            .onTapGesture(count: 2) {
-                                startPathEditing()
-                            }
-                    }
-                }
-                .padding(.horizontal, 8)
-                .frame(height: 20)
-                .background(Color(nsColor: .textBackgroundColor).opacity(0.5))
+                PanePathBar(viewModel: viewModel, style: .quad, onActivate: onActivate)
 
                 Divider()
             }
@@ -304,24 +232,8 @@ struct QuadPaneCell: View {
 
             Divider()
 
-            if appSettings.showStatusBar {
-                HStack {
-                    Text("\(viewModel.filteredItems.count) items")
-                        .font(appSettings.compactListDetailFont)
-                        .foregroundColor(.secondary)
-
-                    Spacer()
-
-                    if !viewModel.selectedItems.isEmpty {
-                        Text("\(viewModel.selectedItems.count) selected")
-                            .font(appSettings.compactListDetailFont)
-                            .foregroundColor(.secondary)
-                    }
-                }
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(Color(nsColor: .controlBackgroundColor))
-            }
+            // An archive copy-out in progress shows even when the status bar is hidden
+            PaneStatusBar(viewModel: viewModel, horizontalPadding: 8, verticalPadding: 3)
         }
         .background(isActive ? Color.clear : Color(nsColor: .windowBackgroundColor).opacity(0.5))
         .overlay(
@@ -331,25 +243,6 @@ struct QuadPaneCell: View {
         .contentShape(Rectangle())
         .onTapGesture {
             onActivate()
-        }
-    }
-
-    private func startPathEditing() {
-        editPathText = viewModel.currentPath.path
-        isEditingPath = true
-    }
-
-    private func cancelPathEditing() {
-        isEditingPath = false
-        isPathFieldFocused = false
-    }
-
-    private func navigateToEditedPath() {
-        if PathEntryResolver.navigate(viewModel, to: editPathText) {
-            cancelPathEditing()
-            onActivate()
-        } else {
-            NSSound.beep()
         }
     }
 }
@@ -428,7 +321,7 @@ struct QuadPaneListRow: View {
         .contentShape(Rectangle())
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
-        .internalDrag(url: item.url)
+        .internalDrag(item: item)
         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
@@ -630,7 +523,7 @@ struct QuadPaneIconCell: View {
         .contentShape(Rectangle())
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
-        .internalDrag(url: item.url)
+        .internalDrag(item: item)
         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,

@@ -11,6 +11,9 @@ struct FileTableView: NSViewRepresentable {
     let items: [FileItem]
     let tagRefreshToken: Int
     var onEmptySpaceClick: (() -> Void)? = nil
+    /// Whether `.focusFileList` requests focus this table. Off for the list under Cover Flow, where
+    /// Cover Flow takes them (exactly one view may respond).
+    var takesFocusRequests = true
 
     func makeCoordinator() -> FileTableCoordinator {
         FileTableCoordinator(
@@ -31,6 +34,7 @@ struct FileTableView: NSViewRepresentable {
         coordinator.columnConfig = columnConfig
         coordinator.appSettings = appSettings
         coordinator.onEmptySpaceClick = onEmptySpaceClick
+        coordinator.takesFocusRequests = takesFocusRequests
 
         // Ensure header menu is set up (in case it wasn't ready before)
         coordinator.ensureHeaderMenu()
@@ -368,6 +372,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     // Callback for empty space click (used by CoverFlow view)
     var onEmptySpaceClick: (() -> Void)?
+    /// See `FileTableView.takesFocusRequests`.
+    var takesFocusRequests = true
 
     /// True while an inline rename is in progress (derived from the cell's field editor).
     var isCurrentlyEditing: Bool {
@@ -1497,7 +1503,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     @objc func handleFocusFileList(_ notification: Notification) {
         // Focus the table view (e.g., after pressing Escape in search field). Only the table in the
         // key window, and only one that's on screen; the poster may also name a window or view model.
-        guard let tableView = tableView,
+        guard takesFocusRequests,
+              let tableView = tableView,
               let window = tableView.window,
               window.isKeyWindow,
               !tableView.isHiddenOrHasHiddenAncestor,

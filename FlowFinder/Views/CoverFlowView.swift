@@ -3226,7 +3226,9 @@ struct FileListSection: View {
             appSettings: appSettings,
             items: items,
             tagRefreshToken: viewModel.tagRefreshToken,
-            onEmptySpaceClick: onEmptySpaceClick
+            onEmptySpaceClick: onEmptySpaceClick,
+            // Cover Flow above handles `.focusFileList` (all its keys work there); only one view may
+            takesFocusRequests: false
         )
         // The table takes file drops itself; this catches what it doesn't (file promises) and
         // shows the badge of the operation that will happen.

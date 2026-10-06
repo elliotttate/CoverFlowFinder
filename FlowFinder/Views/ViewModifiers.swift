@@ -165,19 +165,31 @@ class InternalDragState: ObservableObject {
 // Wraps SwiftUI's onDrag to set internal drag state
 
 struct InternalDragModifier: ViewModifier {
-    let url: URL
+    let item: FileItem
+
+    /// Only real files are dragged: an entry inside an archive has no file at its URL (copy it out
+    /// with Copy instead), and network services aren't files. Same rule as the list view.
+    static func canDrag(_ item: FileItem) -> Bool {
+        !item.isFromArchive && item.url.isFileURL
+    }
 
     func body(content: Content) -> some View {
-        content.onDrag {
-            InternalDragState.shared.beginDrag(urls: [url])
-            return NSItemProvider(object: url as NSURL)
+        if Self.canDrag(item) {
+            let url = item.url
+            content.onDrag {
+                InternalDragState.shared.beginDrag(urls: [url])
+                return NSItemProvider(object: url as NSURL)
+            }
+        } else {
+            content
         }
     }
 }
 
 extension View {
-    /// Adds drag support that marks the drag as internal (from within the app)
-    func internalDrag(url: URL) -> some View {
-        modifier(InternalDragModifier(url: url))
+    /// Adds drag support for `item` that marks the drag as internal (from within the app).
+    /// Items that can't be dragged as files (archive entries) get none.
+    func internalDrag(item: FileItem) -> some View {
+        modifier(InternalDragModifier(item: item))
     }
 }

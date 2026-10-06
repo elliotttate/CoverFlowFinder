@@ -882,7 +882,7 @@ struct MasonryItemView: View {
         .onHover { hovering in
             isHovering = hovering
         }
-        .internalDrag(url: item.url)
+        .internalDrag(item: item)
         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,

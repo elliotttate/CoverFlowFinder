@@ -14,6 +14,23 @@ struct SidebarView: View {
     }
 }
 
+/// Where files dropped on a favorite row go: into the favorite folder (the middle of the row) or
+/// between rows as new favorites (the edges, shown as the insertion line). Dragged folders are more
+/// likely meant to become favorites, so their edges are wider and near a row boundary insertion wins.
+enum FavoriteRowDropZone: Equatable {
+    case before
+    case into
+    case after
+
+    /// `fraction` is the pointer's position down the row (0 = top edge, 1 = bottom edge).
+    static func zone(fraction: CGFloat, isDraggingFolders: Bool) -> FavoriteRowDropZone {
+        let edge: CGFloat = isDraggingFolders ? 0.3 : 0.25
+        if fraction < edge { return .before }
+        if fraction >= 1 - edge { return .after }
+        return .into
+    }
+}
+
 struct SidebarOutlineView: NSViewRepresentable {
     @ObservedObject var appSettings: AppSettings
     @ObservedObject var viewModel: FileBrowserViewModel
@@ -99,6 +116,7 @@ struct SidebarOutlineView: NSViewRepresentable {
         private var environment: SidebarEnvironment
         private var isUpdatingSelection = false
         private var volumeComparisonCache: (sequence: Int, destination: URL, sameVolume: Bool)?
+        private var folderDragCache: (sequence: Int, isFolders: Bool)?
         /// File promises are written on this queue so large files don't block the UI.
         private let filePromiseQueue: OperationQueue = {
             let queue = OperationQueue()
@@ -640,6 +658,23 @@ struct SidebarOutlineView: NSViewRepresentable {
             }
         }
 
+        /// Whether everything dragged is a folder (not a package), read once per drag.
+        private func isDraggingFolders(_ info: NSDraggingInfo) -> Bool {
+            if let cached = folderDragCache, cached.sequence == info.draggingSequenceNumber {
+                return cached.isFolders
+            }
+            let urls = (info.draggingPasteboard.readObjects(
+                forClasses: [NSURL.self],
+                options: [.urlReadingFileURLsOnly: true]
+            ) as? [URL]) ?? []
+            let isFolders = !urls.isEmpty && urls.allSatisfy { url in
+                let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
+                return values?.isDirectory == true && values?.isPackage != true
+            }
+            folderDragCache = (info.draggingSequenceNumber, isFolders)
+            return isFolders
+        }
+
         private func draggingFavoriteIDs(from pasteboard: NSPasteboard) -> [String] {
             guard let items = pasteboard.pasteboardItems else { return [] }
             return items.compactMap { $0.string(forType: internalDragType) }
@@ -648,7 +683,7 @@ struct SidebarOutlineView: NSViewRepresentable {
         /// Where a drag over the sidebar would land. The Favorites header inserts at the start; the strip below the
         /// last favorite, through the next section's header, appends; over a row, the upper half inserts before it
         /// and the lower half after it, except that external files dropped on the middle of a favorite go into that
-        /// folder. Between rows, the nearest row decides.
+        /// folder (see `FavoriteRowDropZone`). Between rows, the nearest row decides.
         private func dropTarget(for info: NSDraggingInfo,
                                 in favoritesSection: SidebarSection,
                                 isInternal: Bool,
@@ -715,9 +750,11 @@ struct SidebarOutlineView: NSViewRepresentable {
                case let .favorite(resolution) = item.kind,
                resolution.isAvailable,
                resolution.url != nil {
-                if fraction < 0.25 { return insertion(at: sectionIndex) }
-                if fraction >= 0.75 { return insertion(at: sectionIndex + 1) }
-                return .onFavorite(item)
+                switch FavoriteRowDropZone.zone(fraction: fraction, isDraggingFolders: isDraggingFolders(info)) {
+                case .before: return insertion(at: sectionIndex)
+                case .after: return insertion(at: sectionIndex + 1)
+                case .into: return .onFavorite(item)
+                }
             }
 
             return insertion(at: fraction < 0.5 ? sectionIndex : sectionIndex + 1)

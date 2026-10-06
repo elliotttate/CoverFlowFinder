@@ -251,12 +251,9 @@ struct BrowserCommands: Commands {
 
             Divider()
 
+            // Always the sheet, for the key window's active pane (that window resolves the pane)
             Button("Go to Folder…") {
-                guard let viewModel, let window = KeyboardManager.shared.keyBrowserWindow() else {
-                    NSSound.beep()
-                    return
-                }
-                GoToFolderPrompt.present(for: viewModel, in: window)
+                BrowserWindowCommand.post(.browserGoToFolder)
             }
             .keyboardShortcut("g", modifiers: [.command, .shift])
         }

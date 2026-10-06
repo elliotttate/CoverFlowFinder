@@ -195,12 +195,6 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         return "\(text).\(ext)"
     }
 
-    /// The edited name without the hidden extension (the view model re-appends it on Tab/⇧Tab).
-    static func baseName(fromEditedText text: String, hiddenExtension ext: String) -> String {
-        guard !ext.isEmpty, text.lowercased().hasSuffix("." + ext.lowercased()) else { return text }
-        return String(text.dropLast(ext.count + 1))
-    }
-
     /// The field text, or nil when it's blank or unchanged (nothing to rename). Not trimmed:
     /// leading and trailing spaces are part of the name, as in Finder.
     private func editedTextIfChanged(for item: FileItem) -> String? {
@@ -357,16 +351,17 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         return false
     }
 
-    /// The base name to hand to the view model's rename-and-advance ("" = don't rename).
-    private func editedBaseName(for item: FileItem) -> String {
-        guard let editedText = editedTextIfChanged(for: item) else { return "" }
-        return Self.baseName(fromEditedText: editedText, hiddenExtension: Self.hiddenExtension(for: item))
+    /// The text to hand to the view model's rename-and-advance ("" = don't rename): the text as typed.
+    /// The view model applies the same naming rule as Return (`FileItem.newName(forEditedText:)`), so
+    /// a typed extension, or a change to its case ("Foo.TXT"), is kept.
+    private func renameAndAdvanceText(for item: FileItem) -> String {
+        editedTextIfChanged(for: item) ?? ""
     }
 
     private func commitRenameAndMoveNext() {
         guard isEditing, let item = currentItem else { return }
 
-        let newName = editedBaseName(for: item)
+        let newName = renameAndAdvanceText(for: item)
         endEditingMode(refocusTable: true)
         delegate?.fileNameCellView(self, commitRenameAndMoveNext: item, newName: newName)
     }
@@ -374,7 +369,7 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
     private func commitRenameAndMovePrevious() {
         guard isEditing, let item = currentItem else { return }
 
-        let newName = editedBaseName(for: item)
+        let newName = renameAndAdvanceText(for: item)
         endEditingMode(refocusTable: true)
         delegate?.fileNameCellView(self, commitRenameAndMovePrevious: item, newName: newName)
     }

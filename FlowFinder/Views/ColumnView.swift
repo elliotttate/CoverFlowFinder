@@ -763,14 +763,13 @@ enum ColumnBrowsing {
         if lstat(folder.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFLNK {
             directoryToList = folder.resolvingSymlinksInPath()
         }
-        var contents = try FileManager.default.contentsOfDirectory(
+        let listed = try FileManager.default.contentsOfDirectory(
             at: directoryToList,
             includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey, .isPackageKey],
             options: showHiddenFiles ? [] : [.skipsHiddenFiles]
         )
-        if directoryToList != folder {
-            contents = contents.map { folder.appendingPathComponent($0.lastPathComponent, isDirectory: $0.hasDirectoryPath) }
-        }
+        // Children keep the folder's path form (/tmp rather than /private/tmp, the link's path)
+        let contents = URL.childURLs(listed, reRootedUnder: folder)
         let fileItems = contents.map { url in
             // Warm the package cache from the prefetched value
             _ = isPackage(url)
@@ -872,7 +871,7 @@ struct SingleColumnView: View {
                                 .opacity(dropTargetedItemID == item.id ? 1 : 0)
                         )
                         .contentShape(Rectangle())
-                        .internalDrag(url: item.url)
+                        .internalDrag(item: item)
                         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                             item: item,
                             viewModel: viewModel,
