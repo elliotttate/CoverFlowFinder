@@ -992,7 +992,14 @@ class FileBrowserViewModel: ObservableObject {
     private let photosImageManager = PHCachingImageManager()
     private var photosAssetCache: [String: PHAsset] = [:]
     private var photosAspectRatioCache: [String: CGFloat] = [:]
-    private var photosThumbnailRequests: [String: PHImageRequestID] = [:]
+    /// In-flight Photos thumbnail requests by "identifier-size"; callers asking for the same
+    /// thumbnail meanwhile wait for the same result.
+    private struct PhotoThumbnailRequest {
+        let token: UUID
+        var requestID: PHImageRequestID?
+        var completions: [(NSImage?, CGFloat?) -> Void]
+    }
+    private var photosThumbnailRequests: [String: PhotoThumbnailRequest] = [:]
     private var photosExportCache: [String: URL] = [:]
     private var isRequestingPhotosAccess = false
     private var pendingPhotosAccessCompletions: [(PHAuthorizationStatus) -> Void] = []
@@ -1304,6 +1311,33 @@ class FileBrowserViewModel: ObservableObject {
                 self.loadContents()
             }
             .store(in: &cancellables)
+
+        // Sent on the main queue
+        CloudStatusManager.shared.statusChanged
+            .sink { [weak self] url in
+                self?.cloudStatusDidChange(for: url)
+            }
+            .store(in: &cancellables)
+
+        // Posted on the main thread right before a volume is ejected
+        NotificationCenter.default.publisher(for: .volumeWillUnmount)
+            .sink { [weak self] notification in
+                guard let volumeURL = notification.userInfo?[AppNotificationKey.url] as? URL else { return }
+                self?.volumeWillUnmount(volumeURL)
+            }
+            .store(in: &cancellables)
+    }
+
+    /// Stops watching (and Spotlight-searching) a folder on a volume that's about to be unmounted,
+    /// so our FSEvents stream doesn't make the eject fail as "in use". The window shell navigates
+    /// panes away from the volume.
+    private func volumeWillUnmount(_ volumeURL: URL) {
+        let volumeKey = volumeURL.standardizedPathKey
+        guard volumeKey != "/" else { return }
+        let folderKey = currentPath.standardizedPathKey
+        guard folderKey == volumeKey || folderKey.hasPrefix(volumeKey + "/") else { return }
+        stopDirectoryWatcher()
+        cancelSearch()
     }
 
     func setBackgroundWorkActive(_ isActive: Bool) {
@@ -1980,6 +2014,22 @@ class FileBrowserViewModel: ObservableObject {
 
     // MARK: - Cloud Status Hydration
 
+    /// `CloudStatusManager` announced a changed status (item invalidated after a file-system event,
+    /// download/eviction progress, or a whole folder): re-hydrate what we show.
+    private func cloudStatusDidChange(for url: URL) {
+        guard currentFolderIsInICloud, !isInsideArchive, photosLibraryInfo == nil, !isTornDown else { return }
+        let key = url.standardizedPathKey
+        if key == currentPath.standardizedPathKey {
+            // The folder itself: refresh every status loaded so far (all of them in small folders)
+            let urls = items.count <= directoryBatchSize ? items.map(\.url) : Array(cloudStatusLoadedURLs)
+            cloudStatusLoadedURLs.removeAll()
+            hydrateCloudStatus(for: urls)
+        } else if let id = itemIDsByPath[key], let item = items.first(where: { $0.id == id }) {
+            cloudStatusLoadedURLs.remove(item.url)
+            hydrateCloudStatus(for: [item.url])
+        }
+    }
+
     /// Request cloud status loading for specific items. `hydrateMetadata(for:)` calls this for
     /// iCloud folders, and loads call it for small iCloud folders.
     func hydrateCloudStatus(for urls: [URL]) {
@@ -2082,7 +2132,10 @@ class FileBrowserViewModel: ObservableObject {
         directoryWatcher?.start(watching: watchPath)
     }
 
-    private func stopDirectoryWatcher() {
+    /// Stops the FSEvents stream for the current folder (synchronously). Called internally when
+    /// leaving a folder, and by the window shell before ejecting the volume the folder is on;
+    /// the next load of a folder starts watching again.
+    func stopDirectoryWatcher() {
         watchedFolderKey = nil
         directoryEventWorkItem?.cancel()
         directoryEventWorkItem = nil
@@ -2267,11 +2320,11 @@ class FileBrowserViewModel: ObservableObject {
             tagRefreshToken &+= 1
         }
         if !cloudURLsToRefresh.isEmpty {
+            // Its `statusChanged` announcements re-hydrate these (see `cloudStatusDidChange`)
             for url in cloudURLsToRefresh {
-                CloudStatusManager.shared.invalidateCache(for: url)
+                CloudStatusManager.shared.invalidate(url: url)
                 cloudStatusLoadedURLs.remove(url)
             }
-            hydrateCloudStatus(for: cloudURLsToRefresh)
         }
     }
 
@@ -2694,7 +2747,14 @@ class FileBrowserViewModel: ObservableObject {
         }
 
         let requestKey = "\(identifier)-\(Int(targetPixelSize))"
-        if photosThumbnailRequests[requestKey] != nil { return }
+        if photosThumbnailRequests[requestKey] != nil {
+            // Already requested: this caller gets the same result
+            photosThumbnailRequests[requestKey]?.completions.append(completion)
+            return
+        }
+
+        let token = UUID()
+        photosThumbnailRequests[requestKey] = PhotoThumbnailRequest(token: token, requestID: nil, completions: [completion])
 
         let options = PHImageRequestOptions()
         options.isNetworkAccessAllowed = true
@@ -2707,18 +2767,40 @@ class FileBrowserViewModel: ObservableObject {
             targetSize: targetSize,
             contentMode: .aspectFill,
             options: options
-        ) { [weak self] image, _ in
-            guard let self else { return }
+        ) { [weak self] image, info in
+            // Opportunistic delivery: maybe a degraded image first, then the final one
+            let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
             DispatchQueue.main.async {
-                self.photosThumbnailRequests.removeValue(forKey: requestKey)
+                guard let self, let request = self.photosThumbnailRequests[requestKey], request.token == token else { return }
+                if !isDegraded {
+                    self.photosThumbnailRequests.removeValue(forKey: requestKey)
+                }
                 let ratio = asset.pixelHeight > 0
                     ? CGFloat(asset.pixelWidth) / CGFloat(asset.pixelHeight)
                     : nil
-                completion(image, ratio)
+                for waiting in request.completions {
+                    waiting(image, ratio)
+                }
             }
         }
 
-        photosThumbnailRequests[requestKey] = requestID
+        if photosThumbnailRequests[requestKey]?.token == token {
+            photosThumbnailRequests[requestKey]?.requestID = requestID
+        }
+    }
+
+    /// Cancels in-flight Photos thumbnail requests; their callers get (nil, nil).
+    private func cancelPhotoThumbnailRequests() {
+        let requests = photosThumbnailRequests.values
+        photosThumbnailRequests.removeAll()
+        for request in requests {
+            if let requestID = request.requestID {
+                photosImageManager.cancelImageRequest(requestID)
+            }
+            for waiting in request.completions {
+                waiting(nil, nil)
+            }
+        }
     }
 
     func photoAssetDragInfo(for item: FileItem) -> PhotoAssetDragInfo? {
@@ -2846,7 +2928,7 @@ class FileBrowserViewModel: ObservableObject {
     private func clearPhotosCaches() {
         photosAssetCache.removeAll()
         photosAspectRatioCache.removeAll()
-        photosThumbnailRequests.removeAll()
+        cancelPhotoThumbnailRequests()
         photosExportCache.removeAll()
         photosImageManager.stopCachingImagesForAllAssets()
         photosSortState = nil
@@ -3449,8 +3531,10 @@ class FileBrowserViewModel: ObservableObject {
         if !isInsideArchive, photosLibraryInfo == nil, currentPath.path != "/Network" {
             // Tags and iCloud status can change behind our back (e.g. edited in Finder)
             FileTagManager.invalidateCache(forDirectory: currentPath)
-            CloudStatusManager.shared.invalidateCacheForDirectory(currentPath)
-            cloudStatusLoadedURLs.removeAll()
+            if currentFolderIsInICloud {
+                CloudStatusManager.shared.invalidate(directory: currentPath)
+                cloudStatusLoadedURLs.removeAll()
+            }
             tagRefreshToken &+= 1
         }
         loadContents()
