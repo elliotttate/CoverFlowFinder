@@ -87,9 +87,12 @@ class ThumbnailCacheManager {
     private let legacyDiskCacheURLs: [URL]
     private let maxDiskCacheBytes: Int
     private var diskCacheBytes = 0  // ioQueue only
+    private var isPruneScheduled = false  // ioQueue only
     private let fileManager = FileManager.default
-    /// Serial queue for all disk-cache reads, writes and pruning.
+    /// Serial queue for disk-cache reads and writes.
     private let ioQueue = DispatchQueue(label: "com.flowfinder.thumbnailcache.io", qos: .userInitiated)
+    /// Pruning (thousands of deletions) runs here, so it never holds up lookups on `ioQueue`.
+    private let pruneQueue = DispatchQueue(label: "com.flowfinder.thumbnailcache.prune", qos: .utility)
     /// Bounded pool for decoding and rendering, so a grid full of requests doesn't spawn a thread each.
     private let workQueue: OperationQueue = {
         let queue = OperationQueue()
@@ -109,7 +112,11 @@ class ThumbnailCacheManager {
 
     // MARK: - Request Tracking (all guarded by stateLock)
     private final class Job {
+        /// Identifies the job in `jobs`, so requests for the same thumbnail share it.
         let key: String
+        /// Memory and disk cache key. Equal to `key`, except for a job that had to look up the
+        /// file's version first (set before the cache is used).
+        var cacheKey: String
         var waiters: [Waiter] = []
         var qlRequest: QLThumbnailGenerator.Request?
         var isCancelled = false
@@ -117,6 +124,7 @@ class ThumbnailCacheManager {
 
         init(key: String) {
             self.key = key
+            self.cacheKey = key
         }
     }
 
@@ -134,9 +142,12 @@ class ThumbnailCacheManager {
     private let stateLock = NSLock()
     private var jobs: [String: Job] = [:]
     private var jobsByToken: [UInt64: Job] = [:]
+    /// Waiters whose job finished and whose result is queued for the main thread.
+    private var deliveringByToken: [UInt64: Waiter] = [:]
     private var tokensByOwner: [UInt64: Set<UInt64>] = [:]
     private var failures: [String: FailureRecord] = [:]  // path -> failed version
     private var versionCache: [String: (version: ThumbnailFileVersion, date: Date)] = [:]
+    private static let versionCacheLimit = 4096
     private var lastToken: UInt64 = 0
 
     // MARK: - Settings
@@ -178,19 +189,31 @@ class ThumbnailCacheManager {
         memoryCache.countLimit = maxMemoryCacheCount
         memoryCache.totalCostLimit = maxMemoryCacheCost
 
-        ioQueue.async { [weak self] in
+        pruneQueue.async { [weak self] in
             self?.prepareDiskCache()
         }
     }
 
     // MARK: - File Versions
 
-    /// The version used for cache keys. Items with loaded metadata need no filesystem access.
+    /// The version used for cache keys. Items with loaded metadata need no filesystem access; for
+    /// others the file is read (see `fileVersion(for: URL)`), so don't call this on the main thread
+    /// for such items — the item-based lookups below never do.
     func fileVersion(for item: FileItem) -> ThumbnailFileVersion {
+        knownFileVersion(for: item) ?? fileVersion(for: item.url)
+    }
+
+    /// The version from the item's metadata or a recent lookup, without touching the file system
+    /// (which can stall on network volumes). Nil means it has to be read first.
+    private func knownFileVersion(for item: FileItem) -> ThumbnailFileVersion? {
         if item.hasMetadata, let date = item.modificationDate {
             return ThumbnailFileVersion(path: item.url.path, modificationTime: date.timeIntervalSince1970, size: item.size)
         }
-        return fileVersion(for: item.url)
+        let path = item.url.path
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        guard let cached = versionCache[path], Date().timeIntervalSince(cached.date) < versionCacheTTL else { return nil }
+        return cached.version
     }
 
     /// Version for a bare URL: one resource-values read, trusted for a couple of seconds.
@@ -213,8 +236,13 @@ class ThumbnailCacheManager {
         )
 
         stateLock.lock()
-        if versionCache.count > 4096 {
+        if versionCache.count >= Self.versionCacheLimit {
             versionCache = versionCache.filter { now.timeIntervalSince($0.value.date) < versionCacheTTL }
+            // Still mostly fresh (a big folder scrolled quickly): start over rather than filtering
+            // again on every insert. Dropped entries are just read again.
+            if versionCache.count >= Self.versionCacheLimit * 3 / 4 {
+                versionCache.removeAll(keepingCapacity: true)
+            }
         }
         versionCache[path] = (version, now)
         stateLock.unlock()
@@ -224,7 +252,8 @@ class ThumbnailCacheManager {
     // MARK: - Public API
 
     /// Memory-cached thumbnail for a URL, or nil. Never touches the disk cache (use
-    /// `generateThumbnail`/`requestThumbnail`, which check it off the main thread).
+    /// `generateThumbnail`/`requestThumbnail`, which check it off the main thread), but reads the
+    /// file's version unless it was read recently; views use the item-based `cachedThumbnail(for:)`.
     func getCachedThumbnail(
         for url: URL,
         maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize
@@ -241,7 +270,9 @@ class ThumbnailCacheManager {
         return memoryCache.object(forKey: key as NSString)
     }
 
-    /// Memory-cached thumbnail for an item, keyed on the item's metadata.
+    /// Memory-cached thumbnail for an item, keyed on the item's metadata. Never touches the file
+    /// system: for an item without metadata whose version isn't known yet this is a miss
+    /// (`requestThumbnail` looks it up off the calling thread).
     func cachedThumbnail(
         for item: FileItem,
         maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize
@@ -250,19 +281,23 @@ class ThumbnailCacheManager {
         if item.isDirectory {
             return memoryCache.object(forKey: directoryKey(path: item.url.path, maxPixelSize: maxPixelSize) as NSString)
         }
-        let key = thumbnailKey(fileVersion(for: item), maxPixelSize: maxPixelSize)
+        guard let version = knownFileVersion(for: item) else { return nil }
+        let key = thumbnailKey(version, maxPixelSize: maxPixelSize)
         return memoryCache.object(forKey: key as NSString)
     }
 
-    /// Whether the current version of the file failed to produce a thumbnail.
+    /// Whether the current version of the file failed to produce a thumbnail (reads the file's version).
     func hasFailed(url: URL) -> Bool {
         if url.path.utf8.contains(35) { return false }
         return hasFailed(version: fileVersion(for: url))
     }
 
+    /// Like `hasFailed(url:)`, without touching the file system (false while the version of an item
+    /// without metadata isn't known).
     func hasFailed(item: FileItem) -> Bool {
         if item.isFromArchive || item.isDirectory { return false }
-        return hasFailed(version: fileVersion(for: item))
+        guard let version = knownFileVersion(for: item) else { return false }
+        return hasFailed(version: version)
     }
 
     private func hasFailed(version: ThumbnailFileVersion) -> Bool {
@@ -293,12 +328,17 @@ class ThumbnailCacheManager {
 
     func isPending(item: FileItem, maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize) -> Bool {
         guard !item.isFromArchive else { return false }
-        let key = item.isDirectory
-            ? directoryKey(path: item.url.path, maxPixelSize: maxPixelSize)
-            : thumbnailKey(fileVersion(for: item), maxPixelSize: maxPixelSize)
+        let keys: [String]
+        if item.isDirectory {
+            keys = [directoryKey(path: item.url.path, maxPixelSize: maxPixelSize)]
+        } else if let version = knownFileVersion(for: item) {
+            keys = [thumbnailKey(version, maxPixelSize: maxPixelSize), unknownVersionKey(path: item.url.path, maxPixelSize: maxPixelSize)]
+        } else {
+            keys = [unknownVersionKey(path: item.url.path, maxPixelSize: maxPixelSize)]
+        }
         stateLock.lock()
         defer { stateLock.unlock() }
-        return jobs[key] != nil
+        return keys.contains { jobs[$0] != nil }
     }
 
     /// Kept for source compatibility. Pending requests are no longer invalidated globally;
@@ -339,6 +379,7 @@ class ThumbnailCacheManager {
     /// Request a thumbnail on behalf of `owner`. Requests for the same file and size share one
     /// job. The completion is always called exactly once, on the main queue, or synchronously when
     /// the result is already known (memory cache hit, known failure); in that case nil is returned.
+    /// Never touches the file system on the calling thread.
     @discardableResult
     func requestThumbnail(
         for item: FileItem,
@@ -372,7 +413,30 @@ class ThumbnailCacheManager {
             }
         }
 
-        let version = fileVersion(for: item)
+        guard let version = knownFileVersion(for: item) else {
+            // No metadata: read the file's version on the work queue (slow volumes), then go on as below
+            let key = unknownVersionKey(path: item.url.path, maxPixelSize: targetSize)
+            return enqueue(key: key, owner: owner, completion: completion) { job in
+                self.workQueue.addOperation { [weak self] in
+                    guard let self, !self.isCancelled(job) else { return }
+                    let version = self.fileVersion(for: item.url)
+                    if self.hasFailed(version: version) {
+                        self.finish(job, result: .failed, cgImage: nil, version: nil)
+                        return
+                    }
+                    let cacheKey = self.thumbnailKey(version, maxPixelSize: targetSize)
+                    self.stateLock.lock()
+                    job.cacheKey = cacheKey
+                    self.stateLock.unlock()
+                    if let cached = self.memoryCache.object(forKey: cacheKey as NSString) {
+                        self.finish(job, result: .loaded(cached), cgImage: nil, version: version, cacheResult: false)
+                        return
+                    }
+                    self.startThumbnailJob(job, url: item.url, version: version, pixelSize: targetSize)
+                }
+            }
+        }
+
         if hasFailed(version: version) {
             completion(.failed)
             return nil
@@ -389,8 +453,10 @@ class ThumbnailCacheManager {
         }
     }
 
-    /// Cancel one request. Its completion is called with `.cancelled`; the underlying work stops
-    /// once no other request is waiting for it.
+    /// Cancel one request. Its completion is called with `.cancelled` — before this returns when
+    /// called on the main thread — unless it has already run; either way it never runs again, so a
+    /// new request made right after can't receive a stale answer. The underlying work stops once no
+    /// other request is waiting for it.
     func cancel(_ token: ThumbnailRequestToken) {
         cancel(tokenIDs: [token.id])
     }
@@ -415,6 +481,12 @@ class ThumbnailCacheManager {
 
         stateLock.lock()
         for tokenID in tokenIDs {
+            if let waiter = deliveringByToken.removeValue(forKey: tokenID) {
+                // Finished, but the result hasn't reached the main thread yet: the cancel wins
+                removeOwnerToken(waiter)
+                cancelledWaiters.append(waiter)
+                continue
+            }
             guard let job = jobsByToken.removeValue(forKey: tokenID),
                   let index = job.waiters.firstIndex(where: { $0.token == tokenID }) else { continue }
             let waiter = job.waiters.remove(at: index)
@@ -437,12 +509,21 @@ class ThumbnailCacheManager {
         for request in requestsToCancel {
             QLThumbnailGenerator.shared.cancel(request)
         }
-        if !cancelledWaiters.isEmpty {
+        guard !cancelledWaiters.isEmpty else { return }
+        if Thread.isMainThread {
+            Self.deliver(.cancelled, to: cancelledWaiters)
+        } else {
             DispatchQueue.main.async {
-                for waiter in cancelledWaiters {
-                    waiter.completion(.cancelled)
-                }
+                Self.deliver(.cancelled, to: cancelledWaiters)
             }
+        }
+    }
+
+    /// Main thread only. Each waiter is answered once: it was taken out of `jobsByToken` or
+    /// `deliveringByToken` (under stateLock) by whoever answers it.
+    private static func deliver(_ result: ThumbnailRequestResult, to waiters: [Waiter]) {
+        for waiter in waiters {
+            waiter.completion(result)
         }
     }
 
@@ -498,8 +579,10 @@ class ThumbnailCacheManager {
         }
     }
 
-    /// Complete a job: cache the result, record failures, and call every waiter on main.
-    private func finish(_ job: Job, result: ThumbnailRequestResult, cgImage: CGImage?, version: ThumbnailFileVersion?) {
+    /// Complete a job: cache the result (unless `cacheResult` is false), record failures, and call
+    /// every waiter on main.
+    private func finish(_ job: Job, result: ThumbnailRequestResult, cgImage: CGImage?, version: ThumbnailFileVersion?,
+                        cacheResult: Bool = true) {
         stateLock.lock()
         guard !job.isFinished else {
             stateLock.unlock()
@@ -507,6 +590,7 @@ class ThumbnailCacheManager {
         }
         job.isFinished = true
         job.qlRequest = nil
+        let cacheKey = job.cacheKey
         // Only remove our own entry; a newer job for the same key may have replaced it.
         if jobs[job.key] === job {
             jobs.removeValue(forKey: job.key)
@@ -515,7 +599,8 @@ class ThumbnailCacheManager {
         job.waiters = []
         for waiter in waiters {
             jobsByToken.removeValue(forKey: waiter.token)
-            removeOwnerToken(waiter)
+            // Still cancellable (by token or owner) until the result reaches the main thread
+            deliveringByToken[waiter.token] = waiter
         }
         if let version {
             switch result {
@@ -529,25 +614,33 @@ class ThumbnailCacheManager {
         }
         stateLock.unlock()
 
-        if case .loaded(let image) = result {
-            memoryCache.setObject(image, forKey: job.key as NSString, cost: estimateCost(for: image))
+        if cacheResult, case .loaded(let image) = result {
+            memoryCache.setObject(image, forKey: cacheKey as NSString, cost: estimateCost(for: image))
             if let cgImage {
-                saveToDisk(cgImage: cgImage, key: job.key)
+                saveToDisk(cgImage: cgImage, key: cacheKey)
             }
         }
 
         guard !waiters.isEmpty else { return }
-        DispatchQueue.main.async {
-            for waiter in waiters {
-                waiter.completion(result)
+        DispatchQueue.main.async { [self] in
+            stateLock.lock()
+            // Those cancelled meanwhile were removed (and answered) by cancel(tokenIDs:)
+            let pending = waiters.filter { deliveringByToken.removeValue(forKey: $0.token) != nil }
+            for waiter in pending {
+                removeOwnerToken(waiter)
             }
+            stateLock.unlock()
+            Self.deliver(result, to: pending)
         }
     }
 
     private func startThumbnailJob(_ job: Job, url: URL, version: ThumbnailFileVersion, pixelSize: CGFloat) {
+        stateLock.lock()
+        let cacheKey = job.cacheKey
+        stateLock.unlock()
         ioQueue.async { [weak self] in
             guard let self, !self.isCancelled(job) else { return }
-            if let data = self.readFromDisk(key: job.key) {
+            if let data = self.readFromDisk(key: cacheKey) {
                 self.workQueue.addOperation { [weak self] in
                     guard let self else { return }
                     if let cgImage = Self.decodeImage(data) {
@@ -580,7 +673,7 @@ class ThumbnailCacheManager {
         if Self.directImageExtensions.contains(url.pathExtension.lowercased()) {
             // QuickLook first: it serves its own thumbnail cache. It still generates when that
             // misses (there's no timeout), so fall back to ImageIO only when it fails.
-            requestQuickLook(for: job, url: url, pixelSize: pixelSize, types: [.thumbnail]) { [weak self] cgImage in
+            requestQuickLook(for: job, url: url, pixelSize: pixelSize, types: [.thumbnail]) { [weak self] cgImage, _ in
                 guard let self else { return }
                 if let cgImage {
                     self.finish(job, result: .loaded(Self.makeImage(cgImage)), cgImage: cgImage, version: version)
@@ -589,9 +682,13 @@ class ThumbnailCacheManager {
                 }
             }
         } else {
-            requestQuickLook(for: job, url: url, pixelSize: pixelSize, types: [.thumbnail, .icon]) { [weak self] cgImage in
+            requestQuickLook(for: job, url: url, pixelSize: pixelSize, types: [.thumbnail, .icon]) { [weak self] cgImage, isIcon in
                 guard let self else { return }
-                if let cgImage {
+                if let cgImage, isIcon {
+                    // Only the file's icon (no thumbnail yet, e.g. an iCloud file that isn't downloaded):
+                    // shown, but not cached, so a later request can still get the real thumbnail
+                    self.finish(job, result: .loaded(Self.makeImage(cgImage)), cgImage: nil, version: version, cacheResult: false)
+                } else if let cgImage {
                     self.finish(job, result: .loaded(Self.makeImage(cgImage)), cgImage: cgImage, version: version)
                 } else {
                     self.finish(job, result: .failed, cgImage: nil, version: version)
@@ -605,7 +702,7 @@ class ThumbnailCacheManager {
         url: URL,
         pixelSize: CGFloat,
         types: QLThumbnailGenerator.Request.RepresentationTypes,
-        completion: @escaping (CGImage?) -> Void
+        completion: @escaping (_ image: CGImage?, _ isIcon: Bool) -> Void
     ) {
         let request = QLThumbnailGenerator.Request(
             fileAt: url,
@@ -624,7 +721,7 @@ class ThumbnailCacheManager {
         guard shouldStart else { return }
 
         QLThumbnailGenerator.shared.generateBestRepresentation(for: request) { thumbnail, _ in
-            completion(thumbnail?.cgImage)
+            completion(thumbnail?.cgImage, thumbnail?.type == .icon)
         }
     }
 
@@ -632,9 +729,10 @@ class ThumbnailCacheManager {
         workQueue.addOperation { [weak self] in
             guard let self, !self.isCancelled(job) else { return }
 
-            // Reading a cloud file that isn't downloaded would download it.
+            // Reading a cloud file that isn't downloaded would download it. Not recorded as a
+            // failure: once downloaded (same version) it is tried again.
             guard Self.isLocallyAvailable(url) else {
-                self.finish(job, result: .failed, cgImage: nil, version: version)
+                self.finish(job, result: .failed, cgImage: nil, version: nil)
                 return
             }
 
@@ -919,6 +1017,11 @@ class ThumbnailCacheManager {
         "dir_\(Int(clampPixelSize(maxPixelSize)))_\(path)"
     }
 
+    /// Job key for a file whose version is read off the calling thread (never a cache key).
+    private func unknownVersionKey(path: String, maxPixelSize: CGFloat) -> String {
+        "unknown_\(Int(clampPixelSize(maxPixelSize).rounded(.toNearestOrAwayFromZero)))_\(path)"
+    }
+
     private func clampPixelSize(_ size: CGFloat) -> CGFloat {
         min(max(size, Self.minimumPixelSize), 1536)
     }
@@ -1007,7 +1110,7 @@ class ThumbnailCacheManager {
         thumbnailKey(fileVersion(for: item), maxPixelSize: maxPixelSize)
     }
 
-    /// ioQueue: drop the legacy cache folder, enforce age and size limits, and total up the cache.
+    /// pruneQueue: drop the legacy cache folder, enforce age and size limits, and total up the cache.
     private func prepareDiskCache() {
         for legacyURL in legacyDiskCacheURLs where legacyURL.standardizedFileURL != diskCacheURL.standardizedFileURL {
             if fileManager.fileExists(atPath: legacyURL.path) {
@@ -1015,7 +1118,10 @@ class ThumbnailCacheManager {
             }
         }
         try? fileManager.createDirectory(at: diskCacheURL, withIntermediateDirectories: true)
-        pruneDiskCache(removingOlderThan: Date().addingTimeInterval(-diskCacheMaxAge))
+        let total = pruneDiskCache(removingOlderThan: Date().addingTimeInterval(-diskCacheMaxAge))
+        ioQueue.async { [weak self] in
+            self?.diskCacheBytes = total
+        }
     }
 
     /// Encode (from a CGImage we own, never an NSImage that's on screen) and write in the background.
@@ -1050,8 +1156,16 @@ class ThumbnailCacheManager {
             guard (try? data.write(to: target, options: .atomic)) != nil else { return }
         }
         diskCacheBytes += data.count
-        if diskCacheBytes > maxDiskCacheBytes {
-            pruneDiskCache(removingOlderThan: nil)
+        if diskCacheBytes > maxDiskCacheBytes && !isPruneScheduled {
+            isPruneScheduled = true
+            pruneQueue.async { [weak self] in
+                guard let self else { return }
+                let total = self.pruneDiskCache(removingOlderThan: nil)
+                self.ioQueue.async {
+                    self.diskCacheBytes = total
+                    self.isPruneScheduled = false
+                }
+            }
         }
     }
 
@@ -1111,17 +1225,16 @@ class ThumbnailCacheManager {
         return false
     }
 
-    /// ioQueue only. Removes files last used before `cutoff`, then the least recently used files
-    /// until the cache is below 80% of its size limit.
-    private func pruneDiskCache(removingOlderThan cutoff: Date?) {
+    /// pruneQueue only. Removes files last used before `cutoff`, then the least recently used files
+    /// until the cache is below 80% of its size limit. Returns the cache's size afterwards.
+    private func pruneDiskCache(removingOlderThan cutoff: Date?) -> Int {
         let keys: [URLResourceKey] = [.contentModificationDateKey, .totalFileAllocatedSizeKey, .fileSizeKey]
         guard let contents = try? fileManager.contentsOfDirectory(
             at: diskCacheURL,
             includingPropertiesForKeys: keys,
             options: [.skipsHiddenFiles]
         ) else {
-            diskCacheBytes = 0
-            return
+            return 0
         }
 
         var entries: [(url: URL, date: Date, size: Int)] = []
@@ -1148,20 +1261,25 @@ class ThumbnailCacheManager {
             }
             os_log(.debug, log: cacheLog, "Pruned thumbnail disk cache to %d bytes", total)
         }
-        diskCacheBytes = total
+        return total
     }
 
     /// Run any queued disk work and enforce the size limit now (tests).
     func flushDiskCache() {
         waitForDiskIO()
-        ioQueue.sync {
+        let total = pruneQueue.sync {
             pruneDiskCache(removingOlderThan: nil)
+        }
+        ioQueue.sync {
+            diskCacheBytes = total
         }
     }
 
-    /// Wait for queued encodes and disk writes (tests).
+    /// Wait for queued encodes, disk writes and pruning (tests).
     func waitForDiskIO() {
         encodeQueue.waitUntilAllOperationsAreFinished()
+        ioQueue.sync {}
+        pruneQueue.sync {}
         ioQueue.sync {}
     }
 

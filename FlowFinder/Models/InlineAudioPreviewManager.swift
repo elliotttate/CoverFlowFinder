@@ -82,6 +82,14 @@ final class InlineAudioPreviewManager: ObservableObject {
     private var statusObserver: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
 
+    /// The window the current preview was requested in (0 if unknown).
+    private var currentWindowNumber = 0
+
+    /// The current item's cloud status wasn't known: check that it's downloaded before loading it.
+    private var needsAvailabilityCheck = false
+    /// The last file found not downloaded; hover heartbeats don't keep re-checking it.
+    private var unavailableURL: URL?
+
     // MARK: - Init
 
     private init() {
@@ -90,11 +98,15 @@ final class InlineAudioPreviewManager: ObservableObject {
 
     // MARK: - Public API
 
+    /// iCloud files that aren't downloaded are skipped (playing one would download it).
     func requestPreview(for item: FileItem) {
         guard item.fileType == .audio, !item.isFromArchive else { return }
         guard AppSettings.shared.inlineAudioPreview else { return }
+        let isLocallyAvailable = InlinePreviews.isLocallyAvailable(item)
+        guard isLocallyAvailable != false else { return }
 
         let url = item.url
+        unavailableURL = nil
 
         if state.isActive, currentPreviewURL == url {
             return
@@ -103,6 +115,8 @@ final class InlineAudioPreviewManager: ObservableObject {
         cancelCurrentState()
 
         state = .debouncing(url)
+        currentWindowNumber = InlinePreviews.windowNumberUnderMouse()
+        needsAvailabilityCheck = isLocallyAvailable == nil
         currentPreviewURL = url
         watchdog.noteHeartbeat(at: NSEvent.mouseLocation, now: CACurrentMediaTime())
         startWatchdog()
@@ -132,7 +146,7 @@ final class InlineAudioPreviewManager: ObservableObject {
         if state.isActive {
             guard currentPreviewURL == item.url else { return }
             watchdog.noteHeartbeat(at: NSEvent.mouseLocation, now: CACurrentMediaTime())
-        } else {
+        } else if item.url != unavailableURL {
             requestPreview(for: item)
         }
     }
@@ -150,6 +164,19 @@ final class InlineAudioPreviewManager: ObservableObject {
         }
     }
 
+    /// Stop the preview if it was requested in `window` (or the window isn't known).
+    func stopPreviews(inWindow window: NSWindow) {
+        guard state.isActive, currentWindowNumber == 0 || currentWindowNumber == window.windowNumber else { return }
+        cancelCurrentState()
+    }
+
+    /// Stop the preview if its file matches `predicate`.
+    func stopPreviews(where predicate: (URL) -> Bool) {
+        guard state.isActive, let url = currentPreviewURL, predicate(url) else { return }
+        cancelCurrentState()
+    }
+
+    /// Stop all previews immediately, in every window (app deactivation, termination).
     func stopAllPreviews() {
         cancelCurrentState()
     }
@@ -158,6 +185,19 @@ final class InlineAudioPreviewManager: ObservableObject {
 
     private func beginLoading(for url: URL) {
         guard case .debouncing(let debouncedURL) = state, debouncedURL == url else {
+            return
+        }
+        if needsAvailabilityCheck {
+            InlinePreviews.checkLocalAvailability(of: url) { [weak self] isAvailable in
+                guard let self, case .debouncing(let debouncedURL) = self.state, debouncedURL == url else { return }
+                guard isAvailable else {
+                    self.cancelCurrentState()
+                    self.unavailableURL = url
+                    return
+                }
+                self.needsAvailabilityCheck = false
+                self.beginLoading(for: url)
+            }
             return
         }
 
@@ -278,6 +318,8 @@ final class InlineAudioPreviewManager: ObservableObject {
         }
 
         state = .idle
+        currentWindowNumber = 0
+        needsAvailabilityCheck = false
         if currentPreviewURL != nil { currentPreviewURL = nil }
         if isPreviewActive { isPreviewActive = false }
         if isPaused { isPaused = false }
