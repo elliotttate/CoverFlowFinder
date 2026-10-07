@@ -211,6 +211,20 @@ enum FileListActions {
             viewModel.openItem(target)
         }
     }
+
+    /// Whether the list shows Spotlight results (items from anywhere) rather than a folder.
+    static func showsSearchResults(_ viewModel: FileBrowserViewModel) -> Bool {
+        viewModel.searchMode == .finder && !viewModel.searchText.isEmpty
+    }
+
+    /// Whether files can be dropped into the location shown: not inside an archive, the Photos
+    /// library or the network browser.
+    static func acceptsDrops(in viewModel: FileBrowserViewModel) -> Bool {
+        !viewModel.isInsideArchive
+            && !viewModel.isPhotosLibraryActive
+            && viewModel.currentPath.isFileURL
+            && viewModel.currentPath.path != "/Network"
+    }
 }
 
 // MARK: - Thumbnail Store
@@ -315,6 +329,34 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var lastSortDirection: SortDirection?
     private var lastSyncedSelection: Set<FileItem>?
     private var activeMouseSelection: Int?  // row the current mouse-down started on (-1 = empty space)
+    private var selectionCancellable: AnyCancellable?
+
+    /// The view model's anchor and cursor are row indexes. Recorded with the items they pointed at
+    /// (and the selection then) so a re-sort or reload can move them to those items' new rows.
+    private struct SelectionEnds {
+        let anchor: Int
+        let anchorURL: URL?
+        let cursor: Int
+        let cursorURL: URL?
+        let selection: Set<FileItem>
+    }
+    private var selectionEnds: SelectionEnds?
+
+    /// A click elsewhere in the list committed a rename. The view model selects the renamed item
+    /// when its listing reloads; the click's selection is kept instead (Finder).
+    private struct ClickCommittedRename {
+        let oldURL: URL
+        let newURL: URL
+        let expires: Date
+    }
+    private var clickCommittedRename: ClickCommittedRename?
+    private var isCommittingForClick = false
+    /// The view model's items changed this run loop turn (a listing was applied, with the
+    /// selection it brings)
+    private var isApplyingViewModelListing = false
+    /// A click on an item of a multi-selection: the table selects just that row on mouse-up, so a
+    /// double-click that follows still opens the whole selection (like Return)
+    private var multiSelectionClick: (row: Int, urls: Set<URL>, time: TimeInterval)?
 
     // Columns
     private var appliedColumns: [ColumnSettings] = []
@@ -338,9 +380,11 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     private var isLiveScrolling = false
     private(set) var requestedCloudStatusURLs: Set<URL> = []
 
-    // Tags are read off the main thread; FileTagManager's cache is warm for these URLs
+    // Tags are read off the main thread; FileTagManager's cache is warm for these URLs. A tag
+    // refresh starts a new generation (reads still in flight from before it are dropped).
     private var loadedTagURLs: Set<URL> = []
     private var pendingTagURLs: Set<URL> = []
+    private var tagGeneration = 0
     private static let tagQueue = DispatchQueue(label: "com.flowfinder.table.tags", qos: .userInitiated)
 
     // Thumbnails, bounded to the rows around the visible ones
@@ -417,10 +461,12 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         tableView.gridStyleMask = []
         tableView.focusRingType = .none
 
-        // Register for drag and drop
+        // Register for drag and drop. Like Cover Flow, drags offer move, copy (Option) and generic
+        // (Command = force move) inside and outside the app; the destination picks (Finder and the
+        // Trash move within a volume)
         tableView.registerForDraggedTypes([.fileURL])
-        tableView.setDraggingSourceOperationMask([.copy, .move], forLocal: true)
-        tableView.setDraggingSourceOperationMask([.copy], forLocal: false)
+        tableView.setDraggingSourceOperationMask([.move, .copy, .generic], forLocal: true)
+        tableView.setDraggingSourceOperationMask([.move, .copy, .generic], forLocal: false)
 
         // Set delegate and data source
         tableView.delegate = self
@@ -469,7 +515,14 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         viewModelItemsCancellable = newViewModel.$items.sink { [weak self] _ in
             // Sent before the new value is stored; rebuilt lazily on next use
             self?.freshItemsByURL = nil
+            self?.viewModelItemsWillChange()
         }
+        selectionCancellable = newViewModel.$selectedItems.sink { [weak self] selection in
+            // Sent before the new value is stored
+            self?.viewModelSelectionWillChange(to: selection)
+        }
+        clickCommittedRename = nil
+        selectionEnds = nil
         NotificationCenter.default.addObserver(self, selector: #selector(handleHydrationCompleted(_:)), name: .metadataHydrationCompleted, object: newViewModel)
         NotificationCenter.default.addObserver(self, selector: #selector(handleHydrationCompleted(_:)), name: .cloudStatusHydrationCompleted, object: newViewModel)
     }
@@ -501,7 +554,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
         if tagRefreshToken != lastTagRefreshToken {
             lastTagRefreshToken = tagRefreshToken
-            reloadRows(loadedRows())
+            reloadTagsForLoadedRows()
         }
         if cutChanged {
             applyCutDimmingToLoadedRows()
@@ -512,6 +565,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         if !isCurrentlyEditing {
             syncSelectionFromViewModel()
         }
+        noteSelectionEnds()
 
         checkForPendingRename()
     }
@@ -584,6 +638,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         let anchor = folderChanged || sortChanged ? nil : (captureScrollAnchor() ?? pendingScrollAnchor)
         items = newItems
         rebuildRowIndex()
+        moveSelectionEndsToNewRows()
         pruneThumbnails(force: true)
         isLiveScrolling = false
         lastVisibleRange = nil
@@ -624,6 +679,37 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             index[item.url] = row
         }
         rowIndex = index
+    }
+
+    // MARK: - Anchor and Cursor
+
+    /// Records which items the view model's anchor and cursor point at (call when they're known to
+    /// index the rows shown).
+    private func noteSelectionEnds() {
+        guard deferredItems == nil else { return }
+        let anchor = viewModel.selectionAnchorIndex
+        let cursor = viewModel.lastSelectedIndex
+        selectionEnds = SelectionEnds(
+            anchor: anchor,
+            anchorURL: items.indices.contains(anchor) ? items[anchor].url : nil,
+            cursor: cursor,
+            cursorURL: items.indices.contains(cursor) ? items[cursor].url : nil,
+            selection: viewModel.selectedItems
+        )
+    }
+
+    /// After the rows were re-sorted or reloaded: moves the anchor and cursor to the rows of the
+    /// items they pointed at, so ⇧-click and ⇧↑/⇧↓ extend from the same item. Indexes the view
+    /// model set since (with a new selection, e.g. after a paste) already refer to the new rows.
+    private func moveSelectionEndsToNewRows() {
+        guard let ends = selectionEnds, viewModel.selectedItems == ends.selection else { return }
+        if viewModel.selectionAnchorIndex == ends.anchor, let url = ends.anchorURL, let row = rowIndex[url] {
+            viewModel.selectionAnchorIndex = row
+        }
+        if viewModel.lastSelectedIndex == ends.cursor, let url = ends.cursorURL, let row = rowIndex[url] {
+            viewModel.lastSelectedIndex = row
+        }
+        noteSelectionEnds()
     }
 
     static func rowsWithChangedContent(old: [FileItem], new: [FileItem], in rows: IndexSet) -> IndexSet {
@@ -822,6 +908,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
     /// Commits an in-progress rename before a click elsewhere in the table is handled.
     func commitEditingForMouseDown() {
         guard let cell = currentEditingCell, cell.isEditing else { return }
+        isCommittingForClick = true
+        defer { isCommittingForClick = false }
         cell.commitEditingFromOutsideClick()
     }
 
@@ -855,8 +943,60 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     func fileNameCellView(_ cell: FileNameCellView, didRenameItem item: FileItem, to newName: String) {
         editingDidEnd()
+        if isCommittingForClick {
+            // The click that ended editing picks the selection
+            let newURL = item.url.deletingLastPathComponent()
+                .appendingPathComponent(FileOperationEngine.fileSystemName(forDisplayName: newName))
+            clickCommittedRename = ClickCommittedRename(oldURL: item.url, newURL: newURL, expires: Date().addingTimeInterval(5))
+        }
         viewModel.renameItem(item, to: newName)
         viewModel.renamingURL = nil
+    }
+
+    /// The view model's items are about to change. While a click-committed rename is pending, notes
+    /// that a listing is being applied; once the listing with the renamed item is in, the view
+    /// model has made its selection for it and nothing is pending any more.
+    private func viewModelItemsWillChange() {
+        guard clickCommittedRename != nil, !isApplyingViewModelListing else { return }
+        isApplyingViewModelListing = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isApplyingViewModelListing = false
+            if let rename = self.clickCommittedRename, self.viewModel.items.contains(where: { $0.url == rename.newURL }) {
+                self.clickCommittedRename = nil
+            }
+        }
+    }
+
+    /// The view model is about to select `newSelection` (its old selection is still current). After a
+    /// rename committed by a click, a listing reload selecting just the renamed item is undone: the
+    /// click's selection is restored, with the renamed item (if it was in it) under its new name.
+    private func viewModelSelectionWillChange(to newSelection: Set<FileItem>) {
+        guard let rename = clickCommittedRename else { return }
+        guard rename.expires > Date() else {
+            clickCommittedRename = nil
+            return
+        }
+        // Only the selection a reload applies (not the user selecting the renamed item)
+        guard isApplyingViewModelListing, newSelection.count == 1, newSelection.first?.url == rename.newURL else { return }
+        clickCommittedRename = nil
+        let clickSelection = Set(viewModel.selectedItems.map { $0.url == rename.oldURL ? rename.newURL : $0.url })
+        guard clickSelection != [rename.newURL] else { return }
+        let ends = selectionEnds
+        // Not from inside the publisher's willSet: the view model is still storing its value
+        DispatchQueue.main.async { [weak self] in
+            guard let self, Set(self.viewModel.selectedItems.map(\.url)) == [rename.newURL] else { return }
+            let current = self.viewModel.filteredItems
+            let restored = current.filter { clickSelection.contains($0.url) }
+            self.viewModel.selectedItems = Set(restored)
+            let urlAt = { (url: URL?) in url.map { $0 == rename.oldURL ? rename.newURL : $0 } }
+            if let anchor = urlAt(ends?.anchorURL), let index = current.firstIndex(where: { $0.url == anchor }) {
+                self.viewModel.selectionAnchorIndex = index
+            }
+            if let cursor = urlAt(ends?.cursorURL), let index = current.firstIndex(where: { $0.url == cursor }) {
+                self.viewModel.lastSelectedIndex = index
+            }
+        }
     }
 
     func fileNameCellViewDidCancelRename(_ cell: FileNameCellView) {
@@ -905,6 +1045,9 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         // preserve the multi-selection (for potential drag)
         // handleSelection would reset to single selection otherwise
         if viewModel.selectedItems.count > 1 && viewModel.selectedItems.contains(item) {
+            if event.clickCount == 1 {
+                multiSelectionClick = (row, Set(viewModel.selectedItems.map(\.url)), event.timestamp)
+            }
             return
         }
 
@@ -935,6 +1078,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         viewModel.selectRange(to: row, in: items)
         syncSelectionFromViewModel(allowScroll: false)
         lastSyncedSelection = viewModel.selectedItems
+        noteSelectionEnds()
     }
 
     /// Handle click on empty space (below all rows) - deselect all items
@@ -1327,6 +1471,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             viewModel.lastSelectedIndex = positions.cursor
         }
         lastSyncedSelection = selectedItems
+        noteSelectionEnds()
         isUpdatingSelection = false
     }
 
@@ -1431,11 +1576,33 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     @objc func tableViewDoubleClicked(_ sender: Any?) {
         guard let tableView = tableView else { return }
-        let clickedRow = tableView.clickedRow
+        openForDoubleClick(row: tableView.clickedRow, at: NSApp.currentEvent?.timestamp ?? ProcessInfo.processInfo.systemUptime)
+    }
+
+    /// Like Return, a double-click on a selected item opens the whole selection (Finder).
+    func openForDoubleClick(row clickedRow: Int, at time: TimeInterval) {
         guard clickedRow >= 0, clickedRow < items.count else { return }
 
         let item = items[clickedRow]
-        viewModel.openItem(item)
+        var selection = Set(viewModel.selectedItems.map(\.url))
+        // The first click of the double-click reduced a multi-selection to this row: open them all
+        if let click = multiSelectionClick, click.row == clickedRow, click.urls.contains(item.url),
+           time - click.time <= NSEvent.doubleClickInterval + 0.1 {
+            selection = click.urls
+        }
+        multiSelectionClick = nil
+        guard selection.count > 1, selection.contains(item.url) else {
+            viewModel.openItem(item)
+            return
+        }
+
+        let targets = items.filter { selection.contains($0.url) }
+        if Set(viewModel.selectedItems.map(\.url)) != selection {
+            viewModel.selectedItems = Set(targets)
+            viewModel.lastSelectedIndex = clickedRow
+            syncSelectionFromViewModel(allowScroll: false)
+        }
+        FileListActions.open(targets, primary: item, viewModel: viewModel)
     }
 
     // MARK: - Keyboard Actions
@@ -1637,21 +1804,40 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         let needed = urls.filter { !loadedTagURLs.contains($0) && !pendingTagURLs.contains($0) }
         guard !needed.isEmpty else { return }
         pendingTagURLs.formUnion(needed)
+        let generation = tagGeneration
         Self.tagQueue.async { [weak self] in
             let results = needed.map { ($0, FileTagManager.getTags(for: $0)) }
             DispatchQueue.main.async {
-                self?.tagsLoaded(results)
+                self?.tagsLoaded(results, generation: generation)
             }
         }
     }
 
-    private func tagsLoaded(_ results: [(URL, [String])]) {
+    private func tagsLoaded(_ results: [(URL, [String])], generation: Int) {
+        // Read before a tag refresh: those rows were requested again
+        guard generation == tagGeneration else { return }
         for (url, tags) in results {
             pendingTagURLs.remove(url)
             loadedTagURLs.insert(url)
-            if !tags.isEmpty, let row = rowIndex[url] {
+            if let row = rowIndex[url] {
                 updateTagViews(row: row, tags: tags)
             }
+        }
+    }
+
+    /// Tags may have changed (refresh, edits elsewhere): the loaded rows re-read theirs in the
+    /// background and keep showing the current ones meanwhile; other rows read theirs when shown.
+    /// Never reads tags here: this runs during a SwiftUI update.
+    private func reloadTagsForLoadedRows() {
+        tagGeneration &+= 1
+        loadedTagURLs.removeAll()
+        pendingTagURLs.removeAll()
+        guard appSettings.showItemTags else { return }
+        let urls = loadedRows().compactMap { row in Self.hasReadableTags(items[row]) ? items[row].url : nil }
+        guard !urls.isEmpty else { return }
+        // Next turn, together with the rows this update configures
+        DispatchQueue.main.async { [weak self] in
+            self?.requestTags(for: urls)
         }
     }
 
@@ -1781,10 +1967,14 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         }
 
         // The completion runs on the main queue, or synchronously (returning no token) when the
-        // answer is already known
+        // answer is already known. Only this request's own token is forgotten: a cancelled one can
+        // report after a newer request for the same file was made.
+        var requestToken: ThumbnailRequestToken?
         let token = thumbnailCache.requestThumbnail(for: item, maxPixelSize: targetPixelSize, owner: thumbnailOwner) { [weak self] result in
             guard let self = self else { return }
-            self.thumbnailRequests[url] = nil
+            if let requestToken, self.thumbnailRequests[url] == requestToken {
+                self.thumbnailRequests[url] = nil
+            }
             switch result {
             case .loaded(let image):
                 self.storeThumbnail(image, for: item)
@@ -1798,6 +1988,7 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             }
         }
         if let token {
+            requestToken = token
             thumbnailRequests[url] = token
         }
     }
@@ -1881,6 +2072,7 @@ extension FileTableCoordinator: NSMenuDelegate {
             viewModel.selectionAnchorIndex = clickedRow
             viewModel.lastSelectedIndex = clickedRow
             lastSyncedSelection = viewModel.selectedItems
+            noteSelectionEnds()
             isUpdatingSelection = false
         }
         contextMenuItems = tableView.selectedRowIndexes.compactMap { $0 < items.count ? items[$0] : nil }
@@ -2198,8 +2390,16 @@ extension FileTableCoordinator {
         return item
     }
 
+    /// Drops onto rows and into the folder being shown: never inside an archive, the Photos library
+    /// or the network browser.
     private var acceptsDrops: Bool {
-        !viewModel.isInsideArchive && !viewModel.isPhotosLibraryActive && viewModel.currentPath.isFileURL
+        FileListActions.acceptsDrops(in: viewModel)
+    }
+
+    /// Spotlight results come from anywhere: a drop there goes onto a folder row or nowhere (not
+    /// into the folder the search started in).
+    private var acceptsDropsIntoShownFolder: Bool {
+        acceptsDrops && !FileListActions.showsSearchResults(viewModel)
     }
 
     private func draggedURLs(_ info: NSDraggingInfo) -> [URL] {
@@ -2274,6 +2474,7 @@ extension FileTableCoordinator {
         if let folder = dropTargetFolder(row: row, dropOperation: dropOperation) {
             destination = folder.url
         } else {
+            guard acceptsDropsIntoShownFolder else { return [] }
             // Not on a folder row: the drop goes into the folder being shown (highlight the whole list)
             tableView.setDropRow(-1, dropOperation: .on)
             destination = viewModel.currentPath
@@ -2307,6 +2508,7 @@ extension FileTableCoordinator {
 
         // nil destination = the folder being shown
         let destination = dropTargetFolder(row: row, dropOperation: dropOperation)?.url
+        guard destination != nil || acceptsDropsIntoShownFolder else { return false }
         viewModel.handleDrop(urls: urls, to: destination, operation: operation)
         return true
     }
