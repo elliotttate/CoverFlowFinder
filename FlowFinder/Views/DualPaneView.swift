@@ -569,10 +569,13 @@ struct PaneListView: View {
                 LazyVStack(spacing: 0) {
                     ForEach(viewModel.filteredItems) { item in
                         let isSelected = viewModel.selectedItems.contains(item)
+                        let isCut = viewModel.isItemCut(item)
                         HStack(spacing: 8) {
                             AsyncListIconView(item: item, size: appSettings.compactListIconSize)
+                                .opacity(item.iconOpacity(isCut: isCut))
 
                             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.compactListFont, alignment: .leading, lineLimit: 1)
+                                .opacity(item.nameOpacity(isCut: isCut, isSelected: isSelected))
 
                             if appSettings.showItemTags, let tags = tagsByURL[item.url] {
                                 TagDotsView(tags: tags)
@@ -608,7 +611,7 @@ struct PaneListView: View {
                                 .padding(.horizontal, 4)
                         )
                         .contentShape(Rectangle())
-                        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+                        .opacity(isCut ? 0.5 : 1.0)
                         .fileDragItem(item)
                         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                             item: item,
@@ -646,6 +649,8 @@ struct PaneListView: View {
                 .fileDragContainer(for: viewModel)
             }
             .paneTagReading(for: viewModel, into: $tagsByURL)
+            // Every row shows its size (folders' and packages' are calculated)
+            .showsItemSizes(.allItems, of: viewModel)
             .onAppear {
                 if let lead = viewModel.primarySelectedItem {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -791,13 +796,16 @@ struct PaneIconView: View {
                     LazyVGrid(columns: columns, spacing: appSettings.dualPaneGridSpacing) {
                         ForEach(viewModel.filteredItems) { item in
                             let isSelected = viewModel.selectedItems.contains(item)
+                            let isCut = viewModel.isItemCut(item)
                             VStack(spacing: 4) {
                                 Image(nsImage: thumbnails[item.url] ?? item.icon)
                                     .resizable()
                                     .aspectRatio(contentMode: .fit)
                                     .frame(width: appSettings.dualPaneIconSize, height: appSettings.dualPaneIconSize)
+                                    .opacity(item.iconOpacity(isCut: isCut))
 
                                 InlineRenameField(item: item, viewModel: viewModel, font: appSettings.dualPaneFont, alignment: .center, lineLimit: 2)
+                                    .opacity(item.nameOpacity(isCut: isCut, isSelected: isSelected))
                                     .frame(width: cellWidth - 16)
 
                                 if appSettings.showItemTags, let tags = tagsByURL[item.url] {
@@ -825,7 +833,7 @@ struct PaneIconView: View {
                             )
                             .cornerRadius(8)
                             .contentShape(Rectangle())
-                            .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+                            .opacity(isCut ? 0.5 : 1.0)
                             .fileDragItem(item)
                             .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                                 item: item,

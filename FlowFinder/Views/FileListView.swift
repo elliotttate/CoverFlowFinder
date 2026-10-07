@@ -32,6 +32,8 @@ struct FileListView: View {
         ))
         .dropTargetOverlay(isTargeted: isDropTargeted && !internalDragState.isDragging)
         .allowsHitTesting(true)
+        // Folders' and packages' sizes in the Size column
+        .showsItemSizes(.sizeColumn, of: viewModel)
         .onChange(of: viewModel.selectedItems) {
             // Quick Look follows the lead item of the selection (refreshes if visible)
             updateQuickLook(for: viewModel.primarySelectedItem)

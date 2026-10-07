@@ -940,6 +940,7 @@ struct MasonryItemView: View {
         let usesPreview = thumbnail != nil && !item.isDirectory
         let displayImage = thumbnail ?? item.icon
         let iconSize = min(columnWidth * 0.5, imageHeight * 0.8)
+        let isCut = viewModel.isItemCut(item)
 
         VStack(alignment: .center, spacing: 6) {
             // Image/icon area - clicks here don't trigger rename
@@ -953,6 +954,7 @@ struct MasonryItemView: View {
                         .scaledToFill()
                         .frame(width: columnWidth, height: imageHeight)
                         .clipped()
+                        .opacity(item.iconOpacity(isCut: isCut))
                         .videoPreviewOnHover(item: item, isHovering: $isHovering, size: CGSize(width: columnWidth, height: imageHeight))
                 } else {
                     Image(nsImage: displayImage)
@@ -960,6 +962,7 @@ struct MasonryItemView: View {
                         .scaledToFit()
                         .frame(width: iconSize, height: iconSize)
                         .foregroundColor(.primary)
+                        .opacity(item.iconOpacity(isCut: isCut))
                         .frame(width: columnWidth, height: imageHeight)
                 }
 
@@ -992,6 +995,7 @@ struct MasonryItemView: View {
                     alignment: .center,
                     lineLimit: 2
                 )
+                .opacity(item.nameOpacity(isCut: isCut, isSelected: isSelected))
                 .frame(width: columnWidth - (labelPadding * 2), height: labelHeight, alignment: .center)
                 .padding(.horizontal, labelPadding)
                 .background(
@@ -1021,7 +1025,7 @@ struct MasonryItemView: View {
                 .stroke(Color.accentColor, lineWidth: 2)
                 .opacity(isSelected ? 1 : 0)
         )
-        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+        .opacity(isCut ? 0.5 : 1.0)
         .onHover { hovering in
             isHovering = hovering
         }

@@ -118,8 +118,35 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         }
         nameTextField.font = NSFont.systemFont(ofSize: appSettings.listFontSize)
         nameTextField.textColor = .labelColor
+        updateHiddenItemDimming()
 
         setTags(tags ?? [], showTags: appSettings.showItemTags)
+    }
+
+    /// The table dims cut items' whole cells (0.5): a hidden item's icon and name are then not
+    /// dimmed again.
+    override var alphaValue: CGFloat {
+        didSet { updateHiddenItemDimming() }
+    }
+
+    /// Set by the row view: emphasized while the row is selected in a focused table.
+    override var backgroundStyle: NSView.BackgroundStyle {
+        didSet { updateHiddenItemDimming() }
+    }
+
+    /// Hidden items' icon and name at half opacity, like Finder; the name of a selected row stays
+    /// readable on the highlight.
+    private func updateHiddenItemDimming() {
+        let isCut = alphaValue < 1
+        let isSelected = backgroundStyle == .emphasized
+        let iconAlpha = CGFloat(currentItem?.iconOpacity(isCut: isCut) ?? 1)
+        let nameAlpha = CGFloat(currentItem?.nameOpacity(isCut: isCut, isSelected: isSelected) ?? 1)
+        if iconView.alphaValue != iconAlpha {
+            iconView.alphaValue = iconAlpha
+        }
+        if nameTextField.alphaValue != nameAlpha {
+            nameTextField.alphaValue = nameAlpha
+        }
     }
 
     func setIcon(_ image: NSImage) {

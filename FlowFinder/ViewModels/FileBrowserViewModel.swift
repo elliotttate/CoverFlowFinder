@@ -1683,6 +1683,29 @@ class FileBrowserViewModel: ObservableObject {
     /// Invalidates in-flight metadata/cloud hydration (new folder, suspension)
     private var hydrationToken = UUID()
     private var hydrationCancellation = LoadCancellationFlag()
+    /// What the views on screen show of folder and package sizes, by registration token
+    private var itemSizeDisplays: [UUID: ItemSizeDisplay] = [:]
+    /// This view model's size calculations (cancelled when it leaves the folder)
+    private var itemSizeRequest: ItemSizeCalculator.Request?
+    /// Path keys of the items whose size is being calculated
+    private var requestedSizeKeys: Set<String> = []
+    /// Path keys of items whose calculated size is outdated (their contents changed, ⌘R, the
+    /// setting changed). It stays shown until the new one is in.
+    private var staleSizeKeys: Set<String> = []
+    /// Calculated sizes waiting to be applied (by path key; nil: couldn't be measured). Applied in
+    /// batches, at most every `itemSizeFlushInterval`: each application re-renders the views.
+    private var pendingItemSizes: [String: Int64?] = [:]
+    private var itemSizeFlushScheduled = false
+    private var lastItemSizeFlush: TimeInterval = 0
+    private var itemSizeUpdateScheduled = false
+    /// Recalculates sizes outdated by directory events, at most once per `changedSizesDelay`
+    private var delayedItemSizeUpdate: DispatchWorkItem?
+    /// When each item's outdated size may be recalculated (system uptime, by path key)
+    private var sizeRecalculationNotBefore: [String: TimeInterval] = [:]
+    static let itemSizeFlushInterval: TimeInterval = 0.35
+    static let changedSizesDelay: TimeInterval = 1.0
+    /// An item is recalculated at most every this many times its last walk took
+    static let recalculationIntervalFactor: TimeInterval = 5
     /// Lookup of `items` indices by URL, rebuilt lazily when `items` changes
     private var itemIndexCache: (revision: Int, indexByURL: [URL: Int])?
     /// Lookup of `items` indices by ID, rebuilt lazily when `items` changes
@@ -1708,6 +1731,8 @@ class FileBrowserViewModel: ObservableObject {
     /// its listing, so the folder can be followed when it's renamed or moved
     private var watchedFolderReference: (identity: FileObjectID?, resolvedPath: String)?
     private var pendingDirectoryEventPaths: Set<String> = []
+    /// Children with changes deeper inside them (only their total size is affected)
+    private var pendingContentsChangedPaths: Set<String> = []
     private var pendingDirectoryRescan = false
     /// The watched folder itself (or a folder above it) was renamed, moved or deleted
     private var pendingWatchedRootCheck = false
@@ -1978,7 +2003,7 @@ class FileBrowserViewModel: ObservableObject {
         case .kind:
             return old.kindDescription == new.kindDescription
         case .size:
-            return old.size == new.size
+            return old.sizeForSorting == new.sizeForSorting
         case .dateModified:
             return old.modificationDate == new.modificationDate
         case .dateCreated:
@@ -2075,6 +2100,35 @@ class FileBrowserViewModel: ObservableObject {
             .sink { [weak self] notification in
                 guard let volumeURL = notification.userInfo?[AppNotificationKey.url] as? URL else { return }
                 self?.volumeWillUnmount(volumeURL)
+            }
+            .store(in: &cancellables)
+
+        // Folder and package sizes: what's on screen decides what's calculated. @Published emits
+        // in willSet, so the update reads the new values on the next run-loop turn.
+        AppSettings.shared.$calculateAllSizes
+            .removeDuplicates()
+            .dropFirst()
+            .sink { [weak self] calculateAll in
+                self?.calculateAllSizesChanged(to: calculateAll)
+            }
+            .store(in: &cancellables)
+
+        Publishers.Merge4(
+            ListColumnConfigManager.shared.$columns.map { _ in () },
+            $folderColumns.map { _ in () },
+            $viewMode.map { _ in () },
+            AppSettings.shared.$columnShowPreview.map { _ in () }
+        )
+        .sink { [weak self] in
+            self?.scheduleItemSizeUpdate()
+        }
+        .store(in: &cancellables)
+
+        $selectedItems
+            .sink { [weak self] _ in
+                // Lists showing every size don't depend on the selection
+                guard let self, self.showsSelectedItemSize, !self.showsAllItemSizes else { return }
+                self.scheduleItemSizeUpdate()
             }
             .store(in: &cancellables)
     }
@@ -2307,9 +2361,13 @@ class FileBrowserViewModel: ObservableObject {
         var contents: [URL] = try autoreleasepool {
             try FileManager.default.contentsOfDirectory(
                 at: directoryToList,
-                includingPropertiesForKeys: [.isDirectoryKey, .contentTypeKey, .isPackageKey, .isSymbolicLinkKey, .isAliasFileKey],
+                includingPropertiesForKeys: FileItem.listingResourceKeys,
                 options: showHiddenFiles ? [] : [.skipsHiddenFiles]
             )
+        }
+        if showHiddenFiles {
+            // Never listed, like in Finder
+            contents.removeAll { FileItem.isAlwaysHiddenName($0.lastPathComponent) }
         }
         // Children keep the folder's path form (/tmp rather than /private/tmp, the link's path)
         contents = URL.childURLs(contents, reRootedUnder: listingURL)
@@ -2347,6 +2405,7 @@ class FileBrowserViewModel: ObservableObject {
         cloudStatusLoadedURLs.removeAll()
         currentFolderIsInICloud = false
         resetHydrationState()
+        resetItemSizeState()
     }
 
     /// Applies a completed listing. A first load replaces `items`; a reload of the same location
@@ -2390,6 +2449,8 @@ class FileBrowserViewModel: ObservableObject {
         if currentFolderIsInICloud, items.count <= directoryBatchSize {
             hydrateCloudStatus(for: items.map(\.url))
         }
+        // Now, so known sizes show with the listing rather than a moment later
+        updateItemSizes()
     }
 
     /// Merges a reloaded listing into `items` without disturbing what's on screen: existing
@@ -2447,6 +2508,7 @@ class FileBrowserViewModel: ObservableObject {
                 // Keep the known cloud status until it's re-hydrated
                 updated.cloudStatus = old.cloudStatus
             }
+            updated = Self.keepingCalculatedSize(of: old, in: updated)
             if Self.displaysIdentically(old, updated) {
                 merged.append(old)
             } else {
@@ -2489,6 +2551,13 @@ class FileBrowserViewModel: ObservableObject {
         lhs.isDirectory == rhs.isDirectory &&
         lhs.fileType == rhs.fileType &&
         lhs.kindDescription == rhs.kindDescription
+    }
+
+    /// `new` (a fresh read of `old`'s file) still showing `old`'s calculated folder or package size:
+    /// it stays shown until it's recalculated (when it's outdated), rather than flashing "--".
+    nonisolated private static func keepingCalculatedSize(of old: FileItem, in new: FileItem) -> FileItem {
+        guard new.calculatedSize == nil, let size = old.calculatedSize, isSameKindOfItem(old, new) else { return new }
+        return new.withCalculatedSize(size)
     }
 
     /// Drops remembered IDs for paths that no longer exist (bounded growth across reloads).
@@ -2783,6 +2852,8 @@ class FileBrowserViewModel: ObservableObject {
         archiveReadSpinnerToken = nil
         // In-flight hydration is dropped; forget it so visible rows are requested again on resume
         resetHydrationState()
+        // Sizes still being calculated are requested again by the reload on resume
+        cancelItemSizeCalculations()
         pendingCloudStatusChanges.removeAll()
         cloudStatusPollWorkItem?.cancel()
         cloudStatusPollWorkItem = nil
@@ -3007,6 +3078,7 @@ class FileBrowserViewModel: ObservableObject {
             if replacement.cloudStatus == nil {
                 replacement.cloudStatus = existing.cloudStatus
             }
+            replacement = Self.keepingCalculatedSize(of: existing, in: replacement)
             updatedItems[index] = replacement
             replaced.append(index)
         }
@@ -3040,6 +3112,277 @@ class FileBrowserViewModel: ObservableObject {
         hydrationToken = UUID()
         pendingHydrationURLs.removeAll()
         pendingCloudStatusURLs.removeAll()
+    }
+
+    // MARK: - Folder and Package Sizes
+
+    /// What a view on screen shows of folder and package sizes (`showsItemSizes(_:of:)`). Sizes
+    /// are only calculated for what's shown.
+    enum ItemSizeDisplay {
+        /// A list with a Size column (List view, Cover Flow's list): every item's size, while the
+        /// column is visible
+        case sizeColumn
+        /// A list that always shows sizes (dual and quad pane lists)
+        case allItems
+        /// The selected item's size (Cover Flow's info panel)
+        case selection
+    }
+
+    /// Registers (or with nil removes) what the view registered under `token` shows.
+    func setItemSizeDisplay(_ display: ItemSizeDisplay?, for token: UUID) {
+        guard itemSizeDisplays[token] != display else { return }
+        itemSizeDisplays[token] = display
+        scheduleItemSizeUpdate()
+    }
+
+    /// Whether a view on screen lists every item's size.
+    var showsAllItemSizes: Bool {
+        let displays = itemSizeDisplays.values
+        if displays.contains(.allItems) { return true }
+        guard displays.contains(.sizeColumn) else { return false }
+        return (folderColumns ?? ListColumnConfigManager.shared.columns).contains { $0.column == .size && $0.isVisible }
+    }
+
+    /// Whether a view on screen shows the selected item's size: Column view's preview (of files and
+    /// packages: folders open as columns), Cover Flow's info panel. (Get Info totals the item itself.)
+    var showsSelectedItemSize: Bool {
+        showsColumnPreview || itemSizeDisplays.values.contains(.selection)
+    }
+
+    private var showsColumnPreview: Bool {
+        viewMode == .columns && AppSettings.shared.columnShowPreview
+    }
+
+    /// Items whose Size shows their contents' total: packages, and folders with "Calculate all
+    /// sizes" on. Never symbolic links (not followed), archive entries or network hosts.
+    nonisolated static func hasCalculableSize(_ item: FileItem, calculateFolders: Bool) -> Bool {
+        guard item.isDirectory, item.url.isFileURL, !item.isFromArchive, !item.isSymbolicLink else { return false }
+        return item.isPackage || calculateFolders
+    }
+
+    /// Updates the calculations on the next run-loop turn (once for several changes), or with
+    /// `after`, no later than that (recalculating outdated sizes while a folder keeps changing).
+    private func scheduleItemSizeUpdate(after delay: TimeInterval = 0) {
+        if delay > 0 {
+            guard delayedItemSizeUpdate == nil else { return }
+            let workItem = DispatchWorkItem { [weak self] in
+                self?.updateItemSizes()
+            }
+            delayedItemSizeUpdate = workItem
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+            return
+        }
+        guard !itemSizeUpdateScheduled else { return }
+        itemSizeUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.itemSizeUpdateScheduled = false
+            self.updateItemSizes()
+        }
+    }
+
+    /// Shows the sizes the views need that are already known and calculates the others in the
+    /// background: every item's while a list shows them all, else the selected item's (which can be
+    /// in one of Column view's sub-columns: its size is then only cached, for the preview).
+    /// Calculations nothing shows any more are cancelled.
+    private func updateItemSizes() {
+        delayedItemSizeUpdate?.cancel()
+        delayedItemSizeUpdate = nil
+        guard !isTornDown, isBackgroundWorkActive, loadedLocationKey != nil,
+              !isInsideArchive, photosLibraryInfo == nil, !isNetworkBrowsing else {
+            cancelItemSizeCalculations()
+            return
+        }
+        let calculateFolders = AppSettings.shared.calculateAllSizes
+        var candidates: [FileItem] = []
+        if showsAllItemSizes {
+            // In display order (the top of the list first); the folder's items while Spotlight
+            // results are shown
+            candidates = filterCurrentDirectoryItems()
+            if candidates.count != items.count {
+                candidates += items
+            }
+        }
+        if showsSelectedItemSize, selectedItems.count == 1, let selected = selectedItems.first {
+            let current = itemIndexByURL()[selected.url].map { items[$0] } ?? selected
+            if current.isPackage || itemSizeDisplays.values.contains(.selection) {
+                candidates.append(current)
+            }
+        }
+
+        let calculator = ItemSizeCalculator.shared
+        let now = ProcessInfo.processInfo.systemUptime
+        var wanted = Set<String>()
+        var known: [String: Int64?] = [:]
+        var toCalculate: [URL] = []
+        var nextRecalculation: TimeInterval?
+        for item in candidates where Self.hasCalculableSize(item, calculateFolders: calculateFolders) {
+            let key = item.url.standardizedPathKey
+            guard wanted.insert(key).inserted, !requestedSizeKeys.contains(key) else { continue }
+            let isStale = staleSizeKeys.contains(key)
+            if item.calculatedSize != nil, !isStale { continue }
+            if item.calculatedSize != nil, let notBefore = sizeRecalculationNotBefore[key], notBefore > now {
+                // Outdated, but recalculated a moment ago: keep showing it for now
+                nextRecalculation = min(nextRecalculation ?? notBefore, notBefore)
+                continue
+            }
+            switch calculator.cachedResult(forKey: key) {
+            case .measured(let bytes):
+                // Cached after any invalidation: current
+                staleSizeKeys.remove(key)
+                if item.calculatedSize != bytes {
+                    known.updateValue(bytes, forKey: key)
+                }
+            case .unmeasurable:
+                staleSizeKeys.remove(key)
+                if item.calculatedSize != nil {
+                    known.updateValue(nil, forKey: key)
+                }
+            case .missing:
+                toCalculate.append(item.url)
+            }
+        }
+
+        let unwanted = requestedSizeKeys.subtracting(wanted)
+        if !unwanted.isEmpty {
+            if let request = itemSizeRequest {
+                calculator.cancel(unwanted, of: request)
+            }
+            requestedSizeKeys.subtract(unwanted)
+        }
+        if !toCalculate.isEmpty {
+            let request: ItemSizeCalculator.Request
+            if let existing = itemSizeRequest {
+                request = existing
+            } else {
+                request = ItemSizeCalculator.Request()
+                itemSizeRequest = request
+            }
+            requestedSizeKeys.formUnion(toCalculate.map(\.standardizedPathKey))
+            calculator.calculate(toCalculate, for: request) { [weak self] key, size, isCurrent, duration in
+                self?.receiveItemSize(size, forKey: key, isCurrent: isCurrent, duration: duration)
+            }
+        }
+        if let nextRecalculation {
+            scheduleItemSizeUpdate(after: max(0.05, nextRecalculation - now))
+        }
+        applyItemSizes(known)
+    }
+
+    /// A calculation finished. `isCurrent` is false when the item changed while it was measured:
+    /// the size is shown anyway and calculated again shortly.
+    private func receiveItemSize(_ size: Int64?, forKey key: String, isCurrent: Bool, duration: TimeInterval) {
+        guard requestedSizeKeys.remove(key) != nil else { return }
+        if duration > 0 {
+            // A folder whose contents keep changing (e.g. one being written to) is recalculated at
+            // most every few times its walk takes, so big ones don't keep the disk busy
+            let now = ProcessInfo.processInfo.systemUptime
+            sizeRecalculationNotBefore[key] = now + max(Self.changedSizesDelay, Self.recalculationIntervalFactor * duration)
+        }
+        if isCurrent {
+            staleSizeKeys.remove(key)
+        } else {
+            staleSizeKeys.insert(key)
+            scheduleItemSizeUpdate(after: Self.changedSizesDelay)
+        }
+        pendingItemSizes.updateValue(size, forKey: key)
+        guard !itemSizeFlushScheduled else { return }
+        itemSizeFlushScheduled = true
+        let now = ProcessInfo.processInfo.systemUptime
+        let wait = max(0.05, lastItemSizeFlush + Self.itemSizeFlushInterval - now)
+        DispatchQueue.main.asyncAfter(deadline: .now() + wait) { [weak self] in
+            guard let self else { return }
+            self.itemSizeFlushScheduled = false
+            self.lastItemSizeFlush = ProcessInfo.processInfo.systemUptime
+            let sizes = self.pendingItemSizes
+            self.pendingItemSizes.removeAll()
+            self.applyItemSizes(sizes)
+        }
+    }
+
+    /// Shows calculated sizes (by path key) on the items, in place: one update for the batch.
+    private func applyItemSizes(_ sizes: [String: Int64?]) {
+        guard !sizes.isEmpty, !items.isEmpty else { return }
+        let calculateFolders = AppSettings.shared.calculateAllSizes
+        let indexByID = itemIndexByID()
+        var updatedItems = items
+        var replaced: [Int] = []
+        for (key, size) in sizes {
+            guard let id = itemIDsByPath[key], let index = indexByID[id] else { continue }
+            let item = updatedItems[index]
+            guard item.url.standardizedPathKey == key,
+                  Self.hasCalculableSize(item, calculateFolders: calculateFolders),
+                  item.calculatedSize != size else { continue }
+            updatedItems[index] = item.withCalculatedSize(size)
+            replaced.append(index)
+        }
+        guard !replaced.isEmpty else { return }
+        assignInPlaceUpdates(updatedItems, replaced: replaced)
+        refreshSelectedItems()
+        // Same notification as metadata: the list reloads the rows whose content changed
+        NotificationCenter.default.post(name: .metadataHydrationCompleted, object: self)
+    }
+
+    /// Children of the folder shown (by path key; nil: all of them) changed: their sizes, the
+    /// folder's and its ancestors' are outdated. Shown ones are recalculated shortly.
+    private func itemSizesChanged(forChildren childKeys: Set<String>?) {
+        guard currentPath.isFileURL, photosLibraryInfo == nil else { return }
+        let folderKey = currentPath.standardizedPathKey
+        let calculator = ItemSizeCalculator.shared
+        calculator.invalidate(pathAndAncestorsOf: folderKey)
+        if let childKeys {
+            guard !childKeys.isEmpty else { return }
+            calculator.invalidate(childKeys)
+            staleSizeKeys.formUnion(childKeys)
+        } else {
+            calculator.invalidate(childrenOf: folderKey)
+            for item in items where item.calculatedSize != nil {
+                staleSizeKeys.insert(item.url.standardizedPathKey)
+            }
+            staleSizeKeys.formUnion(requestedSizeKeys)
+        }
+        scheduleItemSizeUpdate(after: Self.changedSizesDelay)
+    }
+
+    /// "Calculate all sizes" changed (the calculator's cache is cleared): folders stop showing
+    /// their sizes when it's off; every size shown is recalculated.
+    private func calculateAllSizesChanged(to calculateAll: Bool) {
+        cancelItemSizeCalculations()
+        sizeRecalculationNotBefore.removeAll()
+        var updatedItems = items
+        var replaced: [Int] = []
+        for (index, item) in items.enumerated() where item.calculatedSize != nil {
+            if Self.hasCalculableSize(item, calculateFolders: calculateAll) {
+                staleSizeKeys.insert(item.url.standardizedPathKey)
+            } else {
+                updatedItems[index] = item.withCalculatedSize(nil)
+                replaced.append(index)
+            }
+        }
+        if !replaced.isEmpty {
+            assignInPlaceUpdates(updatedItems, replaced: replaced)
+            refreshSelectedItems()
+        }
+        scheduleItemSizeUpdate()
+    }
+
+    /// Stops this view model's calculations (nothing shows sizes, background work suspended).
+    private func cancelItemSizeCalculations() {
+        if let request = itemSizeRequest {
+            ItemSizeCalculator.shared.cancel(request)
+            itemSizeRequest = nil
+        }
+        requestedSizeKeys.removeAll()
+        delayedItemSizeUpdate?.cancel()
+        delayedItemSizeUpdate = nil
+    }
+
+    /// Leaving the location: cancel its calculations and forget its pending results.
+    private func resetItemSizeState() {
+        cancelItemSizeCalculations()
+        staleSizeKeys.removeAll()
+        pendingItemSizes.removeAll()
+        sizeRecalculationNotBefore.removeAll()
     }
 
     // MARK: - Cloud Status Hydration
@@ -3206,12 +3549,14 @@ class FileBrowserViewModel: ObservableObject {
             directoryEventWorkItem?.cancel()
             directoryEventWorkItem = nil
             pendingDirectoryEventPaths.removeAll()
+            pendingContentsChangedPaths.removeAll()
             pendingDirectoryRescan = false
             pendingWatchedRootCheck = false
         }
         if directoryWatcher == nil {
-            directoryWatcher = DirectoryWatcher { [weak self] paths, needsRescan, rootChanged, watchedPath in
-                self?.queueDirectoryEvents(paths, needsRescan: needsRescan, rootChanged: rootChanged, watchedPath: watchedPath)
+            directoryWatcher = DirectoryWatcher { [weak self] paths, contentsChangedPaths, needsRescan, rootChanged, watchedPath in
+                self?.queueDirectoryEvents(paths, contentsChangedPaths: contentsChangedPaths, needsRescan: needsRescan,
+                                           rootChanged: rootChanged, watchedPath: watchedPath)
             }
         }
         watchedFolderKey = folderKey
@@ -3228,6 +3573,7 @@ class FileBrowserViewModel: ObservableObject {
         directoryEventWorkItem?.cancel()
         directoryEventWorkItem = nil
         pendingDirectoryEventPaths.removeAll()
+        pendingContentsChangedPaths.removeAll()
         pendingDirectoryRescan = false
         pendingWatchedRootCheck = false
         directoryWatcher?.stop()
@@ -3235,16 +3581,18 @@ class FileBrowserViewModel: ObservableObject {
 
     /// `paths` are direct children of the watched folder, already mapped to the folder's
     /// displayed path form (FSEvents reports resolved paths, e.g. /private/tmp for /tmp).
+    /// `contentsChangedPaths` are direct children with changes deeper inside them.
     /// `rootChanged`: the watched folder, or a folder above it, was renamed, moved or deleted.
     /// Inside an archive the archive's folder is watched, for changes to the archive itself.
-    private func queueDirectoryEvents(_ paths: [String], needsRescan: Bool, rootChanged: Bool, watchedPath: String) {
+    private func queueDirectoryEvents(_ paths: [String], contentsChangedPaths: [String] = [], needsRescan: Bool, rootChanged: Bool, watchedPath: String) {
         guard !isTornDown, photosLibraryInfo == nil else { return }
         guard let folderKey = watchedFolderKey,
               folderKey == currentPath.standardizedPathKey,
               directoryWatcher?.watchedPath == watchedPath else { return }
-        guard needsRescan || rootChanged || !paths.isEmpty else { return }
+        guard needsRescan || rootChanged || !paths.isEmpty || !contentsChangedPaths.isEmpty else { return }
 
         pendingDirectoryEventPaths.formUnion(paths)
+        pendingContentsChangedPaths.formUnion(contentsChangedPaths)
         pendingDirectoryRescan = pendingDirectoryRescan || needsRescan
         pendingWatchedRootCheck = pendingWatchedRootCheck || rootChanged
         scheduleDirectoryEventProcessing()
@@ -3268,11 +3616,18 @@ class FileBrowserViewModel: ObservableObject {
         // Only direct children of the folder being shown
         let folderKey = currentPath.standardizedPathKey
         let paths = pendingDirectoryEventPaths.filter { ($0 as NSString).deletingLastPathComponent == folderKey }
+        let contentsChangedPaths = pendingContentsChangedPaths.filter { ($0 as NSString).deletingLastPathComponent == folderKey }
         let needsRescan = pendingDirectoryRescan
         let rootChanged = pendingWatchedRootCheck
         pendingDirectoryEventPaths.removeAll()
+        pendingContentsChangedPaths.removeAll()
         pendingDirectoryRescan = false
         pendingWatchedRootCheck = false
+
+        if !rootChanged, !isInsideArchive {
+            // Folder and package sizes that include the changes are outdated
+            itemSizesChanged(forChildren: needsRescan ? nil : paths.union(contentsChangedPaths))
+        }
 
         if rootChanged {
             // The folder may be gone or elsewhere now; that decides what to show
@@ -3424,7 +3779,8 @@ class FileBrowserViewModel: ObservableObject {
             var tagsChanged = false
             for path in paths {
                 var info = stat()
-                guard lstat(path, &info) == 0 else {
+                guard !FileItem.isAlwaysHiddenName((path as NSString).lastPathComponent),
+                      lstat(path, &info) == 0 else {
                     changes.append(.removed(key: path))
                     continue
                 }
@@ -3514,6 +3870,7 @@ class FileBrowserViewModel: ObservableObject {
                     } else if item.cloudStatus == nil {
                         item.cloudStatus = existing.cloudStatus
                     }
+                    item = Self.keepingCalculatedSize(of: existing, in: item)
                     if !Self.displaysIdentically(existing, item) {
                         updatedItems[index] = item
                         replaced.append(index)
@@ -3608,6 +3965,8 @@ class FileBrowserViewModel: ObservableObject {
             var fileItems = ZipArchiveManager.shared.fileItems(from: entriesAtPath, archiveURL: archiveURL)
             if !showHiddenFiles {
                 fileItems = fileItems.filter { !$0.name.hasPrefix(".") }
+            } else {
+                fileItems = fileItems.filter { !FileItem.isAlwaysHiddenName($0.name) }
             }
             let listed = fileItems.map { ListedItem(key: $0.url.standardizedPathKey, item: $0) }
 
@@ -4879,6 +5238,9 @@ class FileBrowserViewModel: ObservableObject {
                 cloudStatusLoadedURLs.removeAll()
             }
             tagRefreshToken &+= 1
+            // So can folder sizes: recalculate them now (the reload's listing requests them)
+            sizeRecalculationNotBefore.removeAll()
+            itemSizesChanged(forChildren: nil)
         }
         loadContents()
     }
@@ -6521,7 +6883,8 @@ private final class SpotlightSearchSession: @unchecked Sendable {
 
     /// Runs on `queue`
     private func addEntry(for result: NSMetadataItem) {
-        guard let path = result.value(forAttribute: NSMetadataItemPathKey) as? String else {
+        guard let path = result.value(forAttribute: NSMetadataItemPathKey) as? String,
+              !FileItem.isAlwaysHiddenName((path as NSString).lastPathComponent) else {
             entries.removeValue(forKey: ObjectIdentifier(result))
             return
         }
@@ -6568,15 +6931,18 @@ private final class SpotlightSearchSession: @unchecked Sendable {
         let isDirectory = contentType.conforms(to: .directory)
         let url = URL(fileURLWithPath: path, isDirectory: isDirectory)
         let size = (result.value(forAttribute: kMDItemFSSize as String) as? NSNumber)?.int64Value ?? 0
+        let name = url.lastPathComponent
+        let isInvisible = (result.value(forAttribute: kMDItemFSInvisible as String) as? NSNumber)?.boolValue == true
         return FileItem(
             id: id,
             url: url,
-            name: url.lastPathComponent,
+            name: name,
             isDirectory: isDirectory,
             size: size,
             modificationDate: result.value(forAttribute: kMDItemFSContentChangeDate as String) as? Date,
             creationDate: result.value(forAttribute: kMDItemFSCreationDate as String) as? Date,
-            contentType: contentType
+            contentType: contentType,
+            isHidden: isInvisible || name.hasPrefix(".")
         )
     }
 }
@@ -6716,14 +7082,408 @@ fileprivate final class NetworkServiceBrowser: NSObject, NetServiceBrowserDelega
     }
 }
 
+// MARK: - Folder and Package Sizes
+
+/// Calculates the total size of folders' and packages' contents for the Size column, in the
+/// background: one queue (at most two walks at a time, utility QoS) and one cache, keyed by path
+/// (`standardizedPathKey`), shared by every window and pane. Contents are measured like the list
+/// measures files (`fileSize`, the logical size), so sums match.
+///
+/// Walks never follow symbolic links, never cross into other volumes and never download iCloud
+/// content: dataless files count the size they report, dataless folders aren't entered. Unreadable
+/// folders inside add nothing (a partial sum); an item that can't be read itself has no size.
+///
+/// The view models invalidate the cache for changes their directory watchers report and on ⌘R;
+/// changing "Calculate all sizes" clears it. Results are delivered on the main queue.
+final class ItemSizeCalculator: ObservableObject, @unchecked Sendable {
+    static let shared = ItemSizeCalculator()
+
+    /// A view model's calculations. Cancelling it stops the walks nobody else waits for.
+    final class Request: @unchecked Sendable {
+        fileprivate let cancellation = LoadCancellationFlag()
+
+        var isCancelled: Bool { cancellation.isCancelled }
+    }
+
+    /// Receives a result on the main queue: the size (nil: couldn't be measured), whether it's
+    /// current (false: the item was invalidated while it was measured, so it wasn't cached) and how
+    /// long measuring it took (0 for cached sizes).
+    typealias Delivery = @MainActor (_ key: String, _ size: Int64?, _ isCurrent: Bool, _ duration: TimeInterval) -> Void
+
+    enum CachedResult: Equatable {
+        case missing
+        case measured(Int64)
+        /// Measured, but the item itself couldn't be read
+        case unmeasurable
+    }
+
+    private struct Waiter {
+        let request: Request
+        let deliver: Delivery
+    }
+
+    private final class Job {
+        let url: URL
+        let cancellation = LoadCancellationFlag()
+        var waiters: [Waiter] = []
+        weak var operation: Operation?
+
+        init(url: URL) {
+            self.url = url
+        }
+    }
+
+    private struct Generation: Equatable {
+        let all: UInt64
+        let item: UInt64
+    }
+
+    private let lock = NSLock()
+    /// Results by path key (`.some(nil)`: couldn't be measured)
+    private var cache: [String: Int64?] = [:]
+    /// Bumped when an item is invalidated: a walk that started before it isn't cached
+    private var itemGenerations: [String: UInt64] = [:]
+    private var allGeneration: UInt64 = 0
+    /// Walks queued or running, by path key (one per item, whoever asked)
+    private var jobs: [String: Job] = [:]
+    private let queue: OperationQueue = {
+        let queue = OperationQueue()
+        queue.name = "com.flowfinder.item-sizes"
+        queue.maxConcurrentOperationCount = 2
+        queue.qualityOfService = .utility
+        return queue
+    }()
+    static let maxCachedEntries = 20_000
+    /// Main queue only
+    private var changePublishScheduled = false
+
+    // MARK: Cache
+
+    func cachedResult(forKey key: String) -> CachedResult {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let entry = cache[key] else { return .missing }
+        return entry.map(CachedResult.measured) ?? .unmeasurable
+    }
+
+    /// The size to show for `item` where views have only the item as it was listed (Column
+    /// view's preview of an item in a sub-column): its own calculated size, else a cached one.
+    @MainActor
+    func formattedSize(of item: FileItem) -> String {
+        guard item.calculatedSize == nil,
+              FileBrowserViewModel.hasCalculableSize(item, calculateFolders: AppSettings.shared.calculateAllSizes),
+              case .measured(let bytes) = cachedResult(forKey: item.url.standardizedPathKey) else {
+            return item.formattedSize
+        }
+        return item.withCalculatedSize(bytes).formattedSize
+    }
+
+    func invalidate<Keys: Sequence>(_ keys: Keys) where Keys.Element == String {
+        lock.lock()
+        for key in keys {
+            invalidateLocked(key)
+        }
+        lock.unlock()
+    }
+
+    /// Invalidates a folder and every folder above it (their totals include it).
+    func invalidate(pathAndAncestorsOf key: String) {
+        var keys: [String] = []
+        var path = key
+        while true {
+            keys.append(path)
+            guard path != "/", !path.isEmpty else { break }
+            let parent = (path as NSString).deletingLastPathComponent
+            guard parent != path, parent.count < path.count else { break }
+            path = parent
+        }
+        invalidate(keys)
+    }
+
+    /// Invalidates the items directly inside a folder.
+    func invalidate(childrenOf folderKey: String) {
+        lock.lock()
+        let keys = Set(cache.keys).union(jobs.keys).filter { ($0 as NSString).deletingLastPathComponent == folderKey }
+        for key in keys {
+            invalidateLocked(key)
+        }
+        lock.unlock()
+    }
+
+    /// Forgets every result ("Calculate all sizes" changed); walks running now aren't cached.
+    func invalidateAll() {
+        lock.lock()
+        cache.removeAll()
+        itemGenerations.removeAll()
+        allGeneration &+= 1
+        lock.unlock()
+    }
+
+    /// Under `lock`
+    private func invalidateLocked(_ key: String) {
+        cache.removeValue(forKey: key)
+        if itemGenerations.count >= Self.maxCachedEntries, itemGenerations[key] == nil {
+            // Bounded: forgetting the counters makes every walk running now count as outdated
+            itemGenerations.removeAll()
+            allGeneration &+= 1
+        }
+        itemGenerations[key, default: 0] &+= 1
+    }
+
+    /// Walks queued or running (for tests and diagnostics).
+    var activeJobCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return jobs.count
+    }
+
+    /// Under `lock`
+    private func generationLocked(_ key: String) -> Generation {
+        Generation(all: allGeneration, item: itemGenerations[key] ?? 0)
+    }
+
+    // MARK: Calculating
+
+    /// Calculates the sizes of `urls` (folders and packages) for `request`. Cached sizes are
+    /// delivered right away, items already being measured for someone else aren't measured twice.
+    func calculate(_ urls: [URL], for request: Request, deliver: @escaping Delivery) {
+        guard !request.isCancelled else { return }
+        var cachedNow: [(key: String, size: Int64?)] = []
+        lock.lock()
+        for url in urls {
+            let key = url.standardizedPathKey
+            if let entry = cache[key] {
+                cachedNow.append((key, entry))
+            } else if let job = jobs[key] {
+                job.waiters.append(Waiter(request: request, deliver: deliver))
+            } else {
+                let job = Job(url: url)
+                job.waiters = [Waiter(request: request, deliver: deliver)]
+                jobs[key] = job
+                let operation = BlockOperation { [weak self] in
+                    self?.run(job, key: key)
+                }
+                job.operation = operation
+                queue.addOperation(operation)
+            }
+        }
+        lock.unlock()
+        guard !cachedNow.isEmpty else { return }
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                for entry in cachedNow where !request.isCancelled {
+                    deliver(entry.key, entry.size, true, 0)
+                }
+            }
+        }
+    }
+
+    /// Stops calculating for `request`.
+    func cancel(_ request: Request) {
+        request.cancellation.cancel()
+        removeWaiters(of: request, forKeys: nil)
+    }
+
+    /// Stops calculating `keys` for `request` (they're no longer shown).
+    func cancel<Keys: Sequence>(_ keys: Keys, of request: Request) where Keys.Element == String {
+        removeWaiters(of: request, forKeys: Set(keys))
+    }
+
+    private func removeWaiters(of request: Request, forKeys keys: Set<String>?) {
+        lock.lock()
+        for key in keys.map(Array.init) ?? Array(jobs.keys) {
+            guard let job = jobs[key] else { continue }
+            job.waiters.removeAll { $0.request === request }
+            if job.waiters.isEmpty {
+                // Nobody waits for it any more
+                job.cancellation.cancel()
+                job.operation?.cancel()
+                jobs.removeValue(forKey: key)
+            }
+        }
+        lock.unlock()
+    }
+
+    /// On `queue`
+    private func run(_ job: Job, key: String) {
+        lock.lock()
+        let generation = generationLocked(key)
+        lock.unlock()
+        guard !job.cancellation.isCancelled else { return }
+
+        let start = ProcessInfo.processInfo.systemUptime
+        let size = Self.measureContents(of: job.url) { job.cancellation.isCancelled }
+        let duration = ProcessInfo.processInfo.systemUptime - start
+
+        lock.lock()
+        // A cancelled job is no longer in `jobs` (and a new one may have taken its place)
+        guard !job.cancellation.isCancelled, jobs[key] === job else {
+            lock.unlock()
+            return
+        }
+        jobs.removeValue(forKey: key)
+        let isCurrent = generationLocked(key) == generation
+        if isCurrent {
+            storeLocked(size, forKey: key)
+        }
+        let waiters = job.waiters
+        lock.unlock()
+
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                for waiter in waiters where !waiter.request.isCancelled {
+                    waiter.deliver(key, size, isCurrent, duration)
+                }
+                self.scheduleChangePublish()
+            }
+        }
+    }
+
+    /// Under `lock`
+    private func storeLocked(_ size: Int64?, forKey key: String) {
+        if cache.count >= Self.maxCachedEntries, cache[key] == nil {
+            // Bounded: keep half (they're recalculated when shown again)
+            cache = Dictionary(uniqueKeysWithValues: cache.prefix(Self.maxCachedEntries / 2).map { ($0.key, $0.value) })
+        }
+        cache.updateValue(size, forKey: key)
+    }
+
+    /// Views showing cached sizes (Column view's preview) re-render, at most a few times a second.
+    @MainActor
+    private func scheduleChangePublish() {
+        guard !changePublishScheduled else { return }
+        changePublishScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + FileBrowserViewModel.itemSizeFlushInterval) {
+            MainActor.assumeIsolated {
+                self.changePublishScheduled = false
+                self.objectWillChange.send()
+            }
+        }
+    }
+
+    // MARK: Measuring
+
+    /// Total logical size (`st_size`, what `fileSize` reports) of everything inside `url`, hidden
+    /// files and package contents included, the way the list measures files. Symbolic links count
+    /// as themselves, hard-linked files once. Doesn't follow links, cross into other volumes or
+    /// enter dataless (not downloaded) folders. nil when `url` can't be read or was cancelled.
+    static func measureContents(of url: URL, isCancelled: () -> Bool) -> Int64? {
+        withDatalessMaterializationDisabled {
+            url.withUnsafeFileSystemRepresentation { representation -> Int64? in
+                guard let representation, let path = strdup(representation) else { return nil }
+                defer { free(path) }
+                var paths: [UnsafeMutablePointer<CChar>?] = [path, nil]
+                guard let fts = fts_open(&paths, FTS_PHYSICAL | FTS_NOCHDIR | FTS_XDEV, nil) else { return nil }
+                defer { fts_close(fts) }
+
+                var total: Int64 = 0
+                var hardLinkedFiles = Set<HardLinkedFile>()
+                var visited = 0
+                while let entry = fts_read(fts) {
+                    visited &+= 1
+                    if visited & 0xFF == 0, isCancelled() { return nil }
+                    let isRoot = entry.pointee.fts_level == FTS_ROOTLEVEL
+                    switch Int32(entry.pointee.fts_info) {
+                    case FTS_D:
+                        if entry.pointee.fts_statp.pointee.st_flags & UInt32(SF_DATALESS) != 0 {
+                            // Its listing isn't on disk: reading it would download it
+                            if isRoot { return nil }
+                            fts_set(fts, entry, FTS_SKIP)
+                        }
+                    case FTS_F:
+                        let info = entry.pointee.fts_statp.pointee
+                        if info.st_nlink > 1,
+                           !hardLinkedFiles.insert(HardLinkedFile(device: info.st_dev, inode: info.st_ino)).inserted {
+                            continue
+                        }
+                        total &+= Int64(info.st_size)
+                    case FTS_SL, FTS_SLNONE:
+                        total &+= Int64(entry.pointee.fts_statp.pointee.st_size)
+                    case FTS_DNR, FTS_ERR, FTS_NS:
+                        // Unreadable: inside, a partial sum; the item itself, no size
+                        if isRoot { return nil }
+                    default:
+                        break
+                    }
+                }
+                return isCancelled() ? nil : total
+            }
+        }
+    }
+
+    private struct HardLinkedFile: Hashable {
+        let device: dev_t
+        let inode: ino_t
+    }
+
+    /// Runs `body` with this thread unable to download iCloud (and other File Provider) content:
+    /// reading a dataless file or folder fails instead of fetching it.
+    static func withDatalessMaterializationDisabled<T>(_ body: () -> T) -> T {
+        let previous = getiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD)
+        setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, IOPOL_MATERIALIZE_DATALESS_FILES_OFF)
+        defer {
+            if previous >= 0 {
+                setiopolicy_np(IOPOL_TYPE_VFS_MATERIALIZE_DATALESS_FILES, IOPOL_SCOPE_THREAD, previous)
+            }
+        }
+        return body()
+    }
+}
+
+extension View {
+    /// Tells `viewModel` what this view shows of folder and package sizes while it's on screen
+    /// (nil: nothing), so they're calculated; nothing is calculated for views that don't show them.
+    func showsItemSizes(_ display: FileBrowserViewModel.ItemSizeDisplay?, of viewModel: FileBrowserViewModel) -> some View {
+        modifier(ItemSizeDisplayRegistration(viewModel: viewModel, display: display))
+    }
+}
+
+private struct ItemSizeDisplayRegistration: ViewModifier {
+    /// The view model registered with (the view can be handed another one)
+    private final class Registration {
+        let token = UUID()
+        weak var viewModel: FileBrowserViewModel?
+    }
+
+    let viewModel: FileBrowserViewModel
+    let display: FileBrowserViewModel.ItemSizeDisplay?
+    @State private var registration = Registration()
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear {
+                register()
+            }
+            .onDisappear {
+                registration.viewModel?.setItemSizeDisplay(nil, for: registration.token)
+                registration.viewModel = nil
+            }
+            .onChange(of: ObjectIdentifier(viewModel)) { _, _ in
+                register()
+            }
+            .onChange(of: display) { _, _ in
+                register()
+            }
+    }
+
+    private func register() {
+        if let previous = registration.viewModel, previous !== viewModel {
+            previous.setItemSizeDisplay(nil, for: registration.token)
+        }
+        registration.viewModel = viewModel
+        viewModel.setItemSizeDisplay(display, for: registration.token)
+    }
+}
+
 // MARK: - Directory Watcher
 
-/// Watches one folder with FSEvents and reports changed direct children, and when the folder itself
-/// (or a folder above it) is renamed, moved or deleted (`rootChanged`). Paths are mapped to the
-/// folder's displayed form (FSEvents reports resolved paths such as /private/tmp for /tmp or a
-/// symlinked folder's target). Callbacks are delivered on the main queue.
+/// Watches one folder with FSEvents and reports changed direct children, children with changes
+/// somewhere inside them (`contentsChangedChildPaths`: their total size changed), and when the
+/// folder itself (or a folder above it) is renamed, moved or deleted (`rootChanged`). Paths are
+/// mapped to the folder's displayed form (FSEvents reports resolved paths such as /private/tmp for
+/// /tmp or a symlinked folder's target). Callbacks are delivered on the main queue.
 private final class DirectoryWatcher {
-    typealias Callback = @MainActor (_ childPaths: [String], _ needsRescan: Bool, _ rootChanged: Bool, _ watchedPath: String) -> Void
+    typealias Callback = @MainActor (_ childPaths: [String], _ contentsChangedChildPaths: [String], _ needsRescan: Bool, _ rootChanged: Bool, _ watchedPath: String) -> Void
 
     /// Per-stream state, retained by the stream through its context
     fileprivate final class StreamContext {
@@ -6837,8 +7597,10 @@ private final class DirectoryWatcher {
         let goneFlags = FSEventStreamEventFlags(kFSEventStreamEventFlagItemRenamed | kFSEventStreamEventFlagItemRemoved)
 
         var childPaths: [String] = []
+        var contentsChangedChildPaths = Set<String>()
         var needsRescan = false
         var rootChanged = false
+        let displayPrefix = context.displayPath == "/" ? "/" : context.displayPath + "/"
         for (index, eventPath) in paths.enumerated() where index < numEvents {
             let flags = eventFlags[index]
             if flags & rootFlag != 0 {
@@ -6870,15 +7632,20 @@ private final class DirectoryWatcher {
             // Only direct children affect the listing
             if (path as NSString).deletingLastPathComponent == context.displayPath {
                 childPaths.append(path)
+            } else if path.hasPrefix(displayPrefix),
+                      let childName = path.dropFirst(displayPrefix.count).split(separator: "/", maxSplits: 1).first {
+                // Deeper down: the child's total size changed
+                contentsChangedChildPaths.insert(displayPrefix + childName)
             }
         }
-        guard needsRescan || rootChanged || !childPaths.isEmpty else { return }
+        guard needsRescan || rootChanged || !childPaths.isEmpty || !contentsChangedChildPaths.isEmpty else { return }
 
         let callback = context.callback
         let watchedPath = context.displayPath
+        let contentsChanged = Array(contentsChangedChildPaths)
         DispatchQueue.main.async {
             MainActor.assumeIsolated {
-                callback(childPaths, needsRescan, rootChanged, watchedPath)
+                callback(childPaths, contentsChanged, needsRescan, rootChanged, watchedPath)
             }
         }
     }

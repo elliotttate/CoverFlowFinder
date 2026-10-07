@@ -367,10 +367,13 @@ class ListColumnConfigManager: ObservableObject {
             case .dateCreated:
                 comparison = (item1.creationDate ?? .distantPast).compare(item2.creationDate ?? .distantPast)
             case .size:
-                if item1.size == item2.size {
+                // Folders' and packages' calculated totals sort with files' sizes
+                let size1 = item1.sizeForSorting
+                let size2 = item2.sizeForSorting
+                if size1 == size2 {
                     comparison = .orderedSame
                 } else {
-                    comparison = item1.size < item2.size ? .orderedAscending : .orderedDescending
+                    comparison = size1 < size2 ? .orderedAscending : .orderedDescending
                 }
             case .kind, .tags, .cloudStatus:
                 comparison = keys[lhs].localizedStandardCompare(keys[rhs])

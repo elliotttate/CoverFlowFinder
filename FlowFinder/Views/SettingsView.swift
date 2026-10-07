@@ -134,6 +134,11 @@ struct SettingsView: View {
                     format: "%.0f pt"
                 )
             }
+
+            Section("Sizes") {
+                Toggle("Calculate all sizes", isOn: $settings.calculateAllSizes)
+                    .help("Show the total size of folders in the Size column and sort folders by it, like Finder's View Options. Sizes are calculated in the background. Apps and other packages always show their size.")
+            }
         }
     }
 
