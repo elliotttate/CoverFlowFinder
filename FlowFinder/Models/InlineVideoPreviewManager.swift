@@ -5,13 +5,66 @@ import os.log
 
 private let previewLog = OSLog(subsystem: "com.flowfinder", category: "InlineVideoPreview")
 
-/// Single entry point for stopping every inline media preview (video and audio).
-/// Call on navigation, refresh, view-mode changes and when a view disappears.
+/// Entry points for stopping inline media previews (video and audio). A window or view model stops
+/// only its own previews, so navigating in one window doesn't cut off a preview in another.
 @MainActor
 enum InlinePreviews {
+    /// Stops every preview in every window (app-level: deactivation, termination).
     static func stopAll() {
         InlineVideoPreviewManager.shared.stopAllPreviews()
         InlineAudioPreviewManager.shared.stopAllPreviews()
+    }
+
+    /// Stops the previews started in `window` — the window under the mouse when the preview was
+    /// requested. Use when that window navigates, refreshes, changes view mode or closes a tab.
+    static func stopPreviews(inWindow window: NSWindow) {
+        InlineVideoPreviewManager.shared.stopPreviews(inWindow: window)
+        InlineAudioPreviewManager.shared.stopPreviews(inWindow: window)
+    }
+
+    /// Stops the previews whose file matches `predicate` — e.g. the items a view model shows, when it
+    /// navigates away (a view model doesn't know its window).
+    static func stopPreviews(where predicate: (URL) -> Bool) {
+        InlineVideoPreviewManager.shared.stopPreviews(where: predicate)
+        InlineAudioPreviewManager.shared.stopPreviews(where: predicate)
+    }
+
+    /// Stops the previews of files directly inside `folder`.
+    static func stopPreviews(inFolder folder: URL) {
+        let folderPath = folder.standardizedFileURL.path
+        stopPreviews { $0.deletingLastPathComponent().standardizedFileURL.path == folderPath }
+    }
+
+    /// Whether `item`'s contents are on disk, judging by its cloud status; nil if that isn't known yet.
+    /// Previewing a cloud file that isn't downloaded would download all of it, so hover previews skip it.
+    static func isLocallyAvailable(_ item: FileItem) -> Bool? {
+        switch item.cloudStatus {
+        case nil:
+            return nil
+        case .notDownloaded?, .downloading?:
+            return false
+        default:
+            return true
+        }
+    }
+
+    /// The number of the window under the mouse (0 if none): the window a hover preview belongs to.
+    static func windowNumberUnderMouse() -> Int {
+        NSWindow.windowNumber(at: NSEvent.mouseLocation, belowWindowWithWindowNumber: 0)
+    }
+
+    /// Checks off the main thread whether `url`'s contents are on disk (an iCloud file may not be),
+    /// then calls `completion` on the main thread.
+    static func checkLocalAvailability(of url: URL, completion: @escaping @MainActor (Bool) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            // A fresh URL: resource values cached on the item's URL could be out of date
+            let isAvailable = ThumbnailCacheManager.isLocallyAvailable(URL(fileURLWithPath: url.path))
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    completion(isAvailable)
+                }
+            }
+        }
     }
 }
 
@@ -156,6 +209,12 @@ final class InlineVideoPreviewManager: ObservableObject {
     /// The host that requested the current preview (nil for SwiftUI overlays).
     private(set) var currentHost: InlinePreviewHostToken?
 
+    /// The window the current preview was requested in (0 if unknown).
+    private var currentWindowNumber = 0
+
+    /// The current item's cloud status wasn't known: check that it's downloaded before loading it.
+    private var needsAvailabilityCheck = false
+
     // MARK: - State Machine
 
     private enum PreviewState {
@@ -240,9 +299,12 @@ final class InlineVideoPreviewManager: ObservableObject {
     /// Request a video preview for the given item. Called on hover enter.
     /// The preview starts after a debounce delay to avoid flicker.
     /// - Parameter host: The registered host requesting the preview, or nil for SwiftUI overlays.
+    /// iCloud files that aren't downloaded are skipped (playing one would download it).
     func requestPreview(for item: FileItem, host: InlinePreviewHostToken? = nil) {
         guard item.fileType == .video, !item.isFromArchive else { return }
         guard AppSettings.shared.inlineVideoPreview else { return }
+        let isLocallyAvailable = InlinePreviews.isLocallyAvailable(item)
+        guard isLocallyAvailable != false else { return }
 
         let url = item.url
 
@@ -257,6 +319,8 @@ final class InlineVideoPreviewManager: ObservableObject {
         // Start debounce
         state = .debouncing(url)
         currentHost = host
+        currentWindowNumber = InlinePreviews.windowNumberUnderMouse()
+        needsAvailabilityCheck = isLocallyAvailable == nil
         currentPreviewURL = url
 
         debounceTimer = Timer.scheduledTimer(withTimeInterval: debounceInterval, repeats: false) { [weak self] _ in
@@ -293,7 +357,19 @@ final class InlineVideoPreviewManager: ObservableObject {
         return currentPreviewURL
     }
 
-    /// Stop all previews immediately. Called on folder navigation, window deactivation.
+    /// Stop the preview if it was requested in `window` (or the window isn't known).
+    func stopPreviews(inWindow window: NSWindow) {
+        guard state.isActive, currentWindowNumber == 0 || currentWindowNumber == window.windowNumber else { return }
+        cancelCurrentState()
+    }
+
+    /// Stop the preview if its file matches `predicate`.
+    func stopPreviews(where predicate: (URL) -> Bool) {
+        guard state.isActive, let url = currentPreviewURL, predicate(url) else { return }
+        cancelCurrentState()
+    }
+
+    /// Stop all previews immediately, in every window (app deactivation, termination).
     func stopAllPreviews() {
         cancelCurrentState()
     }
@@ -398,6 +474,18 @@ final class InlineVideoPreviewManager: ObservableObject {
 
     private func beginLoading(for url: URL) {
         guard case .debouncing(let debouncedURL) = state, debouncedURL == url else {
+            return
+        }
+        if needsAvailabilityCheck {
+            InlinePreviews.checkLocalAvailability(of: url) { [weak self] isAvailable in
+                guard let self, case .debouncing(let debouncedURL) = self.state, debouncedURL == url else { return }
+                guard isAvailable else {
+                    self.cancelCurrentState()
+                    return
+                }
+                self.needsAvailabilityCheck = false
+                self.beginLoading(for: url)
+            }
             return
         }
 
@@ -540,6 +628,8 @@ final class InlineVideoPreviewManager: ObservableObject {
 
         state = .idle
         currentHost = nil
+        currentWindowNumber = 0
+        needsAvailabilityCheck = false
         seekGeneration &+= 1
         seekScheduler.reset()
         if currentPreviewURL != nil { currentPreviewURL = nil }

@@ -65,6 +65,32 @@ struct ZipExtractionResult {
     let failures: [ZipExtractionFailure]
 }
 
+/// Keeps copy-out extractions (`ZipArchiveManager.extractItemForCopy`) on disk while it is alive.
+/// When the last lease on an extraction ends (`release()` or deinit), its temporary folder is
+/// deleted after `ZipArchiveManager.copyExtractionGracePeriod`.
+final class ArchiveExtractionLease: @unchecked Sendable {
+    private let folders: [String]
+    private let lock = NSLock()
+    private var isReleased = false
+
+    fileprivate init(folders: [String]) {
+        self.folders = folders
+    }
+
+    func release() {
+        lock.lock()
+        let wasReleased = isReleased
+        isReleased = true
+        lock.unlock()
+        guard !wasReleased else { return }
+        ZipArchiveManager.shared.endLease(on: folders)
+    }
+
+    deinit {
+        release()
+    }
+}
+
 /// Reads ZIP archives without extracting them, and extracts entries safely on demand.
 /// Safe to call from any thread.
 final class ZipArchiveManager: @unchecked Sendable {
@@ -72,12 +98,25 @@ final class ZipArchiveManager: @unchecked Sendable {
 
     private init() {}
 
-    /// Single files extracted for open / Quick Look / thumbnails (stable, hashed names)
+    /// Single files extracted for open / Quick Look / thumbnails: `<hash>/<name>`, read-only
     private let extractionRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("FlowFinder-ArchivePreview", isDirectory: true)
     /// One fresh subdirectory per copy-out operation
     private let copyRoot = FileManager.default.temporaryDirectory
         .appendingPathComponent("FlowFinder-Extract", isDirectory: true)
+    /// The copy-out root's path as given and with symbolic links resolved (/var is /private/var), to
+    /// recognize URLs that come back in either form
+    private let copyRootPaths: [String] = {
+        let temporary = FileManager.default.temporaryDirectory
+        var paths = [temporary.appendingPathComponent("FlowFinder-Extract", isDirectory: true).standardizedFileURL.path]
+        if let real = ZipArchiveManager.realPath(temporary.path) {
+            paths.append(real + "/FlowFinder-Extract")
+        }
+        return paths
+    }()
+
+    /// How long a copy-out extraction outlives its last lease (a paste in another app may still be reading it)
+    var copyExtractionGracePeriod: TimeInterval = 30
 
     // Parsed archives, invalidated when the file's size, mtime or inode change
     private struct CachedArchive {
@@ -91,8 +130,12 @@ final class ZipArchiveManager: @unchecked Sendable {
     private var indexCache = LRUCache<EntriesFingerprint, ArchiveIndex>(capacity: 8)
     private let cacheLock = NSLock()
     private var didScheduleCleanup = false
-    // Serializes writers of the same preview file (striped by path hash)
-    private let destinationLocks = (0..<16).map { _ in NSLock() }
+    /// Preview and copy-out folders created or reused in this session; the stale-item cleanup keeps them (cacheLock)
+    private var sessionItems = Set<String>()
+    /// Leased copy-out folders: number of leases, and a generation bumped whenever the count drops to 0 (cacheLock)
+    private var copyLeases: [String: (count: Int, generation: Int)] = [:]
+    // Serializes writers of the same preview folder, and the cleanup against them (striped by path hash)
+    private let itemLocks = (0..<16).map { _ in NSLock() }
 
     static let maxCentralDirectorySize: UInt64 = 512 << 20
     static let staleExtractionAge: TimeInterval = 24 * 60 * 60
@@ -130,6 +173,7 @@ final class ZipArchiveManager: @unchecked Sendable {
     }
 
     /// Extract a single file from the archive to a temporary location (for open / Quick Look / thumbnails).
+    /// A symbolic link entry extracts the entry it points to. The file is read-only.
     /// Pass `offsetAdjustment` only to override the value detected when the archive was read.
     func extractFile(_ entry: ZipEntry, from zipURL: URL, offsetAdjustment: Int64? = nil) throws -> URL {
         guard !entry.isDirectory else {
@@ -140,11 +184,16 @@ final class ZipArchiveManager: @unchecked Sendable {
         }
 
         let reader = try ArchiveReader(url: zipURL)
-        let adjustment = try offsetAdjustment ?? cachedArchive(for: zipURL, reader: reader).offsetAdjustment
-        return try extractPreviewFile(entry, archiveURL: zipURL, reader: reader, offsetAdjustment: adjustment)
+        let archive = try cachedArchive(for: zipURL, reader: reader)
+        let adjustment = offsetAdjustment ?? archive.offsetAdjustment
+        let target = entry.isSymbolicLink
+            ? try resolveSymbolicLink(entry, in: archive, reader: reader, offsetAdjustment: adjustment)
+            : entry
+        return try extractPreviewFile(target, archiveURL: zipURL, reader: reader, offsetAdjustment: adjustment)
     }
 
-    /// Extract a file from the archive by its path (uses cached entries)
+    /// Extract a file from the archive by its path (uses cached entries). A symbolic link entry
+    /// extracts the entry it points to. The file is read-only.
     func extractByPath(_ path: String, from archiveURL: URL) throws -> URL {
         let reader = try ArchiveReader(url: archiveURL)
         let archive = try cachedArchive(for: archiveURL, reader: reader)
@@ -155,8 +204,11 @@ final class ZipArchiveManager: @unchecked Sendable {
         guard !entry.isDirectory else {
             throw ZipError.cannotExtractDirectory
         }
+        let target = entry.isSymbolicLink
+            ? try resolveSymbolicLink(entry, in: archive, reader: reader, offsetAdjustment: archive.offsetAdjustment)
+            : entry
 
-        return try extractPreviewFile(entry, archiveURL: archiveURL, reader: reader, offsetAdjustment: archive.offsetAdjustment)
+        return try extractPreviewFile(target, archiveURL: archiveURL, reader: reader, offsetAdjustment: archive.offsetAdjustment)
     }
 
     /// Check if a file has already been extracted (for thumbnail caching)
@@ -167,43 +219,73 @@ final class ZipArchiveManager: @unchecked Sendable {
               !entry.isDirectory else {
             return nil
         }
+        let target = entry.isSymbolicLink
+            ? try? resolveSymbolicLink(entry, in: archive, reader: reader, offsetAdjustment: archive.offsetAdjustment)
+            : entry
+        guard let target else { return nil }
 
-        let tempFile = previewURL(for: entry, archiveURL: archiveURL, stamp: reader.stamp)
-        return FileManager.default.fileExists(atPath: tempFile.path) ? tempFile : nil
+        let file = previewLocation(for: target, archiveURL: archiveURL, stamp: reader.stamp).file
+        return Self.fileType(atPath: file.path) == S_IFREG ? file : nil
     }
 
     /// Extract the file or folder at `archivePath` into a new private temporary directory (for copy/paste).
+    /// A path ending in "/" means the folder when a file has the same name (as in the listing).
     /// Paths are confined to that directory; Unix permissions (minus setuid/setgid/sticky), dates, safe
     /// relative symlinks and the archive's quarantine attribute are carried over. A folder extraction
-    /// continues past per-entry errors and reports them in `failures`; anything else throws.
+    /// writes the members its listing shows and continues past per-entry errors, reporting them in
+    /// `failures` — including entries whose names collide (duplicates, names differing only in case or
+    /// Unicode form, a file and a folder of the same name): one of them is written, never a mix.
+    /// Anything else throws, including too little free space for the declared size.
     ///
     /// `progress` (optional) gets the number of bytes to write as its total and advances as they're
     /// written. Cancelling it stops the extraction with `CocoaError.userCancelled` and removes
     /// everything written so far.
+    ///
+    /// The result stays until `discardCopyExtraction`, the end of the last `leaseCopyExtractions` lease
+    /// on it, or a later launch's stale-item cleanup (a day after it was last used).
     func extractItemForCopy(archivePath: String, from archiveURL: URL, limits: ZipExtractionLimits = .standard,
                             progress: Progress? = nil) throws -> ZipExtractionResult {
         try Self.checkCancellation(progress)
         let reader = try ArchiveReader(url: archiveURL)
         let archive = try cachedArchive(for: archiveURL, reader: reader)
 
-        let trimmedPath = archivePath.hasSuffix("/") ? String(archivePath.dropLast()) : archivePath
+        let wantsFolder = archivePath.hasSuffix("/")
+        let trimmedPath = wantsFolder ? String(archivePath.dropLast()) : archivePath
         guard Self.isSafeEntryPath(trimmedPath) else {
             throw ZipError.unsafeEntryPath(archivePath)
         }
-        guard let entry = archive.index.entry(atPath: trimmedPath) ?? archive.index.entry(atPath: trimmedPath + "/") else {
+        let preferred = archive.index.entry(atPath: wantsFolder ? trimmedPath + "/" : trimmedPath)
+        guard let entry = preferred ?? archive.index.entry(atPath: wantsFolder ? trimmedPath : trimmedPath + "/") else {
             throw ZipError.entryNotFound(archivePath)
+        }
+        guard Self.isSafePathComponent(entry.name) else {
+            throw ZipError.unsafeEntryPath(entry.path)
+        }
+
+        // Check the caps and the free space before anything is written
+        let plan: FolderPlan?
+        if entry.isDirectory {
+            let folderPlan = try planFolderExtraction(entry, index: archive.index, limits: limits)
+            try Self.checkFreeSpace(for: folderPlan.totalBytes)
+            plan = folderPlan
+        } else {
+            guard entry.uncompressedSize <= limits.maxEntryBytes else {
+                throw ZipError.entryTooLarge(entry.uncompressedSize)
+            }
+            try Self.checkFreeSpace(for: entry.uncompressedSize)
+            plan = nil
         }
 
         let operationDirectory = try makeOperationDirectory()
         do {
             let destination = operationDirectory.appendingPathComponent(entry.name, isDirectory: entry.isDirectory)
-            guard Self.isSafePathComponent(entry.name), Self.isContained(destination, in: operationDirectory) else {
+            guard Self.isContained(destination, in: operationDirectory) else {
                 throw ZipError.unsafeEntryPath(entry.path)
             }
 
             let quarantine = Self.quarantineAttribute(of: archiveURL)
-            if entry.isDirectory {
-                let failures = try extractDirectory(entry, archive: archive, reader: reader, to: destination,
+            if let plan {
+                let failures = try extractDirectory(entry, plan: plan, archive: archive, reader: reader, to: destination,
                                                     quarantine: quarantine, limits: limits, progress: progress)
                 Self.finish(progress)
                 return ZipExtractionResult(url: destination, failures: failures)
@@ -212,12 +294,12 @@ final class ZipArchiveManager: @unchecked Sendable {
             progress?.totalUnitCount = Int64(clamping: max(1, entry.uncompressedSize))
             if entry.isSymbolicLink {
                 try writeSymbolicLink(entry, reader: reader, offsetAdjustment: archive.offsetAdjustment,
-                                      components: [entry.name], symlinkKeys: [], to: destination,
+                                      components: [entry.name], to: destination,
                                       quarantine: quarantine, limits: limits, progress: progress)
             } else {
                 try writeFile(entry, reader: reader, offsetAdjustment: archive.offsetAdjustment, to: destination,
                               attributes: Self.fileAttributes(for: entry, quarantine: quarantine, restoreDate: true),
-                              limits: limits, progress: progress)
+                              limits: limits, exclusive: true, progress: progress)
             }
             Self.finish(progress)
             return ZipExtractionResult(url: destination, failures: [])
@@ -231,10 +313,81 @@ final class ZipArchiveManager: @unchecked Sendable {
     /// Removes the temporary folder an `extractItemForCopy` result lives in (e.g. after the copy
     /// it was made for was cancelled). Does nothing for paths outside the copy-out folder.
     func discardCopyExtraction(_ extractedURL: URL) {
-        let operationDirectory = extractedURL.deletingLastPathComponent()
-        guard operationDirectory.deletingLastPathComponent().standardizedFileURL.path == copyRoot.standardizedFileURL.path,
-              Self.isContained(extractedURL, in: operationDirectory) else { return }
-        try? FileManager.default.removeItem(at: operationDirectory)
+        guard let folder = operationFolder(containing: extractedURL) else { return }
+        try? FileManager.default.removeItem(atPath: folder)
+    }
+
+    /// Keeps the copy-out extractions among `urls` (results of `extractItemForCopy`, or items inside
+    /// them) on disk until the returned lease is released; then they're deleted, unless another lease
+    /// still holds them. Hold one for as long as something may still read them — the clipboard
+    /// referencing them, a paste in progress. Returns nil if none of `urls` is such an extraction.
+    func leaseCopyExtractions(_ urls: [URL]) -> ArchiveExtractionLease? {
+        let folders = Array(Set(urls.compactMap(operationFolder(containing:))))
+        guard !folders.isEmpty else { return nil }
+        cacheLock.lock()
+        for folder in folders {
+            let lease = copyLeases[folder] ?? (0, 0)
+            copyLeases[folder] = (lease.count + 1, lease.generation)
+        }
+        cacheLock.unlock()
+        return ArchiveExtractionLease(folders: folders)
+    }
+
+    fileprivate func endLease(on folders: [String]) {
+        var released: [(folder: String, generation: Int)] = []
+        cacheLock.lock()
+        for folder in folders {
+            guard let lease = copyLeases[folder] else { continue }
+            if lease.count > 1 {
+                copyLeases[folder] = (lease.count - 1, lease.generation)
+            } else {
+                copyLeases[folder] = (0, lease.generation + 1)
+                released.append((folder, lease.generation + 1))
+            }
+        }
+        let delay = copyExtractionGracePeriod
+        cacheLock.unlock()
+        guard !released.isEmpty else { return }
+
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + delay) { [self] in
+            for (folder, generation) in released {
+                cacheLock.lock()
+                // Not leased again since
+                let isUnused = copyLeases[folder].map { $0.count == 0 && $0.generation == generation } ?? false
+                if isUnused {
+                    copyLeases[folder] = nil
+                }
+                cacheLock.unlock()
+                if isUnused {
+                    try? FileManager.default.removeItem(atPath: folder)
+                }
+            }
+        }
+    }
+
+    /// The per-operation folder (a direct child of the copy-out root) that `url` is or is inside of
+    private func operationFolder(containing url: URL) -> String? {
+        let path = url.standardizedFileURL.path
+        for root in copyRootPaths {
+            let prefix = root + "/"
+            guard path.hasPrefix(prefix) else { continue }
+            guard let name = path.dropFirst(prefix.count).split(separator: "/").first,
+                  Self.isSafePathComponent(name) else { return nil }
+            return copyRoot.appendingPathComponent(String(name), isDirectory: true).standardizedFileURL.path
+        }
+        return nil
+    }
+
+    /// Throws if the volume holding the temporary folder has less room than `bytes` (plus a margin)
+    private static func checkFreeSpace(for bytes: UInt64) throws {
+        guard bytes > 0,
+              let values = try? FileManager.default.temporaryDirectory.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+              let capacity = values.volumeAvailableCapacityForImportantUsage else { return }
+        let available = UInt64(max(0, capacity))
+        let (needed, overflow) = bytes.addingReportingOverflow(min(bytes / 10, 1 << 30))
+        if overflow || needed > available {
+            throw ZipError.insufficientSpace(needed: bytes, available: available)
+        }
     }
 
     private static func checkCancellation(_ progress: Progress?) throws {
@@ -271,39 +424,53 @@ final class ZipArchiveManager: @unchecked Sendable {
             && component.utf8.count <= 255
     }
 
-    /// A symlink target is accepted only if it is relative and, resolved from the link's folder, never leaves
-    /// the extraction root. ".." is not allowed after passing through another link from the archive, because
-    /// the physical path would no longer match the lexical one.
-    static func isSafeSymlinkTarget(_ target: String, linkComponents: [String], symlinkKeys: Set<String>) -> Bool {
+    /// A symlink target (for a link at `linkComponents` below the extraction root) is accepted only if it is
+    /// relative and can't leave the root: ".." may only lead the target, where it climbs through the real
+    /// folders above the link (never past the root), and the rest only descends by name. Descending through
+    /// other links from the archive is safe because each of them passed this same check. Matching names
+    /// against the archive's other links instead would have to reproduce the file system's case and Unicode
+    /// folding exactly (APFS treats "ſ" as "s", for one).
+    static func isSafeSymlinkTarget(_ target: String, linkComponents: [String]) -> Bool {
         guard !target.isEmpty, !target.hasPrefix("/"), !target.contains("\0"), !target.contains("\\") else {
             return false
         }
-        var stack = Array(linkComponents.dropLast())
-        var passedSymlink = false
+        var foldersAbove = linkComponents.count - 1
+        var isDescending = false
         for component in target.split(separator: "/") {
             switch component {
             case ".":
                 continue
             case "..":
-                guard !passedSymlink, !stack.isEmpty else { return false }
-                stack.removeLast()
+                guard !isDescending, foldersAbove > 0 else { return false }
+                foldersAbove -= 1
             default:
-                stack.append(String(component))
-                if symlinkKeys.contains(pathKey(stack)) { passedSymlink = true }
+                isDescending = true
             }
         }
         return true
     }
 
-    /// Case- and normalization-insensitive key, matching how APFS resolves names
-    private static func pathKey(_ components: [String]) -> String {
-        components.joined(separator: "/").precomposedStringWithCanonicalMapping.lowercased()
+    /// Earlier form of `isSafeSymlinkTarget(_:linkComponents:)`; the other links no longer matter.
+    static func isSafeSymlinkTarget(_ target: String, linkComponents: [String], symlinkKeys: Set<String>) -> Bool {
+        isSafeSymlinkTarget(target, linkComponents: linkComponents)
     }
 
     private static func isContained(_ url: URL, in root: URL) -> Bool {
         let rootPath = root.standardizedFileURL.path
         let path = url.standardizedFileURL.path
         return path.hasPrefix(rootPath.hasSuffix("/") ? rootPath : rootPath + "/")
+    }
+
+    /// The file type bits (S_IFREG, S_IFDIR, ...) of `path` itself, or nil if there's nothing there
+    private static func fileType(atPath path: String) -> mode_t? {
+        var info = stat()
+        return lstat(path, &info) == 0 ? info.st_mode & S_IFMT : nil
+    }
+
+    fileprivate static func realPath(_ path: String) -> String? {
+        guard let resolved = realpath(path, nil) else { return nil }
+        defer { free(resolved) }
+        return String(cString: resolved)
     }
 
     // MARK: - Caching
@@ -348,7 +515,8 @@ final class ZipArchiveManager: @unchecked Sendable {
         return index
     }
 
-    /// Removes leftovers of earlier runs once per launch, off the calling thread
+    /// Removes leftovers of earlier runs once per launch, off the calling thread. Items used in this
+    /// session, leased, or on the clipboard (which can outlive the app) are kept.
     private func scheduleCleanupIfNeeded() {
         cacheLock.lock()
         let shouldRun = !didScheduleCleanup
@@ -356,26 +524,74 @@ final class ZipArchiveManager: @unchecked Sendable {
         cacheLock.unlock()
         guard shouldRun else { return }
 
-        let roots = [extractionRoot, copyRoot]
-        DispatchQueue.global(qos: .utility).async {
-            for root in roots {
-                Self.removeStaleItems(in: root, olderThan: Self.staleExtractionAge)
+        // The pasteboard is read on the main thread
+        DispatchQueue.main.async { [self] in
+            let clipboard = (NSPasteboard.general.readObjects(forClasses: [NSURL.self],
+                                                              options: [.urlReadingFileURLsOnly: true]) as? [URL]) ?? []
+            DispatchQueue.global(qos: .utility).async { [self] in
+                removeStaleExtractions(keeping: clipboard)
             }
         }
     }
 
-    /// Deletes direct children of `directory` that haven't been modified within `age` seconds
-    static func removeStaleItems(in directory: URL, olderThan age: TimeInterval) {
+    /// Deletes previews and copy-out folders last used more than `staleExtractionAge` ago, except those used
+    /// in this session, leased, or containing one of `clipboardURLs`. Runs once per launch on its own.
+    func removeStaleExtractions(keeping clipboardURLs: [URL]) {
+        let clipboardPaths = clipboardURLs.compactMap { Self.realPath($0.path) }
+        for root in [extractionRoot, copyRoot] {
+            Self.removeStaleItems(in: root, olderThan: Self.staleExtractionAge, isInUse: { [self] child in
+                isInUse(child, clipboardPaths: clipboardPaths)
+            }, exclusively: { [self] child, body in
+                // Excludes a concurrent reuse of the same preview (see extractPreviewFile)
+                let lock = itemLock(for: child)
+                lock.lock()
+                body()
+                lock.unlock()
+            })
+        }
+    }
+
+    private func isInUse(_ item: URL, clipboardPaths: [String]) -> Bool {
+        let path = item.standardizedFileURL.path
+        cacheLock.lock()
+        let isActive = sessionItems.contains(path) || copyLeases[path] != nil
+        cacheLock.unlock()
+        if isActive { return true }
+        guard !clipboardPaths.isEmpty, let real = Self.realPath(item.path) else { return false }
+        return clipboardPaths.contains { $0 == real || $0.hasPrefix(real + "/") }
+    }
+
+    /// Notes that `item` (a direct child of a temporary root) is in use in this session
+    private func markUsed(_ item: URL) {
+        cacheLock.lock()
+        sessionItems.insert(item.standardizedFileURL.path)
+        cacheLock.unlock()
+    }
+
+    private func itemLock(for item: URL) -> NSLock {
+        itemLocks[Int(UInt(bitPattern: item.standardizedFileURL.path.hashValue) % UInt(itemLocks.count))]
+    }
+
+    /// Deletes direct children of `directory` that haven't been modified within `age` seconds, except those
+    /// `isInUse` reports. Each check-and-delete runs inside `exclusively` (given the child). Read-only
+    /// folders (opened previews) are made writable first so they can be deleted.
+    static func removeStaleItems(in directory: URL, olderThan age: TimeInterval,
+                                 isInUse: @escaping (URL) -> Bool = { _ in false },
+                                 exclusively: (URL, () -> Void) -> Void = { _, body in body() }) {
         let fileManager = FileManager.default
         guard let children = try? fileManager.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else {
             return
         }
         let cutoff = Date().timeIntervalSince1970 - age
         for child in children {
-            var info = stat()
-            guard lstat(child.path, &info) == 0 else { continue }
-            let mtime = TimeInterval(info.st_mtimespec.tv_sec) + TimeInterval(info.st_mtimespec.tv_nsec) / 1_000_000_000
-            if mtime < cutoff {
+            exclusively(child) {
+                var info = stat()
+                guard lstat(child.path, &info) == 0 else { return }
+                let mtime = TimeInterval(info.st_mtimespec.tv_sec) + TimeInterval(info.st_mtimespec.tv_nsec) / 1_000_000_000
+                guard mtime < cutoff, !isInUse(child) else { return }
+                if info.st_mode & S_IFMT == S_IFDIR {
+                    _ = chmod(child.path, 0o700)
+                }
                 try? fileManager.removeItem(at: child)
             }
         }
@@ -731,41 +947,51 @@ final class ZipArchiveManager: @unchecked Sendable {
 
     // MARK: - Extraction
 
+    /// Extracts `entry` (not a link) to its preview location, or reuses an earlier extraction. The file and
+    /// its folder are read-only, so an app it's opened in can't save edits into this temporary copy.
     private func extractPreviewFile(_ entry: ZipEntry, archiveURL: URL, reader: ArchiveReader, offsetAdjustment: Int64) throws -> URL {
         scheduleCleanupIfNeeded()
-        let destination = previewURL(for: entry, archiveURL: archiveURL, stamp: reader.stamp)
+        let (folder, destination) = previewLocation(for: entry, archiveURL: archiveURL, stamp: reader.stamp)
 
-        let lock = destinationLock(for: destination.path)
+        let lock = itemLock(for: folder)
         lock.lock()
         defer { lock.unlock() }
+        markUsed(folder)
 
         // Files only appear under their final name once fully written and verified.
-        // Reuse refreshes the mtime so the stale-file cleanup sees it as recently used.
-        var info = stat()
-        if lstat(destination.path, &info) == 0, info.st_mode & S_IFMT == S_IFREG {
-            _ = utimes(destination.path, nil)
+        // Reuse refreshes the folder's date so a later launch's cleanup sees it as recently used.
+        if Self.fileType(atPath: destination.path) == S_IFREG {
+            _ = utimes(folder.path, nil)
             return destination
         }
 
         try FileManager.default.createDirectory(at: extractionRoot, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
-        let quarantine = Self.quarantineAttribute(of: archiveURL)
-        try writeFile(entry, reader: reader, offsetAdjustment: offsetAdjustment, to: destination,
-                      attributes: Self.fileAttributes(for: entry, quarantine: quarantine, restoreDate: false),
-                      limits: .standard)
+        // An earlier attempt may have left the folder behind (read-only, or without the file)
+        if mkdir(folder.path, 0o700) != 0 {
+            guard errno == EEXIST, Self.fileType(atPath: folder.path) == S_IFDIR, chmod(folder.path, 0o700) == 0 else {
+                throw Self.posixFailure("Couldn't create folder")
+            }
+        }
+        do {
+            let quarantine = Self.quarantineAttribute(of: archiveURL)
+            try writeFile(entry, reader: reader, offsetAdjustment: offsetAdjustment, to: destination,
+                          attributes: Self.previewAttributes(for: entry, quarantine: quarantine), limits: .standard)
+        } catch {
+            rmdir(folder.path)
+            throw error
+        }
+        _ = chmod(folder.path, 0o555)
         return destination
     }
 
-    private func previewURL(for entry: ZipEntry, archiveURL: URL, stamp: FileStamp) -> URL {
-        let key = "\(archiveURL.standardizedFileURL.path)|\(stamp.size)|\(stamp.mtimeSeconds).\(stamp.mtimeNanoseconds)|\(stamp.inode)|\(entry.path)"
+    /// Where an opened entry is extracted: a folder named by a hash of the archive's identity and the entry's
+    /// path, holding the file under its own name (which is what the app it opens in shows)
+    private func previewLocation(for entry: ZipEntry, archiveURL: URL, stamp: FileStamp) -> (folder: URL, file: URL) {
+        let key = "v2|\(archiveURL.standardizedFileURL.path)|\(stamp.size)|\(stamp.mtimeSeconds).\(stamp.mtimeNanoseconds)|\(stamp.inode)|\(entry.path)"
         let hash = SHA256.hash(data: Data(key.utf8)).compactMap { String(format: "%02x", $0) }.joined()
-        let ext = (entry.name as NSString).pathExtension
-        let filename = (ext.isEmpty || ext.utf8.count > 32) ? hash : "\(hash).\(ext)"
-        return extractionRoot.appendingPathComponent(filename)
-    }
-
-    private func destinationLock(for path: String) -> NSLock {
-        destinationLocks[Int(UInt(bitPattern: path.hashValue) % UInt(destinationLocks.count))]
+        let folder = extractionRoot.appendingPathComponent(hash, isDirectory: true)
+        return (folder, folder.appendingPathComponent(entry.name, isDirectory: false))
     }
 
     private func makeOperationDirectory() throws -> URL {
@@ -773,11 +999,111 @@ final class ZipArchiveManager: @unchecked Sendable {
         let directory = copyRoot.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                                 attributes: [.posixPermissions: 0o700])
+        markUsed(directory)
         return directory
+    }
+
+    /// The entry a symbolic link entry points to, resolved inside the archive the way the file system would
+    /// resolve it once extracted (links to links are followed). Throws if it leads out of the archive, to a
+    /// folder or to nothing.
+    private func resolveSymbolicLink(_ link: ZipEntry, in archive: CachedArchive, reader: ArchiveReader,
+                                     offsetAdjustment: Int64) throws -> ZipEntry {
+        let index = archive.index
+        var resolved: [String] = []
+        // The link itself is the last component, so it is followed like any other
+        var pending = link.path.split(separator: "/").map(String.init)[...]
+        var hops = 0
+        while let component = pending.popFirst() {
+            switch component {
+            case "", ".":
+                continue
+            case "..":
+                guard !resolved.isEmpty else { throw ZipError.brokenSymbolicLink(link.path) }
+                resolved.removeLast()
+            default:
+                resolved.append(component)
+                let path = resolved.joined(separator: "/")
+                let isLast = pending.allSatisfy { $0.isEmpty || $0 == "." }
+                // A folder of the same name wins on the way (its contents are listed under it)
+                guard let entry = index.entry(atPath: path), entry.isSymbolicLink,
+                      isLast || index.entry(atPath: path + "/") == nil else { continue }
+                hops += 1
+                guard hops <= 32,
+                      let target = try readSymbolicLinkTarget(entry, reader: reader, offsetAdjustment: offsetAdjustment),
+                      !target.hasPrefix("/") else {
+                    throw ZipError.brokenSymbolicLink(link.path)
+                }
+                resolved.removeLast()
+                pending = (target.split(separator: "/", omittingEmptySubsequences: false).map(String.init) + pending)[...]
+            }
+        }
+
+        let path = resolved.joined(separator: "/")
+        if let entry = index.entry(atPath: path), !entry.isDirectory {
+            return entry
+        }
+        if resolved.isEmpty || index.entry(atPath: path + "/") != nil {
+            throw ZipError.cannotExtractDirectory
+        }
+        throw ZipError.brokenSymbolicLink(link.path)
+    }
+
+    /// A link entry's target text, or nil if it is too long or not text. Throws if the data can't be read.
+    private func readSymbolicLinkTarget(_ entry: ZipEntry, reader: ArchiveReader, offsetAdjustment: Int64,
+                                        limits: ZipExtractionLimits = .standard) throws -> String? {
+        guard entry.uncompressedSize <= UInt64(PATH_MAX) else { return nil }
+        var bytes: [UInt8] = []
+        try streamEntryData(entry, reader: reader, offsetAdjustment: offsetAdjustment, limits: limits) { chunk in
+            bytes.append(contentsOf: chunk)
+        }
+        return String(validating: bytes, as: UTF8.self)
+    }
+
+    /// A folder's members to extract, in the order to write them (folders before their contents)
+    private struct FolderPlan {
+        var members: [(entry: ZipEntry, components: [String])] = []
+        /// Duplicate entries the listing doesn't show (another entry has the same path)
+        var failures: [ZipExtractionFailure] = []
+        var totalBytes: UInt64 = 0
+    }
+
+    /// Plans extracting `folder` from the archive index, so a copied folder holds exactly what its listing
+    /// (and opening its items) shows: the first of several entries with the same path, folders whose paths
+    /// differ only in Unicode form merged. Hidden duplicates are reported as failures. Throws if the
+    /// declared sizes exceed `limits.maxTotalBytes`.
+    private func planFolderExtraction(_ folder: ZipEntry, index: ArchiveIndex, limits: ZipExtractionLimits) throws -> FolderPlan {
+        var plan = FolderPlan()
+        var folders: [(path: String, components: [String])] = [(folder.path, [])]
+        while let (path, components) = folders.popLast() {
+            // Files first: where a file (or link) and a folder share a name, the file is written and
+            // everything in the folder is reported, so nothing is ever written through a link
+            let children = index.children(of: path)
+            for child in children.filter({ !$0.isDirectory }) + children.filter(\.isDirectory) {
+                let childComponents = components + [child.name]
+                let relativePath = childComponents.joined(separator: "/")
+                // Duplicate folder entries just merge; a hidden file would be lost (or swapped in), so say so
+                if index.hiddenDuplicates(of: child.path).contains(where: { !($0.isDirectory && child.isDirectory) }) {
+                    plan.failures.append(ZipExtractionFailure(path: relativePath, error: ZipError.pathConflict(relativePath)))
+                }
+                plan.members.append((child, childComponents))
+                if child.isDirectory {
+                    folders.append((child.path, childComponents))
+                } else {
+                    // Declared sizes are enforced while streaming, so their sum bounds the total output
+                    let (sum, overflow) = plan.totalBytes.addingReportingOverflow(child.uncompressedSize)
+                    guard !overflow, sum <= limits.maxTotalBytes else {
+                        throw ZipError.entryTooLarge(overflow ? .max : sum)
+                    }
+                    plan.totalBytes = sum
+                }
+            }
+        }
+        return plan
     }
 
     private func extractDirectory(
         _ directoryEntry: ZipEntry,
+        plan: FolderPlan,
         archive: CachedArchive,
         reader: ArchiveReader,
         to root: URL,
@@ -785,31 +1111,8 @@ final class ZipArchiveManager: @unchecked Sendable {
         limits: ZipExtractionLimits,
         progress: Progress? = nil
     ) throws -> [ZipExtractionFailure] {
-        let base = directoryEntry.path.hasSuffix("/") ? directoryEntry.path : directoryEntry.path + "/"
-        var failures: [ZipExtractionFailure] = []
-
-        var members: [(entry: ZipEntry, components: [String])] = []
-        for entry in archive.entries where entry.path.utf8.count > base.utf8.count && entry.path.utf8.starts(with: base.utf8) {
-            let relativePath = String(decoding: entry.path.utf8.dropFirst(base.utf8.count), as: UTF8.self)
-            guard Self.isSafeEntryPath(relativePath) else {
-                failures.append(ZipExtractionFailure(path: relativePath, error: ZipError.unsafeEntryPath(relativePath)))
-                continue
-            }
-            members.append((entry, relativePath.split(separator: "/").map(String.init)))
-        }
-
-        // Declared sizes are enforced while streaming, so their sum bounds the total output
-        var totalSize: UInt64 = 0
-        for member in members where !member.entry.isDirectory {
-            let (sum, overflow) = totalSize.addingReportingOverflow(member.entry.uncompressedSize)
-            guard !overflow, sum <= limits.maxTotalBytes else {
-                throw ZipError.entryTooLarge(overflow ? .max : sum)
-            }
-            totalSize = sum
-        }
-        progress?.totalUnitCount = Int64(clamping: max(1, totalSize))
-
-        let symlinkKeys = Set(members.filter { $0.entry.isSymbolicLink && !$0.entry.isDirectory }.map { Self.pathKey($0.components) })
+        var failures = plan.failures
+        progress?.totalUnitCount = Int64(clamping: max(1, plan.totalBytes))
 
         guard mkdir(root.path, 0o700) == 0 else {
             throw Self.posixFailure("Couldn't create folder")
@@ -819,7 +1122,7 @@ final class ZipArchiveManager: @unchecked Sendable {
         }
 
         var directories: [(components: [String], entry: ZipEntry)] = [([], directoryEntry)]
-        for (entry, components) in members {
+        for (entry, components) in plan.members {
             try Self.checkCancellation(progress)
             let relativePath = components.joined(separator: "/")
             do {
@@ -835,14 +1138,16 @@ final class ZipArchiveManager: @unchecked Sendable {
                     throw ZipError.unsafeEntryPath(relativePath)
                 }
 
+                // Never replaces what an earlier member wrote: names the file system considers the
+                // same (case, Unicode form) are reported as conflicts
                 if entry.isSymbolicLink {
                     try writeSymbolicLink(entry, reader: reader, offsetAdjustment: archive.offsetAdjustment,
-                                          components: components, symlinkKeys: symlinkKeys, to: destination,
+                                          components: components, to: destination,
                                           quarantine: quarantine, limits: limits, progress: progress)
                 } else {
                     try writeFile(entry, reader: reader, offsetAdjustment: archive.offsetAdjustment, to: destination,
                                   attributes: Self.fileAttributes(for: entry, quarantine: quarantine, restoreDate: true),
-                                  limits: limits, progress: progress)
+                                  limits: limits, exclusive: true, progress: progress)
                 }
             } catch let error where Self.isCancellation(error) {
                 throw error
@@ -902,6 +1207,15 @@ final class ZipArchiveManager: @unchecked Sendable {
         return OutputAttributes(quarantine: quarantine, mode: mode, modificationDate: restoreDate ? entry.modificationDate : nil)
     }
 
+    /// Opened entries are read-only (r--r--r--, keeping execute bits)
+    private static func previewAttributes(for entry: ZipEntry, quarantine: Data?) -> OutputAttributes {
+        var mode: mode_t = 0o444
+        if let unixMode = entry.unixMode, !entry.isSymbolicLink, unixMode & 0o777 != 0 {
+            mode |= mode_t(truncatingIfNeeded: unixMode & 0o111)
+        }
+        return OutputAttributes(quarantine: quarantine, mode: mode, modificationDate: nil)
+    }
+
     private static func applyDirectoryAttributes(of entry: ZipEntry, at path: String) {
         var info = stat()
         guard lstat(path, &info) == 0, info.st_mode & S_IFMT == S_IFDIR else { return }
@@ -919,7 +1233,8 @@ final class ZipArchiveManager: @unchecked Sendable {
     }
 
     /// Write `entry` to `destination` through a temporary file in the same folder that is renamed into place
-    /// only after its size and CRC-32 have been verified, so no partial file is ever visible
+    /// only after its size and CRC-32 have been verified, so no partial file is ever visible.
+    /// With `exclusive`, an existing item at `destination` is not replaced (`ZipError.pathConflict`).
     private func writeFile(
         _ entry: ZipEntry,
         reader: ArchiveReader,
@@ -927,6 +1242,7 @@ final class ZipArchiveManager: @unchecked Sendable {
         to destination: URL,
         attributes: OutputAttributes,
         limits: ZipExtractionLimits,
+        exclusive: Bool = false,
         progress: Progress? = nil
     ) throws {
         let temporary = destination.deletingLastPathComponent()
@@ -958,9 +1274,7 @@ final class ZipArchiveManager: @unchecked Sendable {
             guard close(fd) == 0 else {
                 throw Self.posixFailure("Couldn't write file")
             }
-            guard rename(temporary.path, destination.path) == 0 else {
-                throw Self.posixFailure("Couldn't move file into place")
-            }
+            try Self.moveIntoPlace(temporary.path, destination, exclusive: exclusive)
         } catch {
             if isOpen { close(fd) }
             unlink(temporary.path)
@@ -968,31 +1282,45 @@ final class ZipArchiveManager: @unchecked Sendable {
         }
     }
 
-    /// Create a symlink only if its target stays inside the extraction root; otherwise keep the target text as a regular file
+    /// Renames a finished temporary item to `destination`. With `exclusive`, an item already there — which
+    /// may have a name the file system merely considers equal (other case or Unicode form) — is kept.
+    private static func moveIntoPlace(_ temporary: String, _ destination: URL, exclusive: Bool) throws {
+        if exclusive {
+            if renamex_np(temporary, destination.path, UInt32(RENAME_EXCL)) == 0 { return }
+            let code = errno
+            if code == EEXIST {
+                throw ZipError.pathConflict(destination.lastPathComponent)
+            }
+            // File systems without RENAME_EXCL: check, then rename (the folder is private to this operation)
+            guard code == ENOTSUP || code == EINVAL else {
+                throw posixFailure("Couldn't move item into place", code)
+            }
+            if fileType(atPath: destination.path) != nil {
+                throw ZipError.pathConflict(destination.lastPathComponent)
+            }
+        }
+        guard rename(temporary, destination.path) == 0 else {
+            throw posixFailure("Couldn't move item into place")
+        }
+    }
+
+    /// Create a symlink only if its target stays inside the extraction root; otherwise keep the target text as
+    /// a regular file. Never replaces an existing item.
     private func writeSymbolicLink(
         _ entry: ZipEntry,
         reader: ArchiveReader,
         offsetAdjustment: Int64,
         components: [String],
-        symlinkKeys: Set<String>,
         to destination: URL,
         quarantine: Data?,
         limits: ZipExtractionLimits,
         progress: Progress? = nil
     ) throws {
-        var target: String?
-        if entry.uncompressedSize <= UInt64(PATH_MAX) {
-            var bytes: [UInt8] = []
-            try streamEntryData(entry, reader: reader, offsetAdjustment: offsetAdjustment, limits: limits) { chunk in
-                bytes.append(contentsOf: chunk)
-            }
-            target = String(validating: bytes, as: UTF8.self)
-        }
-
-        guard let target, Self.isSafeSymlinkTarget(target, linkComponents: components, symlinkKeys: symlinkKeys) else {
+        let target = try readSymbolicLinkTarget(entry, reader: reader, offsetAdjustment: offsetAdjustment, limits: limits)
+        guard let target, Self.isSafeSymlinkTarget(target, linkComponents: components) else {
             try writeFile(entry, reader: reader, offsetAdjustment: offsetAdjustment, to: destination,
                           attributes: Self.fileAttributes(for: entry, quarantine: quarantine, restoreDate: true),
-                          limits: limits, progress: progress)
+                          limits: limits, exclusive: true, progress: progress)
             return
         }
 
@@ -1001,10 +1329,11 @@ final class ZipArchiveManager: @unchecked Sendable {
         guard symlink(target, temporary.path) == 0 else {
             throw Self.posixFailure("Couldn't create symbolic link")
         }
-        guard rename(temporary.path, destination.path) == 0 else {
-            let failure = Self.posixFailure("Couldn't move symbolic link into place")
+        do {
+            try Self.moveIntoPlace(temporary.path, destination, exclusive: true)
+        } catch {
             unlink(temporary.path)
-            throw failure
+            throw error
         }
         progress?.completedUnitCount += Int64(clamping: entry.uncompressedSize)
     }
@@ -1280,19 +1609,29 @@ private final class ArchiveReader {
     }
 }
 
-/// Path → entry and folder → children lookups for one archive, built once (O(n)) so listing a folder is O(children)
+/// Path → entry and folder → children lookups for one archive, built once (O(n)) so listing a folder is O(children).
+/// The single source of truth for which entry a path means — listing, opening and copying all go through it.
+/// Paths are Swift strings, so Unicode-equivalent forms (NFC/NFD) are the same path; the first entry for a
+/// path wins and later ones are kept aside as hidden duplicates.
 private final class ArchiveIndex: @unchecked Sendable {
     private let entriesByPath: [String: ZipEntry]
     private let childrenByDirectory: [String: [ZipEntry]]
+    private let hiddenByPath: [String: [ZipEntry]]
     private var sortedChildren: [String: [ZipEntry]] = [:]
     private let lock = NSLock()
 
     init(entries: [ZipEntry]) {
         var byPath: [String: ZipEntry] = [:]
+        var hidden: [String: [ZipEntry]] = [:]
         byPath.reserveCapacity(entries.count)
-        for entry in entries where byPath[entry.path] == nil {
-            byPath[entry.path] = entry
+        for entry in entries {
+            if byPath[entry.path] == nil {
+                byPath[entry.path] = entry
+            } else {
+                hidden[entry.path, default: []].append(entry)
+            }
         }
+        hiddenByPath = hidden
 
         // Synthesize folders that only exist implicitly (e.g. "a/" for "a/b.txt")
         for path in Array(byPath.keys) {
@@ -1325,6 +1664,11 @@ private final class ArchiveIndex: @unchecked Sendable {
         entriesByPath[path]
     }
 
+    /// Later entries with the same path as the one `entry(atPath:)` returns
+    func hiddenDuplicates(of path: String) -> [ZipEntry] {
+        hiddenByPath[path] ?? []
+    }
+
     /// Children of a folder path ("" for the root, otherwise ending in "/"): directories first, then by name
     func children(of directory: String) -> [ZipEntry] {
         lock.lock()
@@ -1336,7 +1680,11 @@ private final class ArchiveIndex: @unchecked Sendable {
             if a.isDirectory != b.isDirectory {
                 return a.isDirectory
             }
-            return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
+            switch a.name.localizedCaseInsensitiveCompare(b.name) {
+            case .orderedAscending: return true
+            case .orderedDescending: return false
+            case .orderedSame: return a.name < b.name  // e.g. "Notes" and "notes": a stable order
+            }
         }
         sortedChildren[directory] = sorted
         return sorted
@@ -1482,6 +1830,8 @@ enum ZipError: LocalizedError {
     case entryTooLarge(UInt64)
     case corruptData(String)
     case pathConflict(String)
+    case brokenSymbolicLink(String)
+    case insufficientSpace(needed: UInt64, available: UInt64)
 
     var errorDescription: String? {
         switch self {
@@ -1505,6 +1855,11 @@ enum ZipError: LocalizedError {
             return "The archive data is corrupt: \(reason)"
         case .pathConflict(let path):
             return "“\(path)” conflicts with another item in the archive"
+        case .brokenSymbolicLink(let path):
+            return "“\(path)” is a symbolic link to an item that isn’t in the archive"
+        case .insufficientSpace(let needed, let available):
+            let format = { (bytes: UInt64) in ByteCountFormatter.string(fromByteCount: Int64(clamping: bytes), countStyle: .file) }
+            return "There isn’t enough free space to extract it (\(format(needed)) needed, \(format(available)) available)"
         }
     }
 

@@ -7,9 +7,11 @@ struct AsyncListIconView: View {
     let size: CGFloat
 
     @State private var image: NSImage?
-    /// The key of the request in flight or completed; a completion only applies if it's still current.
+    /// The key of the request in flight or completed (nil: load again).
     @State private var loadedKey: LoadKey?
     @State private var requestToken: ThumbnailRequestToken?
+    /// Identifies the latest request; answers to older (cancelled or replaced) ones are ignored.
+    @State private var requestID = 0
 
     private let thumbnailCache = ThumbnailCacheManager.shared
 
@@ -56,12 +58,14 @@ struct AsyncListIconView: View {
         }
         cancelRequest()
         loadedKey = key
+        requestID &+= 1
+        let id = requestID
 
         let item = item
         // No polling: a request already pending elsewhere is joined and completes this one too.
         let token = thumbnailCache.requestThumbnail(for: item, maxPixelSize: targetPixelSize, owner: nil) { result in
-            // Ignore answers for an older key (item, size or quality changed meanwhile)
-            guard loadedKey == key else { return }
+            // Only the latest request applies (not one cancelled or replaced since, even for the same key)
+            guard requestID == id else { return }
             requestToken = nil
             switch result {
             case .loaded(let thumbnail):
@@ -73,13 +77,15 @@ struct AsyncListIconView: View {
                 loadedKey = nil
             }
         }
-        if loadedKey == key {
+        // Nil when it was answered synchronously
+        if requestID == id {
             requestToken = token
         }
     }
 
     private func cancelRequest() {
         guard let requestToken else { return }
+        requestID &+= 1
         thumbnailCache.cancel(requestToken)
         self.requestToken = nil
         // The abandoned request's key must load again next time

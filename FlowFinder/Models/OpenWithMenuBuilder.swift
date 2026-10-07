@@ -23,17 +23,15 @@ enum OpenWithMenuBuilder {
         // Get the default app
         let defaultAppURL = NSWorkspace.shared.urlForApplication(toOpen: firstURL)
 
-        // Get compatible apps — intersect if multiple files
-        let appURLs: [URL]
-        if fileURLs.count > 1 {
-            var intersection = Set(NSWorkspace.shared.urlsForApplications(toOpen: firstURL))
-            for url in fileURLs.dropFirst() {
-                intersection.formIntersection(NSWorkspace.shared.urlsForApplications(toOpen: url))
-            }
-            appURLs = Array(intersection)
-        } else {
-            appURLs = NSWorkspace.shared.urlsForApplications(toOpen: firstURL)
+        // Get compatible apps — intersect if multiple files. One LaunchServices query per kind of
+        // file, not per file: 2000 selected photos are asked about once.
+        var compatible: Set<URL>?
+        for url in representatives(of: fileURLs) {
+            let apps = Set(NSWorkspace.shared.urlsForApplications(toOpen: url))
+            compatible = compatible.map { $0.intersection(apps) } ?? apps
+            if compatible?.isEmpty == true { break }
         }
+        let appURLs = Array(compatible ?? [])
 
         // Resolve names and icons
         let resolved = appURLs.compactMap { url -> AppInfo? in
@@ -63,6 +61,17 @@ enum OpenWithMenuBuilder {
         return deduped.sorted { lhs, rhs in
             if lhs.isDefault != rhs.isDefault { return lhs.isDefault }
             return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
+        }
+    }
+
+    /// One URL per kind of file in `urls`: the same extension (ignoring case), and file or folder.
+    /// Files without an extension each count as their own kind (LaunchServices looks at them).
+    private static func representatives(of urls: [URL]) -> [URL] {
+        var seenKinds = Set<String>()
+        return urls.filter { url in
+            let ext = url.pathExtension.lowercased()
+            guard !ext.isEmpty else { return true }
+            return seenKinds.insert((url.hasDirectoryPath ? "/" : "") + ext).inserted
         }
     }
 
