@@ -1569,14 +1569,14 @@ struct TabContentWrapper: View {
             CoverFlowView(viewModel: viewModel, items: viewModel.filteredItems)
                 .id("coverflow-\(contentViewId)")
         case .icons:
-            IconGridView(viewModel: viewModel, items: viewModel.filteredItems)
+            IconGridView(viewModel: viewModel, items: viewModel.filteredItems, itemsRevision: viewModel.itemsRevision)
                 .id("icons-\(contentViewId)")
         case .masonry:
             if viewModel.isPhotosLibraryActive {
                 PhotosMasonryView(viewModel: viewModel, items: viewModel.filteredItems)
                     .id("masonry-photos-\(contentViewId)")
             } else {
-                MasonryView(viewModel: viewModel, items: viewModel.filteredItems)
+                MasonryView(viewModel: viewModel, items: viewModel.filteredItems, itemsRevision: viewModel.itemsRevision)
                     .id("masonry-\(contentViewId)")
             }
         case .list:

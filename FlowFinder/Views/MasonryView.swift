@@ -12,6 +12,9 @@ struct MasonryView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject private var internalDragState = InternalDragState.shared
     let items: [FileItem]
+    /// The view model's `itemsRevision` for `items`: FileItem equality is identity, so without it
+    /// SwiftUI keeps the old array after in-place updates (iCloud status, metadata).
+    var itemsRevision = 0
 
     @State private var isDropTargeted = false
     @State private var dropTargetedItemID: UUID?
@@ -33,6 +36,9 @@ struct MasonryView: View {
     @State private var cachedLayout: MasonryLayout?
     /// Finder tags of the items that have any, read off the main thread (see `startTagRead`)
     @State private var tagsByURL: [URL: [String]] = [:]
+    /// Tile frames for the grid's drop target
+    @State private var tileFrames = TileFrameStore()
+    private static let gridSpace = "masonryGrid"
 
     private var columnSpacing: CGFloat {
         max(12, settings.iconGridSpacingValue * 0.6)
@@ -189,6 +195,22 @@ struct MasonryView: View {
                     .padding(.vertical, sidePadding)
                     // Fill remaining space to allow clicking on empty area
                     .frame(minHeight: geometry.size.height)
+                    // Drops onto the grid: the folder tile under the pointer, else this folder
+                    .coordinateSpace(name: Self.gridSpace)
+                    .onDrop(of: DropHelper.acceptedDropTypes, delegate: TileGridDropDelegate(
+                        viewModel: viewModel,
+                        item: { [tileFrames] point in
+                            tileFrames.tile(at: point).flatMap { itemsByURL[$0] }
+                        },
+                        dropTargetedItemID: $dropTargetedItemID,
+                        container: ContainerDropDelegate(
+                            viewModel: viewModel,
+                            isDropTargeted: $isDropTargeted,
+                            containerHeight: currentHeight,
+                            items: items,
+                            autoScroll: false
+                        )
+                    ))
                     .background(
                         Color.clear
                             .contentShape(Rectangle())
@@ -419,6 +441,7 @@ struct MasonryView: View {
             }
         )
         .id(item.url)
+        .reportsTileFrame(item.url, in: tileFrames, space: Self.gridSpace)
         .onAppear {
             thumbnailLoader.tileAppeared(item.url)
         }
@@ -1026,11 +1049,6 @@ struct MasonryItemView: View {
             isHovering = hovering
         }
         .fileDragItem(item)
-        .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
-            item: item,
-            viewModel: viewModel,
-            dropTargetedItemID: $dropTargetedItemID
-        ))
         .contextMenu {
             FileItemContextMenu(item: item, viewModel: viewModel) { item in
                 viewModel.renamingURL = item.url

@@ -9,6 +9,9 @@ struct IconGridView: View {
     @ObservedObject private var internalDragState = InternalDragState.shared
     private var autoScrollState: DragAutoScrollState { DragAutoScrollState.shared }
     let items: [FileItem]
+    /// The view model's `itemsRevision` for `items`: FileItem equality is identity, so without it
+    /// SwiftUI keeps the old array after in-place updates (iCloud status, metadata).
+    var itemsRevision = 0
     @State private var isDropTargeted = false
     @State private var dropTargetedItemID: UUID?
     @State private var currentWidth: CGFloat = 800
@@ -23,6 +26,9 @@ struct IconGridView: View {
     @StateObject private var tagReader = GridTagReader()
     /// Finder tags of the items that have any, read off the main thread (see `startTagRead`)
     @State private var tagsByURL: [URL: [String]] = [:]
+    /// Tile frames for the grid's drop target
+    @State private var tileFrames = TileFrameStore()
+    private static let gridSpace = "iconGrid"
 
     private var cellWidth: CGFloat {
         let iconSize = settings.iconGridIconSizeValue
@@ -99,11 +105,7 @@ struct IconGridView: View {
                                 thumbnailLoader.setOnScreen(item.url, isVisible)
                             }
                             .fileDragItem(item)
-                            .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
-                                item: item,
-                                viewModel: viewModel,
-                                dropTargetedItemID: $dropTargetedItemID
-                            ))
+                            .reportsTileFrame(item.url, in: tileFrames, space: Self.gridSpace)
                             .contextMenu {
                                 FileItemContextMenu(item: item, viewModel: viewModel) { item in
                                     viewModel.renamingURL = item.url
@@ -116,6 +118,22 @@ struct IconGridView: View {
                     .padding(20)
                     // Fill remaining space to allow clicking on empty area
                     .frame(minHeight: geometry.size.height, alignment: .top)
+                    // Drops onto the grid: the folder tile under the pointer, else this folder
+                    .coordinateSpace(name: Self.gridSpace)
+                    .onDrop(of: DropHelper.acceptedDropTypes, delegate: TileGridDropDelegate(
+                        viewModel: viewModel,
+                        item: { [tileFrames, items] point in
+                            tileFrames.tile(at: point).flatMap { url in items.first { $0.url == url } }
+                        },
+                        dropTargetedItemID: $dropTargetedItemID,
+                        container: ContainerDropDelegate(
+                            viewModel: viewModel,
+                            isDropTargeted: $isDropTargeted,
+                            containerHeight: currentHeight,
+                            items: items,
+                            autoScroll: false
+                        )
+                    ))
                     .background(
                         Color.clear
                             .contentShape(Rectangle())
