@@ -445,6 +445,7 @@ struct IconGridItem: View {
         let iconSize = appSettings.iconGridIconSizeValue
         let backgroundSize = iconSize + 10
         let labelWidth = iconSize + 20
+        let isCut = viewModel.isItemCut(item)
 
         VStack(spacing: 8) {
             // Icon area - clicks here don't trigger rename
@@ -458,6 +459,7 @@ struct IconGridItem: View {
                     .aspectRatio(contentMode: .fit)
                     .frame(width: iconSize, height: iconSize)
                     .cornerRadius(4)
+                    .opacity(item.iconOpacity(isCut: isCut))
                     .videoPreviewOnHover(item: item, isHovering: $isHovering, size: CGSize(width: iconSize, height: iconSize))
             }
             .overlay(alignment: .bottomTrailing) {
@@ -478,6 +480,7 @@ struct IconGridItem: View {
             // Text/label area - clicks here can trigger rename
             VStack(spacing: 2) {
                 InlineRenameField(item: item, viewModel: viewModel, font: appSettings.iconGridFont, alignment: .center, lineLimit: 2)
+                    .opacity(item.nameOpacity(isCut: isCut, isSelected: isSelected))
                     .frame(width: labelWidth)
                     .padding(.horizontal, 4)
                     .padding(.vertical, 2)
@@ -504,7 +507,7 @@ struct IconGridItem: View {
         .onHover { hovering in
             isHovering = hovering
         }
-        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+        .opacity(isCut ? 0.5 : 1.0)
     }
 
     private func handleTap(onTextArea: Bool) {

@@ -1268,11 +1268,15 @@ enum ColumnBrowsing {
         if lstat(folder.path, &info) == 0, (info.st_mode & S_IFMT) == S_IFLNK {
             directoryToList = folder.resolvingSymlinksInPath()
         }
-        let listed = try FileManager.default.contentsOfDirectory(
+        var listed = try FileManager.default.contentsOfDirectory(
             at: directoryToList,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey, .isPackageKey, .fileResourceIdentifierKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey, .isPackageKey, .fileResourceIdentifierKey, .isHiddenKey],
             options: showHiddenFiles ? [] : [.skipsHiddenFiles]
         )
+        if showHiddenFiles {
+            // Never listed, like in Finder
+            listed.removeAll { FileItem.isAlwaysHiddenName($0.lastPathComponent) }
+        }
         // Children keep the folder's path form (/tmp rather than /private/tmp, the link's path)
         let contents = URL.childURLs(listed, reRootedUnder: folder)
         var fileIDs: [URL: FileIdentity] = [:]
@@ -1330,6 +1334,8 @@ enum ColumnBrowsing {
         var fileItems = archive.fileItems(from: archive.entriesAtPath(path, in: entries), archiveURL: archiveURL)
         if !showHiddenFiles {
             fileItems = fileItems.filter { !$0.name.hasPrefix(".") }
+        } else {
+            fileItems = fileItems.filter { !FileItem.isAlwaysHiddenName($0.name) }
         }
         return ListColumnConfigManager.sortedItems(fileItems, sortState: sortState, foldersFirst: foldersFirst)
     }
@@ -1562,7 +1568,9 @@ struct ColumnRowView: View {
                     .foregroundColor(.secondary)
             }
         }
-        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+        // Cut items, and hidden ones (selected ones stay readable), at half opacity: one modifier
+        // per row keeps scrolling fast
+        .opacity(viewModel.isItemCut(item) || (item.isHidden && !isSelected) ? 0.5 : 1.0)
         .onAppear {
             loadFolderStatusIfNeeded()
         }
@@ -1596,6 +1604,8 @@ struct ColumnRowView: View {
 struct PreviewColumn: View {
     @EnvironmentObject private var appSettings: AppSettings
     @Environment(\.displayScale) private var displayScale
+    /// Packages' (and folders') sizes, calculated for the selection in the background
+    @ObservedObject private var itemSizes = ItemSizeCalculator.shared
     let item: FileItem
 
     @State private var thumbnail: NSImage?
@@ -1642,7 +1652,7 @@ struct PreviewColumn: View {
 
                 VStack(alignment: .leading, spacing: 4) {
                     InfoRow(label: "Kind", value: item.kindDescription)
-                    InfoRow(label: "Size", value: item.formattedSize)
+                    InfoRow(label: "Size", value: itemSizes.formattedSize(of: item))
                     InfoRow(label: "Modified", value: item.formattedDate)
                 }
                 .font(appSettings.columnDetailFont)

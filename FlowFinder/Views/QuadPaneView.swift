@@ -266,6 +266,8 @@ struct QuadPaneListView: View {
                 .fileDragContainer(for: viewModel)
             }
             .paneTagReading(for: viewModel, into: $tagsByURL)
+            // Every row shows its size (folders' and packages' are calculated)
+            .showsItemSizes(.allItems, of: viewModel)
             .onAppear {
                 if let lead = viewModel.primarySelectedItem {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -296,10 +298,13 @@ struct QuadPaneListRow: View {
 
     var body: some View {
         let isSelected = viewModel.selectedItems.contains(item)
+        let isCut = viewModel.isItemCut(item)
         HStack(spacing: 6) {
             AsyncListIconView(item: item, size: appSettings.compactListIconSize)
+                .opacity(item.iconOpacity(isCut: isCut))
 
             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.compactListFont, alignment: .leading, lineLimit: 1)
+                .opacity(item.nameOpacity(isCut: isCut, isSelected: isSelected))
 
             if appSettings.showItemTags, !tags.isEmpty {
                 TagDotsView(tags: tags)
@@ -327,7 +332,7 @@ struct QuadPaneListRow: View {
         )
         .cornerRadius(3)
         .contentShape(Rectangle())
-        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+        .opacity(isCut ? 0.5 : 1.0)
         .id(item.id)
         .fileDragItem(item)
         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
@@ -507,6 +512,7 @@ struct QuadPaneIconCell: View {
 
     var body: some View {
         let isSelected = viewModel.selectedItems.contains(item)
+        let isCut = viewModel.isItemCut(item)
         let iconSize = appSettings.quadPaneIconSize
         let labelWidth = iconSize + 24
         VStack(spacing: 2) {
@@ -514,8 +520,10 @@ struct QuadPaneIconCell: View {
                 .resizable()
                 .aspectRatio(contentMode: .fit)
                 .frame(width: iconSize, height: iconSize)
+                .opacity(item.iconOpacity(isCut: isCut))
 
             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.quadPaneFont, alignment: .center, lineLimit: 2)
+                .opacity(item.nameOpacity(isCut: isCut, isSelected: isSelected))
                 .frame(width: labelWidth, height: 28)
 
             if appSettings.showItemTags, !tags.isEmpty {
@@ -536,7 +544,7 @@ struct QuadPaneIconCell: View {
         )
         .cornerRadius(6)
         .contentShape(Rectangle())
-        .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+        .opacity(isCut ? 0.5 : 1.0)
         .id(item.id)
         .fileDragItem(item)
         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(

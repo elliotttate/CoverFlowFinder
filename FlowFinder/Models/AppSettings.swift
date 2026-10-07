@@ -45,6 +45,7 @@ final class AppSettings: ObservableObject {
         static let coverFlowShowInfo = "settings.coverFlowShowInfo"
         static let coverFlowPaneHeight = "settings.coverFlowPaneHeight"
         static let usePerFolderColumnState = "settings.usePerFolderColumnState"
+        static let calculateAllSizes = "settings.calculateAllSizes"
         static let inlineVideoPreview = "settings.inlineVideoPreview"
         static let inlineAudioPreview = "settings.inlineAudioPreview"
         static let videoSkimming = "settings.videoSkimming"
@@ -93,6 +94,7 @@ final class AppSettings: ObservableObject {
         static let coverFlowShowInfo = true
         static let coverFlowPaneHeight: Double = 0
         static let usePerFolderColumnState = true  // Finder-like behavior (default)
+        static let calculateAllSizes = false
         static let inlineVideoPreview = true
         static let inlineAudioPreview = true
         static let videoSkimming = true
@@ -203,6 +205,17 @@ final class AppSettings: ObservableObject {
     @Published var usePerFolderColumnState: Bool {
         didSet { defaults.set(usePerFolderColumnState, forKey: Keys.usePerFolderColumnState) }
     }
+    /// Lists show the total size of folders too (Finder's "Calculate all sizes"), and sort by it.
+    /// Packages (.app, …) show theirs either way.
+    @Published var calculateAllSizes: Bool {
+        didSet {
+            defaults.set(calculateAllSizes, forKey: Keys.calculateAllSizes)
+            if calculateAllSizes != oldValue {
+                // Sizes calculated so far are recalculated (the views re-request them)
+                ItemSizeCalculator.shared.invalidateAll()
+            }
+        }
+    }
     @Published var inlineVideoPreview: Bool {
         didSet { defaults.set(inlineVideoPreview, forKey: Keys.inlineVideoPreview) }
     }
@@ -251,6 +264,7 @@ final class AppSettings: ObservableObject {
             Keys.coverFlowShowInfo: Defaults.coverFlowShowInfo,
             Keys.coverFlowPaneHeight: Defaults.coverFlowPaneHeight,
             Keys.usePerFolderColumnState: Defaults.usePerFolderColumnState,
+            Keys.calculateAllSizes: Defaults.calculateAllSizes,
             Keys.inlineVideoPreview: Defaults.inlineVideoPreview,
             Keys.inlineAudioPreview: Defaults.inlineAudioPreview,
             Keys.videoSkimming: Defaults.videoSkimming
@@ -308,6 +322,7 @@ final class AppSettings: ObservableObject {
         coverFlowShowInfo = defaults.bool(forKey: Keys.coverFlowShowInfo)
         coverFlowPaneHeight = defaults.double(forKey: Keys.coverFlowPaneHeight)
         usePerFolderColumnState = defaults.bool(forKey: Keys.usePerFolderColumnState)
+        calculateAllSizes = defaults.bool(forKey: Keys.calculateAllSizes)
         inlineVideoPreview = defaults.bool(forKey: Keys.inlineVideoPreview)
         inlineAudioPreview = defaults.bool(forKey: Keys.inlineAudioPreview)
         videoSkimming = defaults.bool(forKey: Keys.videoSkimming)
@@ -350,6 +365,7 @@ final class AppSettings: ObservableObject {
         coverFlowShowInfo = Defaults.coverFlowShowInfo
         coverFlowPaneHeight = Defaults.coverFlowPaneHeight
         usePerFolderColumnState = Defaults.usePerFolderColumnState
+        calculateAllSizes = Defaults.calculateAllSizes
         inlineVideoPreview = Defaults.inlineVideoPreview
         inlineAudioPreview = Defaults.inlineAudioPreview
         videoSkimming = Defaults.videoSkimming

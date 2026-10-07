@@ -346,6 +346,10 @@ struct FileItem: Identifiable, Hashable {
     let name: String
     let isDirectory: Bool
     let size: Int64
+    /// Total size of a folder's or package's contents, once calculated in the background
+    /// (`ItemSizeCalculator`); nil until then and for everything else. Kept apart from `size`,
+    /// which stays the item's own size (thumbnail caches key on it).
+    private(set) var calculatedSize: Int64?
     let modificationDate: Date?
     let creationDate: Date?
     let fileType: FileType
@@ -357,6 +361,9 @@ struct FileItem: Identifiable, Hashable {
     let isSymbolicLink: Bool
     /// The item is a Finder alias file (resolved when opened, not when listed).
     let isAliasFile: Bool
+    /// The item is hidden: its name starts with "." or it has the hidden flag (`chflags hidden`).
+    /// Listed only while hidden files are shown, and then drawn dimmed like in Finder.
+    let isHidden: Bool
     /// Finder-style kind ("Folder", "PNG image", "Application", …)
     let kindDescription: String
 
@@ -463,8 +470,10 @@ struct FileItem: Identifiable, Hashable {
         self.archiveURL = nil
         self.archivePath = nil
 
+        // Listings prefetch these keys (see `FileItem.listingResourceKeys`), so reading them here
+        // doesn't touch the disk again
         var requestedKeys: Set<URLResourceKey> = [
-            .isDirectoryKey, .contentTypeKey, .isPackageKey, .isSymbolicLinkKey, .isAliasFileKey
+            .isDirectoryKey, .contentTypeKey, .isPackageKey, .isSymbolicLinkKey, .isAliasFileKey, .isHiddenKey
         ]
         if loadMetadata {
             requestedKeys.formUnion([.fileSizeKey, .contentModificationDateKey, .creationDateKey])
@@ -492,6 +501,7 @@ struct FileItem: Identifiable, Hashable {
         self.isSymbolicLink = isSymbolicLink
         // isAliasFile is also true for symlinks; keep it for Finder aliases only
         self.isAliasFile = !isSymbolicLink && (resourceValues?.isAliasFile ?? false)
+        self.isHidden = url.lastPathComponent.hasPrefix(".") || resourceValues?.isHidden == true
 
         if loadMetadata {
             self.size = Int64(resourceValues?.fileSize ?? 0)
@@ -543,7 +553,8 @@ struct FileItem: Identifiable, Hashable {
     }
 
     /// Initialize from already-known values (ZIP entries, Spotlight results, network hosts, Photos).
-    /// `isPackage` defaults to whether `contentType` is a package type.
+    /// `isPackage` defaults to whether `contentType` is a package type, `isHidden` to whether the
+    /// name starts with ".".
     init(id: UUID = UUID(),
          url: URL,
          name: String,
@@ -556,7 +567,8 @@ struct FileItem: Identifiable, Hashable {
          isFromArchive: Bool = false,
          archiveURL: URL? = nil,
          archivePath: String? = nil,
-         isPackage: Bool? = nil) {
+         isPackage: Bool? = nil,
+         isHidden: Bool? = nil) {
         self.id = id
         self.url = url
         self.name = name
@@ -572,6 +584,7 @@ struct FileItem: Identifiable, Hashable {
         self.isPackage = isPackage
         self.isSymbolicLink = false
         self.isAliasFile = false
+        self.isHidden = isHidden ?? name.hasPrefix(".")
 
         // Determine file type
         let fileType: FileType
@@ -612,6 +625,19 @@ struct FileItem: Identifiable, Hashable {
         var copy = self
         copy.cloudStatus = status
         return copy
+    }
+
+    /// Return a copy of this item showing `size` as its contents' total (nil: not calculated)
+    func withCalculatedSize(_ size: Int64?) -> FileItem {
+        var copy = self
+        copy.calculatedSize = size
+        return copy
+    }
+
+    /// The size the Size column shows and sorts by: a folder's or package's calculated total,
+    /// else the item's own size.
+    var sizeForSorting: Int64 {
+        calculatedSize ?? size
     }
 
     private static func determineFileType(from type: UTType) -> FileType {
@@ -660,6 +686,10 @@ struct FileItem: Identifiable, Hashable {
     }()
 
     var formattedSize: String {
+        // A folder's or package's contents, once totalled
+        if isDirectory, let calculatedSize {
+            return Self.formattedByteCount(calculatedSize)
+        }
         // Not hydrated yet (large folders load sizes for visible rows): unknown, not "Zero KB"
         guard hasMetadata else { return "--" }
         // Folders have no size; packages show theirs when it's known
@@ -667,23 +697,31 @@ struct FileItem: Identifiable, Hashable {
         return Self.byteCountFormatter.string(fromByteCount: size)
     }
 
+    /// A byte count as the Size column shows it ("12 KB").
+    static func formattedByteCount(_ bytes: Int64) -> String {
+        byteCountFormatter.string(fromByteCount: bytes)
+    }
+
     var formattedDate: String {
         guard let date = modificationDate else { return "--" }
         return Self.dateFormatter.string(from: date)
     }
 
-    /// Snapshot of the displayed metadata. Changes whenever size, dates, metadata hydration
-    /// or cloud status change, while `==`/`hash` stay URL-based (identity).
-    /// Use this (not `==`) for change detection and cache keys.
+    /// Snapshot of the displayed metadata. Changes whenever size, dates, metadata hydration,
+    /// cloud status, a calculated folder size or the hidden flag change, while `==`/`hash` stay
+    /// URL-based (identity). Use this (not `==`) for change detection and cache keys.
     struct ContentVersion: Hashable {
         let modificationDate: Date?
         let size: Int64
         let hasMetadata: Bool
         let cloudStatus: CloudSyncStatus?
+        var calculatedSize: Int64? = nil
+        var isHidden = false
     }
 
     var contentVersion: ContentVersion {
-        ContentVersion(modificationDate: modificationDate, size: size, hasMetadata: hasMetadata, cloudStatus: cloudStatus)
+        ContentVersion(modificationDate: modificationDate, size: size, hasMetadata: hasMetadata, cloudStatus: cloudStatus,
+                       calculatedSize: calculatedSize, isHidden: isHidden)
     }
 
     func hash(into hasher: inout Hasher) {
@@ -711,5 +749,37 @@ extension FileItem {
 
     private static func displayForm(of fileSystemName: String) -> String {
         fileSystemName.contains(":") ? fileSystemName.replacingOccurrences(of: ":", with: "/") : fileSystemName
+    }
+}
+
+// MARK: - Hidden Items
+
+extension FileItem {
+    /// Resource keys every folder listing prefetches, so creating items reads nothing more from
+    /// the disk for them (`init(url:loadMetadata: false)` reads exactly these).
+    static let listingResourceKeys: [URLResourceKey] = [
+        .isDirectoryKey, .contentTypeKey, .isPackageKey, .isSymbolicLinkKey, .isAliasFileKey, .isHiddenKey
+    ]
+
+    /// Names never listed, even while hidden files are shown (like Finder: .DS_Store only stores
+    /// Finder's view settings).
+    static func isAlwaysHiddenName(_ name: String) -> Bool {
+        name == ".DS_Store"
+    }
+
+    /// Opacity of hidden items' icons and names when hidden files are shown (Finder draws them
+    /// at about half opacity).
+    static let hiddenItemOpacity: Double = 0.5
+
+    /// Opacity for the item's icon. Views draw cut items at half opacity as a whole, so a hidden
+    /// item that is also cut isn't dimmed a second time.
+    func iconOpacity(isCut: Bool) -> Double {
+        isHidden && !isCut ? Self.hiddenItemOpacity : 1
+    }
+
+    /// Opacity for the item's name: like the icon, but selected names stay fully opaque so they
+    /// remain readable on the selection highlight.
+    func nameOpacity(isCut: Bool, isSelected: Bool) -> Double {
+        isHidden && !isCut && !isSelected ? Self.hiddenItemOpacity : 1
     }
 }

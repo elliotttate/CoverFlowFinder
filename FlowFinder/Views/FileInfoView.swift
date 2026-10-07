@@ -540,16 +540,27 @@ enum FolderSizeCalculator {
         .fileAllocatedSizeKey,
         .totalFileAllocatedSizeKey,
         .linkCountKey,
-        .fileResourceIdentifierKey
+        .fileResourceIdentifierKey,
+        .isVolumeKey
     ]
 
     /// Totals everything inside `url`, including hidden files and package contents. Symbolic links aren't
-    /// followed and hard-linked files are counted once. Returns nil as soon as `isCancelled` reports true.
+    /// followed, other volumes mounted inside aren't entered, iCloud content that isn't downloaded isn't
+    /// downloaded, and hard-linked files are counted once. Returns nil as soon as `isCancelled` reports true.
     /// `progress` receives running totals (on the calling thread) at most every `progressInterval` seconds.
     static func calculate(url: URL,
                           isCancelled: () -> Bool = { Task.isCancelled },
                           progressInterval: TimeInterval = 0.25,
                           progress: ((FolderSizeTotals) -> Void)? = nil) -> FolderSizeTotals? {
+        ItemSizeCalculator.withDatalessMaterializationDisabled {
+            walk(url, isCancelled: isCancelled, progressInterval: progressInterval, progress: progress)
+        }
+    }
+
+    private static func walk(_ url: URL,
+                             isCancelled: () -> Bool,
+                             progressInterval: TimeInterval,
+                             progress: ((FolderSizeTotals) -> Void)?) -> FolderSizeTotals? {
         guard let enumerator = FileManager.default.enumerator(
             at: url,
             includingPropertiesForKeys: resourceKeys,
@@ -570,7 +581,13 @@ enum FolderSizeCalculator {
                   let values = try? fileURL.resourceValues(forKeys: keySet) else { continue }
 
             totals.itemCount += 1
-            guard values.isDirectory != true else { continue }
+            guard values.isDirectory != true else {
+                if values.isVolume == true {
+                    // A volume mounted here isn't part of this folder
+                    enumerator.skipDescendants()
+                }
+                continue
+            }
 
             if values.isRegularFile == true,
                let linkCount = values.linkCount, linkCount > 1,

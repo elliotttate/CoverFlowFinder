@@ -287,7 +287,8 @@ struct CoverFlowView: View {
                             .font(settings.coverFlowTitleFont)
                             .lineLimit(1)
                         HStack(spacing: 16) {
-                            if !selectedItem.isDirectory {
+                            // Folders and packages once their contents are totalled
+                            if !selectedItem.isDirectory || selectedItem.calculatedSize != nil {
                                 Text(selectedItem.formattedSize)
                                     .foregroundColor(.secondary)
                             }
@@ -304,6 +305,8 @@ struct CoverFlowView: View {
                             Color.clear.preference(key: CoverFlowInfoHeightKey.self, value: proxy.size.height)
                         }
                     )
+                    // Shows the selected package's (or folder's) total size
+                    .showsItemSizes(.selection, of: viewModel)
                 }
 
                 CoverFlowResizeHandle(
@@ -1385,10 +1388,15 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         for coverLayer in coverLayers {
             if let index = coverLayer.value(forKey: "itemIndex") as? Int,
                index < items.count {
-                let isCut = cutItemURLs.contains(items[index].url)
-                coverLayer.opacity = isCut ? 0.5 : 1.0
+                coverLayer.opacity = coverOpacity(for: items[index])
             }
         }
+    }
+
+    /// Cut items and hidden ones (shown with hidden files on) are drawn at half opacity, like
+    /// Finder; an item that's both isn't dimmed twice.
+    private func coverOpacity(for item: FileItem) -> Float {
+        cutItemURLs.contains(item.url) || item.isHidden ? 0.5 : 1.0
     }
 
     func updateActivityState() {
@@ -1908,7 +1916,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             } else {
                 // Create new layer
                 coverLayer = createCoverLayer(for: item, at: index)
-                coverLayer.opacity = cutItemURLs.contains(item.url) ? 0.5 : 1.0
+                coverLayer.opacity = coverOpacity(for: item)
                 layer?.addSublayer(coverLayer)
                 coverLayers.append(coverLayer)
             }
@@ -1942,8 +1950,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         for coverLayer in coverLayers {
             if let index = coverLayer.value(forKey: "itemIndex") as? Int {
                 positionCover(coverLayer, at: index, animated: true)
-                let isCut = index < items.count && cutItemURLs.contains(items[index].url)
-                coverLayer.opacity = isCut ? 0.5 : 1.0
+                coverLayer.opacity = index < items.count ? coverOpacity(for: items[index]) : 1.0
             }
         }
 
@@ -1972,7 +1979,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         coverLayer.setValue(index, forKey: "itemIndex")
         coverLayer.setValue(item.url, forKey: "itemURL")
         coverLayer.setValue(thumbnailToken(for: item, thumbnail: thumbnail), forKey: "thumbnailToken")
-        coverLayer.opacity = cutItemURLs.contains(item.url) ? 0.5 : 1.0
+        coverLayer.opacity = coverOpacity(for: item)
         applyCoverGeometry(to: coverLayer, size: coverSize)
 
         // Get image content - use NSImage directly for icons to preserve transparency
@@ -3594,6 +3601,8 @@ struct FileListSection: View {
                 .stroke(isDropTargeted ? Color.accentColor : Color.clear, lineWidth: 2)
                 .allowsHitTesting(false)
         )
+        // Folders' and packages' sizes in the Size column
+        .showsItemSizes(.sizeColumn, of: viewModel)
     }
 }
 
