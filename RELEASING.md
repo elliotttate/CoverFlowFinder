@@ -274,7 +274,7 @@ Or add the item by hand at the top of `<channel>`, using the output of `sign_upd
     <pubDate>Tue, 06 Oct 2026 12:00:00 -0400</pubDate>
     <sparkle:version>139</sparkle:version>                        <!-- CFBundleVersion -->
     <sparkle:shortVersionString>1.39.0</sparkle:shortVersionString>
-    <sparkle:minimumSystemVersion>26.0</sparkle:minimumSystemVersion>  <!-- MACOSX_DEPLOYMENT_TARGET -->
+    <sparkle:minimumSystemVersion>15.0</sparkle:minimumSystemVersion>  <!-- MACOSX_DEPLOYMENT_TARGET -->
     <description><![CDATA[
         <h2>What's New</h2>
         <ul><li>Your release notes here</li></ul>

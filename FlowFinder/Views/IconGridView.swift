@@ -127,7 +127,7 @@ struct IconGridView: View {
                             }
                     )
                 }
-                .scrollEdgeEffectStyle(.soft, for: .top)
+                .softTopScrollEdge()
                 .onAppear {
                     currentWidth = geometry.size.width
                     currentHeight = geometry.size.height

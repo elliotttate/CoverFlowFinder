@@ -869,7 +869,7 @@ final class ZipArchiveManager: @unchecked Sendable {
                     var crc = CRC32()
                     nameBytes.withUnsafeBytes { crc.update($0) }
                     if crc.value == nameCRC,
-                       let path = String(validating: bytes[(dataStart + 5)..<dataEnd], as: UTF8.self) {
+                       let path = String(bytes: bytes[(dataStart + 5)..<dataEnd], encoding: .utf8) {
                         info.unicodePath = path
                     }
                 }
@@ -913,7 +913,7 @@ final class ZipArchiveManager: @unchecked Sendable {
         if let unicodePath {
             return unicodePath
         }
-        if let utf8 = String(validating: bytes, as: UTF8.self) {
+        if let utf8 = String(bytes: bytes, encoding: .utf8) {
             return utf8
         }
         let data = Data(bytes)
@@ -1056,7 +1056,7 @@ final class ZipArchiveManager: @unchecked Sendable {
         try streamEntryData(entry, reader: reader, offsetAdjustment: offsetAdjustment, limits: limits) { chunk in
             bytes.append(contentsOf: chunk)
         }
-        return String(validating: bytes, as: UTF8.self)
+        return String(bytes: bytes, encoding: .utf8)
     }
 
     /// A folder's members to extract, in the order to write them (folders before their contents)

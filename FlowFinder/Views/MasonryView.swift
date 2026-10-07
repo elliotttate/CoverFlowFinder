@@ -199,7 +199,7 @@ struct MasonryView: View {
                             }
                     )
                 }
-                .scrollEdgeEffectStyle(.soft, for: .top)
+                .softTopScrollEdge()
                 .overlay {
                     // No layout until the first dimensions are read (seconds on a slow share): say so
                     if cachedLayout == nil && !items.isEmpty {

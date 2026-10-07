@@ -228,8 +228,18 @@ struct FileDragContainerModifier: ViewModifier {
     }
 
     func body(content: Content) -> some View {
+        if #available(macOS 26, *) {
+            dragContainer(content)
+        } else {
+            // Before macOS 26 each item drags itself alone (see `FileDragItemModifier`)
+            content
+        }
+    }
+
+    @available(macOS 26, *)
+    private func dragContainer(_ content: Content) -> some View {
         let viewModel = viewModel
-        content
+        return content
             .dragContainer(for: DraggedFile.self, itemID: \.url) { urls in
                 urls.map(DraggedFile.init)
             }
@@ -258,10 +268,13 @@ struct FileDragItemModifier: ViewModifier {
     let item: FileItem
 
     func body(content: Content) -> some View {
-        if InternalDragModifier.canDrag(item) {
+        if !InternalDragModifier.canDrag(item) {
+            content
+        } else if #available(macOS 26, *) {
             content.draggable(containerItemID: item.url)
         } else {
-            content
+            // Drag containers (several items per drag) are macOS 26: drag this item alone
+            content.modifier(InternalDragModifier(item: item))
         }
     }
 }
@@ -278,5 +291,17 @@ extension View {
     /// can't be dragged.
     func fileDragItem(_ item: FileItem) -> some View {
         modifier(FileDragItemModifier(item: item))
+    }
+}
+
+extension View {
+    /// The soft top scroll edge of macOS 26 (content fades under the toolbar); nothing before.
+    @ViewBuilder
+    func softTopScrollEdge() -> some View {
+        if #available(macOS 26, *) {
+            scrollEdgeEffectStyle(.soft, for: .top)
+        } else {
+            self
+        }
     }
 }
