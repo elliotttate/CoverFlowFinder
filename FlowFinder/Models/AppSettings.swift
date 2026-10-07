@@ -85,7 +85,7 @@ final class AppSettings: ObservableObject {
         static let columnIconSize: Double = 16
         static let columnWidth: Double = 220
         static let columnShowPreview = true
-        static let columnPreviewWidth: Double = 260
+        static let columnPreviewWidth: Double = 220
 
         static let coverFlowTitleFontSize: Double = 15
         static let coverFlowScale: Double = 1.2

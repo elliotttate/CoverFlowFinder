@@ -30,28 +30,22 @@ struct ColumnView: View {
     var body: some View {
         ScrollViewReader { scrollProxy in
             ScrollView(.horizontal, showsIndicators: true) {
+                // Each column has a divider on its right edge that resizes it
                 HStack(spacing: 0) {
                     // First column with current items
-                    singleColumn(depth: 0, items: items, url: viewModel.currentPath)
+                    resizableColumn(depth: 0, items: items, url: viewModel.currentPath)
                         .id(Self.rootColumnID)
 
                     // Additional columns for subdirectories
                     ForEach(Array(columns.enumerated()), id: \.element.id) { index, column in
-                        HStack(spacing: 0) {
-                            Divider()
-                            singleColumn(depth: index + 1, items: column.items, url: column.url)
-                        }
-                        .id(column.id)
+                        resizableColumn(depth: index + 1, items: column.items, url: column.url)
+                            .id(column.id)
                     }
 
                     // Preview column for selected file
                     if let previewItem {
-                        HStack(spacing: 0) {
-                            Divider()
-                            PreviewColumn(item: previewItem)
-                                .id(previewItem.url)
-                        }
-                        .id(Self.previewColumnID)
+                        ResizablePreviewColumn(item: previewItem)
+                            .id(Self.previewColumnID)
                     }
                 }
             }
@@ -151,6 +145,41 @@ struct ColumnView: View {
             onNewFolder: { createNewFolder(inColumnAt: depth) },
             onRefresh: { refreshColumn(atDepth: depth) }
         )
+    }
+
+    // MARK: - Column Widths
+
+    /// The column at `depth` at its width, with the divider on its right edge
+    private func resizableColumn(depth: Int, items: [FileItem], url: URL) -> some View {
+        ResizableColumn(
+            url: url,
+            shownColumnURLs: { shownColumnURLs },
+            onFit: { urls in fitColumns(urls) }
+        ) {
+            singleColumn(depth: depth, items: items, url: url)
+        }
+    }
+
+    /// The folders of the columns shown, root first (⌥ on a divider acts on all of them)
+    private var shownColumnURLs: [URL] {
+        [viewModel.currentPath] + columns.map(\.url)
+    }
+
+    /// Fits each column to its longest name (divider double-click).
+    private func fitColumns(_ urls: [URL]) {
+        let showTags = appSettings.showItemTags
+        var widths: [URL: CGFloat] = [:]
+        for url in urls {
+            guard let depth = depth(ofColumn: url), let items = columnItems(atDepth: depth) else { continue }
+            let rows = ColumnLayout.fitRows(
+                for: items,
+                showFileExtensions: appSettings.showFileExtensions,
+                // The column read its items' tags: they're cached
+                tags: { showTags && !$0.isFromArchive ? FileTagManager.cachedTags(for: $0.url) ?? [] : [] }
+            )
+            widths[url] = ColumnLayout.fitWidth(rows, fontSize: appSettings.columnFontSize, iconSize: appSettings.columnIconSizeValue)
+        }
+        ColumnWidthStore.shared.setWidths(widths)
     }
 
     /// The URL of the folder represented by the currently active column.
@@ -1445,7 +1474,8 @@ struct SingleColumnView: View {
                 // Dragging a selected item drags the whole selection
                 .fileDragContainer(for: viewModel)
             }
-            .frame(width: appSettings.columnWidthValue)
+            // As wide as `ResizableColumn` makes it
+            .frame(maxWidth: .infinity)
             .onDrop(of: DropHelper.acceptedDropTypes, delegate: ColumnBackgroundDropDelegate(
                 columnURL: columnURL,
                 viewModel: viewModel,
@@ -1600,34 +1630,49 @@ struct PreviewColumn: View {
     @EnvironmentObject private var appSettings: AppSettings
     @Environment(\.displayScale) private var displayScale
     let item: FileItem
+    /// The column's width (nil: the Settings default)
+    var width: CGFloat? = nil
 
     @State private var thumbnail: NSImage?
     @State private var thumbnailRequest: QLThumbnailGenerator.Request?
     @State private var isHovering = false
 
+    private var columnWidth: CGFloat {
+        width ?? appSettings.columnPreviewWidthValue
+    }
+
+    /// The image area: a square as wide as the column less its side padding
+    private var imageSize: CGSize {
+        let side = ColumnLayout.previewImageSide(columnWidth: columnWidth)
+        return CGSize(width: side, height: side)
+    }
+
+    /// The thumbnail size requested: the image area, in steps (resizing the column doesn't
+    /// request a thumbnail for every point)
     private var previewSize: CGSize {
-        CGSize(width: 200, height: 200)
+        let side = ColumnLayout.previewThumbnailSide(imageSide: imageSize.width)
+        return CGSize(width: side, height: side)
     }
 
     var body: some View {
         VStack(spacing: 16) {
-            // Thumbnail or icon
+            // Thumbnail or icon, centered
             Group {
                 if let thumbnail = thumbnail {
                     Image(nsImage: thumbnail)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .frame(maxWidth: previewSize.width, maxHeight: previewSize.height)
+                        .frame(maxWidth: imageSize.width, maxHeight: imageSize.height)
                         .cornerRadius(8)
                         .shadow(radius: 4)
                 } else {
                     Image(nsImage: item.icon)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .frame(width: 128, height: 128)
+                        .frame(width: min(128, imageSize.width), height: min(128, imageSize.height))
                 }
             }
-            .videoPreviewOnHover(item: item, isHovering: $isHovering, size: previewSize)
+            .videoPreviewOnHover(item: item, isHovering: $isHovering, size: imageSize)
             .onHover { hovering in
                 isHovering = hovering
             }
@@ -1641,7 +1686,7 @@ struct PreviewColumn: View {
                     .multilineTextAlignment(.center)
 
                 Divider()
-                    .frame(width: 100)
+                    .frame(width: min(100, imageSize.width))
 
                 VStack(alignment: .leading, spacing: 4) {
                     InfoRow(label: "Kind", value: item.kindDescription)
@@ -1653,7 +1698,9 @@ struct PreviewColumn: View {
 
             Spacer()
         }
-        .frame(width: appSettings.columnPreviewWidthValue)
+        // Clear of the column to its left and of its own divider
+        .padding(.horizontal, ColumnLayout.previewPadding)
+        .frame(width: columnWidth)
         .background(Color(nsColor: .windowBackgroundColor))
         .onAppear {
             loadThumbnail()
@@ -1661,6 +1708,12 @@ struct PreviewColumn: View {
         .onChange(of: item.contentVersion) { _, _ in
             // Edited in place: show the new contents
             loadThumbnail()
+        }
+        .onChange(of: previewSize) { oldSize, newSize in
+            // A wider column shows a bigger image: load a sharper thumbnail
+            if newSize.width > oldSize.width {
+                loadThumbnail()
+            }
         }
         .onDisappear {
             // The selection moved on (this view is recreated per item)
@@ -1714,6 +1767,306 @@ struct InfoRow: View {
             Text(value)
                 .lineLimit(1)
         }
+    }
+}
+
+// MARK: - Column Widths
+
+/// Column view width math: divider drags, fitting a column to its names, the preview's layout.
+enum ColumnLayout {
+    /// Limits for a column dragged or fitted with its divider
+    static let columnWidthRange: ClosedRange<CGFloat> = 120...1000
+    static let previewWidthRange: ClosedRange<CGFloat> = 160...1000
+    /// Width of the divider on a column's right edge: a 1 pt line, the rest is room to grab it
+    static let dividerWidth: CGFloat = 5
+    /// The preview's side padding (its content stays clear of the columns on either side)
+    static let previewPadding: CGFloat = 16
+
+    static func clamped(_ width: CGFloat, to range: ClosedRange<CGFloat>) -> CGFloat {
+        min(max(width, range.lowerBound), range.upperBound)
+    }
+
+    /// The width a divider drag gives: the column's width when the drag started plus the
+    /// distance dragged, within `range`.
+    static func draggedWidth(startWidth: CGFloat, translation: CGFloat, range: ClosedRange<CGFloat>) -> CGFloat {
+        clamped((startWidth + translation).rounded(), to: range)
+    }
+
+    // Row layout (`SingleColumnView`/`ColumnRowView`): horizontal padding on both sides, then
+    // icon, iCloud badge, name, tag dots, a spacer and the folder chevron, 8 pt apart.
+    static let rowHorizontalPadding: CGFloat = 4
+    static let rowSpacing: CGFloat = 8
+    static let spacerMinLength: CGFloat = 8
+    static let cloudBadgeWidth: CGFloat = 16
+    static let tagDotWidth: CGFloat = 10
+    static let tagDotSpacing: CGFloat = 2
+    static let maxTagDots = 3
+
+    /// What a row shows besides its icon
+    struct FitRow: Equatable {
+        let name: String
+        var tagDots = 0
+        var hasCloudBadge = false
+        var hasChevron = false
+    }
+
+    /// The rows of `items` as a column shows them.
+    /// - Parameter tags: an item's Finder tags (nothing when tags aren't shown)
+    static func fitRows(for items: [FileItem], showFileExtensions: Bool, tags: (FileItem) -> [String]) -> [FitRow] {
+        items.map { item in
+            FitRow(
+                name: item.displayName(showFileExtensions: showFileExtensions),
+                tagDots: min(maxTagDots, tags(item).filter { FinderTag.from(name: $0) != nil }.count),
+                hasCloudBadge: item.cloudStatus?.shouldShowBadge == true,
+                // As the row draws it until it's known (see `ColumnRowView.isBrowsableFolder`)
+                hasChevron: ColumnBrowsing.cachedIsBrowsableFolder(item) ?? (item.isDirectory && !item.isPackage)
+            )
+        }
+    }
+
+    /// The width that shows every row's name in full (Finder's divider double-click), within
+    /// `columnWidthRange`. Names are measured at the column font; with legacy (always shown)
+    /// scroll bars, the vertical scroller's width is added.
+    static func fitWidth(_ rows: [FitRow], fontSize: Double, iconSize: CGFloat, scrollerWidth: CGFloat? = nil) -> CGFloat {
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: CGFloat(fontSize))]
+        let chevron = chevronWidth(fontSize: fontSize)
+        var widest: CGFloat = 0
+        for row in rows {
+            let nameWidth = ceil((row.name as NSString).size(withAttributes: attributes).width)
+            widest = max(widest, rowWidth(nameWidth: nameWidth, iconSize: iconSize, row: row, chevronWidth: chevron))
+        }
+        let scroller = scrollerWidth ?? (NSScroller.preferredScrollerStyle == .legacy
+            ? NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy)
+            : 0)
+        return clamped(ceil(widest + scroller), to: columnWidthRange)
+    }
+
+    /// The width a row needs to show its name (`nameWidth` wide) in full.
+    static func rowWidth(nameWidth: CGFloat, iconSize: CGFloat, row: FitRow, chevronWidth: CGFloat) -> CGFloat {
+        var width = 2 * rowHorizontalPadding + iconSize + rowSpacing + nameWidth
+        if row.hasCloudBadge {
+            width += cloudBadgeWidth + rowSpacing
+        }
+        if row.tagDots > 0 {
+            width += rowSpacing + CGFloat(row.tagDots) * tagDotWidth + CGFloat(row.tagDots - 1) * tagDotSpacing
+        }
+        // The spacer at its minimum length, then the chevron (folders); a little slack so the
+        // name never truncates
+        width += rowSpacing + spacerMinLength
+        if row.hasChevron {
+            width += rowSpacing + chevronWidth
+        }
+        return width + 2
+    }
+
+    /// Width of the folder chevron at the column's detail font (`AppSettings.columnDetailFont`).
+    static func chevronWidth(fontSize: Double) -> CGFloat {
+        let pointSize = CGFloat(max(9, fontSize - 2))
+        let image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)?
+            .withSymbolConfiguration(NSImage.SymbolConfiguration(pointSize: pointSize, weight: .regular))
+        return ceil(image?.size.width ?? pointSize * 0.7)
+    }
+
+    /// The preview image's side: the column width less the side padding.
+    static func previewImageSide(columnWidth: CGFloat) -> CGFloat {
+        max(0, columnWidth - 2 * previewPadding)
+    }
+
+    /// The thumbnail size the preview requests for an image area `imageSide` wide: rounded up to
+    /// 100 pt steps.
+    static func previewThumbnailSide(imageSide: CGFloat) -> CGFloat {
+        max(100, ceil(imageSide / 100) * 100)
+    }
+}
+
+/// Column view widths for this session (all windows): a width per column folder, set by dragging
+/// or double-clicking the column's divider, and the preview column's. Columns without one use the
+/// Settings default; changing a Settings width forgets the widths set before.
+@MainActor
+final class ColumnWidthStore: ObservableObject {
+    static let shared = ColumnWidthStore(settings: .shared)
+
+    /// Width per column folder (`key(for:)`)
+    @Published private(set) var columnWidths: [String: CGFloat] = [:]
+    @Published private(set) var previewWidth: CGFloat?
+    private var settingsObservers: [AnyCancellable] = []
+
+    init(settings: AppSettings) {
+        // Sent before the new value is stored; only changes count (not the current value)
+        settingsObservers = [
+            settings.$columnWidth.removeDuplicates().dropFirst().sink { [weak self] _ in
+                self?.resetColumnWidths()
+            },
+            settings.$columnPreviewWidth.removeDuplicates().dropFirst().sink { [weak self] _ in
+                self?.setPreviewWidth(nil)
+            }
+        ]
+    }
+
+    /// A folder's key: "/a/b/" (from a listing) and "/a/b" (the root column) are the same column.
+    static func key(for url: URL) -> String {
+        url.isFileURL ? url.standardizedPathKey : url.absoluteString
+    }
+
+    func width(ofColumn url: URL, defaultWidth: CGFloat) -> CGFloat {
+        columnWidths[Self.key(for: url)] ?? defaultWidth
+    }
+
+    /// Sets the width of the columns showing `urls` (⌥-drag: all of them).
+    func setWidth(_ width: CGFloat, ofColumns urls: [URL]) {
+        setWidths(Dictionary(urls.map { ($0, width) }, uniquingKeysWith: { first, _ in first }))
+    }
+
+    /// Sets several columns' widths in one change.
+    func setWidths(_ widths: [URL: CGFloat]) {
+        var updated = columnWidths
+        for (url, width) in widths {
+            updated[Self.key(for: url)] = ColumnLayout.clamped(width, to: ColumnLayout.columnWidthRange)
+        }
+        if updated != columnWidths {
+            columnWidths = updated
+        }
+    }
+
+    func resetColumnWidths() {
+        if !columnWidths.isEmpty {
+            columnWidths = [:]
+        }
+    }
+
+    func previewWidth(defaultWidth: CGFloat) -> CGFloat {
+        previewWidth ?? defaultWidth
+    }
+
+    /// Sets the preview column's width; nil restores the Settings default.
+    func setPreviewWidth(_ width: CGFloat?) {
+        let width = width.map { ColumnLayout.clamped($0, to: ColumnLayout.previewWidthRange) }
+        if width != previewWidth {
+            previewWidth = width
+        }
+    }
+}
+
+/// A column at its width, with the divider on its right edge. Only these views observe the
+/// widths: a divider drag lays the columns out again without rebuilding their rows.
+struct ResizableColumn<Content: View>: View {
+    @EnvironmentObject private var appSettings: AppSettings
+    @ObservedObject private var widthStore = ColumnWidthStore.shared
+    /// The column's folder
+    let url: URL
+    /// The folders of every column shown (⌥ acts on all of them)
+    let shownColumnURLs: () -> [URL]
+    /// Fits the columns of these folders to their names
+    let onFit: ([URL]) -> Void
+    /// Built once by the column view (not again for each width)
+    private let content: Content
+
+    init(url: URL, shownColumnURLs: @escaping () -> [URL], onFit: @escaping ([URL]) -> Void, @ViewBuilder content: () -> Content) {
+        self.url = url
+        self.shownColumnURLs = shownColumnURLs
+        self.onFit = onFit
+        self.content = content()
+    }
+
+    var body: some View {
+        let width = widthStore.width(ofColumn: url, defaultWidth: appSettings.columnWidthValue)
+        HStack(spacing: 0) {
+            content
+                .frame(width: width)
+            ColumnResizeDivider(
+                width: width,
+                range: ColumnLayout.columnWidthRange,
+                onResize: { newWidth, allColumns in
+                    widthStore.setWidth(newWidth, ofColumns: allColumns ? shownColumnURLs() : [url])
+                },
+                onDoubleClick: { allColumns in
+                    onFit(allColumns ? shownColumnURLs() : [url])
+                }
+            )
+        }
+    }
+}
+
+/// The preview column at its width, with its own divider: dragging it resizes the preview, a
+/// double-click restores the default width.
+struct ResizablePreviewColumn: View {
+    @EnvironmentObject private var appSettings: AppSettings
+    @ObservedObject private var widthStore = ColumnWidthStore.shared
+    let item: FileItem
+
+    var body: some View {
+        let width = widthStore.previewWidth(defaultWidth: appSettings.columnPreviewWidthValue)
+        HStack(spacing: 0) {
+            PreviewColumn(item: item, width: width)
+                .id(item.url)
+            ColumnResizeDivider(
+                width: width,
+                range: ColumnLayout.previewWidthRange,
+                onResize: { newWidth, _ in
+                    widthStore.setPreviewWidth(newWidth)
+                },
+                onDoubleClick: { _ in
+                    widthStore.setPreviewWidth(nil)
+                }
+            )
+        }
+    }
+}
+
+/// The divider on a column's right edge. Dragging it resizes the column (⌥: all columns), a
+/// double-click fits it to its names (⌥: all columns). One per column (rows add nothing).
+struct ColumnResizeDivider: View {
+    /// The column's current width
+    let width: CGFloat
+    let range: ClosedRange<CGFloat>
+    /// A drag: the new width, and whether ⌥ is held (all columns)
+    let onResize: (CGFloat, Bool) -> Void
+    /// A double-click, and whether ⌥ is held
+    let onDoubleClick: (Bool) -> Void
+
+    /// The column's width when the drag started
+    @State private var dragStartWidth: CGFloat?
+
+    var body: some View {
+        Rectangle()
+            .fill(Color(nsColor: .separatorColor))
+            .frame(width: 1)
+            .frame(width: ColumnLayout.dividerWidth)
+            .frame(maxHeight: .infinity)
+            .contentShape(Rectangle())
+            .pointerStyle(.columnResize)
+            // Global coordinates: the divider moves with the drag
+            .gesture(
+                DragGesture(minimumDistance: 2, coordinateSpace: .global)
+                    .onChanged { value in
+                        let start = dragStartWidth ?? width
+                        if dragStartWidth == nil {
+                            dragStartWidth = start
+                        }
+                        let newWidth = ColumnLayout.draggedWidth(startWidth: start, translation: value.translation.width, range: range)
+                        onResize(newWidth, Self.isOptionHeld)
+                    }
+                    .onEnded { _ in
+                        dragStartWidth = nil
+                    }
+            )
+            .simultaneousGesture(
+                TapGesture(count: 2).onEnded {
+                    onDoubleClick(Self.isOptionHeld)
+                }
+            )
+            .accessibilityElement()
+            .accessibilityLabel("Column width")
+            .accessibilityValue("\(Int(width)) points")
+            .accessibilityAdjustableAction { direction in
+                let step: CGFloat = direction == .increment ? 20 : -20
+                onResize(ColumnLayout.clamped(width + step, to: range), false)
+            }
+    }
+
+    /// ⌥ is held (now, or in the mouse event being handled)
+    private static var isOptionHeld: Bool {
+        NSEvent.modifierFlags.contains(.option) || NSApp.currentEvent?.modifierFlags.contains(.option) == true
     }
 }
 

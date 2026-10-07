@@ -1131,8 +1131,8 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(settings.column.rawValue))
         column.title = settings.column.rawValue
         column.width = settings.width
+        // No maximum width (AppKit's default): any width; the list scrolls horizontally
         column.minWidth = settings.column.minWidth
-        column.maxWidth = 600
         column.isEditable = false
         column.resizingMask = .userResizingMask
 
@@ -1153,8 +1153,18 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
         // Configure header cell
         column.headerCell.alignment = .left
+        column.headerCell.font = Self.headerFont(isSortColumn: settings.column == viewModel.sortState.column)
         return column
     }
+
+    /// Header title font: the sort column's title is semibold (like Finder), the others regular.
+    /// Only the font is set, so the title keeps the header's own (appearance-dependent) text color.
+    static func headerFont(isSortColumn: Bool) -> NSFont {
+        NSFont.systemFont(ofSize: headerFontSize, weight: isSortColumn ? .semibold : .regular)
+    }
+
+    /// The size of AppKit's header titles
+    private static let headerFontSize = NSTableHeaderCell().font?.pointSize ?? NSFont.smallSystemFontSize
 
     /// The column layout this list shows: the folder's own (per-folder memory) or the shared one.
     private var currentColumns: [ColumnSettings] {
@@ -1251,14 +1261,23 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     private func updateSortIndicator() {
         guard let tableView = tableView else { return }
+        let sort = viewModel.sortState
 
-        // Clear all indicators
+        // Clear all indicators; only the sort column's title is bold
+        var titleFontChanged = false
         for column in tableView.tableColumns {
             tableView.setIndicatorImage(nil, in: column)
+            let font = Self.headerFont(isSortColumn: column.identifier.rawValue == sort.column.rawValue)
+            if column.headerCell.font != font {
+                column.headerCell.font = font
+                titleFontChanged = true
+            }
+        }
+        if titleFontChanged {
+            tableView.headerView?.needsDisplay = true
         }
 
         // Set indicator on sorted column
-        let sort = viewModel.sortState
         if let column = tableView.tableColumns.first(where: { $0.identifier.rawValue == sort.column.rawValue }) {
             let image = sort.direction == .ascending
                 ? NSImage(systemSymbolName: "chevron.up", accessibilityDescription: "Ascending")
