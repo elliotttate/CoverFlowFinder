@@ -110,7 +110,9 @@ private struct BrowserWindowNotifications: ViewModifier {
     let onGoToFolder: () -> Void
     let onViewModeRequest: (FileBrowserViewModel, ViewMode) -> Void
     let onShowInfo: (FileItem) -> Void
-    let onVolumeUnmount: (URL) -> Void
+    let onVolumeWillUnmount: (URL) -> Void
+    let onVolumeDidUnmount: (URL) -> Void
+    let onVolumeUnmountFailed: (URL) -> Void
 
     func body(content: Content) -> some View {
         content
@@ -148,15 +150,21 @@ private struct BrowserWindowNotifications: ViewModifier {
                 onViewModeRequest(viewModel, mode)
             }
             // The sidebar forwards NSWorkspace's (un)mount notifications and posts these before its own
-            // ejects. Leave the volume synchronously on "will" so our folder watchers don't block the eject.
+            // ejects. Leave the volume synchronously on "will" so our folder watchers, listings and
+            // thumbnails don't block the eject; come back if it doesn't happen after all.
             .onReceive(NotificationCenter.default.publisher(for: .volumeWillUnmount)) { notification in
                 if let volumeURL = notification.userInfo?[AppNotificationKey.url] as? URL {
-                    onVolumeUnmount(volumeURL)
+                    onVolumeWillUnmount(volumeURL)
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: .volumeDidUnmount)) { notification in
                 if let volumeURL = notification.userInfo?[AppNotificationKey.url] as? URL {
-                    onVolumeUnmount(volumeURL)
+                    onVolumeDidUnmount(volumeURL)
+                }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: .volumeUnmountFailed)) { notification in
+                if let volumeURL = notification.userInfo?[AppNotificationKey.url] as? URL {
+                    onVolumeUnmountFailed(volumeURL)
                 }
             }
     }
@@ -172,6 +180,9 @@ struct ContentView: View {
     @StateObject private var tabStore = BrowserTabStore()
     @StateObject private var auxiliaryPaneStore = AuxiliaryPaneStore()
     @StateObject private var hostWindow = HostWindowBox()
+    /// What the menu bar acts on in this window (the active pane), registered with `MenuValidationState`.
+    @StateObject private var commandContext = BrowserCommandContext()
+    @StateObject private var volumeLeaves = VolumeLeaveTracker()
 
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
     @State private var activePane: DualPaneView.Pane = .left
@@ -249,7 +260,6 @@ struct ContentView: View {
         splitView
             .toolbar { toolbarItems }
             .navigationTitle(windowTitle)
-            .focusedSceneObject(activeViewModel)
             .sheet(item: $showingInfoItem) { item in
                 FileInfoView(item: item)
             }
@@ -263,7 +273,9 @@ struct ContentView: View {
                 onGoToFolder: presentGoToFolder,
                 onViewModeRequest: handleViewModeRequest,
                 onShowInfo: showInfoIfOwned,
-                onVolumeUnmount: leaveUnmountedVolume
+                onVolumeWillUnmount: leaveUnmountingVolume,
+                onVolumeDidUnmount: leaveUnmountedVolume,
+                onVolumeUnmountFailed: returnToVolume
             ))
             .onReceive(activeViewModel.locationTitlePublisher) { title in
                 windowTitle = title
@@ -329,19 +341,25 @@ struct ContentView: View {
             onAppearAction: {
                 currentViewMode = viewModel.viewMode
                 syncWindowTitle()
+                syncCommandContext()
                 updateViewModelActivity()
             },
             onSelectedTabChange: {
                 currentViewMode = viewModel.viewMode
                 syncWindowTitle()
+                syncCommandContext()
                 updateViewModelActivity()
             },
             onRefreshAll: refreshAllViewModels,
             onUpdateActivity: {
                 syncWindowTitle()
+                syncCommandContext()
                 updateViewModelActivity()
             },
-            onTabsChange: updateViewModelActivity
+            onTabsChange: {
+                syncCommandContext()
+                updateViewModelActivity()
+            }
         )
     }
 
@@ -404,10 +422,17 @@ struct ContentView: View {
         hostWindow.window = window
         if let window {
             KeyboardManager.shared.registerBrowserWindow(window)
+            let context = commandContext
             DispatchQueue.main.async {
-                MenuValidationState.shared.refresh()
+                MenuValidationState.shared.setCommandContext(context, for: window)
             }
         }
+    }
+
+    /// Points the menu bar's commands at the active pane and tells it the tab count.
+    private func syncCommandContext() {
+        commandContext.bind(to: activeViewModel)
+        commandContext.setTabCount(tabs.count)
     }
 
     private func isTargetWindow(_ object: Any?) -> Bool {
@@ -455,19 +480,33 @@ struct ContentView: View {
         showingInfoItem = item
     }
 
-    /// Sends every tab/pane of this window showing a folder on an unmounting volume to the home
-    /// folder. Runs synchronously: the folder watcher on the volume is stopped before returning, and
-    /// nothing on the volume is listed again (leaving a ZIP would otherwise list its folder first).
-    /// Safe to call repeatedly for the same volume.
+    /// A volume is about to be unmounted: every tab/pane of this window showing it goes to the home
+    /// folder now, so nothing of ours keeps the volume busy, and comes back if the volume is still
+    /// mounted a little later (the eject was refused).
+    private func leaveUnmountingVolume(_ volumeURL: URL) {
+        let left = volumeLeaves.leave(volumeURL, in: managedViewModels)
+        if !left.isEmpty {
+            // Resume per the usual visibility rules; resumed panes load the home folder.
+            updateViewModelActivity()
+        }
+    }
+
+    /// The volume is gone: leave it for good (a pane that came back to it, or one that missed the
+    /// "will" notification, goes home too).
     private func leaveUnmountedVolume(_ volumeURL: URL) {
+        volumeLeaves.volumeDidUnmount(volumeURL)
         var leftVolume = false
         for viewModel in managedViewModels where VolumePaths.leaveVolume(at: volumeURL, in: viewModel) {
             leftVolume = true
         }
         if leftVolume {
-            // Resume per the usual visibility rules; resumed panes load the home folder.
             updateViewModelActivity()
         }
+    }
+
+    /// The eject failed: panes that left the volume for it go back.
+    private func returnToVolume(_ volumeURL: URL) {
+        volumeLeaves.returnToVolume(volumeURL)
     }
 
     // MARK: - Tab Management
@@ -502,7 +541,8 @@ struct ContentView: View {
     }
 
     private func shutDown(_ viewModel: FileBrowserViewModel) {
-        InlinePreviews.stopAll()
+        // Only the closed tab's preview: other tabs and windows keep theirs.
+        TabInlinePreviews.stop(showing: viewModel)
         PendingSelection.cancel(for: viewModel)
         // Stops the closed tab's folder watcher, loads, network browsing and searches for good.
         viewModel.tearDown()
@@ -1190,12 +1230,14 @@ final class StatusBarModel: ObservableObject {
 
     /// The listed files' total size; nil when there are no files, or while some sizes aren't
     /// loaded (large folders load them for visible rows only) — a partial sum isn't the total.
+    /// Saturates instead of overflowing: archive entries declare their own sizes (up to Int64.max).
     static func totalSizeText(for items: [FileItem]) -> String? {
         var total: Int64 = 0
         var hasFiles = false
         for item in items where !item.isDirectory {
             guard item.hasMetadata else { return nil }
-            total += item.size
+            let (sum, overflow) = total.addingReportingOverflow(max(0, item.size))
+            total = overflow ? .max : sum
             hasFiles = true
         }
         return hasFiles ? ByteCountFormatter.string(fromByteCount: total, countStyle: .file) : nil
@@ -1506,10 +1548,7 @@ struct TabContentWrapper: View {
 enum VolumePaths {
     /// Whether `url` is on the volume mounted at `volumeURL` (never true for the root volume).
     static func isURL(_ url: URL, onVolumeAt volumeURL: URL) -> Bool {
-        var volumePath = volumeURL.standardizedFileURL.path
-        while volumePath.count > 1 && volumePath.hasSuffix("/") {
-            volumePath.removeLast()
-        }
+        let volumePath = pathKey(volumeURL)
         guard volumePath != "/" else { return false }
         let path = url.standardizedFileURL.path
         return path == volumePath || path.hasPrefix(volumePath + "/")
@@ -1529,6 +1568,136 @@ enum VolumePaths {
         viewModel.setBackgroundWorkActive(false)
         viewModel.navigateTo(FileManager.default.homeDirectoryForCurrentUser)
         return true
+    }
+
+    /// Whether a volume is still mounted at `volumeURL`.
+    static func isMounted(_ volumeURL: URL) -> Bool {
+        let key = pathKey(volumeURL)
+        let mounted = FileManager.default.mountedVolumeURLs(includingResourceValuesForKeys: nil, options: []) ?? []
+        return mounted.contains { pathKey($0) == key }
+    }
+
+    static func pathKey(_ url: URL) -> String {
+        var path = url.standardizedFileURL.path
+        while path.count > 1 && path.hasSuffix("/") {
+            path.removeLast()
+        }
+        return path
+    }
+}
+
+extension Notification.Name {
+    /// An unmount announced with `volumeWillUnmount` failed (the volume is busy): panes that left
+    /// the volume for it come back. Same payload as `volumeWillUnmount`; posted by whoever started
+    /// the eject.
+    static let volumeUnmountFailed = Notification.Name("volumeUnmountFailed")
+}
+
+/// Panes sent home because their volume was about to be unmounted. They come back when the eject
+/// doesn't happen after all (a busy volume): on `volumeUnmountFailed`, or when the volume is still
+/// mounted at the last of `recheckTimes`. A pane the user has navigated since stays where it is.
+@MainActor
+final class VolumeLeaveTracker: ObservableObject {
+    private struct Departure {
+        weak var viewModel: FileBrowserViewModel?
+        let volumeKey: String
+        /// Where the pane was right after leaving (the home folder): unchanged means it can go back.
+        let historyIndex: Int
+        let historyCount: Int
+        let homeKey: String
+    }
+
+    /// Seconds after leaving at which the volume's mount state is checked.
+    var recheckTimes: [TimeInterval] = [2, 5, 10]
+    var isMounted: (URL) -> Bool = VolumePaths.isMounted
+
+    private var departures: [Departure] = []
+    private var checkGenerations: [String: Int] = [:]
+
+    /// Sends the view models showing the volume home (see `VolumePaths.leaveVolume`) and returns them.
+    @discardableResult
+    func leave(_ volumeURL: URL, in viewModels: [FileBrowserViewModel]) -> [FileBrowserViewModel] {
+        let volumeKey = VolumePaths.pathKey(volumeURL)
+        var left: [FileBrowserViewModel] = []
+        for viewModel in viewModels where VolumePaths.leaveVolume(at: volumeURL, in: viewModel) {
+            departures.removeAll { $0.viewModel == nil || $0.viewModel === viewModel }
+            departures.append(Departure(
+                viewModel: viewModel,
+                volumeKey: volumeKey,
+                historyIndex: viewModel.historyIndex,
+                historyCount: viewModel.navigationHistory.count,
+                homeKey: VolumePaths.pathKey(viewModel.currentPath)
+            ))
+            left.append(viewModel)
+        }
+        if !left.isEmpty {
+            scheduleChecks(for: volumeURL)
+        }
+        return left
+    }
+
+    /// The volume is gone: nothing goes back to it.
+    func volumeDidUnmount(_ volumeURL: URL) {
+        forget(VolumePaths.pathKey(volumeURL))
+    }
+
+    /// The eject failed: panes that left the volume and haven't moved since go back.
+    func returnToVolume(_ volumeURL: URL) {
+        let volumeKey = VolumePaths.pathKey(volumeURL)
+        let returning = departures.filter { $0.volumeKey == volumeKey }
+        forget(volumeKey)
+        for departure in returning {
+            guard let viewModel = departure.viewModel,
+                  viewModel.historyIndex == departure.historyIndex,
+                  viewModel.navigationHistory.count == departure.historyCount,
+                  !viewModel.isInsideArchive,
+                  VolumePaths.pathKey(viewModel.currentPath) == departure.homeKey else { continue }
+            viewModel.goBack()
+            // Drop the detour from the history, as if the pane had never left.
+            if viewModel.historyIndex == viewModel.navigationHistory.count - 2 {
+                viewModel.navigationHistory.removeLast()
+            }
+        }
+    }
+
+    private func forget(_ volumeKey: String) {
+        departures.removeAll { $0.volumeKey == volumeKey || $0.viewModel == nil }
+        checkGenerations[volumeKey, default: 0] += 1
+    }
+
+    private func scheduleChecks(for volumeURL: URL) {
+        let volumeKey = VolumePaths.pathKey(volumeURL)
+        checkGenerations[volumeKey, default: 0] += 1
+        let generation = checkGenerations[volumeKey, default: 0]
+        for (index, time) in recheckTimes.enumerated() {
+            let isLast = index == recheckTimes.count - 1
+            DispatchQueue.main.asyncAfter(deadline: .now() + time) { [weak self] in
+                guard let self, self.checkGenerations[volumeKey] == generation,
+                      self.departures.contains(where: { $0.volumeKey == volumeKey }) else { return }
+                if !self.isMounted(volumeURL) {
+                    self.forget(volumeKey)
+                } else if isLast {
+                    self.returnToVolume(volumeURL)
+                }
+            }
+        }
+    }
+}
+
+/// Inline media previews of one tab.
+@MainActor
+enum TabInlinePreviews {
+    /// Stops an inline video or audio preview of one of `viewModel`'s items (a closed tab).
+    static func stop(showing viewModel: FileBrowserViewModel) {
+        let items = viewModel.filteredItems
+        let video = InlineVideoPreviewManager.shared
+        if let url = video.currentPreviewURL, items.contains(where: { $0.url == url }) {
+            video.cancelPreview(for: url)
+        }
+        let audio = InlineAudioPreviewManager.shared
+        if let url = audio.currentPreviewURL, items.contains(where: { $0.url == url }) {
+            audio.cancelPreview(for: url)
+        }
     }
 }
 
@@ -1565,12 +1734,19 @@ struct SearchField: NSViewRepresentable {
 
     func updateNSView(_ nsView: NSSearchField, context: Context) {
         // The binding changes when the active pane or tab changes.
-        context.coordinator.parent = self
+        let coordinator = context.coordinator
+        let isRebound = focusTarget.map(ObjectIdentifier.init) != coordinator.parent.focusTarget.map(ObjectIdentifier.init)
+        coordinator.parent = self
 
-        // Only update text if different AND the field is not being actively edited
-        // This prevents interference with user typing
-        let isFirstResponder = nsView.window?.firstResponder == nsView.currentEditor()
-        if nsView.stringValue != text && !isFirstResponder {
+        if let editor = nsView.currentEditor(), nsView.window?.firstResponder === editor {
+            // Being edited: leave the user's typing alone, unless the field now filters another
+            // pane or tab; then it shows that one's text, and the next keystroke edits it.
+            if isRebound && nsView.stringValue != text {
+                nsView.stringValue = text
+                editor.string = text
+                editor.selectedRange = NSRange(location: (text as NSString).length, length: 0)
+            }
+        } else if nsView.stringValue != text {
             nsView.stringValue = text
         }
         // Update placeholder if it changed
