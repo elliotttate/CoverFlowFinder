@@ -5,8 +5,9 @@ import Combine
 final class CloudStatusManager: ObservableObject {
     static let shared = CloudStatusManager()
 
-    /// Publisher for status changes (sent on the main queue)
-    let statusChanged = PassthroughSubject<URL, Never>()
+    /// Publisher for status changes: everything invalidated since the last announcement, in one
+    /// batch per run-loop turn (sent on the main queue)
+    let statusesChanged = PassthroughSubject<[URL], Never>()
 
     /// How long a cached status is trusted. Transitional states (and errors) change on their own, so they expire quickly.
     static let transitionalStatusTTL: TimeInterval = 5
@@ -20,7 +21,16 @@ final class CloudStatusManager: ObservableObject {
     /// Cache for cloud status to avoid repeated filesystem queries
     private var statusCache: [URL: CacheEntry] = [:]
     private let cacheQueue = DispatchQueue(label: "com.flowfinder.cloudstatus", qos: .userInitiated)
-    private static let maxCacheEntries = 20_000
+    static let maxCacheEntries = 20_000
+    /// A full cache is trimmed to this many entries (expired first, then the oldest), so trimming
+    /// happens once per (max - this) insertions rather than on every insertion
+    static let cacheEntriesKeptOnEviction = 15_000
+
+    /// Invalidated URLs not announced yet, and whether an announcement is scheduled (on `cacheQueue`)
+    private var pendingAnnouncements: [URL] = []
+    private var announcementScheduled = false
+    /// Items a Download is being watched for (one polling chain per item, on `cacheQueue`)
+    private var settlingURLs: Set<URL> = []
 
     /// iCloud locations (standardized paths without trailing slash). Anything outside them is local.
     private let iCloudRoots: [String]
@@ -97,17 +107,31 @@ final class CloudStatusManager: ObservableObject {
             return .local
         }
 
-        let status = fetcher?(url) ?? fetchStatus(for: url)
+        guard let status = fetcher?(url) ?? fetchStatus(for: url) else {
+            // Gone (deleted, renamed): no badge, and nothing cached for whatever appears there next
+            return .local
+        }
         cacheQueue.sync {
-            if statusCache.count >= Self.maxCacheEntries {
-                statusCache = statusCache.filter { now.timeIntervalSince($0.value.fetchedAt) < Self.timeToLive(for: $0.value.status) }
-                if statusCache.count >= Self.maxCacheEntries {
-                    statusCache.removeAll()
-                }
+            if statusCache.count >= Self.maxCacheEntries, statusCache[url] == nil {
+                trimCache(now: now)
             }
             statusCache[url] = CacheEntry(status: status, fetchedAt: now)
         }
         return status
+    }
+
+    /// On `cacheQueue`: drops expired entries, then the oldest ones, down to `cacheEntriesKeptOnEviction`.
+    private func trimCache(now: Date) {
+        statusCache = statusCache.filter { now.timeIntervalSince($0.value.fetchedAt) < Self.timeToLive(for: $0.value.status) }
+        let excess = statusCache.count - Self.cacheEntriesKeptOnEviction
+        guard excess > 0 else { return }
+        let cutoff = statusCache.values.map(\.fetchedAt).sorted()[excess - 1]
+        statusCache = statusCache.filter { $0.value.fetchedAt > cutoff }
+    }
+
+    /// Number of cached statuses (for tests and diagnostics).
+    var cachedStatusCount: Int {
+        cacheQueue.sync { statusCache.count }
     }
 
     static func timeToLive(for status: CloudSyncStatus) -> TimeInterval {
@@ -163,15 +187,19 @@ final class CloudStatusManager: ObservableObject {
         return .downloaded
     }
 
-    /// Fetch status from filesystem
-    private func fetchStatus(for url: URL) -> CloudSyncStatus {
+    /// Fetch status from filesystem; nil when the item doesn't exist (anymore)
+    private func fetchStatus(for url: URL) -> CloudSyncStatus? {
         // Legacy placeholder for an item that isn't downloaded (".Name.ext.icloud")
         if Self.isPlaceholderName(url.lastPathComponent) {
             return .notDownloaded
         }
 
-        guard let values = try? url.resourceValues(forKeys: Self.cloudResourceKeys) else {
-            return .error
+        // A fresh URL: URL instances cache resource values
+        var freshURL = url
+        freshURL.removeAllCachedResourceValues()
+        guard let values = try? freshURL.resourceValues(forKeys: Self.cloudResourceKeys) else {
+            var info = stat()
+            return lstat(url.path, &info) == 0 ? .error : nil
         }
         return Self.status(for: ItemState(values))
     }
@@ -182,12 +210,20 @@ final class CloudStatusManager: ObservableObject {
 
     // MARK: - Invalidation
 
-    /// Drops the cached status of `url` and announces it on `statusChanged`. Call when the item changed on disk.
+    /// Drops the cached status of `url` and announces it (see `statusesChanged`). Call when the item changed on disk.
     func invalidate(url: URL) {
-        cacheQueue.sync { _ = statusCache.removeValue(forKey: url) }
-        DispatchQueue.main.async {
-            self.statusChanged.send(url)
+        invalidate(urls: [url])
+    }
+
+    /// Drops the cached statuses of `urls` and announces them together.
+    func invalidate(urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        cacheQueue.sync {
+            for url in urls {
+                statusCache.removeValue(forKey: url)
+            }
         }
+        announce(urls)
     }
 
     /// Drops the cached statuses of `directory` and everything inside it (e.g. on file-system events for that folder).
@@ -203,19 +239,30 @@ final class CloudStatusManager: ObservableObject {
                 statusCache.removeValue(forKey: key)
             }
         }
-        DispatchQueue.main.async {
-            self.statusChanged.send(directory)
+        announce([directory])
+    }
+
+    /// Collects invalidated URLs and publishes them once on the next main-queue turn, so a burst
+    /// of invalidations (an iCloud sync touching thousands of files) is one batch, not one
+    /// main-queue hop and one re-hydration per file.
+    private func announce(_ urls: [URL]) {
+        let shouldSchedule: Bool = cacheQueue.sync {
+            pendingAnnouncements.append(contentsOf: urls)
+            guard !announcementScheduled else { return false }
+            announcementScheduled = true
+            return true
         }
-    }
-
-    /// Invalidate cache for a URL
-    func invalidateCache(for url: URL) {
-        invalidate(url: url)
-    }
-
-    /// Invalidate cache for all URLs in a directory
-    func invalidateCacheForDirectory(_ directoryURL: URL) {
-        invalidate(directory: directoryURL)
+        guard shouldSchedule else { return }
+        DispatchQueue.main.async {
+            let batch: [URL] = self.cacheQueue.sync {
+                let batch = self.pendingAnnouncements
+                self.pendingAnnouncements.removeAll()
+                self.announcementScheduled = false
+                return batch
+            }
+            var seen = Set<URL>()
+            self.statusesChanged.send(batch.filter { seen.insert($0).inserted })
+        }
     }
 
     /// Clear all cached statuses
@@ -231,9 +278,12 @@ final class CloudStatusManager: ObservableObject {
         let actualURL = resolveICloudPlaceholder(url)
 
         try FileManager.default.startDownloadingUbiquitousItem(at: actualURL)
-        invalidate(url: url)
-        invalidate(url: actualURL)
-        watchUntilSettled(actualURL)
+        invalidate(urls: url == actualURL ? [url] : [url, actualURL])
+        // One watch per item: clicking Download again doesn't start another polling chain
+        let isNewWatch = cacheQueue.sync { settlingURLs.insert(actualURL).inserted }
+        if isNewWatch {
+            watchUntilSettled(actualURL)
+        }
     }
 
     /// Evict (remove local copy of) an iCloud item
@@ -242,14 +292,16 @@ final class CloudStatusManager: ObservableObject {
         invalidate(url: url)
     }
 
-    /// Re-checks a transferring item until it leaves the transitional state, then invalidates it so the new status
-    /// (e.g. Downloaded) is published on `statusChanged`.
+    /// Re-checks a transferring item until it leaves the transitional state (or is gone), then
+    /// invalidates it so the new status (e.g. Downloaded) is announced.
     private func watchUntilSettled(_ url: URL, attempt: Int = 0) {
         let maxAttempts = 240 // 2 s apart: up to 8 minutes
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2) { [weak self] in
             guard let self else { return }
             let status = self.fetcher?(url) ?? self.fetchStatus(for: url)
-            if Self.timeToLive(for: status) == Self.stableStatusTTL || attempt >= maxAttempts {
+            let settled = status.map { Self.timeToLive(for: $0) == Self.stableStatusTTL } ?? true
+            if settled || attempt >= maxAttempts {
+                self.cacheQueue.sync { _ = self.settlingURLs.remove(url) }
                 self.invalidate(url: url)
             } else {
                 self.watchUntilSettled(url, attempt: attempt + 1)

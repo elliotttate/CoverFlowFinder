@@ -62,8 +62,17 @@ enum FileTagManager {
     private static let tagAttributeName = "com.apple.metadata:_kMDItemUserTags"
     /// Cached tags keyed by path. Entries are dropped on our own edits, for files reported by
     /// directory events and for a whole folder on refresh, so edits made in Finder show up.
-    private static var tagCache: [String: [String]] = [:]
-    private static let maxCachedEntries = 20_000
+    /// Least recently used entries are evicted in bulk when it's full, so a big folder being
+    /// sorted or filtered by tags keeps its entries (no full clear and re-read).
+    private struct CachedTags {
+        let tags: [String]
+        var lastUse: UInt64
+    }
+    private static var tagCache: [String: CachedTags] = [:]
+    private static var useCounter: UInt64 = 0
+    static let maxCachedEntries = 50_000
+    /// Entries kept by an eviction (the most recently used ones)
+    static let entriesKeptOnEviction = 37_500
     private static let cacheQueue = DispatchQueue(label: "com.coverflowfinder.tagcache", qos: .userInitiated)
 
     private static func cacheKey(for url: URL) -> String {
@@ -77,7 +86,7 @@ enum FileTagManager {
     /// Read tags from a file URL
     static func getTags(for url: URL) -> [String] {
         let key = cacheKey(for: url)
-        if let cached = cacheQueue.sync(execute: { tagCache[key] }) {
+        if let cached = cacheQueue.sync(execute: { cachedValue(forKey: key) }) {
             return cached
         }
         // URL instances cache resource values; read through a fresh one so external edits are seen.
@@ -91,7 +100,21 @@ enum FileTagManager {
     /// The cached tags for a URL, without touching the file system (nil when not cached).
     static func cachedTags(for url: URL) -> [String]? {
         let key = cacheKey(for: url)
-        return cacheQueue.sync { tagCache[key] }
+        return cacheQueue.sync { cachedValue(forKey: key) }
+    }
+
+    /// Number of cached entries (for tests and diagnostics).
+    static var cachedEntryCount: Int {
+        cacheQueue.sync { tagCache.count }
+    }
+
+    /// On `cacheQueue`: the cached tags, marking the entry as just used.
+    private static func cachedValue(forKey key: String) -> [String]? {
+        guard var entry = tagCache[key] else { return nil }
+        useCounter &+= 1
+        entry.lastUse = useCounter
+        tagCache[key] = entry
+        return entry.tags
     }
 
     /// Set tags on a file URL using xattr (compatible with Finder on all macOS versions).
@@ -185,11 +208,21 @@ enum FileTagManager {
 
     private static func storeInCache(_ tags: [String], forKey key: String) {
         cacheQueue.sync {
-            if tagCache.count >= maxCachedEntries {
-                tagCache.removeAll(keepingCapacity: true)
+            if tagCache.count >= maxCachedEntries, tagCache[key] == nil {
+                evictLeastRecentlyUsed()
             }
-            tagCache[key] = tags
+            useCounter &+= 1
+            tagCache[key] = CachedTags(tags: tags, lastUse: useCounter)
         }
+    }
+
+    /// On `cacheQueue`: keeps the `entriesKeptOnEviction` most recently used entries. Runs once
+    /// per (max - kept) insertions, not per insertion.
+    private static func evictLeastRecentlyUsed() {
+        let excess = tagCache.count - entriesKeptOnEviction
+        guard excess > 0 else { return }
+        let cutoff = tagCache.values.map(\.lastUse).sorted()[excess - 1]
+        tagCache = tagCache.filter { $0.value.lastUse > cutoff }
     }
 }
 
