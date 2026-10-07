@@ -20,6 +20,9 @@ final class AppSettings: ObservableObject {
         static let sidebarFavorites = "settings.sidebarFavorites"
         /// Holds a favorites blob this version couldn't read (e.g. written by a newer version), saved before it's replaced.
         static let sidebarFavoritesUnreadableBackup = "settings.sidebarFavorites.unreadableBackup"
+        /// Format of the stored favorites, written with them since 1.39. Its absence means 1.38 or earlier wrote them.
+        static let sidebarFavoritesFormat = "settings.sidebarFavorites.format"
+        static let sidebarCollapsedSections = "settings.sidebarCollapsedSections"
         static let thumbnailQuality = "settings.thumbnailQuality"
         static let masonryShowFilenames = "settings.masonryShowFilenames"
 
@@ -137,6 +140,11 @@ final class AppSettings: ObservableObject {
     private var preservedUnknownFavorites: [SidebarFavoritesCoding.UnknownElement] = []
     /// The stored favorites blob when it couldn't be decoded at all; backed up before the first write replaces it.
     private var unreadableFavoritesData: Data?
+    /// Sidebar sections the user collapsed (`SidebarSection.Kind` raw values). Not published: only the sidebar reads
+    /// it, when it rebuilds its rows.
+    var sidebarCollapsedSections: Set<String> {
+        didSet { defaults.set(sidebarCollapsedSections.sorted(), forKey: Keys.sidebarCollapsedSections) }
+    }
     @Published var thumbnailQuality: Double {
         didSet { defaults.set(thumbnailQuality, forKey: Keys.thumbnailQuality) }
     }
@@ -265,6 +273,11 @@ final class AppSettings: ObservableObject {
         switch SidebarFavoritesCoding.decode(storedFavorites) {
         case .notSet:
             sidebarFavorites = Defaults.sidebarFavorites
+        case .decoded(let favorites, let unknown)
+            where favorites.isEmpty && unknown.isEmpty && defaults.object(forKey: Keys.sidebarFavoritesFormat) == nil:
+            // 1.38 and earlier showed the defaults for a stored empty list, so that's what such a list means. Only
+            // an empty list saved by this version (with the format key) is one the user chose.
+            sidebarFavorites = Defaults.sidebarFavorites
         case .decoded(let favorites, let unknown):
             sidebarFavorites = favorites
             preservedUnknownFavorites = unknown
@@ -272,6 +285,7 @@ final class AppSettings: ObservableObject {
             sidebarFavorites = Defaults.sidebarFavorites
             unreadableFavoritesData = storedFavorites
         }
+        sidebarCollapsedSections = Set(defaults.stringArray(forKey: Keys.sidebarCollapsedSections) ?? [])
         thumbnailQuality = defaults.double(forKey: Keys.thumbnailQuality)
         masonryShowFilenames = defaults.bool(forKey: Keys.masonryShowFilenames)
 
@@ -313,6 +327,7 @@ final class AppSettings: ObservableObject {
         sidebarShowTags = Defaults.sidebarShowTags
         preservedUnknownFavorites = []
         sidebarFavorites = Defaults.sidebarFavorites
+        sidebarCollapsedSections = []
         thumbnailQuality = Defaults.thumbnailQuality
         masonryShowFilenames = Defaults.masonryShowFilenames
 
@@ -459,6 +474,7 @@ final class AppSettings: ObservableObject {
         }
         guard let data = SidebarFavoritesCoding.encode(sidebarFavorites, preserving: preservedUnknownFavorites) else { return }
         defaults.set(data, forKey: Keys.sidebarFavorites)
+        defaults.set(SidebarFavoritesCoding.currentFormat, forKey: Keys.sidebarFavoritesFormat)
     }
 }
 
@@ -647,6 +663,10 @@ struct SidebarFavoriteResolution: Equatable, Sendable {
 /// Element-wise coding of the stored favorites list, so one entry this version doesn't understand (e.g. a `Kind`
 /// added by a newer version) doesn't throw away the whole list.
 enum SidebarFavoritesCoding {
+    /// Stored next to the favorites (see `AppSettings`). Format 2: an empty list means no favorites (1.38 and earlier
+    /// showed the defaults for it).
+    static let currentFormat = 2
+
     /// A stored element that didn't decode, kept verbatim (with its position) so it's written back unchanged.
     struct UnknownElement: Equatable {
         let index: Int

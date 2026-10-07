@@ -123,8 +123,35 @@ struct MasonryView: View {
     /// Recalculate and cache the layout for the current items
     private func recalculateLayout() {
         let layout = calculateLayout(for: runtime.items)
+        runtime.layoutItemsVersion = runtime.itemsVersion
         if layout != cachedLayout {
             cachedLayout = layout
+        }
+    }
+
+    /// Lays out again after dimensions arrived for `changedItems`. When the cached layout is for the current items
+    /// and columns, only the items from the first changed one on are placed again (everything before it stays put),
+    /// so reading a big folder's dimensions chunk by chunk doesn't redo the whole layout each time.
+    private func relayoutAfterDimensionsArrived(for changedItems: [FileItem]) {
+        guard let layout = cachedLayout,
+              runtime.layoutItemsVersion == runtime.itemsVersion,
+              layout.columnCount == columnCount, layout.columnWidth == columnWidth,
+              layout.keys.count == runtime.items.count else {
+            recalculateLayout()
+            return
+        }
+        let indices = changedItems.compactMap { item -> Int? in
+            guard let index = thumbnailLoader.index(of: item.url),
+                  runtime.items.indices.contains(index), runtime.items[index].url == item.url else { return nil }
+            return index
+        }
+        guard let start = indices.min() else { return }
+
+        let tail = runtime.items[start...]
+        let dimensions = thumbnailCache.cachedImageDimensions(for: tail.filter { !$0.isDirectory })
+        let tailHeights = tail.map { itemHeight(for: $0, dimensions: dimensions[$0.url]) }
+        if let updated = layout.relayout(from: start, tailHeights: tailHeights) {
+            cachedLayout = updated
         }
     }
 
@@ -155,6 +182,8 @@ struct MasonryView: View {
                             }
                         }
                     }
+                    // Dragging a selected tile drags the whole selection
+                    .fileDragContainer(for: viewModel)
                     .padding(.horizontal, sidePadding)
                     .padding(.vertical, sidePadding)
                     // Fill remaining space to allow clicking on empty area
@@ -170,10 +199,17 @@ struct MasonryView: View {
                     )
                 }
                 .scrollEdgeEffectStyle(.soft, for: .top)
+                .overlay {
+                    // No layout until the first dimensions are read (seconds on a slow share): say so
+                    if cachedLayout == nil && !items.isEmpty {
+                        MasonryLoadingIndicator()
+                    }
+                }
                 .onAppear {
                     currentWidth = geometry.size.width
                     currentHeight = geometry.size.height
                     runtime.items = items
+                    runtime.itemsVersion += 1
                     thumbnailLoader.viewModel = viewModel
                     thumbnailLoader.loadsPhotosAssets = true
                     thumbnailLoader.columnCount = columnCount
@@ -195,6 +231,7 @@ struct MasonryView: View {
                     // Abandon pending dimension reads; the next appearance starts over
                     runtime.prefetchGeneration += 1
                     runtime.prefetchingURLs.removeAll()
+                    runtime.dimensionAttempts.removeAll()
                     thumbnailLoader.stop()
                     autoScrollTimer?.invalidate()
                     autoScrollTimer = nil
@@ -302,9 +339,16 @@ struct MasonryView: View {
         .onChange(of: items) { oldItems, newItems in
             itemsDidChange(from: oldItems, to: newItems)
         }
-        .onChange(of: items.map(\.contentVersion)) { _, _ in
-            // Metadata, cloud status or in-place edits: re-read changed files' dimensions/thumbnails
-            itemsDidChange(from: runtime.items, to: items)
+        .onChange(of: items.map(\.contentVersion)) { oldVersions, newVersions in
+            // Metadata, cloud status or in-place edits: re-read changed files' dimensions/thumbnails.
+            // When only iCloud status changed (syncing), sizes and tags didn't: no new layout or tag read.
+            let onlyCloudStatus = oldVersions.count == newVersions.count
+                && zip(oldVersions, newVersions).allSatisfy {
+                    $0.modificationDate == $1.modificationDate && $0.size == $1.size && $0.hasMetadata == $1.hasMetadata
+                }
+                && runtime.items.count == items.count
+                && zip(runtime.items, items).allSatisfy { $0.url == $1.url }
+            itemsDidChange(from: runtime.items, to: items, layoutAffected: !onlyCloudStatus)
         }
         .onChange(of: settings.iconGridIconSize) { _, _ in
             layoutSettingsChanged()
@@ -390,16 +434,19 @@ struct MasonryView: View {
     /// Items were added, removed, reordered or updated. Tiles that remain keep their thumbnails;
     /// the layout is recomputed from cached dimensions (shortest-column placement, so tiles above
     /// the first change don't move) and only files without known dimensions are read.
-    private func itemsDidChange(from oldItems: [FileItem], to newItems: [FileItem]) {
+    /// `layoutAffected` is false when the same files only changed iCloud status.
+    private func itemsDidChange(from oldItems: [FileItem], to newItems: [FileItem], layoutAffected: Bool = true) {
         if GridThumbnailLoader.sameStorage(newItems, runtime.items) { return }
-        let change = MasonryLayout.classifyChange(from: oldItems.map(\.url), to: newItems.map(\.url))
-        os_log(.debug, log: masonryLog, "items changed: %{public}@ %d -> %d", String(describing: change), oldItems.count, newItems.count)
-
         runtime.items = newItems
         thumbnailLoader.setItems(newItems)
-        recalculateLayoutIfReady()
+        if layoutAffected {
+            let change = MasonryLayout.classifyChange(from: oldItems.map(\.url), to: newItems.map(\.url))
+            os_log(.debug, log: masonryLog, "items changed: %{public}@ %d -> %d", String(describing: change), oldItems.count, newItems.count)
+            runtime.itemsVersion += 1
+            recalculateLayoutIfReady()
+            startTagRead()
+        }
         startDimensionPrefetch()
-        startTagRead()
     }
 
     /// Tags live in an extended attribute per file, so they're read in the background (through
@@ -443,6 +490,7 @@ struct MasonryView: View {
             !item.isDirectory
                 && (item.fileType == .image || item.fileType == .video)
                 && !runtime.prefetchingURLs.contains(item.url)
+                && runtime.dimensionAttempts[item.url] != item.contentVersion
                 && !thumbnailCache.hasDimensionRecord(for: item)
         }
         guard !needed.isEmpty else {
@@ -480,8 +528,13 @@ struct MasonryView: View {
             guard state.prefetchGeneration == generation else { return }
             for item in chunk {
                 state.prefetchingURLs.remove(item.url)
+                if !thumbnailCache.hasDimensionRecord(for: item) {
+                    // Not read (an iCloud file that isn't downloaded, an archive member): it keeps the default
+                    // shape and is tried again only once it changes (e.g. when it has been downloaded).
+                    state.dimensionAttempts[item.url] = item.contentVersion
+                }
             }
-            recalculateLayout()
+            relayoutAfterDimensionsArrived(for: chunk)
             prefetchDimensionChunks(chunks.dropFirst(), generation: generation)
         }
     }
@@ -676,24 +729,92 @@ struct MasonryLayout: Equatable {
     var positions: [URL: Position]
     var columnCount: Int
     var columnWidth: CGFloat
+    // The inputs, so `relayout(from:tailHeights:)` can place just the tail again (not compared: the
+    // columns and positions above follow from them).
+    /// All keys, in order
+    var keys: [URL] = []
+    /// The column each key went into; -1 for a repeated key (skipped)
+    var placements: [Int] = []
+    var heights: [CGFloat] = []
+    var spacing: CGFloat = 0
 
     static let empty = MasonryLayout(columns: [], positions: [:], columnCount: 0, columnWidth: 0)
+
+    static func == (lhs: MasonryLayout, rhs: MasonryLayout) -> Bool {
+        lhs.columnCount == rhs.columnCount
+            && lhs.columnWidth == rhs.columnWidth
+            && lhs.columns == rhs.columns
+            && lhs.positions == rhs.positions
+    }
 
     static func compute(keys: [URL], heights: [CGFloat], columnCount: Int, columnWidth: CGFloat, spacing: CGFloat) -> MasonryLayout {
         let count = max(1, columnCount)
         guard !keys.isEmpty else {
-            return MasonryLayout(columns: [], positions: [:], columnCount: count, columnWidth: columnWidth)
+            return MasonryLayout(columns: [], positions: [:], columnCount: count, columnWidth: columnWidth, spacing: spacing)
         }
 
-        var columns = Array(repeating: [URL](), count: count)
+        var layout = MasonryLayout(
+            columns: Array(repeating: [URL](), count: count),
+            positions: [:],
+            columnCount: count,
+            columnWidth: columnWidth,
+            spacing: spacing
+        )
+        layout.positions.reserveCapacity(keys.count)
+        layout.keys.reserveCapacity(keys.count)
+        layout.placements.reserveCapacity(keys.count)
+        layout.heights.reserveCapacity(keys.count)
         var columnHeights = Array(repeating: CGFloat(0), count: count)
-        var positions: [URL: Position] = [:]
-        positions.reserveCapacity(keys.count)
+        layout.place(keys[...], heights: heights, columnHeights: &columnHeights)
+        return layout
+    }
 
-        for (index, key) in keys.enumerated() where positions[key] == nil {
-            let height = index < heights.count ? heights[index] : 0
+    /// This layout with new heights for the keys from `start` on (`tailHeights[0]` is the height of
+    /// `keys[start]`). Items before `start` keep their places, since a position only depends on
+    /// the items before it; only the rest are placed again. Nil when no height changed.
+    func relayout(from start: Int, tailHeights: [CGFloat]) -> MasonryLayout? {
+        guard start >= 0, start <= keys.count, tailHeights.count == keys.count - start,
+              tailHeights != Array(heights[start...]) else { return nil }
+
+        // How many items each column keeps, and how tall it is where the tail begins
+        var kept = Array(repeating: 0, count: columnCount)
+        for column in placements[..<start] where column >= 0 {
+            kept[column] += 1
+        }
+        var columnHeights = Array(repeating: CGFloat(0), count: columnCount)
+        for column in 0..<columnCount where kept[column] > 0 {
+            if let last = positions[columns[column][kept[column] - 1]] {
+                columnHeights[column] = last.y + last.height + spacing
+            }
+        }
+
+        var layout = self
+        for index in start..<keys.count where placements[index] >= 0 {
+            layout.positions[keys[index]] = nil
+        }
+        for column in layout.columns.indices {
+            layout.columns[column].removeSubrange(kept[column]...)
+        }
+        layout.keys.removeSubrange(start...)
+        layout.placements.removeSubrange(start...)
+        layout.heights.removeSubrange(start...)
+        layout.place(keys[start...], heights: tailHeights, columnHeights: &columnHeights)
+        return layout
+    }
+
+    /// Appends `newKeys`, each into the currently shortest column (ties go left); a key that's
+    /// already placed is skipped.
+    private mutating func place(_ newKeys: ArraySlice<URL>, heights newHeights: [CGFloat], columnHeights: inout [CGFloat]) {
+        for (offset, key) in newKeys.enumerated() {
+            let height = offset < newHeights.count ? newHeights[offset] : 0
+            keys.append(key)
+            heights.append(height)
+            guard positions[key] == nil else {
+                placements.append(-1)
+                continue
+            }
             var shortest = 0
-            for column in 1..<count where columnHeights[column] < columnHeights[shortest] {
+            for column in 1..<columnCount where columnHeights[column] < columnHeights[shortest] {
                 shortest = column
             }
             positions[key] = Position(
@@ -704,9 +825,8 @@ struct MasonryLayout: Equatable {
             )
             columns[shortest].append(key)
             columnHeights[shortest] += height + spacing
+            placements.append(shortest)
         }
-
-        return MasonryLayout(columns: columns, positions: positions, columnCount: count, columnWidth: columnWidth)
     }
 
     enum Change: Equatable {
@@ -736,9 +856,15 @@ struct MasonryLayout: Equatable {
 final class MasonryRuntime: ObservableObject {
     /// Always the latest items: async work reads this, never a captured copy.
     var items: [FileItem] = []
+    /// Bumped when the files in `items` (or their order) change, not for metadata or iCloud status updates
+    var itemsVersion = 0
+    /// The `itemsVersion` the cached layout was computed for
+    var layoutItemsVersion = -1
     var needsScrollToSelection = false
     /// Media files whose dimensions are being read
     var prefetchingURLs: Set<URL> = []
+    /// Media files whose dimensions couldn't be read, with the version that was tried
+    var dimensionAttempts: [URL: FileItem.ContentVersion] = [:]
     /// Bumped when the view disappears so in-flight dimension reads stop
     var prefetchGeneration = 0
     /// Identifies the latest tag read (older ones are dropped)
@@ -767,6 +893,22 @@ final class MasonryRuntime: ObservableObject {
             itemsByURL = Dictionary(items.map { ($0.url, $0) }, uniquingKeysWith: { first, _ in first })
         }
         return itemsByURL
+    }
+}
+
+/// Spinner shown while Masonry waits for its first layout; it only appears if that takes a moment,
+/// so folders that open right away don't flash it.
+private struct MasonryLoadingIndicator: View {
+    @State private var isVisible = false
+
+    var body: some View {
+        ProgressView()
+            .controlSize(.small)
+            .opacity(isVisible ? 1 : 0)
+            .task {
+                try? await Task.sleep(for: .milliseconds(300))
+                isVisible = true
+            }
     }
 }
 
@@ -882,7 +1024,7 @@ struct MasonryItemView: View {
         .onHover { hovering in
             isHovering = hovering
         }
-        .internalDrag(item: item)
+        .fileDragItem(item)
         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
@@ -1545,12 +1687,7 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
                 return
             }
 
-            let destinationURL: URL
-            if url.hasDirectoryPath || url.pathExtension.isEmpty {
-                destinationURL = url.appendingPathComponent(info.filename)
-            } else {
-                destinationURL = url
-            }
+            let destinationURL = PhotosDragWriter.destinationURL(forPromisedURL: url, filename: info.filename)
             guard let identifier = photosAssetIdentifier(from: info.item),
                   let asset = PHAsset.fetchAssets(withLocalIdentifiers: [identifier], options: nil).firstObject,
                   let resource = primaryResource(for: asset) else {
@@ -1562,7 +1699,6 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
             options.isNetworkAccessAllowed = true
 
             try? FileManager.default.createDirectory(at: destinationURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? FileManager.default.removeItem(at: destinationURL)
 
             PHAssetResourceManager.default().writeData(for: resource, toFile: destinationURL, options: options) { error in
                 completionHandler(error)
@@ -1610,77 +1746,135 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
     }
 }
 
-private final class PhotosMasonryLayout: NSCollectionViewLayout {
+/// Where a dragged Photos asset is written for a file promise.
+enum PhotosDragWriter {
+    /// `promisedURL` is the file the receiver asked for (a folder only if it ends in "/", then
+    /// `filename` goes inside it). Nothing already there is ever replaced: the file then gets the
+    /// next free name next to it ("IMG_0001 2.HEIC"). A name without an extension is still a file.
+    nonisolated static func destinationURL(forPromisedURL promisedURL: URL, filename: String) -> URL {
+        let fileURL = promisedURL.hasDirectoryPath
+            ? promisedURL.appendingPathComponent(filename, isDirectory: false)
+            : promisedURL
+        return FileOperationEngine.uniqueDestinationURL(for: fileURL)
+    }
+}
+
+/// Masonry columns for the Photos library. Each item goes into the shortest column, so appending
+/// items never moves the ones already placed: new items are laid out on their own, and only
+/// settings, width or reload changes lay everything out again. Rect queries binary-search each
+/// column (its items are stacked top to bottom) instead of testing every item.
+final class PhotosMasonryLayout: NSCollectionViewLayout {
     var idealColumnWidth: CGFloat = 180 {
-        didSet { invalidateLayout() }
+        didSet { invalidateEverything() }
     }
     var columnSpacing: CGFloat = 12 {
-        didSet { invalidateLayout() }
+        didSet { invalidateEverything() }
     }
     var contentInsets: NSEdgeInsets = .init(top: 16, left: 16, bottom: 16, right: 16) {
-        didSet { invalidateLayout() }
+        didSet { invalidateEverything() }
     }
     var labelHeight: CGFloat = 0 {
-        didSet { invalidateLayout() }
+        didSet { invalidateEverything() }
     }
     var showsLabels = false {
-        didSet { invalidateLayout() }
+        didSet { invalidateEverything() }
     }
 
     var itemHeightProvider: ((IndexPath, CGFloat) -> CGFloat)?
 
     private(set) var currentColumnWidth: CGFloat = 0
-    private var cachedAttributes: [IndexPath: NSCollectionViewLayoutAttributes] = [:]
+    /// By item index
+    private var cachedAttributes: [NSCollectionViewLayoutAttributes] = []
+    /// Item indices of each column, top to bottom
+    private var columnItems: [[Int]] = []
+    private var columnX: [CGFloat] = []
+    /// Where the next item of each column goes
+    private var columnBottoms: [CGFloat] = []
     private var contentHeight: CGFloat = 0
+    private var preparedWidth: CGFloat = -1
+    /// Set by anything but appended items (settings, reload): lay out every item again
+    private var needsFullLayout = true
 
     private let verticalPadding: CGFloat = 12
     private let labelSpacing: CGFloat = 6
 
+    private func invalidateEverything() {
+        needsFullLayout = true
+        invalidateLayout()
+    }
+
+    override func invalidateLayout(with context: NSCollectionViewLayoutInvalidationContext) {
+        // Inserting items only changes the counts; anything else (reloadData, invalidateLayout())
+        // may change every item's height
+        if context.invalidateEverything || !context.invalidateDataSourceCounts {
+            needsFullLayout = true
+        }
+        super.invalidateLayout(with: context)
+    }
+
     override func prepare() {
         guard let collectionView else { return }
-        cachedAttributes.removeAll(keepingCapacity: true)
-        contentHeight = 0
+        let width = collectionView.bounds.width
+        let itemCount = collectionView.numberOfItems(inSection: 0)
+        let isUnchanged = !needsFullLayout && width == preparedWidth
+        needsFullLayout = false
 
+        if isUnchanged && itemCount == cachedAttributes.count {
+            return
+        } else if isUnchanged && itemCount > cachedAttributes.count && !columnBottoms.isEmpty {
+            appendItems(upTo: itemCount)
+        } else {
+            layoutAllItems(width: width, itemCount: itemCount)
+        }
+    }
+
+    private func layoutAllItems(width: CGFloat, itemCount: Int) {
+        preparedWidth = width
+        cachedAttributes.removeAll(keepingCapacity: true)
         let metrics = Self.columnMetrics(
-            for: collectionView.bounds.width,
+            for: width,
             idealColumnWidth: idealColumnWidth,
             spacing: columnSpacing,
             insets: contentInsets
         )
         currentColumnWidth = metrics.width
 
-        let columnCount = metrics.count
-        guard columnCount > 0, currentColumnWidth > 0 else { return }
-
-        var xOffsets: [CGFloat] = []
-        xOffsets.reserveCapacity(columnCount)
-        for column in 0..<columnCount {
-            let x = contentInsets.left + CGFloat(column) * (currentColumnWidth + columnSpacing)
-            xOffsets.append(x)
+        guard metrics.count > 0, currentColumnWidth > 0 else {
+            columnItems = []
+            columnX = []
+            columnBottoms = []
+            contentHeight = 0
+            return
         }
+        columnX = (0..<metrics.count).map { contentInsets.left + CGFloat($0) * (currentColumnWidth + columnSpacing) }
+        columnBottoms = Array(repeating: contentInsets.top, count: metrics.count)
+        columnItems = Array(repeating: [], count: metrics.count)
+        appendItems(upTo: itemCount)
+    }
 
-        var yOffsets = Array(repeating: contentInsets.top, count: columnCount)
-
-        let itemCount = collectionView.numberOfItems(inSection: 0)
-        for item in 0..<itemCount {
+    /// Places the items from `cachedAttributes.count` up to `itemCount`.
+    private func appendItems(upTo itemCount: Int) {
+        let labelStackHeight = showsLabels ? labelHeight + labelSpacing : 0
+        for item in cachedAttributes.count..<max(itemCount, cachedAttributes.count) {
             let indexPath = IndexPath(item: item, section: 0)
             let imageHeight = itemHeightProvider?(indexPath, currentColumnWidth) ?? currentColumnWidth
-            let labelStackHeight = showsLabels ? labelHeight + labelSpacing : 0
             let itemHeight = imageHeight + labelStackHeight + verticalPadding
 
-            let column = yOffsets.enumerated().min(by: { $0.element < $1.element })?.offset ?? 0
-            let frame = NSRect(x: xOffsets[column], y: yOffsets[column], width: currentColumnWidth, height: itemHeight)
+            var column = 0
+            for candidate in 1..<columnBottoms.count where columnBottoms[candidate] < columnBottoms[column] {
+                column = candidate
+            }
             let attributes = NSCollectionViewLayoutAttributes(forItemWith: indexPath)
-            attributes.frame = frame
-            cachedAttributes[indexPath] = attributes
-            yOffsets[column] = frame.maxY + columnSpacing
-            contentHeight = max(contentHeight, yOffsets[column])
+            attributes.frame = NSRect(x: columnX[column], y: columnBottoms[column], width: currentColumnWidth, height: itemHeight)
+            cachedAttributes.append(attributes)
+            columnItems[column].append(item)
+            columnBottoms[column] = attributes.frame.maxY + columnSpacing
         }
 
-        if itemCount == 0 {
+        if cachedAttributes.isEmpty {
             contentHeight = contentInsets.top + contentInsets.bottom
         } else {
-            contentHeight += contentInsets.bottom - columnSpacing
+            contentHeight = (columnBottoms.max() ?? contentInsets.top) - columnSpacing + contentInsets.bottom
         }
     }
 
@@ -1689,11 +1883,33 @@ private final class PhotosMasonryLayout: NSCollectionViewLayout {
     }
 
     override func layoutAttributesForElements(in rect: NSRect) -> [NSCollectionViewLayoutAttributes] {
-        cachedAttributes.values.filter { $0.frame.intersects(rect) }
+        var results: [NSCollectionViewLayoutAttributes] = []
+        for items in columnItems {
+            // First item that ends below the top of the rect
+            var low = 0
+            var high = items.count
+            while low < high {
+                let middle = (low + high) / 2
+                if cachedAttributes[items[middle]].frame.maxY <= rect.minY {
+                    low = middle + 1
+                } else {
+                    high = middle
+                }
+            }
+            for item in items[low...] {
+                let attributes = cachedAttributes[item]
+                if attributes.frame.minY >= rect.maxY { break }
+                if attributes.frame.intersects(rect) {
+                    results.append(attributes)
+                }
+            }
+        }
+        return results
     }
 
     override func layoutAttributesForItem(at indexPath: IndexPath) -> NSCollectionViewLayoutAttributes? {
-        cachedAttributes[indexPath]
+        guard indexPath.section == 0, cachedAttributes.indices.contains(indexPath.item) else { return nil }
+        return cachedAttributes[indexPath.item]
     }
 
     override func shouldInvalidateLayout(forBoundsChange newBounds: NSRect) -> Bool {

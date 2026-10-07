@@ -1,6 +1,7 @@
 import AppKit
 import Combine
 import SwiftUI
+import IOKit
 import SystemConfiguration
 
 struct SidebarView: View {
@@ -52,7 +53,10 @@ struct SidebarOutlineView: NSViewRepresentable {
         scrollView.borderType = .noBorder
         scrollView.contentView.drawsBackground = false
 
-        let outlineView = NSOutlineView()
+        let outlineView = SidebarNSOutlineView()
+        outlineView.onReturn = { [weak coordinator = context.coordinator] in
+            coordinator?.activateSelectedRow()
+        }
         outlineView.headerView = nil
         outlineView.style = .sourceList
         outlineView.floatsGroupRows = true
@@ -115,13 +119,17 @@ struct SidebarOutlineView: NSViewRepresentable {
         private var snapshot: SidebarSnapshot?
         private var environment: SidebarEnvironment
         private var isUpdatingSelection = false
+        /// Set while the sections are expanded or collapsed in code, so only the user's changes are remembered.
+        private var isRestoringExpansion = false
         private var volumeComparisonCache: (sequence: Int, destination: URL, sameVolume: Bool)?
-        private var folderDragCache: (sequence: Int, isFolders: Bool)?
-        /// File promises are written on this queue so large files don't block the UI.
+        private var draggedKindsCache: (sequence: Int, kinds: DraggedFileKinds)?
+        /// File promises for AirDrop are written on this queue so large files don't block the UI. Serial, so an
+        /// operation added after the readers runs after every file already delivered.
         private let filePromiseQueue: OperationQueue = {
             let queue = OperationQueue()
             queue.name = "com.flowfinder.sidebar.filePromises"
             queue.qualityOfService = .userInitiated
+            queue.maxConcurrentOperationCount = 1
             return queue
         }()
 
@@ -163,19 +171,47 @@ struct SidebarOutlineView: NSViewRepresentable {
                 sections = buildSections()
                 // Reloading can change the selected row; that must not count as a user selection.
                 isUpdatingSelection = true
+                isRestoringExpansion = true
                 outlineView?.reloadData()
-                expandAllSections()
+                restoreSectionExpansion()
+                isRestoringExpansion = false
                 isUpdatingSelection = false
             }
 
             updateSelection()
         }
 
-        private func expandAllSections() {
+        /// The rebuilt sections start collapsed: expand them, except the ones the user collapsed.
+        private func restoreSectionExpansion() {
             guard let outlineView else { return }
+            let collapsed = appSettings.sidebarCollapsedSections
             for section in sections {
-                outlineView.expandItem(section)
+                if collapsed.contains(section.kind.rawValue) {
+                    outlineView.collapseItem(section)
+                } else {
+                    outlineView.expandItem(section)
+                }
             }
+        }
+
+        func outlineViewItemDidExpand(_ notification: Notification) {
+            sectionExpansionChanged(notification, isCollapsed: false)
+        }
+
+        func outlineViewItemDidCollapse(_ notification: Notification) {
+            sectionExpansionChanged(notification, isCollapsed: true)
+        }
+
+        private func sectionExpansionChanged(_ notification: Notification, isCollapsed: Bool) {
+            guard !isRestoringExpansion,
+                  let section = notification.userInfo?["NSObject"] as? SidebarSection else { return }
+            var collapsed = appSettings.sidebarCollapsedSections
+            if isCollapsed {
+                collapsed.insert(section.kind.rawValue)
+            } else {
+                collapsed.remove(section.kind.rawValue)
+            }
+            appSettings.sidebarCollapsedSections = collapsed
         }
 
         // MARK: - NSOutlineViewDataSource
@@ -244,7 +280,8 @@ struct SidebarOutlineView: NSViewRepresentable {
 
             switch target {
             case .between(let sectionIndex, _):
-                if !isInternal && hasPromises && !hasURLs {
+                // Only folders become favorites; files can still be dropped into a favorite (the middle of its row).
+                if !isInternal && !(hasURLs && draggedFileKinds(info).hasDirectory) {
                     return []
                 }
                 outlineView.setDropItem(favoritesSection, dropChildIndex: sectionIndex)
@@ -303,8 +340,7 @@ struct SidebarOutlineView: NSViewRepresentable {
                !urls.isEmpty {
                 switch target {
                 case .between(_, let favoritesIndex):
-                    insertFavorites(urls: urls, at: favoritesIndex)
-                    return true
+                    return insertFavorites(urls: urls, at: favoritesIndex)
                 case .onFavorite(let favoriteItem):
                     guard case let .favorite(resolution) = favoriteItem.kind,
                           let destination = resolution.url else { return false }
@@ -324,32 +360,16 @@ struct SidebarOutlineView: NSViewRepresentable {
             case .onFavorite(let favoriteItem):
                 guard case let .favorite(resolution) = favoriteItem.kind,
                       let destination = resolution.url else { return false }
-                let viewModel = self.viewModel
-                receiveFilePromises(from: info) { urls, tempDirectory in
-                    guard !urls.isEmpty else {
-                        if let tempDirectory {
-                            try? FileManager.default.removeItem(at: tempDirectory)
-                        }
+                // Written straight into the folder, like promises dropped on the file views.
+                return DropHelper.receivePromisedFiles(into: destination)
+            case .airDrop:
+                return receiveFilePromisesForAirDrop(from: info) { [weak self] urls, tempDirectory in
+                    guard let self, !urls.isEmpty else {
+                        try? FileManager.default.removeItem(at: tempDirectory)
                         return
                     }
-                    // Promised files are new files in our temp folder: always copy them out.
-                    viewModel.handleDrop(urls: urls, to: destination, operation: .copy) {
-                        if let tempDirectory {
-                            try? FileManager.default.removeItem(at: tempDirectory)
-                        }
-                    }
+                    self.performAirDrop(urls: urls, temporaryDirectory: tempDirectory)
                 }
-                return true
-            case .airDrop:
-                receiveFilePromises(from: info) { [weak self] urls, tempDirectory in
-                    if let self, !urls.isEmpty {
-                        self.performAirDrop(urls: urls)
-                    }
-                    if let tempDirectory {
-                        try? FileManager.default.removeItem(at: tempDirectory)
-                    }
-                }
-                return true
             }
         }
 
@@ -395,7 +415,23 @@ struct SidebarOutlineView: NSViewRepresentable {
 
             let row = outlineView.selectedRow
             guard row >= 0, let item = outlineView.item(atRow: row) as? SidebarItem else { return }
+            switch item.kind {
+            case .airDrop, .photosLibrary:
+                // Arrowing past these must not open the AirDrop picker or switch to the Photos library (which can
+                // ask for permission): they act on a click or Return only.
+                return
+            default:
+                handleSelection(for: item)
+            }
+        }
+
+        /// Return on the highlighted row acts like clicking it.
+        func activateSelectedRow() {
+            guard let outlineView else { return }
+            let row = outlineView.selectedRow
+            guard row >= 0, let item = outlineView.item(atRow: row) as? SidebarItem, item.isEnabled else { return }
             handleSelection(for: item)
+            updateSelection()
         }
 
         @objc func outlineViewClicked(_ sender: Any?) {
@@ -619,60 +655,79 @@ struct SidebarOutlineView: NSViewRepresentable {
             (pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver]) ?? []
         }
 
-        /// Receives promised files into a temporary folder. The files are written on `filePromiseQueue`;
-        /// `completion` runs on the main queue once all of them have arrived.
-        private func receiveFilePromises(from info: NSDraggingInfo, completion: @escaping @MainActor ([URL], URL?) -> Void) {
+        /// Receives promised files into a new temporary folder, to send with AirDrop. A receiver's reader runs once
+        /// per file it delivers (a legacy promise can deliver several), so the group is left once per receiver, on
+        /// its first file or error; files delivered after that are still collected. `completion` runs on the main
+        /// queue and owns the temporary folder. Returns false when there are no promises.
+        private func receiveFilePromisesForAirDrop(from info: NSDraggingInfo, completion: @escaping @MainActor ([URL], URL) -> Void) -> Bool {
             let receivers = filePromiseReceivers(from: info.draggingPasteboard)
-            guard !receivers.isEmpty else {
-                completion([], nil)
-                return
-            }
+            guard !receivers.isEmpty else { return false }
 
             let tempDirectory = FileManager.default.temporaryDirectory
                 .appendingPathComponent("FlowFinderDrop-\(UUID().uuidString)", isDirectory: true)
             try? FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
 
+            let queue = filePromiseQueue
             let group = DispatchGroup()
             let lock = NSLock()
             var receivedURLs: [URL] = []
 
             for receiver in receivers {
                 group.enter()
-                receiver.receivePromisedFiles(atDestination: tempDirectory, options: [:], operationQueue: filePromiseQueue) { url, error in
+                var hasLeft = false
+                receiver.receivePromisedFiles(atDestination: tempDirectory, options: [:], operationQueue: queue) { url, error in
+                    lock.lock()
                     if error == nil {
-                        lock.lock()
                         receivedURLs.append(url)
-                        lock.unlock()
                     }
-                    group.leave()
+                    let shouldLeave = !hasLeft
+                    hasLeft = true
+                    lock.unlock()
+                    if shouldLeave {
+                        group.leave()
+                    }
                 }
             }
 
             group.notify(queue: .main) {
-                lock.lock()
-                let urls = receivedURLs
-                lock.unlock()
-                MainActor.assumeIsolated {
-                    completion(urls, tempDirectory)
+                // Further files from a receiver are queued behind its first one on the serial queue: take those too.
+                queue.addOperation {
+                    lock.lock()
+                    let urls = receivedURLs
+                    lock.unlock()
+                    DispatchQueue.main.async {
+                        MainActor.assumeIsolated {
+                            completion(urls, tempDirectory)
+                        }
+                    }
                 }
             }
+            return true
         }
 
-        /// Whether everything dragged is a folder (not a package), read once per drag.
-        private func isDraggingFolders(_ info: NSDraggingInfo) -> Bool {
-            if let cached = folderDragCache, cached.sequence == info.draggingSequenceNumber {
-                return cached.isFolders
+        private struct DraggedFileKinds {
+            /// Everything dragged is a folder (not a package).
+            let isFolders: Bool
+            /// At least one dragged item is a directory (packages included), i.e. something that can become a favorite.
+            let hasDirectory: Bool
+        }
+
+        /// What kind of files are being dragged, read once per drag.
+        private func draggedFileKinds(_ info: NSDraggingInfo) -> DraggedFileKinds {
+            if let cached = draggedKindsCache, cached.sequence == info.draggingSequenceNumber {
+                return cached.kinds
             }
             let urls = (info.draggingPasteboard.readObjects(
                 forClasses: [NSURL.self],
                 options: [.urlReadingFileURLsOnly: true]
             ) as? [URL]) ?? []
-            let isFolders = !urls.isEmpty && urls.allSatisfy { url in
-                let values = try? url.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey])
-                return values?.isDirectory == true && values?.isPackage != true
-            }
-            folderDragCache = (info.draggingSequenceNumber, isFolders)
-            return isFolders
+            let values = urls.map { try? $0.resourceValues(forKeys: [.isDirectoryKey, .isPackageKey]) }
+            let kinds = DraggedFileKinds(
+                isFolders: !values.isEmpty && values.allSatisfy { $0?.isDirectory == true && $0?.isPackage != true },
+                hasDirectory: values.contains { $0?.isDirectory == true }
+            )
+            draggedKindsCache = (info.draggingSequenceNumber, kinds)
+            return kinds
         }
 
         private func draggingFavoriteIDs(from pasteboard: NSPasteboard) -> [String] {
@@ -750,7 +805,7 @@ struct SidebarOutlineView: NSViewRepresentable {
                case let .favorite(resolution) = item.kind,
                resolution.isAvailable,
                resolution.url != nil {
-                switch FavoriteRowDropZone.zone(fraction: fraction, isDraggingFolders: isDraggingFolders(info)) {
+                switch FavoriteRowDropZone.zone(fraction: fraction, isDraggingFolders: draggedFileKinds(info).isFolders) {
                 case .before: return insertion(at: sectionIndex)
                 case .after: return insertion(at: sectionIndex + 1)
                 case .into: return .onFavorite(item)
@@ -793,7 +848,8 @@ struct SidebarOutlineView: NSViewRepresentable {
             appSettings.sidebarFavorites = remaining
         }
 
-        private func insertFavorites(urls: [URL], at index: Int) {
+        /// Adds the dragged folders as favorites; false when none could be added (no folders, or all already there).
+        private func insertFavorites(urls: [URL], at index: Int) -> Bool {
             var favorites = appSettings.sidebarFavorites
             var insertIndex = min(max(0, index), favorites.count)
 
@@ -805,9 +861,9 @@ struct SidebarOutlineView: NSViewRepresentable {
                 insertIndex += 1
             }
 
-            if favorites != appSettings.sidebarFavorites {
-                appSettings.sidebarFavorites = favorites
-            }
+            guard favorites != appSettings.sidebarFavorites else { return false }
+            appSettings.sidebarFavorites = favorites
+            return true
         }
 
         private func favoriteFromURL(_ url: URL) -> SidebarFavorite? {
@@ -962,7 +1018,10 @@ struct SidebarOutlineView: NSViewRepresentable {
                         isEnabled: true
                     )
                 }
-                let fallbackSymbol = location.url.path == "/" ? "desktopcomputer" : "externaldrive"
+                // Network volumes have no icon loaded (reading one could hang on an unresponsive server).
+                let fallbackSymbol = location.url.path == "/"
+                    ? "desktopcomputer"
+                    : location.isNetwork ? "externaldrive.connected.to.line.below" : "externaldrive"
                 let icon = environment.icons.icon(forPath: location.url.path) ?? symbolIcon(name: fallbackSymbol)
                 return SidebarItemPresentation(
                     title: location.name.finderDisplayName,
@@ -1023,9 +1082,18 @@ struct SidebarOutlineView: NSViewRepresentable {
             }
         }
 
-        private func performAirDrop(urls: [URL]) {
+        /// Opens the AirDrop picker for `urls`. `temporaryDirectory` (received file promises) is removed once AirDrop
+        /// is done with it, or right away if nothing is shared.
+        private func performAirDrop(urls: [URL], temporaryDirectory: URL? = nil) {
+            func discardTemporaryFiles() {
+                if let temporaryDirectory {
+                    try? FileManager.default.removeItem(at: temporaryDirectory)
+                }
+            }
+
             let validURLs = urls.filter { FileManager.default.fileExists(atPath: $0.path) }
             guard !validURLs.isEmpty else {
+                discardTemporaryFiles()
                 showAirDropAlert(
                     title: "AirDrop",
                     message: "The selected items are not available to share."
@@ -1034,6 +1102,7 @@ struct SidebarOutlineView: NSViewRepresentable {
             }
 
             guard let service = NSSharingService(named: .sendViaAirDrop) else {
+                discardTemporaryFiles()
                 showAirDropAlert(
                     title: "AirDrop Unavailable",
                     message: "AirDrop is not available on this Mac right now."
@@ -1042,6 +1111,7 @@ struct SidebarOutlineView: NSViewRepresentable {
             }
 
             guard service.canPerform(withItems: validURLs) else {
+                discardTemporaryFiles()
                 showAirDropAlert(
                     title: "AirDrop Unavailable",
                     message: "AirDrop cannot share the selected items."
@@ -1049,6 +1119,10 @@ struct SidebarOutlineView: NSViewRepresentable {
                 return
             }
 
+            if let temporaryDirectory {
+                // `perform` only opens the picker; the files are read when the user picks a recipient.
+                service.delegate = SidebarAirDropTemporaryFiles.keep(temporaryDirectory)
+            }
             FinderSoundEffects.shared.play(.invitation)
             service.perform(withItems: validURLs)
         }
@@ -1070,7 +1144,8 @@ struct SidebarOutlineView: NSViewRepresentable {
 
 // MARK: - Sidebar environment (file-system state, loaded off the main thread)
 
-/// Everything the sidebar shows that needs file-system access. Built by `load(favorites:)` on a background queue.
+/// Everything the sidebar shows that needs file-system access, kept up to date in the background by
+/// `SidebarEnvironmentStore`.
 struct SidebarEnvironment: Equatable {
     var computerName: String
     var iCloudURL: URL?
@@ -1099,35 +1174,41 @@ struct SidebarEnvironment: Equatable {
             && lhs.favoriteResolutions == rhs.favoriteResolutions
     }
 
-    /// Gathers the sidebar's file-system state. Blocking (volume and bookmark lookups can hang on a dead network
-    /// mount): never call on the main thread.
-    static func load(favorites: [SidebarFavorite], fileManager: FileManager = .default) -> SidebarEnvironment {
+    /// The computer, mounted volumes, iCloud Drive and the Photos library. Blocking, but it only reads local disks
+    /// (network volumes are never touched, see `volumeLocations`): call off the main thread.
+    static func loadVolumes(fileManager: FileManager = .default) -> SidebarVolumeState {
         let computerName = currentComputerName()
-        let locations = volumeLocations(computerName: computerName, fileManager: fileManager)
-
-        var resolutions: [String: SidebarFavoriteResolution] = [:]
-        for favorite in favorites {
-            resolutions[favorite.id] = favorite.resolve(fileManager: fileManager)
-        }
+        let locations = volumeLocations(computerName: computerName)
 
         var icons: [String: NSImage] = [:]
-        for location in locations where location != .network {
+        for location in locations where location != .network && !location.isNetwork {
             icons[location.url.path] = NSWorkspace.shared.icon(forFile: location.url.path)
         }
-        for resolution in resolutions.values where resolution.isAvailable {
-            if let url = resolution.url {
-                icons[url.path] = NSWorkspace.shared.icon(forFile: url.path)
-            }
-        }
 
-        return SidebarEnvironment(
+        return SidebarVolumeState(
             computerName: computerName,
             iCloudURL: iCloudDriveURL(fileManager: fileManager),
             photosLibraryInfo: photosLibraryInfo(fileManager: fileManager),
             locations: locations,
-            favoriteResolutions: resolutions,
-            icons: SidebarIconSet(icons)
+            icons: icons
         )
+    }
+
+    /// Resolves one favorite and loads its icon. Blocking (bookmark resolution, existence checks): call off the main
+    /// thread. A custom favorite on a network volume isn't touched at all (a server that stopped responding would
+    /// block here): it counts as available while its volume is mounted.
+    static func resolveFavorite(_ favorite: SidebarFavorite, mounts: SidebarMountTable) -> (resolution: SidebarFavoriteResolution, icon: NSImage?) {
+        if favorite.kind == .custom,
+           let path = favorite.path, !path.isEmpty,
+           let mount = mounts.mount(containing: path), !mount.isLocal {
+            let url = URL(fileURLWithPath: path, isDirectory: true)
+            let resolution = SidebarFavoriteResolution(favorite: favorite, url: url, name: url.lastPathComponent, isAvailable: true, updatedFavorite: nil)
+            return (resolution, nil)
+        }
+
+        let resolution = favorite.resolve()
+        guard resolution.isAvailable, let url = resolution.url else { return (resolution, nil) }
+        return (resolution, NSWorkspace.shared.icon(forFile: url.path))
     }
 
     /// The "Computer Name" from Sharing settings. Unlike `Host.current().localizedName` or
@@ -1142,36 +1223,54 @@ struct SidebarEnvironment: Equatable {
         return "Computer"
     }
 
-    static func volumeLocations(computerName: String, fileManager: FileManager = .default) -> [SidebarLocation] {
+    /// The computer, then the browsable mounted volumes by name, then Network. Local volumes are asked for their name
+    /// and whether they're ejectable; network volumes come from the mount table alone.
+    static func volumeLocations(computerName: String, mounts: SidebarMountTable = .current()) -> [SidebarLocation] {
         var locations = [SidebarLocation(name: computerName, url: URL(fileURLWithPath: "/", isDirectory: true), isEjectable: false, isNetwork: false)]
 
-        let keys: [URLResourceKey] = [
-            .volumeIsRootFileSystemKey,
-            .volumeIsLocalKey,
+        let keys: Set<URLResourceKey> = [
+            .volumeLocalizedNameKey,
             .volumeIsEjectableKey,
             .volumeIsRemovableKey,
             .volumeIsInternalKey
         ]
-        // Browsable volumes only, like Finder: no system/hidden volumes or `-nobrowse` mounts.
-        let volumes = fileManager.mountedVolumeURLs(includingResourceValuesForKeys: keys, options: [.skipHiddenVolumes]) ?? []
         var mounted: [SidebarLocation] = []
-        for volume in volumes {
-            let values = try? volume.resourceValues(forKeys: Set(keys))
-            // The boot volume is already listed as the computer.
-            if values?.volumeIsRootFileSystem == true || volume.standardizedFileURL.path == "/" { continue }
-
-            let isNetwork = values?.volumeIsLocal == false
-            let isEjectable = isNetwork
-                || values?.volumeIsEjectable == true
+        // Browsable volumes only, like Finder: no system volumes or `-nobrowse` mounts. The boot volume is already
+        // listed as the computer.
+        for mount in mounts.mounts where mount.isBrowsable && !mount.isRoot && mount.path != "/" {
+            let url = URL(fileURLWithPath: mount.path, isDirectory: true)
+            guard mount.isLocal else {
+                mounted.append(SidebarLocation(name: networkVolumeName(mount), url: url, isEjectable: true, isNetwork: true))
+                continue
+            }
+            let values = try? url.resourceValues(forKeys: keys)
+            let isEjectable = values?.volumeIsEjectable == true
                 || values?.volumeIsRemovable == true
                 || values?.volumeIsInternal == false
-            mounted.append(SidebarLocation(name: volume.lastPathComponent, url: volume, isEjectable: isEjectable, isNetwork: isNetwork))
+            // The name Finder shows: two disks named "Untitled" are both "Untitled" (mounted at "Untitled" and "Untitled 1").
+            let name = values?.volumeLocalizedName ?? url.lastPathComponent
+            mounted.append(SidebarLocation(name: name, url: url, isEjectable: isEjectable, isNetwork: false))
         }
-        mounted.sort { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
+        mounted.sort { lhs, rhs in
+            let order = lhs.name.localizedStandardCompare(rhs.name)
+            return order == .orderedSame ? lhs.url.path < rhs.url.path : order == .orderedAscending
+        }
 
         locations += mounted
         locations.append(.network)
         return locations
+    }
+
+    /// A network share's name from what was mounted (`//user@server/My%20Share` is "My Share"), else its mount point's.
+    private static func networkVolumeName(_ mount: SidebarMountTable.Mount) -> String {
+        if mount.source.hasPrefix("//") {
+            let components = mount.source.split(separator: "/")
+            if components.count >= 2, let share = components.last {
+                let name = String(share).removingPercentEncoding ?? String(share)
+                if !name.isEmpty { return name }
+            }
+        }
+        return URL(fileURLWithPath: mount.path, isDirectory: true).lastPathComponent
     }
 
     static func iCloudDriveURL(fileManager: FileManager = .default) -> URL? {
@@ -1233,6 +1332,77 @@ struct SidebarEnvironment: Equatable {
     }
 }
 
+/// The part of `SidebarEnvironment` that doesn't depend on the favorites, from `SidebarEnvironment.loadVolumes()`.
+struct SidebarVolumeState {
+    let computerName: String
+    let iCloudURL: URL?
+    let photosLibraryInfo: PhotosLibraryInfo?
+    let locations: [SidebarLocation]
+    /// Icons of the local volumes, by path.
+    let icons: [String: NSImage]
+}
+
+/// The mounted file systems, from `getfsstat` with `MNT_NOWAIT`: the kernel's cached list, so reading it never waits
+/// on a volume (not even a network share whose server stopped responding). Cheap enough for the main thread.
+struct SidebarMountTable {
+    struct Mount: Equatable {
+        /// Mount point.
+        let path: String
+        /// What's mounted there, e.g. `/dev/disk5s1` or `//user@server/Share`.
+        let source: String
+        let isLocal: Bool
+        /// Not mounted `nobrowse` (system volumes, `-nobrowse` disk images): the volumes Finder lists.
+        let isBrowsable: Bool
+        let isRoot: Bool
+    }
+
+    let mounts: [Mount]
+
+    static func current() -> SidebarMountTable {
+        let count = getfsstat(nil, 0, MNT_NOWAIT)
+        guard count > 0 else { return SidebarMountTable(mounts: []) }
+        // Room for volumes mounted in between the two calls.
+        let capacity = Int(count) + 8
+        let entries = UnsafeMutablePointer<statfs>.allocate(capacity: capacity)
+        defer { entries.deallocate() }
+        let filled = Int(getfsstat(entries, Int32(capacity * MemoryLayout<statfs>.stride), MNT_NOWAIT))
+        guard filled > 0 else { return SidebarMountTable(mounts: []) }
+
+        func string<T>(_ characters: T) -> String {
+            withUnsafeBytes(of: characters) { bytes in
+                String(decoding: bytes.prefix { $0 != 0 }, as: UTF8.self)
+            }
+        }
+        let localFlag = UInt32(MNT_LOCAL)
+        let noBrowseFlag = UInt32(MNT_DONTBROWSE)
+        let rootFlag = UInt32(MNT_ROOTFS)
+        var mounts: [Mount] = []
+        for index in 0..<min(filled, capacity) {
+            let entry = entries[index]
+            let flags: UInt32 = entry.f_flags
+            mounts.append(Mount(
+                path: string(entry.f_mntonname),
+                source: string(entry.f_mntfromname),
+                isLocal: flags & localFlag != 0,
+                isBrowsable: flags & noBrowseFlag == 0,
+                isRoot: flags & rootFlag != 0
+            ))
+        }
+        return SidebarMountTable(mounts: mounts)
+    }
+
+    /// The mount that holds `path`: the longest mount point it's inside of (by path, symlinks aren't followed).
+    func mount(containing path: String) -> Mount? {
+        var best: Mount?
+        for mount in mounts {
+            let isInside = mount.path == "/" || path == mount.path || path.hasPrefix(mount.path + "/")
+            guard isInside, mount.path.count > (best?.path.count ?? -1) else { continue }
+            best = mount
+        }
+        return best
+    }
+}
+
 /// Immutable icon lookup shared between the background loader and the sidebar.
 final class SidebarIconSet: @unchecked Sendable {
     private let icons: [String: NSImage]
@@ -1273,6 +1443,10 @@ extension SidebarFavoriteResolution {
 
 /// Keeps one `SidebarEnvironment` for all sidebars and refreshes it in the background: when volumes mount, unmount
 /// or are renamed, when favorites change, when the app becomes active, and on a slow timer.
+///
+/// The volume list and the favorites load independently: volumes in one coalesced load at a time, each favorite on
+/// its own. A favorite whose folder doesn't answer (a disk that hangs) never holds up mount and unmount updates or
+/// the other favorites.
 @MainActor
 final class SidebarEnvironmentStore {
     static let shared = SidebarEnvironmentStore()
@@ -1283,13 +1457,32 @@ final class SidebarEnvironmentStore {
 
     private static let timerInterval: TimeInterval = 60
     private static let activationRefreshInterval: TimeInterval = 5
+    /// A new or edited favorite that hasn't resolved after this long shows as unavailable until its answer arrives.
+    static let favoriteResolutionTimeout: TimeInterval = 5
 
-    private let loadQueue = DispatchQueue(label: "com.flowfinder.sidebar.environment", qos: .utility)
-    private var isLoading = false
-    private var needsAnotherLoad = false
+    private let volumeQueue = DispatchQueue(label: "com.flowfinder.sidebar.volumes", qos: .utility)
+    private let favoriteQueue = DispatchQueue(label: "com.flowfinder.sidebar.favorites", qos: .utility, attributes: .concurrent)
+    private var isLoadingVolumes = false
+    private var needsAnotherVolumeLoad = false
     private var lastLoadStart = Date.distantPast
     private var favorites: [SidebarFavorite] = []
     private weak var settings: AppSettings?
+
+    private struct PendingResolution {
+        let favorite: SidebarFavorite
+        let token: Int
+        /// Requested again while running: resolve once more when it finishes.
+        var needsRerun = false
+    }
+    /// Resolutions in flight, by favorite id: at most one per favorite, so one on a hung volume ties up one thread
+    /// rather than one per refresh. A newer request for an edited favorite replaces it (the old answer is dropped).
+    private var pendingResolutions: [String: PendingResolution] = [:]
+    private var nextResolutionToken = 0
+    private var locationIcons: [String: NSImage] = [:]
+    /// By favorite id.
+    private var favoriteIcons: [String: (path: String, image: NSImage)] = [:]
+    /// Resolutions whose moved path or new bookmark is waiting to be written to the settings (in one batch).
+    private var pendingFavoriteUpdates: [SidebarFavoriteResolution] = []
     /// Favorites whose bookmark was created or refreshed this session. That happens at most once per favorite, so
     /// a bookmark that keeps failing can't cause endless rewrites. (Moves always apply; they converge.)
     private var rebookmarkedFavoriteIDs: Set<String> = []
@@ -1302,55 +1495,153 @@ final class SidebarEnvironmentStore {
     func requestRefresh(favorites: [SidebarFavorite], settings: AppSettings) {
         self.favorites = favorites
         self.settings = settings
+        // Forget removed favorites (not a visible change: rows come from the favorites list).
+        let ids = Set(favorites.map(\.id))
+        environment.favoriteResolutions = environment.favoriteResolutions.filter { ids.contains($0.key) }
+        favoriteIcons = favoriteIcons.filter { ids.contains($0.key) }
         requestRefresh()
     }
 
-    /// Reloads in the background. Requests made while a load is running are coalesced into one more load.
+    /// Reloads the volumes and resolves every favorite again, in the background.
     func requestRefresh() {
-        guard !isLoading else {
-            needsAnotherLoad = true
+        lastLoadStart = Date()
+        loadVolumes()
+        let mounts = SidebarMountTable.current()
+        for favorite in favorites {
+            resolve(favorite, mounts: mounts)
+        }
+    }
+
+    // MARK: Volumes
+
+    /// One load at a time; requests made meanwhile are coalesced into one more load.
+    private func loadVolumes() {
+        guard !isLoadingVolumes else {
+            needsAnotherVolumeLoad = true
             return
         }
-        isLoading = true
-        lastLoadStart = Date()
-        let favorites = self.favorites
-        loadQueue.async {
-            let loaded = SidebarEnvironment.load(favorites: favorites)
+        isLoadingVolumes = true
+        volumeQueue.async {
+            let state = SidebarEnvironment.loadVolumes()
             DispatchQueue.main.async {
                 MainActor.assumeIsolated {
-                    SidebarEnvironmentStore.shared.finishLoad(loaded)
+                    SidebarEnvironmentStore.shared.finishVolumeLoad(state)
                 }
             }
         }
     }
 
-    private func finishLoad(_ loaded: SidebarEnvironment) {
-        isLoading = false
-        if loaded != environment {
-            environment = loaded
-            environmentDidChange.send()
-        }
-        applyFavoriteUpdates(from: loaded)
+    private func finishVolumeLoad(_ state: SidebarVolumeState) {
+        isLoadingVolumes = false
+        locationIcons = state.icons
+        var updated = environment
+        updated.computerName = state.computerName
+        updated.iCloudURL = state.iCloudURL
+        updated.photosLibraryInfo = state.photosLibraryInfo
+        updated.locations = state.locations
+        apply(updated)
 
-        if needsAnotherLoad {
-            needsAnotherLoad = false
-            requestRefresh()
+        if needsAnotherVolumeLoad {
+            needsAnotherVolumeLoad = false
+            loadVolumes()
+        }
+    }
+
+    // MARK: Favorites
+
+    private func resolve(_ favorite: SidebarFavorite, mounts: SidebarMountTable) {
+        if var pending = pendingResolutions[favorite.id], pending.favorite == favorite {
+            pending.needsRerun = true
+            pendingResolutions[favorite.id] = pending
+            return
+        }
+        nextResolutionToken += 1
+        let token = nextResolutionToken
+        pendingResolutions[favorite.id] = PendingResolution(favorite: favorite, token: token)
+
+        favoriteQueue.async {
+            let result = SidebarEnvironment.resolveFavorite(favorite, mounts: mounts)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    SidebarEnvironmentStore.shared.finishResolution(result.resolution, icon: result.icon, token: token)
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.favoriteResolutionTimeout) {
+            MainActor.assumeIsolated {
+                SidebarEnvironmentStore.shared.resolutionTimedOut(favoriteID: favorite.id, token: token)
+            }
+        }
+    }
+
+    private func finishResolution(_ resolution: SidebarFavoriteResolution, icon: NSImage?, token: Int) {
+        let id = resolution.favorite.id
+        guard let pending = pendingResolutions[id], pending.token == token else { return }
+        pendingResolutions[id] = nil
+
+        // Only for the favorite as it is now (not one edited or removed meanwhile).
+        if favorites.contains(resolution.favorite) {
+            if let icon, let url = resolution.url {
+                favoriteIcons[id] = (url.path, icon)
+            } else {
+                favoriteIcons[id] = nil
+            }
+            var updated = environment
+            updated.favoriteResolutions[id] = resolution
+            apply(updated)
+            if resolution.updatedFavorite != nil {
+                scheduleFavoriteUpdate(resolution)
+            }
+        }
+
+        if pending.needsRerun, let current = favorites.first(where: { $0.id == id }) {
+            resolve(current, mounts: .current())
+        }
+    }
+
+    private func resolutionTimedOut(favoriteID id: String, token: Int) {
+        guard let pending = pendingResolutions[id], pending.token == token,
+              favorites.contains(pending.favorite),
+              environment.favoriteResolutions[id]?.favorite != pending.favorite else { return }
+        // Not known yet and not answering: show it as unavailable rather than let a click wait on it. (A favorite
+        // that resolved before keeps its last state.)
+        let provisional = SidebarFavoriteResolution.provisional(for: pending.favorite)
+        var updated = environment
+        updated.favoriteResolutions[id] = SidebarFavoriteResolution(
+            favorite: pending.favorite,
+            url: provisional.url,
+            name: provisional.name,
+            isAvailable: false,
+            updatedFavorite: nil
+        )
+        apply(updated)
+    }
+
+    /// Updates arriving together are written to the settings in one go.
+    private func scheduleFavoriteUpdate(_ resolution: SidebarFavoriteResolution) {
+        pendingFavoriteUpdates.append(resolution)
+        guard pendingFavoriteUpdates.count == 1 else { return }
+        DispatchQueue.main.async {
+            MainActor.assumeIsolated {
+                SidebarEnvironmentStore.shared.applyFavoriteUpdates()
+            }
         }
     }
 
     /// Stores moved paths and new bookmarks back into the settings.
-    private func applyFavoriteUpdates(from loaded: SidebarEnvironment) {
+    private func applyFavoriteUpdates() {
+        let resolutions = pendingFavoriteUpdates
+        pendingFavoriteUpdates.removeAll()
         guard let settings else { return }
         var favorites = settings.sidebarFavorites
         var changed = false
 
-        for (index, favorite) in favorites.enumerated() {
+        for resolution in resolutions {
             // Only if the favorite hasn't been edited since it was resolved.
-            guard let resolution = loaded.favoriteResolutions[favorite.id],
-                  resolution.favorite == favorite,
-                  let updated = resolution.updatedFavorite else { continue }
+            guard let updated = resolution.updatedFavorite,
+                  let index = favorites.firstIndex(of: resolution.favorite) else { continue }
             if !resolution.didMove {
-                guard rebookmarkedFavoriteIDs.insert(favorite.id).inserted else { continue }
+                guard rebookmarkedFavoriteIDs.insert(resolution.favorite.id).inserted else { continue }
             }
             favorites[index] = updated
             changed = true
@@ -1358,6 +1649,23 @@ final class SidebarEnvironmentStore {
 
         if changed {
             settings.sidebarFavorites = favorites
+        }
+    }
+
+    // MARK: Publishing
+
+    /// Replaces the environment (with the current icons) and announces it if anything shown changed.
+    private func apply(_ updated: SidebarEnvironment) {
+        var icons = locationIcons
+        for (path, image) in favoriteIcons.values {
+            icons[path] = image
+        }
+        var updated = updated
+        updated.icons = SidebarIconSet(icons)
+        let changed = updated != environment
+        environment = updated
+        if changed {
+            environmentDidChange.send()
         }
     }
 
@@ -1418,16 +1726,61 @@ final class SidebarEnvironmentStore {
 /// Ejects volumes from the sidebar without blocking the main thread.
 @MainActor
 enum SidebarVolumeEjector {
+    /// Like Finder: a volume that shares its disk with other mounted volumes asks whether to eject all of them or
+    /// just this one; otherwise the whole disk is ejected. Network shares are unmounted.
     static func eject(_ location: SidebarLocation, window: NSWindow?) {
+        guard !location.isNetwork else {
+            unmount(location, otherVolumes: [], ejectingDisk: false, window: window)
+            return
+        }
+        let others = otherMountedVolumes(onDiskOf: location.url)
+        guard !others.isEmpty else {
+            unmount(location, otherVolumes: [], ejectingDisk: true, window: window)
+            return
+        }
+
+        let name = location.name.finderDisplayName
+        let otherNames = others.map { "“\(URL(fileURLWithPath: $0.path, isDirectory: true).finderDisplayName)”" }
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "“\(name)” is on a disk with other volumes."
+        alert.informativeText = "Do you want to eject all volumes on the disk (also \(ListFormatter.localizedString(byJoining: otherNames))), or just “\(name)”?"
+        alert.addButton(withTitle: "Eject All")
+        alert.addButton(withTitle: "Eject")
+        alert.addButton(withTitle: "Cancel")
+
+        let handle: (NSApplication.ModalResponse) -> Void = { response in
+            switch response {
+            case .alertFirstButtonReturn:
+                unmount(location, otherVolumes: others, ejectingDisk: true, window: window)
+            case .alertSecondButtonReturn:
+                unmount(location, otherVolumes: [], ejectingDisk: false, window: window)
+            default:
+                break
+            }
+        }
+        if let window {
+            alert.beginSheetModal(for: window) { response in
+                MainActor.assumeIsolated { handle(response) }
+            }
+        } else {
+            handle(alert.runModal())
+        }
+    }
+
+    /// Unmounts `location`; with `ejectingDisk`, every volume on its disk and the disk itself.
+    private static func unmount(_ location: SidebarLocation, otherVolumes: [SidebarMountTable.Mount], ejectingDisk: Bool, window: NSWindow?) {
         let url = location.url
         let name = location.name
-        // Let panes showing this volume move away and stop watching it first, so we don't block our own eject.
-        SidebarEnvironmentStore.postVolumeNotification(.volumeWillUnmount, volumeURL: url)
+        // Let panes showing these volumes move away and stop watching them first, so we don't block our own eject.
+        let announcedURLs = [url] + otherVolumes.map { URL(fileURLWithPath: $0.path, isDirectory: true) }
+        for volumeURL in announcedURLs {
+            SidebarEnvironmentStore.postVolumeNotification(.volumeWillUnmount, volumeURL: volumeURL)
+        }
 
-        // Network shares have no disk to eject; everything else is unmounted with all its partitions and ejected.
-        let options: FileManager.UnmountOptions = location.isNetwork
-            ? [.withoutUI]
-            : [.allPartitionsAndEjectDisk, .withoutUI]
+        let options: FileManager.UnmountOptions = ejectingDisk
+            ? [.allPartitionsAndEjectDisk, .withoutUI]
+            : [.withoutUI]
 
         DispatchQueue.global(qos: .userInitiated).asyncAfter(deadline: .now() + 0.2) { [weak window] in
             FileManager.default.unmountVolume(at: url, options: options) { error in
@@ -1435,6 +1788,11 @@ enum SidebarVolumeEjector {
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         if let failure {
+                            // Panes that left these volumes for the eject come back (volumes that did go
+                            // away were already reported by didUnmount).
+                            for volumeURL in announcedURLs {
+                                SidebarEnvironmentStore.postVolumeNotification(.volumeUnmountFailed, volumeURL: volumeURL)
+                            }
                             presentEjectError(failure, volumeName: name, window: window)
                         } else {
                             // The eject sound comes from FinderSoundEffectsMonitor's didUnmount observer.
@@ -1446,10 +1804,43 @@ enum SidebarVolumeEjector {
         }
     }
 
+    /// The other browsable volumes mounted from the physical disk that holds `volumeURL` (none for a network volume).
+    /// Reads only the mount table and the I/O Registry, so it never waits on a volume.
+    static func otherMountedVolumes(onDiskOf volumeURL: URL, mounts: SidebarMountTable = .current()) -> [SidebarMountTable.Mount] {
+        let path = volumeURL.standardizedFileURL.path
+        guard let volume = mounts.mounts.first(where: { $0.path == path }),
+              let disk = physicalDisk(ofDevice: volume.source) else { return [] }
+        return mounts.mounts.filter { mount in
+            mount.path != volume.path && mount.isBrowsable && !mount.isRoot
+                && physicalDisk(ofDevice: mount.source) == disk
+        }
+    }
+
+    /// The BSD name of the physical disk a device such as `/dev/disk5s1` is on: the outermost whole disk above it in
+    /// the I/O Registry, which follows an APFS container to its physical store. Nil for anything that isn't a disk.
+    static func physicalDisk(ofDevice device: String) -> String? {
+        guard device.hasPrefix("/dev/disk") else { return nil }
+        let bsdName = String(device.dropFirst("/dev/".count))
+        var entry = IOServiceGetMatchingService(kIOMainPortDefault, IOBSDNameMatching(kIOMainPortDefault, 0, bsdName))
+        var outermost: String?
+        while entry != IO_OBJECT_NULL {
+            if IOObjectConformsTo(entry, "IOMedia") != 0,
+               (IORegistryEntryCreateCFProperty(entry, "Whole" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? Bool) == true,
+               let name = IORegistryEntryCreateCFProperty(entry, "BSD Name" as CFString, kCFAllocatorDefault, 0)?.takeRetainedValue() as? String {
+                outermost = name
+            }
+            var parent: io_registry_entry_t = IO_OBJECT_NULL
+            let status = IORegistryEntryGetParentEntry(entry, kIOServicePlane, &parent)
+            IOObjectRelease(entry)
+            entry = status == KERN_SUCCESS ? parent : IO_OBJECT_NULL
+        }
+        return outermost
+    }
+
     static func presentEjectError(_ error: NSError, volumeName: String, window: NSWindow?) {
         let alert = NSAlert()
         alert.alertStyle = .warning
-        alert.messageText = "The volume “\(volumeName)” wasn’t ejected."
+        alert.messageText = "The volume “\(volumeName.finderDisplayName)” wasn’t ejected."
 
         if error.domain == NSCocoaErrorDomain, error.code == CocoaError.fileManagerUnmountBusy.rawValue {
             var reason = "It’s in use"
@@ -1469,6 +1860,51 @@ enum SidebarVolumeEjector {
         } else {
             alert.runModal()
         }
+    }
+}
+
+/// Promised files received for AirDrop live in a temporary folder that must outlast `NSSharingService.perform`, which
+/// only opens the picker. The folder is removed when the share finishes, fails or is cancelled, or when the app quits.
+@MainActor
+final class SidebarAirDropTemporaryFiles: NSObject, NSSharingServiceDelegate {
+    private static var pending: [SidebarAirDropTemporaryFiles] = []
+    private static var quitObserver: NSObjectProtocol?
+
+    let directory: URL
+
+    private init(directory: URL) {
+        self.directory = directory
+    }
+
+    /// Keeps `directory` until the share ends. Use the result as the sharing service's delegate (it's kept alive here:
+    /// the service only holds its delegate weakly).
+    static func keep(_ directory: URL) -> SidebarAirDropTemporaryFiles {
+        let files = SidebarAirDropTemporaryFiles(directory: directory)
+        pending.append(files)
+        if quitObserver == nil {
+            quitObserver = NotificationCenter.default.addObserver(forName: NSApplication.willTerminateNotification, object: nil, queue: .main) { _ in
+                MainActor.assumeIsolated {
+                    for files in SidebarAirDropTemporaryFiles.pending {
+                        try? FileManager.default.removeItem(at: files.directory)
+                    }
+                    SidebarAirDropTemporaryFiles.pending.removeAll()
+                }
+            }
+        }
+        return files
+    }
+
+    func sharingService(_ sharingService: NSSharingService, didShareItems items: [Any]) {
+        finish()
+    }
+
+    func sharingService(_ sharingService: NSSharingService, didFailToShareItems items: [Any], error: Error) {
+        finish()
+    }
+
+    private func finish() {
+        try? FileManager.default.removeItem(at: directory)
+        Self.pending.removeAll { $0 === self }
     }
 }
 
@@ -1492,8 +1928,23 @@ private struct SidebarItemPresentation {
     let isEnabled: Bool
 }
 
+/// Return acts on the highlighted row (arrowing only moves the highlight for AirDrop and Photos).
+private final class SidebarNSOutlineView: NSOutlineView {
+    var onReturn: (() -> Void)?
+
+    override func keyDown(with event: NSEvent) {
+        let modifiers = event.modifierFlags.intersection([.command, .option, .control, .shift])
+        if (event.keyCode == 36 || event.keyCode == 76), modifiers.isEmpty, let onReturn {
+            onReturn()
+            return
+        }
+        super.keyDown(with: event)
+    }
+}
+
 private final class SidebarSection: NSObject {
-    enum Kind {
+    /// Raw values are stored in `AppSettings.sidebarCollapsedSections`.
+    enum Kind: String {
         case favorites
         case icloud
         case locations
