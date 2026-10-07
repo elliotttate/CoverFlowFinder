@@ -177,22 +177,15 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         item.displayName(showFileExtensions: showFileExtensions).replacingOccurrences(of: ":", with: "/")
     }
 
-    /// The rename field's text: files without their extension (it's kept), folders and packages
-    /// with their full name; ":" shown as "/" (the view model stores "/" back as ":").
-    static func editingText(for item: FileItem) -> String {
-        let name = item.isDirectory ? item.name : item.url.deletingPathExtension().lastPathComponent
-        return name.replacingOccurrences(of: ":", with: "/")
-    }
-
-    /// The extension hidden from the rename field ("" for folders and packages).
-    static func hiddenExtension(for item: FileItem) -> String {
-        item.isDirectory ? "" : item.url.pathExtension
-    }
-
-    /// The new full name: the hidden extension is put back unless the user typed it.
-    static func fullName(fromEditedText text: String, hiddenExtension ext: String) -> String {
-        guard !ext.isEmpty, !text.lowercased().hasSuffix("." + ext.lowercased()) else { return text }
-        return "\(text).\(ext)"
+    /// The part of the rename field's text to select when editing starts: the base name when the
+    /// field shows a file's (or package's) extension, as Finder does, else everything. UTF-16 range.
+    static func initialSelection(forEditingText text: String, of item: FileItem) -> NSRange {
+        let all = NSRange(location: 0, length: (text as NSString).length)
+        guard !item.isDirectory || item.isPackage else { return all }
+        let ext = item.url.pathExtension
+        guard !ext.isEmpty, text.count > ext.count + 1,
+              text.lowercased().hasSuffix("." + ext.lowercased()) else { return all }
+        return NSRange(location: 0, length: all.length - (ext as NSString).length - 1)
     }
 
     /// The field text, or nil when it's blank or unchanged (nothing to rename). Not trimmed:
@@ -200,7 +193,7 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
     private func editedTextIfChanged(for item: FileItem) -> String? {
         let text = nameTextField.stringValue
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              text != Self.editingText(for: item) else { return nil }
+              text != item.editingName else { return nil }
         return text
     }
 
@@ -212,8 +205,9 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         isEditing = true
         editingStartedAt = Date()
 
-        // Set up for editing
-        nameTextField.stringValue = Self.editingText(for: item)
+        // Set up for editing (the same naming rule as every other rename field)
+        let text = item.editingName
+        nameTextField.stringValue = text
         nameTextField.isEditable = true
         nameTextField.isSelectable = true
         nameTextField.isBordered = true
@@ -227,8 +221,11 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
             // First, end any existing editing in the window
             self.window?.endEditing(for: nil)
 
-            // Now start editing our field
+            // Now start editing our field, with the base name selected
             self.nameTextField.selectText(nil)
+            if let editor = self.nameTextField.currentEditor(), editor.string == text {
+                editor.selectedRange = Self.initialSelection(forEditingText: text, of: item)
+            }
         }
     }
 
@@ -309,9 +306,9 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
 
         endEditingMode(refocusTable: refocusTable)
 
-        // Only rename if name actually changed and is not empty
-        if let editedText {
-            let newName = Self.fullName(fromEditedText: editedText, hiddenExtension: Self.hiddenExtension(for: item))
+        // Only rename if the name actually changes (`FileItem.newName(forEditedText:)` is the rule
+        // every rename field uses)
+        if let editedText, let newName = item.newName(forEditedText: editedText) {
             delegate?.fileNameCellView(self, didRenameItem: item, to: newName)
         } else {
             // Restore original name
