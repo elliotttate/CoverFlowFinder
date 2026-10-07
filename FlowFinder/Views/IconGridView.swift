@@ -97,7 +97,7 @@ struct IconGridView: View {
                             .onScrollVisibilityChange(threshold: GridThumbnailLoader.onScreenThreshold) { isVisible in
                                 thumbnailLoader.setOnScreen(item.url, isVisible)
                             }
-                            .internalDrag(item: item)
+                            .fileDragItem(item)
                             .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                                 item: item,
                                 viewModel: viewModel,
@@ -110,6 +110,8 @@ struct IconGridView: View {
                             }
                         }
                     }
+                    // Dragging a selected tile drags the whole selection
+                    .fileDragContainer(for: viewModel)
                     .padding(20)
                     // Fill remaining space to allow clicking on empty area
                     .frame(minHeight: geometry.size.height, alignment: .top)

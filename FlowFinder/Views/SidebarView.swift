@@ -1773,9 +1773,9 @@ enum SidebarVolumeEjector {
         let url = location.url
         let name = location.name
         // Let panes showing these volumes move away and stop watching them first, so we don't block our own eject.
-        SidebarEnvironmentStore.postVolumeNotification(.volumeWillUnmount, volumeURL: url)
-        for other in otherVolumes {
-            SidebarEnvironmentStore.postVolumeNotification(.volumeWillUnmount, volumeURL: URL(fileURLWithPath: other.path, isDirectory: true))
+        let announcedURLs = [url] + otherVolumes.map { URL(fileURLWithPath: $0.path, isDirectory: true) }
+        for volumeURL in announcedURLs {
+            SidebarEnvironmentStore.postVolumeNotification(.volumeWillUnmount, volumeURL: volumeURL)
         }
 
         let options: FileManager.UnmountOptions = ejectingDisk
@@ -1788,6 +1788,11 @@ enum SidebarVolumeEjector {
                 DispatchQueue.main.async {
                     MainActor.assumeIsolated {
                         if let failure {
+                            // Panes that left these volumes for the eject come back (volumes that did go
+                            // away were already reported by didUnmount).
+                            for volumeURL in announcedURLs {
+                                SidebarEnvironmentStore.postVolumeNotification(.volumeUnmountFailed, volumeURL: volumeURL)
+                            }
                             presentEjectError(failure, volumeName: name, window: window)
                         } else {
                             // The eject sound comes from FinderSoundEffectsMonitor's didUnmount observer.

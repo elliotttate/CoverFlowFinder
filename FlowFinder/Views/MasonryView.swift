@@ -182,6 +182,8 @@ struct MasonryView: View {
                             }
                         }
                     }
+                    // Dragging a selected tile drags the whole selection
+                    .fileDragContainer(for: viewModel)
                     .padding(.horizontal, sidePadding)
                     .padding(.vertical, sidePadding)
                     // Fill remaining space to allow clicking on empty area
@@ -1022,7 +1024,7 @@ struct MasonryItemView: View {
         .onHover { hovering in
             isHovering = hovering
         }
-        .internalDrag(item: item)
+        .fileDragItem(item)
         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
