@@ -274,6 +274,9 @@ struct KeyboardHandlers {
     var onCopy: () -> Void = {}
     var onCut: () -> Void = {}
     var onPaste: () -> Void = {}
+    /// Select All (Edit menu, ⌘A) for views whose items aren't the view model's `filteredItems`
+    /// (Column view: the active column's); nil selects all of the view model's items.
+    var onSelectAll: (() -> Void)?
     var onTypeAhead: ((String) -> Void)?
 }
 
@@ -565,8 +568,8 @@ final class KeyboardManager {
 
     /// File side of Copy/Cut/Paste/Select All/Duplicate/Move to Trash/Delete Immediately. Prefers
     /// the handlers of the window's file view (e.g. Column view pastes into the active column),
-    /// falling back to the view model.
-    private func performFileCommand(_ command: EditCommand, viewModel: FileBrowserViewModel?, in window: NSWindow?) {
+    /// falling back to the view model. Internal (not private) so tests can drive it.
+    func performFileCommand(_ command: EditCommand, viewModel: FileBrowserViewModel?, in window: NSWindow?) {
         let handlers = window.flatMap { activeHandlers(for: $0) }
         guard let viewModel else {
             NSSound.beep()
@@ -590,7 +593,7 @@ final class KeyboardManager {
             }
             if let handlers { handlers.onPaste() } else { viewModel.paste() }
         case .selectAll:
-            viewModel.selectAll()
+            if let onSelectAll = handlers?.onSelectAll { onSelectAll() } else { viewModel.selectAll() }
         case .duplicate:
             viewModel.duplicateSelectedItems()
         case .moveToTrash:
@@ -952,7 +955,8 @@ struct KeyboardNavigable: ViewModifier {
 extension View {
     /// Routes arrow keys, Return/⌘↓, Space and type-ahead typed in this view's window to these
     /// closures (only while the file area has focus), and lets the Edit menu use `onCopy`/`onCut`/
-    /// `onPaste`/`onDelete` for this view. The closures are refreshed on every update of the view.
+    /// `onPaste`/`onDelete`/`onSelectAll` for this view. The closures are refreshed on every update
+    /// of the view.
     func keyboardNavigable(
         isActive: Bool = true,
         onUpArrow: @escaping (_ shift: Bool) -> Void = { _ in },
@@ -965,6 +969,7 @@ extension View {
         onCopy: @escaping () -> Void = {},
         onCut: @escaping () -> Void = {},
         onPaste: @escaping () -> Void = {},
+        onSelectAll: (() -> Void)? = nil,
         onTypeAhead: ((String) -> Void)? = nil
     ) -> some View {
         modifier(KeyboardNavigable(
@@ -980,6 +985,7 @@ extension View {
                 onCopy: onCopy,
                 onCut: onCut,
                 onPaste: onPaste,
+                onSelectAll: onSelectAll,
                 onTypeAhead: onTypeAhead
             )
         ))
@@ -1016,14 +1022,15 @@ final class HostingWindowReaderView: NSView {
 
 // MARK: - Pane Keyboard Navigation
 
-/// Keyboard actions shared by the dual and quad pane views.
+/// Keyboard actions shared by the dual and quad pane views. `window` is the panes' window: an open
+/// Quick Look panel follows the selection only if it belongs to that window.
 @MainActor
 enum PaneKeyboardNavigation {
     /// Moves the selection by `offset` items (±1, or ± the column count for ↑/↓ in icon mode), like
     /// the list view: with nothing (visible) selected, a forward arrow selects the first item and a
     /// backward one the last; a plain arrow moves past the end of a multi-selection it points to;
     /// ⇧ extends from the anchor.
-    static func move(_ viewModel: FileBrowserViewModel, by offset: Int, extend: Bool = false) {
+    static func move(_ viewModel: FileBrowserViewModel, by offset: Int, extend: Bool = false, window: NSWindow? = nil) {
         let items = viewModel.filteredItems
         guard !items.isEmpty, offset != 0 else { return }
         let maxIndex = items.count - 1
@@ -1037,7 +1044,7 @@ enum PaneKeyboardNavigation {
         }
 
         guard let lowest = selectedIndices.first, let highest = selectedIndices.last else {
-            select(offset > 0 ? 0 : maxIndex, in: items, viewModel: viewModel)
+            select(offset > 0 ? 0 : maxIndex, in: items, viewModel: viewModel, window: window)
             return
         }
 
@@ -1056,20 +1063,20 @@ enum PaneKeyboardNavigation {
             guard newIndex != cursor else { return }
             viewModel.selectionAnchorIndex = anchor
             viewModel.selectRange(to: newIndex, in: items)
-            viewModel.updateQuickLookPreview(for: items[newIndex])
+            viewModel.updateQuickLookPreview(for: items[newIndex], in: window)
             return
         }
 
         let newIndex = offset > 0 ? min(highest + offset, maxIndex) : max(lowest + offset, 0)
         if selectedIndices.count == 1 && newIndex == lowest { return }  // already at the end
-        select(newIndex, in: items, viewModel: viewModel)
+        select(newIndex, in: items, viewModel: viewModel, window: window)
     }
 
-    private static func select(_ index: Int, in items: [FileItem], viewModel: FileBrowserViewModel) {
+    private static func select(_ index: Int, in items: [FileItem], viewModel: FileBrowserViewModel, window: NSWindow?) {
         viewModel.selectItem(items[index])
         viewModel.lastSelectedIndex = index
         viewModel.selectionAnchorIndex = index
-        viewModel.updateQuickLookPreview(for: items[index])
+        viewModel.updateQuickLookPreview(for: items[index], in: window)
     }
 
     static func openSelection(in viewModel: FileBrowserViewModel) {
@@ -1078,13 +1085,15 @@ enum PaneKeyboardNavigation {
         }
     }
 
-    static func toggleQuickLook(in viewModel: FileBrowserViewModel) {
-        viewModel.toggleQuickLookForSelection { offset in
-            move(viewModel, by: offset)
+    static func toggleQuickLook(in viewModel: FileBrowserViewModel, window: NSWindow? = nil) {
+        // Weak: the shared Quick Look controller must not keep a closed pane's view model alive
+        viewModel.toggleQuickLookForSelection(in: window) { [weak viewModel, weak window] offset in
+            guard let viewModel else { return }
+            move(viewModel, by: offset, window: window)
         }
     }
 
-    static func jumpToMatch(_ prefix: String, in viewModel: FileBrowserViewModel) {
+    static func jumpToMatch(_ prefix: String, in viewModel: FileBrowserViewModel, window: NSWindow? = nil) {
         guard !prefix.isEmpty else { return }
         let lowercased = prefix.lowercased()
         let items = viewModel.filteredItems
@@ -1092,32 +1101,31 @@ enum PaneKeyboardNavigation {
         viewModel.selectItem(items[index])
         viewModel.lastSelectedIndex = index
         viewModel.selectionAnchorIndex = index
-        viewModel.updateQuickLookPreview(for: items[index])
+        viewModel.updateQuickLookPreview(for: items[index], in: window)
     }
 }
 
 // MARK: - QuickLook Helper Extension
 
 extension FileBrowserViewModel {
-    /// Updates QuickLook preview for the given item, or clears it if nil
-    func updateQuickLookPreview(for item: FileItem?) {
+    /// Shows `item` in an open Quick Look panel, or closes the panel for nil. `window` is the
+    /// calling view's window: the panel only follows the window it was opened from, so a view in
+    /// another (e.g. background) window can't take it over or close it.
+    func updateQuickLookPreview(for item: FileItem?, in window: NSWindow? = nil) {
         guard let item else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
+            QuickLookControllerView.shared.updatePreview(for: nil, from: window)
             return
         }
 
         // Use async version to avoid blocking during archive extraction
         previewURL(for: item) { previewURL in
-            if let previewURL = previewURL {
-                QuickLookControllerView.shared.updatePreview(for: previewURL)
-            } else {
-                QuickLookControllerView.shared.updatePreview(for: nil)
-            }
+            QuickLookControllerView.shared.updatePreview(for: previewURL, from: window)
         }
     }
 
-    /// Toggles QuickLook for the selection's lead item with navigation callback
-    func toggleQuickLookForSelection(onNavigate: @escaping (Int) -> Void) {
+    /// Toggles Quick Look for the selection's lead item, opening it for `window` (the calling
+    /// view's), with a callback for the panel's arrow keys.
+    func toggleQuickLookForSelection(in window: NSWindow? = nil, onNavigate: @escaping (Int) -> Void) {
         guard let selectedItem = primarySelectedItem else { return }
 
         // Use async version to avoid blocking during archive extraction
@@ -1126,7 +1134,7 @@ extension FileBrowserViewModel {
                 NSSound.beep()
                 return
             }
-            QuickLookControllerView.shared.togglePreview(for: previewURL, navigate: onNavigate)
+            QuickLookControllerView.shared.togglePreview(for: previewURL, in: window, navigate: onNavigate)
         }
     }
 }

@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 import Quartz
 
 struct DualPaneView: View {
+    @Environment(\.browserWindow) private var browserWindow
     @ObservedObject var leftViewModel: FileBrowserViewModel
     @ObservedObject var rightViewModel: FileBrowserViewModel
     @Binding var activePane: Pane
@@ -83,21 +84,21 @@ struct DualPaneView: View {
         // Same guarded, per-window handling as the single-pane views; keys go to the active pane.
         // The closures read the active pane, its mode and column count when the key is pressed.
         .keyboardNavigable(
-            onUpArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: -activeColumnsCount, extend: shift) },
-            onDownArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: activeColumnsCount, extend: shift) },
+            onUpArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: -activeColumnsCount, extend: shift, window: browserWindow?.window) },
+            onDownArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: activeColumnsCount, extend: shift, window: browserWindow?.window) },
             onLeftArrow: { shift in
-                if activeMode == .icons { PaneKeyboardNavigation.move(activeViewModel, by: -1, extend: shift) }
+                if activeMode == .icons { PaneKeyboardNavigation.move(activeViewModel, by: -1, extend: shift, window: browserWindow?.window) }
             },
             onRightArrow: { shift in
-                if activeMode == .icons { PaneKeyboardNavigation.move(activeViewModel, by: 1, extend: shift) }
+                if activeMode == .icons { PaneKeyboardNavigation.move(activeViewModel, by: 1, extend: shift, window: browserWindow?.window) }
             },
             onReturn: { PaneKeyboardNavigation.openSelection(in: activeViewModel) },
-            onSpace: { PaneKeyboardNavigation.toggleQuickLook(in: activeViewModel) },
+            onSpace: { PaneKeyboardNavigation.toggleQuickLook(in: activeViewModel, window: browserWindow?.window) },
             onDelete: { activeViewModel.deleteSelectedItems() },
             onCopy: { activeViewModel.copySelectedItems() },
             onCut: { activeViewModel.cutSelectedItems() },
             onPaste: { activeViewModel.paste() },
-            onTypeAhead: { prefix in PaneKeyboardNavigation.jumpToMatch(prefix, in: activeViewModel) }
+            onTypeAhead: { prefix in PaneKeyboardNavigation.jumpToMatch(prefix, in: activeViewModel, window: browserWindow?.window) }
         )
     }
 }
@@ -415,6 +416,44 @@ final class PaneFocusRequestView: NSView {
     }
 }
 
+// MARK: - Pane tags
+
+/// Reads the Finder tags of a pane's items off the main thread (the first read of a file's tags
+/// hits its extended attributes, slow on network volumes) into `tags`: again when the items, the
+/// Show Tags setting or the view model's tags change. Same reader as the icon grid.
+struct PaneTagReading: ViewModifier {
+    @EnvironmentObject private var appSettings: AppSettings
+    @ObservedObject var viewModel: FileBrowserViewModel
+    @Binding var tags: [URL: [String]]
+    @StateObject private var reader = GridTagReader()
+
+    func body(content: Content) -> some View {
+        content
+            .onAppear { read() }
+            .onDisappear { reader.cancel() }
+            .onChange(of: viewModel.filteredItems) { _, _ in read() }
+            .onChange(of: appSettings.showItemTags) { _, _ in read() }
+            // Tags edited here or elsewhere (the cache entries were dropped): read them again
+            .onChange(of: viewModel.tagRefreshToken) { _, _ in read() }
+    }
+
+    private func read() {
+        guard appSettings.showItemTags else { return }
+        reader.read(viewModel.filteredItems) { newTags in
+            if newTags != tags {
+                tags = newTags
+            }
+        }
+    }
+}
+
+extension View {
+    /// Keeps `tags` (URL → tags, for the items that have any) current for `viewModel`'s items.
+    func paneTagReading(for viewModel: FileBrowserViewModel, into tags: Binding<[URL: [String]]>) -> some View {
+        modifier(PaneTagReading(viewModel: viewModel, tags: tags))
+    }
+}
+
 // MARK: - Dual pane
 
 struct PaneView: View {
@@ -517,9 +556,12 @@ struct PaneView: View {
 
 struct PaneListView: View {
     @EnvironmentObject private var appSettings: AppSettings
+    @Environment(\.browserWindow) private var browserWindow
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
     @State private var dropTargetedItemID: UUID?
+    /// Finder tags of the items that have any, read off the main thread
+    @State private var tagsByURL: [URL: [String]] = [:]
 
     var body: some View {
         ScrollViewReader { scrollProxy in
@@ -532,8 +574,8 @@ struct PaneListView: View {
 
                             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.compactListFont, alignment: .leading, lineLimit: 1)
 
-                            if appSettings.showItemTags, !item.tags.isEmpty {
-                                TagDotsView(tags: item.tags)
+                            if appSettings.showItemTags, let tags = tagsByURL[item.url] {
+                                TagDotsView(tags: tags)
                             }
 
                             Spacer()
@@ -586,7 +628,7 @@ struct PaneListView: View {
                                         withShift: modifiers.contains(.shift),
                                         withCommand: modifiers.contains(.command)
                                     )
-                                    viewModel.updateQuickLookPreview(for: item)
+                                    viewModel.updateQuickLookPreview(for: item, in: browserWindow?.window)
                                 }
                             },
                             onDoubleClick: {
@@ -603,6 +645,7 @@ struct PaneListView: View {
                 }
                 .fileDragContainer(for: viewModel)
             }
+            .paneTagReading(for: viewModel, into: $tagsByURL)
             .onAppear {
                 if let lead = viewModel.primarySelectedItem {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -681,6 +724,7 @@ final class PaneThumbnailState {
 
 struct PaneIconView: View {
     @EnvironmentObject private var appSettings: AppSettings
+    @Environment(\.browserWindow) private var browserWindow
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
     let onColumnsCalculated: (Int) -> Void
@@ -689,6 +733,8 @@ struct PaneIconView: View {
     @State private var thumbnails: [URL: NSImage] = [:]
     @State private var thumbnailState = PaneThumbnailState()
     @State private var dropTargetedItemID: UUID?
+    /// Finder tags of the items that have any, read off the main thread
+    @State private var tagsByURL: [URL: [String]] = [:]
     private static let maxDisplayedThumbnails = 300
 
     private var cellWidth: CGFloat {
@@ -754,8 +800,8 @@ struct PaneIconView: View {
                                 InlineRenameField(item: item, viewModel: viewModel, font: appSettings.dualPaneFont, alignment: .center, lineLimit: 2)
                                     .frame(width: cellWidth - 16)
 
-                                if appSettings.showItemTags, !item.tags.isEmpty {
-                                    TagDotsView(tags: item.tags)
+                                if appSettings.showItemTags, let tags = tagsByURL[item.url] {
+                                    TagDotsView(tags: tags)
                                 }
                             }
                             .id(item.id)
@@ -799,7 +845,7 @@ struct PaneIconView: View {
                                             withShift: modifiers.contains(.shift),
                                             withCommand: modifiers.contains(.command)
                                         )
-                                        viewModel.updateQuickLookPreview(for: item)
+                                        viewModel.updateQuickLookPreview(for: item, in: browserWindow?.window)
                                     }
                                 },
                                 onDoubleClick: {
@@ -817,6 +863,7 @@ struct PaneIconView: View {
                     .fileDragContainer(for: viewModel)
                     .padding()
                 }
+                .paneTagReading(for: viewModel, into: $tagsByURL)
                 .onAppear {
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
                     // Scroll to selected item when view appears (e.g., when switching view modes)

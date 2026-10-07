@@ -286,13 +286,3 @@ class QuickLookControllerView: NSResponder, QLPreviewPanelDataSource, QLPreviewP
         }
     }
 }
-
-/// Used by the browser window's content. The controller links itself into the window that opens
-/// a preview, so there is nothing to install up front.
-struct QuickLookWindowController: NSViewRepresentable {
-    func makeNSView(context: Context) -> NSView {
-        NSView(frame: .zero)
-    }
-
-    func updateNSView(_ nsView: NSView, context: Context) {}
-}

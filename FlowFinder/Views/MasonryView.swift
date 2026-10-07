@@ -8,6 +8,7 @@ private let masonryLog = OSLog(subsystem: "com.flowfinder", category: "MasonryLa
 
 struct MasonryView: View {
     @EnvironmentObject private var settings: AppSettings
+    @Environment(\.browserWindow) private var browserWindow
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject private var internalDragState = InternalDragState.shared
     let items: [FileItem]
@@ -659,13 +660,13 @@ struct MasonryView: View {
     }
 
     private func toggleQuickLook() {
-        viewModel.toggleQuickLookForSelection { [self] offset in
+        viewModel.toggleQuickLookForSelection(in: browserWindow?.window) { [self] offset in
             navigateLinear(by: offset)
         }
     }
 
     private func updateQuickLook(for item: FileItem?) {
-        viewModel.updateQuickLookPreview(for: item)
+        viewModel.updateQuickLookPreview(for: item, in: browserWindow?.window)
     }
 
     @discardableResult
@@ -1652,10 +1653,11 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
                   items.indices.contains(indexPath.item) else { return }
 
             let item = items[indexPath.item]
+            let window = collectionView?.window
             // Use async version to avoid blocking during archive extraction
             viewModel.previewURL(for: item) { [weak self] previewURL in
                 if let previewURL = previewURL {
-                    QuickLookControllerView.shared.togglePreview(for: previewURL) { [weak self] offset in
+                    QuickLookControllerView.shared.togglePreview(for: previewURL, in: window) { [weak self] offset in
                         self?.navigateLinear(by: offset)
                     }
                     return
@@ -1667,7 +1669,7 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
                         NSSound.beep()
                         return
                     }
-                    QuickLookControllerView.shared.togglePreview(for: url) { [weak self] offset in
+                    QuickLookControllerView.shared.togglePreview(for: url, in: window) { [weak self] offset in
                         self?.navigateLinear(by: offset)
                     }
                 }
@@ -1720,17 +1722,10 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
             return resources.first { $0.type == .photo || $0.type == .fullSizePhoto } ?? resources.first
         }
 
+        /// Shows `item` in an open Quick Look panel, if the panel belongs to this view's window.
         private func updateQuickLook(for item: FileItem?) {
-            guard let item else {
-                QuickLookControllerView.shared.updatePreview(for: nil)
-                return
-            }
-
-            if let previewURL = viewModel.previewURL(for: item) {
-                QuickLookControllerView.shared.updatePreview(for: previewURL)
-            } else {
-                QuickLookControllerView.shared.updatePreview(for: nil)
-            }
+            let previewURL = item.flatMap { viewModel.previewURL(for: $0) }
+            QuickLookControllerView.shared.updatePreview(for: previewURL, from: collectionView?.window)
         }
 
         private func navigateLinear(by offset: Int) {

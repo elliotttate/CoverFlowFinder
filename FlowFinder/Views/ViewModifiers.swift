@@ -214,10 +214,17 @@ struct DraggedFile: Transferable {
 struct FileDragContainerModifier: ViewModifier {
     let viewModel: FileBrowserViewModel
 
-    /// The selected items that can be dragged, in display order.
+    /// The selected items that can be dragged: the listed ones in display order, then any selected
+    /// items the view model doesn't list (a Column view sub-column's), by path.
     @MainActor
     static func draggableSelection(of viewModel: FileBrowserViewModel) -> [URL] {
-        viewModel.orderedSelectedItems.filter(InternalDragModifier.canDrag).map(\.url)
+        let selection = viewModel.selectedItems
+        var ordered = viewModel.orderedSelectedItems
+        if ordered.count < selection.count {
+            let listed = Set(ordered)
+            ordered += selection.filter { !listed.contains($0) }.sorted { $0.url.path < $1.url.path }
+        }
+        return ordered.filter(InternalDragModifier.canDrag).map(\.url)
     }
 
     func body(content: Content) -> some View {

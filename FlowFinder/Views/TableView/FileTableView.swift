@@ -1612,13 +1612,14 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
             NSSound.beep()
             return
         }
+        let window = tableView?.window
         // Use async version to avoid blocking main thread during archive extraction
         viewModel.previewURL(for: item) { [weak self] previewURL in
             guard let previewURL = previewURL else {
                 NSSound.beep()
                 return
             }
-            QuickLookControllerView.shared.togglePreview(for: previewURL) { [weak self] offset in
+            QuickLookControllerView.shared.togglePreview(for: previewURL, in: window) { [weak self] offset in
                 self?.navigateSelection(by: offset)
             }
         }

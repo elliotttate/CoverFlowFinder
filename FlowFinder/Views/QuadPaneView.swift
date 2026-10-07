@@ -4,6 +4,7 @@ import UniformTypeIdentifiers
 import Quartz
 
 struct QuadPaneView: View {
+    @Environment(\.browserWindow) private var browserWindow
     @ObservedObject var topLeftViewModel: FileBrowserViewModel
     @ObservedObject var topRightViewModel: FileBrowserViewModel
     @ObservedObject var bottomLeftViewModel: FileBrowserViewModel
@@ -138,17 +139,17 @@ struct QuadPaneView: View {
         // Same guarded, per-window handling as the single-pane views; keys go to the active pane.
         // The closures read the active pane, its mode and column count when the key is pressed.
         .keyboardNavigable(
-            onUpArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: -activeColumnsCount, extend: shift) },
-            onDownArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: activeColumnsCount, extend: shift) },
-            onLeftArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: -1, extend: shift) },
-            onRightArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: 1, extend: shift) },
+            onUpArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: -activeColumnsCount, extend: shift, window: browserWindow?.window) },
+            onDownArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: activeColumnsCount, extend: shift, window: browserWindow?.window) },
+            onLeftArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: -1, extend: shift, window: browserWindow?.window) },
+            onRightArrow: { shift in PaneKeyboardNavigation.move(activeViewModel, by: 1, extend: shift, window: browserWindow?.window) },
             onReturn: { PaneKeyboardNavigation.openSelection(in: activeViewModel) },
-            onSpace: { PaneKeyboardNavigation.toggleQuickLook(in: activeViewModel) },
+            onSpace: { PaneKeyboardNavigation.toggleQuickLook(in: activeViewModel, window: browserWindow?.window) },
             onDelete: { activeViewModel.deleteSelectedItems() },
             onCopy: { activeViewModel.copySelectedItems() },
             onCut: { activeViewModel.cutSelectedItems() },
             onPaste: { activeViewModel.paste() },
-            onTypeAhead: { prefix in PaneKeyboardNavigation.jumpToMatch(prefix, in: activeViewModel) }
+            onTypeAhead: { prefix in PaneKeyboardNavigation.jumpToMatch(prefix, in: activeViewModel, window: browserWindow?.window) }
         )
     }
 }
@@ -251,17 +252,20 @@ struct QuadPaneListView: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
     @State private var dropTargetedItemID: UUID?
+    /// Finder tags of the items that have any, read off the main thread
+    @State private var tagsByURL: [URL: [String]] = [:]
 
     var body: some View {
         ScrollViewReader { scrollProxy in
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(viewModel.filteredItems) { item in
-                        QuadPaneListRow(item: item, viewModel: viewModel, onActivate: onActivate, dropTargetedItemID: $dropTargetedItemID)
+                        QuadPaneListRow(item: item, viewModel: viewModel, onActivate: onActivate, tags: tagsByURL[item.url] ?? [], dropTargetedItemID: $dropTargetedItemID)
                     }
                 }
                 .fileDragContainer(for: viewModel)
             }
+            .paneTagReading(for: viewModel, into: $tagsByURL)
             .onAppear {
                 if let lead = viewModel.primarySelectedItem {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -282,9 +286,12 @@ struct QuadPaneListView: View {
 
 struct QuadPaneListRow: View {
     @EnvironmentObject private var appSettings: AppSettings
+    @Environment(\.browserWindow) private var browserWindow
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
+    /// The item's Finder tags (read in the background by the list)
+    let tags: [String]
     @Binding var dropTargetedItemID: UUID?
 
     var body: some View {
@@ -294,8 +301,8 @@ struct QuadPaneListRow: View {
 
             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.compactListFont, alignment: .leading, lineLimit: 1)
 
-            if appSettings.showItemTags, !item.tags.isEmpty {
-                TagDotsView(tags: item.tags)
+            if appSettings.showItemTags, !tags.isEmpty {
+                TagDotsView(tags: tags)
             }
 
             Spacer()
@@ -356,7 +363,7 @@ struct QuadPaneListRow: View {
             )
         }
         onActivate()
-        viewModel.updateQuickLookPreview(for: item)
+        viewModel.updateQuickLookPreview(for: item, in: browserWindow?.window)
     }
 }
 
@@ -370,6 +377,8 @@ struct QuadPaneIconView: View {
     @State private var thumbnails: [URL: NSImage] = [:]
     @State private var thumbnailState = PaneThumbnailState()
     @State private var dropTargetedItemID: UUID?
+    /// Finder tags of the items that have any, read off the main thread
+    @State private var tagsByURL: [URL: [String]] = [:]
     private static let maxDisplayedThumbnails = 300
 
     private var cellWidth: CGFloat {
@@ -425,7 +434,7 @@ struct QuadPaneIconView: View {
                 ScrollView {
                     LazyVGrid(columns: columns, spacing: appSettings.quadPaneGridSpacing) {
                         ForEach(viewModel.filteredItems) { item in
-                            QuadPaneIconCell(item: item, viewModel: viewModel, onActivate: onActivate, thumbnail: thumbnails[item.url], dropTargetedItemID: $dropTargetedItemID)
+                            QuadPaneIconCell(item: item, viewModel: viewModel, onActivate: onActivate, thumbnail: thumbnails[item.url], tags: tagsByURL[item.url] ?? [], dropTargetedItemID: $dropTargetedItemID)
                                 .onAppear {
                                     thumbnailState.visibleURLs.insert(item.url)
                                     loadThumbnail(for: item)
@@ -438,6 +447,7 @@ struct QuadPaneIconView: View {
                     .fileDragContainer(for: viewModel)
                     .padding(8)
                 }
+                .paneTagReading(for: viewModel, into: $tagsByURL)
                 .onAppear {
                     onColumnsCalculated(calculateColumns(width: geometry.size.width))
                     // Scroll to selected item when view appears (e.g., when switching view modes)
@@ -486,10 +496,13 @@ struct QuadPaneIconView: View {
 
 struct QuadPaneIconCell: View {
     @EnvironmentObject private var appSettings: AppSettings
+    @Environment(\.browserWindow) private var browserWindow
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let onActivate: () -> Void
     let thumbnail: NSImage?
+    /// The item's Finder tags (read in the background by the grid)
+    let tags: [String]
     @Binding var dropTargetedItemID: UUID?
 
     var body: some View {
@@ -505,8 +518,8 @@ struct QuadPaneIconCell: View {
             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.quadPaneFont, alignment: .center, lineLimit: 2)
                 .frame(width: labelWidth, height: 28)
 
-            if appSettings.showItemTags, !item.tags.isEmpty {
-                TagDotsView(tags: item.tags)
+            if appSettings.showItemTags, !tags.isEmpty {
+                TagDotsView(tags: tags)
             }
         }
         .frame(width: labelWidth)
@@ -559,7 +572,7 @@ struct QuadPaneIconCell: View {
             )
         }
         onActivate()
-        viewModel.updateQuickLookPreview(for: item)
+        viewModel.updateQuickLookPreview(for: item, in: browserWindow?.window)
     }
 }
 
