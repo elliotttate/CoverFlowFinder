@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import Quartz
 
 // MARK: - Keyboard Routing (pure decision logic)
@@ -38,24 +39,48 @@ enum KeyboardResponderKind: Equatable {
         }
     }
 
-    /// Whether a click on `view` engages the sidebar / a control (true), leaves it for the file area
-    /// (false), or doesn't matter (nil: text views).
+    /// Where a mouse-down landed, as far as keyboard focus is concerned.
+    enum ClickTarget: Equatable {
+        /// The sidebar's outline view: it keeps the keys.
+        case sidebar
+        /// The file list's table (AppKit makes it first responder itself).
+        case fileTable
+        /// SwiftUI file views, Cover Flow, empty space: the file area takes the keys back.
+        case fileContent
+        /// A text view or field editor.
+        case text
+        /// A button, picker, scroll bar or other control. Clicking one leaves keyboard focus where
+        /// it was (Finder's toolbar buttons, view picker and scroll bars never take it).
+        case control
+        /// Outside the window's content view: title bar and toolbar.
+        case windowChrome
+    }
+
     @MainActor
-    static func clickEngagesFocus(on view: NSView) -> Bool? {
+    static func clickTarget(of view: NSView, contentView: NSView?) -> ClickTarget {
         var ancestors: [NSView] = []
         var current: NSView? = view
         while let candidate = current {
             ancestors.append(candidate)
             current = candidate.superview
         }
-        // Inside a table: the sidebar engages, the file list doesn't (its cells contain controls).
+        // Inside a table: the sidebar or the file list (their cells contain controls). A table's
+        // scroll bars are outside it, so they count as controls.
         for candidate in ancestors {
-            if candidate is NSOutlineView { return true }
-            if candidate is NSTableView { return false }
+            if candidate is NSOutlineView { return .sidebar }
+            if candidate is NSTableView { return .fileTable }
         }
-        if ancestors.contains(where: { $0 is NSText }) { return nil }
-        if ancestors.contains(where: { $0 is NSControl }) { return true }
-        return false
+        if ancestors.contains(where: { $0 is NSText }) { return .text }
+        if let contentView, !ancestors.contains(where: { $0 === contentView }) { return .windowChrome }
+        if ancestors.contains(where: { $0 is NSControl }) { return .control }
+        return .fileContent
+    }
+
+    /// Whether a control that took first responder when clicked (Full Keyboard Access, a slider)
+    /// keeps the keys. Buttons, pickers and scroll bars never do.
+    @MainActor
+    static func controlKeepsKeysWhenFocused(_ control: NSControl) -> Bool {
+        !(control is NSButton || control is NSSegmentedControl || control is NSScroller)
     }
 }
 
@@ -313,14 +338,44 @@ final class KeyboardManager {
             return
         }
         let point = frameView.superview.map { $0.convert(event.locationInWindow, from: nil) } ?? event.locationInWindow
-        guard let hitView = frameView.hitTest(point),
-              let engages = KeyboardResponderKind.clickEngagesFocus(on: hitView) else {
-            return
-        }
-        if engages {
+        guard let hitView = frameView.hitTest(point) else { return }
+        switch KeyboardResponderKind.clickTarget(of: hitView, contentView: window.contentView) {
+        case .sidebar:
             focusEngagedWindows.add(window)
-        } else {
+        case .fileTable:
             focusEngagedWindows.remove(window)
+        case .fileContent:
+            focusEngagedWindows.remove(window)
+            endTextEditing(in: window)
+        case .control:
+            engageIfClickedControlTakesFocus(hitView, in: window)
+        case .text, .windowChrome:
+            break
+        }
+    }
+
+    /// Clicking SwiftUI file content doesn't take first responder, so a search field, a path field
+    /// or an inline rename would keep the keys (arrows and Space would edit text). Like clicking a
+    /// Finder file view, the click ends the editing: the search keeps its text, a rename commits.
+    private func endTextEditing(in window: NSWindow) {
+        guard KeyboardResponderKind.classify(window.firstResponder) == .textEditing else { return }
+        window.makeFirstResponder(nil)
+    }
+
+    /// A clicked control that took first responder keeps the keys if it uses them (a slider with
+    /// Full Keyboard Access on); checked once AppKit has handled the click.
+    private func engageIfClickedControlTakesFocus(_ hitView: NSView, in window: NSWindow) {
+        var current: NSView? = hitView
+        while let view = current, !(view is NSControl) {
+            current = view.superview
+        }
+        guard let control = current as? NSControl,
+              KeyboardResponderKind.controlKeepsKeysWhenFocused(control) else { return }
+        DispatchQueue.main.async { [weak self, weak window, weak control] in
+            guard let self, let window, let control,
+                  let responder = window.firstResponder as? NSView,
+                  responder === control || responder.isDescendant(of: control) else { return }
+            self.focusEngagedWindows.add(window)
         }
     }
 
@@ -366,6 +421,17 @@ final class KeyboardManager {
         return nil
     }
 
+    /// The window the Edit and Go menus act on: the key window, or the browser window behind the
+    /// Quick Look panel while the panel is key (Copy, Paste, Enclosing Folder, Duplicate and Move
+    /// to Trash still apply to the files it previews).
+    func commandTargetWindow() -> NSWindow? {
+        let keyWindow = NSApp.keyWindow
+        if keyWindow is QLPreviewPanel, let mainWindow = NSApp.mainWindow, isBrowserWindow(mainWindow) {
+            return mainWindow
+        }
+        return keyWindow
+    }
+
     // MARK: Handler registration
 
     func register(_ host: KeyboardHandlerHost) {
@@ -388,7 +454,9 @@ final class KeyboardManager {
         return candidates.max(by: { $0.stamp < $1.stamp })?.host?.keyboardHandlers
     }
 
-    /// Suspends every handler currently registered in `window` (they resume when they re-register).
+    /// Suspends every handler currently registered in `window`. A suspended handler resumes when
+    /// its view registers again or is updated (`resumeHandlers(of:)`): a view SwiftUI still updates
+    /// is live, only one that is on its way out stays suspended.
     func suspendHandlers(in window: NSWindow?) {
         guard let window else { return }
         for index in registrations.indices where registrations[index].host?.keyboardHostWindow === window {
@@ -396,10 +464,22 @@ final class KeyboardManager {
         }
     }
 
-    /// Used by views with their own `keyDown` handling (Cover Flow) so a handler registered by the
-    /// view they replace can't take their keys.
+    /// Lifts a suspension of `host`'s handlers (its view was updated).
+    func resumeHandlers(of host: KeyboardHandlerHost) {
+        for index in registrations.indices where registrations[index].isSuspended && registrations[index].host === host {
+            registrations[index].isSuspended = false
+        }
+    }
+
+    /// Used by views with their own `keyDown` handling (Cover Flow) when they appear in `window`,
+    /// so a handler registered there by the view they replace can't take their keys.
+    func clearHandler(in window: NSWindow?) {
+        suspendHandlers(in: window)
+    }
+
+    /// Older form of `clearHandler(in:)` for callers that don't know their window: assumes the key window.
     func clearHandler() {
-        suspendHandlers(in: NSApp.keyWindow)
+        clearHandler(in: NSApp.keyWindow)
     }
 
     // MARK: Event handling
@@ -459,23 +539,25 @@ final class KeyboardManager {
     /// when appropriate, otherwise performs the file action. Returns the route that was taken.
     @discardableResult
     func performMenuCommand(_ command: EditCommand, viewModel: FileBrowserViewModel?, fileAction: (() -> Void)? = nil) -> EditCommandRoute {
-        let keyWindow = NSApp.keyWindow
+        let window = commandTargetWindow()
         let route = EditCommandRouting.route(
             command,
-            isBrowserWindow: isBrowserWindow(keyWindow) && keyWindow?.attachedSheet == nil,
-            responder: effectiveResponderKind(in: keyWindow),
+            isBrowserWindow: isBrowserWindow(window) && window?.attachedSheet == nil,
+            responder: effectiveResponderKind(in: window),
             isKeyEquivalent: NSApp.currentEvent?.type == .keyDown
         )
         switch route {
         case .forward(let selector):
-            NSApp.sendAction(selector, to: nil, from: nil)
+            // Behind the Quick Look panel: to that window's text field, not the panel.
+            let target = (window == nil || window === NSApp.keyWindow) ? nil : window?.firstResponder
+            NSApp.sendAction(selector, to: target, from: nil)
         case .ignore:
             break
         case .files:
             if let fileAction {
                 fileAction()
             } else {
-                performFileCommand(command, viewModel: viewModel, in: keyWindow)
+                performFileCommand(command, viewModel: viewModel, in: window)
             }
         }
         return route
@@ -597,9 +679,124 @@ enum BrowserWindowCommand {
     }
 }
 
+/// View ▸ as …: ⌘1–⌘4 are Finder's (Icons, List, Columns, Gallery — here Cover Flow); the layouts
+/// Finder doesn't have follow on ⌘5–⌘7.
+enum ViewModeShortcuts {
+    static let menuOrder: [ViewMode] = {
+        let finderOrder: [ViewMode] = [.icons, .list, .columns, .coverFlow, .masonry, .dualPane, .quadPane]
+        return finderOrder + ViewMode.allCases.filter { !finderOrder.contains($0) }
+    }()
+
+    /// The digit of `mode`'s ⌘-shortcut (nil past ⌘9).
+    static func digit(for mode: ViewMode) -> Character? {
+        guard let index = menuOrder.firstIndex(of: mode), index < 9 else { return nil }
+        return Character(String(index + 1))
+    }
+}
+
+/// What the menu bar needs from one browser window: its active pane's view model and the few facts
+/// the enabled states depend on, republished only when one of them changes. (Observing the view
+/// model itself rebuilt the whole menu bar, reading the pasteboard each time, on every listing
+/// batch, metadata update and thumbnail.)
+@MainActor
+final class BrowserCommandContext: ObservableObject {
+    private(set) weak var viewModel: FileBrowserViewModel?
+    @Published private(set) var hasSelection = false
+    @Published private(set) var canGoBack = false
+    @Published private(set) var canGoForward = false
+    @Published private(set) var canPaste = false
+    /// Tabs in the window (⌘W closes the window when there is one).
+    @Published private(set) var tabCount = 1
+
+    /// What `canPaste` was computed from: the pasteboard is read again only when this changes.
+    private struct PasteInputs: Equatable {
+        let clipboardRevision: Int
+        let isInsideArchive: Bool
+        let activation: Int
+    }
+
+    private var pasteInputs: PasteInputs?
+    private var activationCount = 0
+    private var viewModelSubscription: AnyCancellable?
+    private var activationSubscription: AnyCancellable?
+    private var isUpdateScheduled = false
+
+    init() {
+        // Another app may have changed the pasteboard while we were in the background.
+        activationSubscription = NotificationCenter.default
+            .publisher(for: NSApplication.didBecomeActiveNotification)
+            .sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    self.activationCount &+= 1
+                    self.update()
+                }
+            }
+    }
+
+    func bind(to viewModel: FileBrowserViewModel) {
+        guard self.viewModel !== viewModel else { return }
+        self.viewModel = viewModel
+        pasteInputs = nil
+        // A copy or cut in any window or pane then reaches us through the view model.
+        FileClipboard.shared.addObserver(viewModel)
+        // objectWillChange fires before the change: read the new values once the burst is over.
+        viewModelSubscription = viewModel.objectWillChange.sink { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.scheduleUpdate()
+            }
+        }
+        update()
+    }
+
+    func setTabCount(_ count: Int) {
+        if tabCount != count { tabCount = count }
+    }
+
+    private func scheduleUpdate() {
+        guard !isUpdateScheduled else { return }
+        isUpdateScheduled = true
+        DispatchQueue.main.async { [weak self] in
+            guard let self else { return }
+            self.isUpdateScheduled = false
+            self.update()
+        }
+    }
+
+    /// Re-reads the facts from the view model, publishing only the ones that changed.
+    func update() {
+        guard let viewModel else {
+            assign(\.hasSelection, false)
+            assign(\.canGoBack, false)
+            assign(\.canGoForward, false)
+            assign(\.canPaste, false)
+            return
+        }
+        assign(\.hasSelection, !viewModel.selectedItems.isEmpty)
+        assign(\.canGoBack, viewModel.canGoBack)
+        assign(\.canGoForward, viewModel.canGoForward)
+        let inputs = PasteInputs(
+            clipboardRevision: FileClipboard.shared.revision,
+            isInsideArchive: viewModel.isInsideArchive,
+            activation: activationCount
+        )
+        if inputs != pasteInputs {
+            pasteInputs = inputs
+            assign(\.canPaste, viewModel.canPaste)
+        }
+    }
+
+    private func assign(_ keyPath: ReferenceWritableKeyPath<BrowserCommandContext, Bool>, _ value: Bool) {
+        if self[keyPath: keyPath] != value {
+            self[keyPath: keyPath] = value
+        }
+    }
+}
+
 /// Key-window state the menu bar's enabled states depend on but SwiftUI can't observe: whether a
-/// text field is being edited (or a non-browser window is key), and whether a sheet is up.
-/// Updated from key-window changes and KVO on the key window's first responder.
+/// text field is being edited (or a non-browser window is key), whether a sheet is up, and the
+/// command context of the browser window the menus act on. Updated from key-window changes and KVO
+/// on that window's first responder.
 @MainActor
 final class MenuValidationState: ObservableObject {
     static let shared = MenuValidationState()
@@ -609,11 +806,17 @@ final class MenuValidationState: ObservableObject {
     @Published private(set) var usesStandardEditing = true
     /// A sheet is attached to, or is, the key window.
     @Published private(set) var isSheetActive = false
-    /// Bumped when the app becomes active, so pasteboard-dependent states are re-read.
-    @Published private(set) var pasteboardGeneration = 0
+    /// The key window is a browser window (⌘W closes a tab or that window, not a panel).
+    @Published private(set) var isKeyWindowBrowser = false
+    /// The command context of the browser window the menus act on (the one behind the Quick Look
+    /// panel while the panel is key); nil when that isn't a browser window. Its changes are
+    /// republished as changes of this object.
+    @Published private(set) var commandContext: BrowserCommandContext?
 
     private var firstResponderObservation: NSKeyValueObservation?
+    private var contextSubscription: AnyCancellable?
     private var observers: [NSObjectProtocol] = []
+    private let contexts = NSMapTable<NSWindow, BrowserCommandContext>.weakToWeakObjects()
 
     private init() {
         let center = NotificationCenter.default
@@ -625,17 +828,19 @@ final class MenuValidationState: ObservableObject {
                 }
             })
         }
-        observers.append(center.addObserver(forName: NSApplication.didBecomeActiveNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.pasteboardGeneration &+= 1
-                self?.update()
-            }
-        })
         keyWindowChanged()
     }
 
+    /// Registers the command context of a browser window (its `ContentView`'s).
+    func setCommandContext(_ context: BrowserCommandContext, for window: NSWindow) {
+        if contexts.object(forKey: window) !== context {
+            contexts.setObject(context, forKey: window)
+        }
+        refresh()
+    }
+
     private func keyWindowChanged() {
-        firstResponderObservation = NSApp.keyWindow?.observe(\.firstResponder, options: []) { [weak self] _, _ in
+        firstResponderObservation = KeyboardManager.shared.commandTargetWindow()?.observe(\.firstResponder, options: []) { [weak self] _, _ in
             // Deferred: first-responder changes can happen inside a SwiftUI update.
             DispatchQueue.main.async {
                 self?.update()
@@ -650,14 +855,28 @@ final class MenuValidationState: ObservableObject {
     }
 
     private func update() {
-        let keyWindow = NSApp.keyWindow
         let manager = KeyboardManager.shared
+        let keyWindow = NSApp.keyWindow
+        let targetWindow = manager.commandTargetWindow()
+        let isTargetBrowser = manager.isBrowserWindow(targetWindow)
         let sheetActive = keyWindow.map { $0.sheetParent != nil || $0.attachedSheet != nil } ?? false
-        let standardEditing = !manager.isBrowserWindow(keyWindow)
+        let standardEditing = !isTargetBrowser
             || sheetActive
-            || KeyboardResponderKind.classify(keyWindow?.firstResponder) == .textEditing
+            || targetWindow?.attachedSheet != nil
+            || KeyboardResponderKind.classify(targetWindow?.firstResponder) == .textEditing
+        let keyIsBrowser = manager.isBrowserWindow(keyWindow)
+        let context = isTargetBrowser ? targetWindow.flatMap { contexts.object(forKey: $0) } : nil
         if usesStandardEditing != standardEditing { usesStandardEditing = standardEditing }
         if isSheetActive != sheetActive { isSheetActive = sheetActive }
+        if isKeyWindowBrowser != keyIsBrowser { isKeyWindowBrowser = keyIsBrowser }
+        if commandContext !== context {
+            commandContext = context
+            contextSubscription = context?.objectWillChange.sink { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.objectWillChange.send()
+                }
+            }
+        }
     }
 }
 
@@ -665,7 +884,14 @@ final class MenuValidationState: ObservableObject {
 
 /// Invisible view that ties a view's keyboard handlers to the window hosting it.
 final class KeyboardHandlerProbeView: NSView, KeyboardHandlerHost {
-    var handlers = KeyboardHandlers()
+    /// Set on every update of the owning view, which also lifts a suspension (the view is live).
+    var handlers = KeyboardHandlers() {
+        didSet {
+            if window != nil {
+                KeyboardManager.shared.resumeHandlers(of: self)
+            }
+        }
+    }
     var isActive = true {
         didSet {
             if isActive && !oldValue && window != nil {
@@ -793,33 +1019,57 @@ final class HostingWindowReaderView: NSView {
 /// Keyboard actions shared by the dual and quad pane views.
 @MainActor
 enum PaneKeyboardNavigation {
+    /// Moves the selection by `offset` items (±1, or ± the column count for ↑/↓ in icon mode), like
+    /// the list view: with nothing (visible) selected, a forward arrow selects the first item and a
+    /// backward one the last; a plain arrow moves past the end of a multi-selection it points to;
+    /// ⇧ extends from the anchor.
     static func move(_ viewModel: FileBrowserViewModel, by offset: Int, extend: Bool = false) {
         let items = viewModel.filteredItems
-        guard !items.isEmpty else { return }
+        guard !items.isEmpty, offset != 0 else { return }
+        let maxIndex = items.count - 1
+        let selection = viewModel.selectedItems
 
-        // When extending, lastSelectedIndex tracks the moving end of the range; otherwise start
-        // from the lead item (a Set has no order).
-        let currentIndex: Int
-        if extend {
-            currentIndex = viewModel.lastSelectedIndex
-        } else if let lead = viewModel.primarySelectedItem,
-                  let index = items.firstIndex(of: lead) {
-            currentIndex = index
-        } else {
-            currentIndex = viewModel.lastSelectedIndex
+        var selectedIndices: [Int] = []
+        if selection.count == 1, let only = selection.first, let index = items.firstIndex(of: only) {
+            selectedIndices = [index]
+        } else if !selection.isEmpty {
+            selectedIndices = items.indices.filter { selection.contains(items[$0]) }
         }
-        let clampedCurrentIndex = max(0, min(items.count - 1, currentIndex))
-        let newIndex = max(0, min(items.count - 1, clampedCurrentIndex + offset))
-        guard newIndex != clampedCurrentIndex || viewModel.selectedItems.isEmpty else { return }
+
+        guard let lowest = selectedIndices.first, let highest = selectedIndices.last else {
+            select(offset > 0 ? 0 : maxIndex, in: items, viewModel: viewModel)
+            return
+        }
 
         if extend {
+            // lastSelectedIndex tracks the moving end of the range.
+            var anchor = viewModel.selectionAnchorIndex
+            var cursor = viewModel.lastSelectedIndex
+            if !items.indices.contains(cursor) || !selection.contains(items[cursor]) {
+                // Stale cursor (filter or sort changed): extend from the end in the arrow's direction
+                cursor = offset > 0 ? highest : lowest
+                anchor = offset > 0 ? lowest : highest
+            } else if !items.indices.contains(anchor) {
+                anchor = cursor
+            }
+            let newIndex = max(0, min(maxIndex, cursor + offset))
+            guard newIndex != cursor else { return }
+            viewModel.selectionAnchorIndex = anchor
             viewModel.selectRange(to: newIndex, in: items)
-        } else {
-            viewModel.selectItem(items[newIndex])
-            viewModel.lastSelectedIndex = newIndex
-            viewModel.selectionAnchorIndex = newIndex
+            viewModel.updateQuickLookPreview(for: items[newIndex])
+            return
         }
-        viewModel.updateQuickLookPreview(for: items[newIndex])
+
+        let newIndex = offset > 0 ? min(highest + offset, maxIndex) : max(lowest + offset, 0)
+        if selectedIndices.count == 1 && newIndex == lowest { return }  // already at the end
+        select(newIndex, in: items, viewModel: viewModel)
+    }
+
+    private static func select(_ index: Int, in items: [FileItem], viewModel: FileBrowserViewModel) {
+        viewModel.selectItem(items[index])
+        viewModel.lastSelectedIndex = index
+        viewModel.selectionAnchorIndex = index
+        viewModel.updateQuickLookPreview(for: items[index])
     }
 
     static func openSelection(in viewModel: FileBrowserViewModel) {

@@ -16,6 +16,9 @@ struct FlowFinderApp: App {
             updaterDelegate: nil,
             userDriverDelegate: nil
         )
+        // One tab system: the browser windows' own tabs, not AppKit's window tabs as well
+        // (View ▸ Show Tab Bar, Window ▸ Merge All Windows).
+        NSWindow.allowsAutomaticWindowTabbing = false
     }
 
     var body: some Scene {
@@ -42,16 +45,25 @@ struct FlowFinderApp: App {
     }
 }
 
-/// File, Edit, View, Window and Go menu commands. They act on the active pane of the key browser
-/// window (published by ContentView with `focusedSceneObject`), and hand text-editing shortcuts
-/// back to text fields and non-browser windows.
+/// File, Edit, View, Window and Go menu commands. They act on the active pane of the browser
+/// window in front (its `BrowserCommandContext`, tracked by `MenuValidationState`), and hand
+/// text-editing shortcuts back to text fields and non-browser windows.
 struct BrowserCommands: Commands {
-    @FocusedObject private var viewModel: FileBrowserViewModel?
     @ObservedObject var settings: AppSettings
     @ObservedObject var menuState: MenuValidationState
 
+    private var context: BrowserCommandContext? {
+        menuState.commandContext
+    }
+
+    /// The active pane's view model; nil while a sheet is up, so no command acts on the window
+    /// behind it.
+    private var viewModel: FileBrowserViewModel? {
+        menuState.isSheetActive ? nil : context?.viewModel
+    }
+
     private var hasSelection: Bool {
-        !(viewModel?.selectedItems.isEmpty ?? true)
+        viewModel != nil && (context?.hasSelection ?? false)
     }
 
     /// Text fields and non-browser windows get the standard Copy/Cut/Paste, so those stay enabled.
@@ -60,8 +72,12 @@ struct BrowserCommands: Commands {
     }
 
     private var canPasteFiles: Bool {
-        _ = menuState.pasteboardGeneration  // re-read after another app changed the pasteboard
-        return viewModel?.canPaste ?? false
+        viewModel != nil && (context?.canPaste ?? false)
+    }
+
+    /// ⌘W closes the tab of a browser window with several tabs, otherwise the window in front.
+    private var closesTab: Bool {
+        menuState.isKeyWindowBrowser && (context?.tabCount ?? 1) > 1
     }
 
     var body: some Commands {
@@ -71,9 +87,10 @@ struct BrowserCommands: Commands {
                 BrowserWindowCommand.post(.newTab)
             }
             .keyboardShortcut("t", modifiers: .command)
+            .disabled(menuState.isSheetActive)
 
             // Disabled while a sheet is up so ⌘W reaches the sheet (Get Info's Close).
-            Button("Close Tab") {
+            Button(closesTab ? "Close Tab" : "Close Window") {
                 BrowserWindowCommand.closeTabOrWindow()
             }
             .keyboardShortcut("w", modifiers: .command)
@@ -102,11 +119,13 @@ struct BrowserCommands: Commands {
                 BrowserWindowCommand.post(.nextTab)
             }
             .keyboardShortcut("]", modifiers: [.command, .shift])
+            .disabled(menuState.isSheetActive)
 
             Button("Show Previous Tab") {
                 BrowserWindowCommand.post(.previousTab)
             }
             .keyboardShortcut("[", modifiers: [.command, .shift])
+            .disabled(menuState.isSheetActive)
         }
 
         // Edit menu commands. While a text field is edited (or a non-browser window is key) they
@@ -165,11 +184,17 @@ struct BrowserCommands: Commands {
         CommandGroup(after: .toolbar) {
             Divider()
 
-            ForEach(Array(ViewMode.allCases.prefix(9).enumerated()), id: \.element) { index, mode in
-                Button("as \(mode.rawValue)") {
+            // Finder's ⌘1–⌘4 (Icons, List, Columns, Gallery = Cover Flow), then the extra layouts
+            ForEach(ViewModeShortcuts.menuOrder, id: \.self) { mode in
+                let button = Button("as \(mode.rawValue)") {
                     BrowserWindowCommand.post(.browserSetViewMode, userInfo: [BrowserWindowCommand.viewModeKey: mode.rawValue])
                 }
-                .keyboardShortcut(KeyEquivalent(Character(String(index + 1))), modifiers: .command)
+                .disabled(menuState.isSheetActive)
+                if let digit = ViewModeShortcuts.digit(for: mode) {
+                    button.keyboardShortcut(KeyEquivalent(digit), modifiers: .command)
+                } else {
+                    button
+                }
             }
 
             Divider()
@@ -183,6 +208,7 @@ struct BrowserCommands: Commands {
                 BrowserWindowCommand.post(.focusSearch)
             }
             .keyboardShortcut("f", modifiers: .command)
+            .disabled(menuState.isSheetActive)
 
             Button("Refresh") {
                 viewModel?.refresh()
@@ -203,13 +229,13 @@ struct BrowserCommands: Commands {
                 viewModel?.goBack()
             }
             .keyboardShortcut("[", modifiers: .command)
-            .disabled(!(viewModel?.canGoBack ?? false))
+            .disabled(viewModel == nil || !(context?.canGoBack ?? false))
 
             Button("Forward") {
                 viewModel?.goForward()
             }
             .keyboardShortcut("]", modifiers: .command)
-            .disabled(!(viewModel?.canGoForward ?? false))
+            .disabled(viewModel == nil || !(context?.canGoForward ?? false))
 
             Button("Enclosing Folder") {
                 perform(.enclosingFolder)
@@ -222,6 +248,7 @@ struct BrowserCommands: Commands {
                 viewModel?.navigateTo(FileManager.default.homeDirectoryForCurrentUser)
             }
             .keyboardShortcut("h", modifiers: [.command, .shift])
+            .disabled(viewModel == nil)
 
             Button("Desktop") {
                 if let desktop = FileManager.default.urls(for: .desktopDirectory, in: .userDomainMask).first {
@@ -229,6 +256,7 @@ struct BrowserCommands: Commands {
                 }
             }
             .keyboardShortcut("d", modifiers: [.command, .shift])
+            .disabled(viewModel == nil)
 
             Button("Documents") {
                 if let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first {
@@ -236,6 +264,7 @@ struct BrowserCommands: Commands {
                 }
             }
             .keyboardShortcut("o", modifiers: [.command, .shift])
+            .disabled(viewModel == nil)
 
             Button("Downloads") {
                 if let downloads = FileManager.default.urls(for: .downloadsDirectory, in: .userDomainMask).first {
@@ -243,11 +272,13 @@ struct BrowserCommands: Commands {
                 }
             }
             .keyboardShortcut("l", modifiers: [.command, .shift])
+            .disabled(viewModel == nil)
 
             Button("Applications") {
                 viewModel?.navigateTo(URL(fileURLWithPath: "/Applications"))
             }
             .keyboardShortcut("a", modifiers: [.command, .shift])
+            .disabled(viewModel == nil)
 
             Divider()
 
@@ -256,6 +287,7 @@ struct BrowserCommands: Commands {
                 BrowserWindowCommand.post(.browserGoToFolder)
             }
             .keyboardShortcut("g", modifiers: [.command, .shift])
+            .disabled(menuState.isSheetActive)
         }
     }
 
