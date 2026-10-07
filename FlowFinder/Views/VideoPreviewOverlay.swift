@@ -156,18 +156,38 @@ struct VideoSkimProgressBar: View {
     }
 }
 
-/// Whether the current inline preview belongs to one cell. Subscribes once per cell and publishes
-/// only when the answer changes, so cells don't re-render on every preview change elsewhere.
+/// The file a cell previews. A rename keeps the cell (same item ID) but changes its URL.
+private struct MediaPreviewKey: Equatable {
+    let url: URL
+    let fileType: FileItem.FileType
+}
+
+/// Whether the current inline preview belongs to one cell. Subscribes once per cell (again when
+/// the cell's file is renamed) and publishes only when the answer changes, so cells don't
+/// re-render on every preview change elsewhere.
 @MainActor
 private final class MediaPreviewMatch: ObservableObject {
     @Published private(set) var isVideoPreviewing = false
     @Published private(set) var isVideoSkimming = false
     @Published private(set) var isAudioPreviewing = false
 
+    private var watched: MediaPreviewKey?
     private var cancellables: Set<AnyCancellable> = []
 
-    init(url: URL, fileType: FileItem.FileType) {
-        switch fileType {
+    init(key: MediaPreviewKey) {
+        watch(key)
+    }
+
+    /// Follows the previews of `key`'s file (no-op if it already does).
+    func watch(_ key: MediaPreviewKey) {
+        guard key != watched else { return }
+        watched = key
+        cancellables.removeAll()
+        apply(VideoMatch(isPreviewing: false, isSkimming: false))
+        if isAudioPreviewing { isAudioPreviewing = false }
+
+        let url = key.url
+        switch key.fileType {
         case .video:
             let manager = InlineVideoPreviewManager.shared
             manager.$currentPreviewURL
@@ -229,7 +249,7 @@ struct MediaPreviewModifier: ViewModifier {
         self.item = item
         self._isHovering = isHovering
         self.size = size
-        self._match = StateObject(wrappedValue: MediaPreviewMatch(url: item.url, fileType: item.fileType))
+        self._match = StateObject(wrappedValue: MediaPreviewMatch(key: MediaPreviewKey(url: item.url, fileType: item.fileType)))
     }
 
     func body(content: Content) -> some View {
@@ -271,6 +291,10 @@ struct MediaPreviewModifier: ViewModifier {
                         InlineVideoPreviewManager.shared.endSkimming(for: item.url)
                     }
                 }
+            }
+            // A rename keeps this cell: watch the file under its new name
+            .onChange(of: MediaPreviewKey(url: item.url, fileType: item.fileType)) { _, key in
+                match.watch(key)
             }
             // Preview lifecycle driven by parent's onHover binding
             .onChange(of: isHovering) { _, hovering in

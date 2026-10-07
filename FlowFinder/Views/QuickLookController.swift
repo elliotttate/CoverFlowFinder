@@ -2,8 +2,7 @@ import AppKit
 import SwiftUI
 import Quartz
 
-/// Arrow-key navigation for the Quick Look panel, shared by the controller's keyDown and the
-/// panel delegate's event handler.
+/// Arrow-key navigation for the Quick Look panel while the panel itself is key.
 enum QuickLookKeyAction: Equatable {
     case navigate(Int)
     case close
@@ -25,42 +24,46 @@ enum QuickLookKeyAction: Equatable {
     }
 }
 
-/// A window-level Quick Look controller that handles preview for all SwiftUI views.
+/// The app's Quick Look panel controller, shared by every view.
 ///
-/// QLPreviewPanel looks for its controller in the key window's responder chain, so while the panel
-/// is open this hidden view is installed in the window that opened it and made first responder
-/// there. It works from any window: showing the panel moves the view into the current window.
-/// Key handling is done through the responder chain (`keyDown`) and the panel delegate
-/// (`previewPanel(_:handle:)`), never through event monitors.
-class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
-    static let shared = QuickLookControllerView(frame: .zero)
+/// QLPreviewPanel looks for its controller in the responder chain of the key (or main) window.
+/// While a preview is open, this responder is linked into the chain of the window that opened it,
+/// right after the window itself, so the panel finds it whichever view of that window has focus.
+/// Nothing takes first responder: the browser view keeps its keys (Return, ⌘↓, Home/End,
+/// type-ahead), and clicking around the window doesn't cost the panel its controller.
+///
+/// Updates that name a window are only taken from the window the preview belongs to, so a
+/// background window refreshing its listing can't take over (or close) the panel.
+class QuickLookControllerView: NSResponder, QLPreviewPanelDataSource, QLPreviewPanelDelegate {
+    static let shared = QuickLookControllerView()
 
     /// The URL currently being previewed
     var previewURL: URL?
 
-    private weak var previousFirstResponder: NSResponder?
-    private var panelCloseObserver: NSObjectProtocol?
-
-    /// Callback for navigation
+    /// Moves the selection of the view that opened the preview (arrow keys while the panel is key).
+    /// Dropped when the preview closes, so a closed tab's view isn't kept alive.
     var onNavigate: ((Int) -> Void)?
 
-    private override init(frame: NSRect) {
-        super.init(frame: frame)
-        // Make invisible but still in responder chain
-        self.isHidden = true
+    /// The browser window the open preview belongs to; this controller is in its responder chain.
+    private(set) weak var sessionWindow: NSWindow?
+    private var panelCloseObserver: NSObjectProtocol?
+    private var windowCloseObserver: NSObjectProtocol?
+    /// Set while `showPreview` hands the panel to us (it may end and restart our control then)
+    private var isOpeningPanel = false
+
+    private override init() {
+        super.init()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
-    override var acceptsFirstResponder: Bool { true }
-
     // MARK: - Quick Look Panel Control
 
     override func acceptsPreviewPanelControl(_ panel: QLPreviewPanel!) -> Bool {
-        // Only the window we're installed in can control the panel through us
-        return window != nil
+        // Only reachable through the responder chain of the window the preview belongs to
+        return sessionWindow != nil
     }
 
     override func beginPreviewPanelControl(_ panel: QLPreviewPanel!) {
@@ -76,8 +79,11 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
         if panel.delegate as? QuickLookControllerView === self {
             panel.delegate = nil
         }
-        // The panel closed (e.g. via its close button) or another controller took over
-        finishPreviewSession()
+        // Another window became key: the panel takes us back when the preview's window does.
+        // Closed (e.g. its close button): the session is over.
+        if !isOpeningPanel && !panel.isVisible {
+            finishPreviewSession()
+        }
     }
 
     // MARK: - QLPreviewPanelDataSource
@@ -115,44 +121,7 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
         return NSWorkspace.shared.icon(forFile: url.path)
     }
 
-    // MARK: - Keyboard (while we're first responder in the browser window)
-
-    override func keyDown(with event: NSEvent) {
-        guard isPanelVisible,
-              let action = QuickLookKeyAction(keyCode: event.keyCode, modifierFlags: event.modifierFlags) else {
-            super.keyDown(with: event)
-            return
-        }
-        switch action {
-        case .navigate(let offset):
-            onNavigate?(offset)
-        case .close:
-            hidePreview()
-        }
-    }
-
     // MARK: - Public API
-
-    fileprivate func installIfNeeded(in window: NSWindow?) {
-        guard let window, self.window !== window else { return }
-        moveToWindow(window)
-    }
-
-    private func moveToWindow(_ window: NSWindow) {
-        // Leaving another window: give its focus back first
-        if let oldWindow = self.window, oldWindow !== window {
-            if oldWindow.firstResponder === self {
-                restorePreviousFirstResponder()
-            }
-            previousFirstResponder = nil
-        }
-        removeFromSuperview()
-        if let themeFrame = window.contentView?.superview {
-            themeFrame.addSubview(self)
-        } else {
-            window.contentView?.addSubview(self)
-        }
-    }
 
     /// The browser window that should own the panel: the key window, unless that's the panel itself.
     private var targetWindow: NSWindow? {
@@ -172,26 +141,21 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
         Self.isPanelVisible
     }
 
-    func showPreview(for url: URL, navigate: @escaping (Int) -> Void) {
+    /// Opens the panel on `url` for `window` (default: the key browser window).
+    func showPreview(for url: URL, in window: NSWindow? = nil, navigate: @escaping (Int) -> Void) {
+        guard let panel = QLPreviewPanel.shared() else { return }
+        isOpeningPanel = true
+        defer { isOpeningPanel = false }
         previewURL = url
         onNavigate = navigate
 
-        guard let panel = QLPreviewPanel.shared() else { return }
-
-        // Install in the window that asked for the preview
-        if let target = targetWindow {
-            installIfNeeded(in: target)
+        if let window = window ?? targetWindow {
+            beginSession(in: window)
         }
-
-        // Become the panel's controller through the responder chain
-        if panel.dataSource as? QuickLookControllerView !== self || window?.firstResponder !== self {
-            storePreviousFirstResponder()
-            window?.makeFirstResponder(self)
-            panel.updateController()
-        }
-        // The panel finds its controller through the key window's responder chain. With no key
-        // window (app not active, e.g. invoked from a Service or automation) that finds nothing and
-        // the panel shows "No items selected" — take control directly in that case.
+        // The responder chain changed without the panel noticing: let it find us
+        panel.updateController()
+        // With no key window (app not active, e.g. invoked from a Service or automation) the
+        // responder chain finds nothing and the panel shows "No items selected": take control directly.
         if panel.dataSource as? QuickLookControllerView !== self {
             panel.dataSource = self
             panel.delegate = self
@@ -204,19 +168,34 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
     }
 
     func updatePreview(for url: URL) {
-        updatePreview(for: Optional(url))
+        updatePreview(for: Optional(url), from: nil)
     }
 
     func updatePreview(for url: URL?) {
-        previewURL = url
+        updatePreview(for: url, from: nil)
+    }
 
-        guard isPanelVisible, let panel = QLPreviewPanel.shared() else { return }
+    /// Shows `url` in the open panel (nil closes it). `window` is the caller's window: updates
+    /// from any window other than the preview's are ignored. Nothing happens while the panel is
+    /// closed (opening it sets the URL).
+    func updatePreview(for url: URL?, from window: NSWindow?) {
+        guard Self.acceptsUpdate(from: window, sessionWindow: sessionWindow, isPanelVisible: isPanelVisible),
+              let panel = QLPreviewPanel.shared() else { return }
+        previewURL = url
         if url == nil {
             panel.orderOut(nil)
             finishPreviewSession()
         } else {
             panel.reloadData()
         }
+    }
+
+    /// Whether an update from a view in `window` may change the preview. A caller that doesn't
+    /// name its window is trusted.
+    static func acceptsUpdate(from window: NSWindow?, sessionWindow: NSWindow?, isPanelVisible: Bool) -> Bool {
+        guard isPanelVisible else { return false }
+        guard let window, let sessionWindow else { return true }
+        return window === sessionWindow
     }
 
     func hidePreview() {
@@ -226,15 +205,73 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
         finishPreviewSession()
     }
 
-    func togglePreview(for url: URL, navigate: @escaping (Int) -> Void) {
+    func togglePreview(for url: URL, in window: NSWindow? = nil, navigate: @escaping (Int) -> Void) {
         if isPanelVisible {
             hidePreview()
         } else {
-            showPreview(for: url, navigate: navigate)
+            showPreview(for: url, in: window, navigate: navigate)
         }
     }
 
-    // MARK: - Session Cleanup
+    // MARK: - Session
+
+    /// Makes `window` the preview's window: links this controller into its responder chain, right
+    /// after the window (and out of the previous window's chain).
+    func beginSession(in window: NSWindow) {
+        if sessionWindow === window, isLinked(into: window) { return }
+        unlinkFromResponderChain()
+        nextResponder = window.nextResponder
+        window.nextResponder = self
+        sessionWindow = window
+        windowCloseObserver = NotificationCenter.default.addObserver(
+            forName: NSWindow.willCloseNotification,
+            object: window,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.hidePreview()
+            }
+        }
+    }
+
+    /// The preview closed: leave the window's responder chain and drop what the session held.
+    func finishPreviewSession() {
+        onNavigate = nil
+        previewURL = nil
+        unlinkFromResponderChain()
+    }
+
+    private func isLinked(into window: NSWindow) -> Bool {
+        var responder = window.nextResponder
+        for _ in 0..<64 {
+            guard let current = responder else { return false }
+            if current === self { return true }
+            responder = current.nextResponder
+        }
+        return false
+    }
+
+    private func unlinkFromResponderChain() {
+        if let observer = windowCloseObserver {
+            NotificationCenter.default.removeObserver(observer)
+            windowCloseObserver = nil
+        }
+        defer {
+            nextResponder = nil
+            sessionWindow = nil
+        }
+        guard let window = sessionWindow else { return }
+        // Bounded walk: a broken chain can't hang us
+        var responder: NSResponder = window
+        for _ in 0..<64 {
+            guard let next = responder.nextResponder else { return }
+            if next === self {
+                responder.nextResponder = nextResponder
+                return
+            }
+            responder = next
+        }
+    }
 
     private func observePanelClose(_ panel: QLPreviewPanel) {
         guard panelCloseObserver == nil else { return }
@@ -248,47 +285,13 @@ class QuickLookControllerView: NSView, QLPreviewPanelDataSource, QLPreviewPanelD
             }
         }
     }
-
-    /// Give focus back to whatever had it before the panel opened — but only if we still hold it.
-    /// If the user has since clicked into a text field (e.g. typed a search that emptied the
-    /// selection), focus stays there.
-    private func finishPreviewSession() {
-        restorePreviousFirstResponder()
-    }
-
-    private func storePreviousFirstResponder() {
-        guard previousFirstResponder == nil else { return }
-        if let window, window.firstResponder !== self {
-            previousFirstResponder = window.firstResponder
-        }
-    }
-
-    private func restorePreviousFirstResponder() {
-        defer { previousFirstResponder = nil }
-        guard let window, window.firstResponder === self else { return }
-        if let previous = previousFirstResponder, previous !== self {
-            window.makeFirstResponder(previous)
-        } else {
-            window.makeFirstResponder(window.contentView)
-        }
-    }
 }
 
-/// SwiftUI view that ensures QuickLookControllerView is installed in a window
+/// Used by the browser window's content. The controller links itself into the window that opens
+/// a preview, so there is nothing to install up front.
 struct QuickLookWindowController: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
-        let view = NSView(frame: .zero)
-
-        // Install the shared controller in the first window; showing the panel moves it
-        // into whichever window asks for a preview.
-        DispatchQueue.main.async {
-            if let window = view.window,
-               QuickLookControllerView.shared.window == nil {
-                QuickLookControllerView.shared.installIfNeeded(in: window)
-            }
-        }
-
-        return view
+        NSView(frame: .zero)
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {}
