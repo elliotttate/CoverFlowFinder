@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Combine
 import QuickLookThumbnailing
 import Quartz
 
@@ -16,49 +17,48 @@ struct ColumnView: View {
     /// Load tokens, folder watchers and selection bookkeeping (never publishes)
     @StateObject private var columnState = ColumnViewState()
 
+    /// Scroll targets in the horizontal scroll view (sub-columns use their IDs)
+    private static let rootColumnID = "column-root"
+    private static let previewColumnID = "column-preview"
+
     var body: some View {
-        ScrollView(.horizontal, showsIndicators: true) {
-            HStack(spacing: 0) {
-                // First column with current items
-                SingleColumnView(
-                    items: items,
-                    selectedItem: columnSelections[viewModel.currentPath],
-                    columnURL: viewModel.currentPath,
-                    viewModel: viewModel,
-                    onSelect: { item in
-                        selectInColumn(depth: 0, item: item)
-                        columnState.notePushed(viewModel.selectedItems)
-                    },
-                    onDoubleClick: { item in
-                        viewModel.openItem(item)
-                    }
-                )
+        ScrollViewReader { scrollProxy in
+            ScrollView(.horizontal, showsIndicators: true) {
+                HStack(spacing: 0) {
+                    // First column with current items
+                    singleColumn(depth: 0, items: items, url: viewModel.currentPath)
+                        .id(Self.rootColumnID)
 
-                // Additional columns for subdirectories
-                ForEach(Array(columns.enumerated()), id: \.element.id) { index, column in
-                    Divider()
-                    SingleColumnView(
-                        items: column.items,
-                        selectedItem: columnSelections[column.url],
-                        columnURL: column.url,
-                        viewModel: viewModel,
-                        onSelect: { item in
-                            selectInColumn(depth: index + 1, item: item)
-                            columnState.notePushed(viewModel.selectedItems)
-                        },
-                        onDoubleClick: { item in
-                            viewModel.openItem(item)
+                    // Additional columns for subdirectories
+                    ForEach(Array(columns.enumerated()), id: \.element.id) { index, column in
+                        HStack(spacing: 0) {
+                            Divider()
+                            singleColumn(depth: index + 1, items: column.items, url: column.url)
                         }
-                    )
-                }
+                        .id(column.id)
+                    }
 
-                // Preview column for selected file
-                if appSettings.columnShowPreview,
-                   let lastSelection = lastSelectedItem,
-                   !ColumnBrowsing.isBrowsableFolder(lastSelection) {
-                    Divider()
-                    PreviewColumn(item: lastSelection)
-                        .id(lastSelection.url)
+                    // Preview column for selected file
+                    if let previewItem {
+                        HStack(spacing: 0) {
+                            Divider()
+                            PreviewColumn(item: previewItem)
+                                .id(previewItem.url)
+                        }
+                        .id(Self.previewColumnID)
+                    }
+                }
+            }
+            // Drilling in shows the new column (Finder scrolls it into view)
+            .onChange(of: rightmostColumnID) { _, id in
+                DispatchQueue.main.async {
+                    withAnimation { scrollProxy.scrollTo(id, anchor: .trailing) }
+                }
+            }
+            .onChange(of: activeColumnIndex) { _, depth in
+                let id: AnyHashable = depth == 0 ? AnyHashable(Self.rootColumnID) : columns.indices.contains(depth - 1) ? AnyHashable(columns[depth - 1].id) : rightmostColumnID
+                DispatchQueue.main.async {
+                    withAnimation { scrollProxy.scrollTo(id) }
                 }
             }
         }
@@ -77,14 +77,9 @@ struct ColumnView: View {
             onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
         .onAppear {
-            columnState.watcher.onChange = { url in
-                MainActor.assumeIsolated {
-                    reloadColumn(at: url)
-                }
-            }
             columnState.watcher.watch(columns.map(\.url))
-            // Show the view model's selection (and the folder it's in) when the view appears
-            syncSelectionFromViewModel(force: true)
+            // Show the view model's selection (and the folders it's in) when the view appears
+            syncSelectionFromViewModel(force: true, restoringColumns: true)
         }
         .onDisappear {
             columnState.watcher.watch([])
@@ -95,6 +90,10 @@ struct ColumnView: View {
             if viewModel.viewMode != .columns {
                 showDeepestFolderInViewModel()
             }
+        }
+        // Folder watcher events (delivered through the state object: no closure holds this view)
+        .onReceive(columnState.folderChanges) { url in
+            reloadColumn(at: url)
         }
         .onChange(of: columns.map(\.url)) { _, urls in
             // Watch the folders shown in sub-columns (the view model watches the root)
@@ -122,6 +121,26 @@ struct ColumnView: View {
         }
     }
 
+    private func singleColumn(depth: Int, items: [FileItem], url: URL) -> some View {
+        SingleColumnView(
+            items: items,
+            selectedItem: columnSelections[url],
+            columnURL: url,
+            viewModel: viewModel,
+            onClick: { item, index, modifiers in
+                handleClick(depth: depth, item: item, index: index, modifiers: modifiers)
+            },
+            onDoubleClick: { item in
+                viewModel.openItem(item)
+            },
+            onRowAppear: { item in
+                rowAppeared(item, depth: depth)
+            },
+            onNewFolder: { createNewFolder(inColumnAt: depth) },
+            onRefresh: { refreshColumn(atDepth: depth) }
+        )
+    }
+
     /// The URL of the folder represented by the currently active column.
     private var activeColumnURL: URL {
         columnURL(atDepth: activeColumnIndex) ?? viewModel.currentPath
@@ -132,6 +151,20 @@ struct ColumnView: View {
             return selection
         }
         return columnSelections[viewModel.currentPath]
+    }
+
+    /// The file shown in the preview column (the deepest selection, when it isn't a folder)
+    private var previewItem: FileItem? {
+        guard appSettings.columnShowPreview, let item = lastSelectedItem,
+              !ColumnBrowsing.isBrowsableFolder(item) else { return nil }
+        return item
+    }
+
+    /// The rightmost column: the preview, else the deepest column
+    private var rightmostColumnID: AnyHashable {
+        if previewItem != nil { return Self.previewColumnID }
+        if let last = columns.last { return last.id }
+        return Self.rootColumnID
     }
 
     /// Navigates the view model to the deepest folder the user has drilled into via sub-columns.
@@ -187,7 +220,8 @@ struct ColumnView: View {
 
     /// Select `item` in the column at `depth`, make that column active and show the folder's
     /// contents to its right (packages are files). Does not touch the view model's selection.
-    private func selectInColumn(depth: Int, item: FileItem) {
+    /// - Parameter opensFolder: false when it's one of several selected items (no column to the right).
+    private func selectInColumn(depth: Int, item: FileItem, opensFolder: Bool = true) {
         guard let url = columnURL(atDepth: depth) else { return }
         let previous = columnSelections[url]
         columnSelections[url] = item
@@ -196,7 +230,7 @@ struct ColumnView: View {
         }
         activeColumnIndex = depth
 
-        if ColumnBrowsing.isBrowsableFolder(item) {
+        if opensFolder, ColumnBrowsing.isBrowsableFolder(item) {
             // Keep the open child column when the same folder is selected again
             let isAlreadyOpen = previous?.url == item.url && columns.count > depth && columns[depth].folder.url == item.url
             if !isAlreadyOpen {
@@ -241,7 +275,9 @@ struct ColumnView: View {
     /// Lists a folder (or a folder inside a ZIP archive) in the background. Each depth has one
     /// current request: a newer open or a truncation invalidates older ones, so holding ↓ over
     /// folders never stacks columns.
-    private func loadColumn(for folder: FileItem, atDepth depth: Int, reloading: Bool) {
+    /// - Parameter rename: a folder the column is inside was renamed: its items keep their IDs
+    ///   under their new paths.
+    private func loadColumn(for folder: FileItem, atDepth depth: Int, reloading: Bool, movedBy rename: (from: URL, to: URL)? = nil) {
         let archiveFolder = ColumnBrowsing.archiveColumnSource(for: folder)
         let token = UUID()
         columnState.loadTokens[depth] = token
@@ -249,24 +285,26 @@ struct ColumnView: View {
         let foldersFirst = appSettings.foldersFirst
         let sortState = viewModel.sortState
         let existingIDs: [URL: UUID] = reloading
-            ? Dictionary(columnItems(atDepth: depth)?.map { ($0.url, $0.id) } ?? [], uniquingKeysWith: { first, _ in first })
+            ? Dictionary((columnItems(atDepth: depth) ?? []).map { item in
+                (rename.flatMap { ColumnBrowsing.url(item.url, movedFrom: $0.from, to: $0.to) } ?? item.url, item.id)
+            }, uniquingKeysWith: { first, _ in first })
             : [:]
 
         DispatchQueue.global(qos: .userInitiated).async {
-            let loaded: [FileItem]?
+            let listing: ColumnBrowsing.Listing?
             var contentsURL = folder.url
             if let archiveFolder {
                 // Archive entries keep their IDs while the archive is unchanged
-                loaded = try? ColumnBrowsing.loadArchiveItems(
+                listing = (try? ColumnBrowsing.loadArchiveItems(
                     in: archiveFolder.archiveURL,
                     at: archiveFolder.path,
                     showHiddenFiles: showHiddenFiles,
                     sortState: sortState,
                     foldersFirst: foldersFirst
-                )
+                )).map { ColumnBrowsing.Listing(items: $0, fileIDs: [:]) }
             } else if let resolved = ColumnBrowsing.contentsURL(of: folder) {
                 contentsURL = resolved
-                loaded = try? ColumnBrowsing.loadItems(
+                listing = try? ColumnBrowsing.loadListing(
                     in: resolved,
                     showHiddenFiles: showHiddenFiles,
                     sortState: sortState,
@@ -275,45 +313,111 @@ struct ColumnView: View {
                 )
             } else {
                 // An alias whose original can't be found
-                loaded = nil
+                listing = nil
             }
+            // The folder's own identity, to follow it when it's renamed
+            let folderID = archiveFolder == nil ? FileIdentity(folder.url) : nil
 
             DispatchQueue.main.async {
                 guard columnState.loadTokens[depth] == token else { return }
                 columnState.loadTokens.removeValue(forKey: depth)
 
                 if reloading {
-                    applyReload(of: folder.url, atDepth: depth, loaded: loaded)
+                    applyReload(of: folder.url, atDepth: depth, listing: listing, folderID: folderID)
                     return
                 }
-                guard let loaded else { return }
+                guard let listing else { return }
                 // Replace whatever is at this depth (and drop anything deeper)
-                columns = Array(columns.prefix(depth - 1)) + [ColumnData(folder: folder, url: contentsURL, items: loaded)]
+                columns = Array(columns.prefix(depth - 1)) + [ColumnData(
+                    folder: folder, url: contentsURL, items: listing.items, fileIDs: listing.fileIDs, folderID: folderID
+                )]
+                loadCloudStatus(ofColumnAt: depth)
                 resolvePendingSelection()
             }
         }
     }
 
-    private func applyReload(of folderURL: URL, atDepth depth: Int, loaded: [FileItem]?) {
+    private func applyReload(of folderURL: URL, atDepth depth: Int, listing: ColumnBrowsing.Listing?, folderID: FileIdentity?) {
         guard columns.indices.contains(depth - 1), columns[depth - 1].folder.url == folderURL else { return }
-        guard let loaded else {
-            // The folder itself is gone: close it and everything to its right. Its parent column
-            // reloads too and moves its selection.
-            truncateColumns(keepingThrough: depth - 1)
+        let old = columns[depth - 1]
+        guard let listing else {
+            // The folder itself is gone. Renamed, its parent column's reload moves the columns to
+            // the new name; otherwise (a second look later) close it and everything to its right.
+            // Its parent column reloads too and moves its selection.
+            if columnState.missingFolders.insert(old.url).inserted {
+                let url = old.url
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak columnState] in
+                    columnState?.folderChanges.send(url)
+                }
+            } else {
+                columnState.missingFolders.remove(old.url)
+                truncateColumns(keepingThrough: depth - 1)
+            }
             return
         }
-        let old = columns[depth - 1]
-        columns[depth - 1] = ColumnData(id: old.id, folder: old.folder, url: old.url, items: loaded)
-        reconcileSelection(depth: depth, oldItems: old.items, newItems: loaded)
+        columnState.missingFolders.remove(old.url)
+        // iCloud badges stay until their status is reloaded
+        let statuses = Dictionary(old.items.compactMap { item in item.cloudStatus.map { (item.url, $0) } }, uniquingKeysWith: { first, _ in first })
+        let items = statuses.isEmpty ? listing.items : listing.items.map { item in
+            statuses[item.url].map { item.withCloudStatus($0) } ?? item
+        }
+        columns[depth - 1] = ColumnData(id: old.id, folder: old.folder, url: old.url, items: items, fileIDs: listing.fileIDs, folderID: folderID ?? old.folderID)
+        reconcileSelection(depth: depth, oldItems: old.items, newItems: items, oldIDs: old.fileIDs, newIDs: listing.fileIDs)
+        loadCloudStatus(ofColumnAt: depth)
         resolvePendingSelection()
     }
 
+    /// Sub-columns list their folders themselves: their items' iCloud status (badges, preview) is
+    /// loaded in the background.
+    private func loadCloudStatus(ofColumnAt depth: Int) {
+        guard columns.indices.contains(depth - 1) else { return }
+        let column = columns[depth - 1]
+        guard CloudStatusManager.shared.isInICloud(column.url) else { return }
+        let urls = column.items.compactMap { $0.cloudStatus == nil && !$0.isFromArchive ? $0.url : nil }
+        guard !urls.isEmpty else { return }
+        DispatchQueue.global(qos: .utility).async {
+            var statuses: [URL: CloudSyncStatus] = [:]
+            for url in urls {
+                statuses[url] = CloudStatusManager.shared.getStatus(for: url)
+            }
+            DispatchQueue.main.async {
+                guard let index = columns.firstIndex(where: { $0.id == column.id }), columns[index].url == column.url else { return }
+                let current = columns[index]
+                var changed = false
+                let items = current.items.map { item -> FileItem in
+                    guard let status = statuses[item.url], item.cloudStatus != status else { return item }
+                    changed = true
+                    return item.withCloudStatus(status)
+                }
+                guard changed else { return }
+                columns[index] = ColumnData(id: current.id, folder: current.folder, url: current.url, items: items, fileIDs: current.fileIDs, folderID: current.folderID)
+                refreshSelection(depth: index + 1, in: items)
+            }
+        }
+    }
+
     /// After a column's contents changed: keep its selection when the item still exists (with
-    /// fresh metadata); otherwise select the neighbour in that column, like Finder.
-    private func reconcileSelection(depth: Int, oldItems: [FileItem], newItems: [FileItem]) {
+    /// fresh metadata) or was renamed; otherwise select the neighbour in that column, like Finder.
+    /// `oldIDs`/`newIDs` are the listings' file identities (none for the root column).
+    private func reconcileSelection(
+        depth: Int,
+        oldItems: [FileItem],
+        newItems: [FileItem],
+        oldIDs: [URL: FileIdentity] = [:],
+        newIDs: [URL: FileIdentity] = [:]
+    ) {
         guard let url = columnURL(atDepth: depth), let selected = columnSelections[url] else { return }
         if newItems.contains(where: { $0.url == selected.url }) {
             refreshSelection(depth: depth, in: newItems)
+            return
+        }
+
+        // Renamed (the same file under a new name): it stays selected, and the columns showing
+        // its contents stay open
+        let oldURLs = Set(oldItems.map(\.url))
+        let added = newItems.filter { !oldURLs.contains($0.url) }
+        if let renamed = renamedItem(selected, atDepth: depth, oldIDs: oldIDs, among: added, newIDs: newIDs) {
+            applyRename(atDepth: depth, from: selected, to: renamed)
             return
         }
 
@@ -359,6 +463,108 @@ struct ColumnView: View {
         columnSelections[url] = fresh
     }
 
+    // MARK: - Renames
+
+    /// The item among `candidates` (items that just appeared in the column at `depth`) that is
+    /// `item` under a new name: the same file. Identities come from the column listings, or from
+    /// the open column for a folder on the drilled path; the few candidates without one are read.
+    private func renamedItem(
+        _ item: FileItem,
+        atDepth depth: Int,
+        oldIDs: [URL: FileIdentity],
+        among candidates: [FileItem],
+        newIDs: [URL: FileIdentity]
+    ) -> FileItem? {
+        guard !candidates.isEmpty, !item.isFromArchive else { return nil }
+        var identity = oldIDs[item.url]
+        if identity == nil, columns.indices.contains(depth), columns[depth].folder.url == item.url {
+            identity = columns[depth].folderID
+        }
+        guard let identity else { return nil }
+        let unlisted = candidates.filter { newIDs[$0.url] == nil }
+        guard unlisted.count <= 32 else { return nil }
+        return candidates.first { candidate in
+            !candidate.isFromArchive && (newIDs[candidate.url] ?? FileIdentity(candidate.url)) == identity
+        }
+    }
+
+    /// `old`, selected in the column at `depth`, was renamed to `new`: select it under its new
+    /// name, move the columns showing its contents (and their selections) along, and point the
+    /// view model's selection at the new paths.
+    private func applyRename(atDepth depth: Int, from old: FileItem, to new: FileItem) {
+        guard let url = columnURL(atDepth: depth) else { return }
+        columnSelections[url] = new
+        if let index = columnItems(atDepth: depth)?.firstIndex(where: { $0.url == new.url }) {
+            columnState.selectionIndex[url] = index
+        }
+
+        if columns.indices.contains(depth), columns[depth].folder.url == old.url {
+            for index in depth..<columns.count {
+                let column = columns[index]
+                let folder = index == depth ? new : Self.item(column.folder, movedFrom: old.url, to: new.url)
+                // An alias's column lists its original, elsewhere: that one keeps its path
+                let columnURL = ColumnBrowsing.url(column.url, movedFrom: old.url, to: new.url) ?? column.url
+                if columnURL != column.url {
+                    if let selection = columnSelections.removeValue(forKey: column.url) {
+                        columnSelections[columnURL] = Self.item(selection, movedFrom: old.url, to: new.url)
+                    }
+                    if let selectionIndex = columnState.selectionIndex.removeValue(forKey: column.url) {
+                        columnState.selectionIndex[columnURL] = selectionIndex
+                    }
+                    columnState.missingFolders.remove(column.url)
+                }
+                // The items are relisted under their new paths right away
+                columns[index] = ColumnData(id: column.id, folder: folder, url: columnURL, items: column.items, fileIDs: column.fileIDs, folderID: column.folderID)
+            }
+            for index in depth..<columns.count {
+                loadColumn(for: columns[index].folder, atDepth: index + 1, reloading: true, movedBy: (old.url, new.url))
+            }
+        }
+
+        // The view model's selection follows: the renamed item, or items inside a renamed folder
+        var moved = false
+        let selection = Set(viewModel.selectedItems.map { selected -> FileItem in
+            if selected.url == old.url {
+                moved = true
+                return new
+            }
+            let item = Self.item(selected, movedFrom: old.url, to: new.url)
+            if item.url != selected.url {
+                moved = true
+            }
+            return item
+        })
+        if moved {
+            pushSelection(selection, index: columnItems(atDepth: activeColumnIndex)?.firstIndex { selection.contains($0) })
+        }
+    }
+
+    /// `item` under its new path after the folder it's in (or it) moved from `old` to `new`.
+    private static func item(_ item: FileItem, movedFrom old: URL, to new: URL) -> FileItem {
+        guard let url = ColumnBrowsing.url(item.url, movedFrom: old, to: new) else { return item }
+        return FileItem(url: url, id: item.id)
+    }
+
+    /// The view model selected the renamed copy of a folder on the drilled path (it selects items
+    /// it renamed): the columns showing that folder's contents move along instead of closing.
+    private func followRenamedPathFolder(to selection: Set<FileItem>) {
+        guard selection.count == 1, let selected = selection.first else { return }
+        for depth in 0..<columns.count {
+            guard let url = columnURL(atDepth: depth),
+                  let pathItem = columnSelections[url],
+                  pathItem.url != selected.url,
+                  columns[depth].folder.url == pathItem.url,
+                  let listed = columnItems(atDepth: depth),
+                  listed.contains(where: { $0.url == selected.url }),
+                  !listed.contains(where: { $0.url == pathItem.url }) else { continue }
+            let newIDs = depth > 0 ? columns[depth - 1].fileIDs : [:]
+            if let renamed = renamedItem(pathItem, atDepth: depth, oldIDs: [:], among: [selected], newIDs: newIDs) {
+                applyRename(atDepth: depth, from: pathItem, to: renamed)
+            }
+            return
+        }
+    }
+
     // MARK: - Selection sync with the view model
 
     /// Set the view model's selection and remember that we did (so the sync ignores it).
@@ -373,12 +579,27 @@ struct ColumnView: View {
 
     /// Mirror selection changes made elsewhere (delete, Select All, menus, another view) into
     /// the columns.
-    private func syncSelectionFromViewModel(force: Bool) {
+    /// - Parameter restoringColumns: the view just appeared: a selection inside folders below the
+    ///   root opens the columns down to it.
+    private func syncSelectionFromViewModel(force: Bool, restoringColumns: Bool = false) {
         let selection = viewModel.selectedItems
         let selectedURLs = Set(selection.map(\.url))
         if !force && columnState.pushedSelectionURLs == selectedURLs { return }
         columnState.pushedSelectionURLs = selectedURLs
         columnState.pendingSelectionURLs = nil
+        // All the columns down to a restored selection are open now
+        let restoredPathIsOpen = columnState.pendingPath?.isEmpty == true
+        columnState.pendingPath = nil
+
+        followRenamedPathFolder(to: selection)
+
+        // Select All (Edit menu, ⌘A) selects the root column's items: in a sub-column it means
+        // that column's items
+        if activeColumnIndex > 0, selection.count > 1, selection.count == items.count,
+           selectedURLs == Set(items.map(\.url)) {
+            selectAllInActiveColumn()
+            return
+        }
 
         // After deleting in a sub-column the view model selects an item of the root column.
         // Keep the selection in the column the user was working in instead.
@@ -434,24 +655,102 @@ struct ColumnView: View {
             let selectedInColumn = columnItems.filter { selectedURLs.contains($0.url) }
             guard !selectedInColumn.isEmpty else { continue }
 
-            // Lead item: the column's current one if still selected, else the first in display order
+            // Lead item: the column's current one if still selected, else the first in display order.
+            // Several selected items show no column to their right (Finder).
             let lead = selectedInColumn.first { $0.url == columnSelections[url]?.url } ?? selectedInColumn[0]
+            let isSingle = selectedInColumn.count == 1
             if columnSelections[url]?.url != lead.url || activeColumnIndex != depth {
-                selectInColumn(depth: depth, item: lead)
+                selectInColumn(depth: depth, item: lead, opensFolder: isSingle)
             } else {
                 refreshSelection(depth: depth, in: columnItems)
+                if !isSingle {
+                    truncateColumns(keepingThrough: depth)
+                }
             }
             return
         }
 
+        if restoredPathIsOpen {
+            // The columns down to its folder are open and it isn't there (hidden, gone): select
+            // nothing rather than something no column shows
+            pushSelection([])
+            return
+        }
+        if restoringColumns, restoreColumnPath(to: selection) {
+            return
+        }
         // Not shown yet (e.g. a new folder before the refresh): try again when columns change
         columnState.pendingSelectionURLs = selectedURLs
     }
 
     private func resolvePendingSelection() {
-        guard let pending = columnState.pendingSelectionURLs,
-              pending == Set(viewModel.selectedItems.map(\.url)) else { return }
+        guard let pending = columnState.pendingSelectionURLs else { return }
+        guard pending == Set(viewModel.selectedItems.map(\.url)) else {
+            // The selection changed meanwhile: stop opening columns for the old one
+            columnState.pendingPath = nil
+            return
+        }
+        if let path = columnState.pendingPath, !path.isEmpty {
+            continuePendingPath()
+            return
+        }
         syncSelectionFromViewModel(force: true)
+    }
+
+    /// The view model's selection is in a folder below the root that no column shows (the column
+    /// view was recreated, e.g. for a tab switch): opens the columns down to it, one load at a time.
+    /// False when it isn't below the root.
+    private func restoreColumnPath(to selection: Set<FileItem>) -> Bool {
+        guard let first = selection.first, !first.isFromArchive, first.url.isFileURL else { return false }
+        let parent = first.url.deletingLastPathComponent()
+        let parentKey = parent.standardizedPathKey
+        guard selection.allSatisfy({ $0.url.deletingLastPathComponent().standardizedPathKey == parentKey }) else { return false }
+        let rootKey = viewModel.currentPath.standardizedPathKey
+        guard parentKey.hasPrefix(rootKey.hasSuffix("/") ? rootKey : rootKey + "/") else { return false }
+
+        // The folders from the root's child down to the selection's folder
+        var path: [URL] = []
+        var folder = parent
+        while folder.standardizedPathKey != rootKey {
+            guard path.count < 256 else { return false }
+            path.insert(folder, at: 0)
+            folder = folder.deletingLastPathComponent()
+        }
+        truncateColumns(keepingThrough: 0)
+        columnState.pendingPath = path
+        columnState.pendingSelectionURLs = Set(selection.map(\.url))
+        continuePendingPath()
+        return true
+    }
+
+    /// Opens the next folder of a restored path once the column listing it is loaded.
+    private func continuePendingPath() {
+        guard let path = columnState.pendingPath, let next = path.first else { return }
+        let depth = columns.count
+        // Wait for the column that lists it
+        guard next.deletingLastPathComponent().standardizedPathKey == columnURL(atDepth: depth)?.standardizedPathKey else { return }
+        let nextKey = next.standardizedPathKey
+        guard let folder = columnItems(atDepth: depth)?.first(where: { $0.url.standardizedPathKey == nextKey }),
+              ColumnBrowsing.isBrowsableFolder(folder) else {
+            // Not listed (hidden, gone): select nothing rather than something no column shows
+            columnState.pendingPath = nil
+            columnState.pendingSelectionURLs = nil
+            pushSelection([])
+            return
+        }
+        columnState.pendingPath = Array(path.dropFirst())
+        // Opens its column; its load continues with `resolvePendingSelection`
+        selectInColumn(depth: depth, item: folder)
+    }
+
+    /// Select All in the active column (with several items selected, nothing opens to its right).
+    private func selectAllInActiveColumn() {
+        guard let url = columnURL(atDepth: activeColumnIndex),
+              let activeItems = columnItems(atDepth: activeColumnIndex), !activeItems.isEmpty else { return }
+        truncateColumns(keepingThrough: activeColumnIndex)
+        let lead = columnSelections[url].flatMap { selected in activeItems.first { $0.url == selected.url } } ?? activeItems[0]
+        columnSelections[url] = lead
+        pushSelection(Set(activeItems), index: activeItems.firstIndex(of: lead))
     }
 
     private func deleteSelection() {
@@ -464,6 +763,101 @@ struct ColumnView: View {
             )
         }
         viewModel.deleteSelectedItems()
+    }
+
+    // MARK: - Mouse
+
+    /// A click on `item` (at `index`) in the column at `depth`.
+    private func handleClick(depth: Int, item: FileItem, index: Int, modifiers: NSEvent.ModifierFlags) {
+        guard let url = columnURL(atDepth: depth), let columnItems = columnItems(atDepth: depth) else { return }
+        let shift = modifiers.contains(.shift)
+        let command = modifiers.contains(.command)
+        if (shift || command) && depth != activeColumnIndex {
+            // Selections don't span columns: ⇧/⌘-click in another column starts over in that one,
+            // a ⇧ range from its own selected item (the folder on the drilled path)
+            let here = Set(columnItems.map(\.url))
+            let kept = viewModel.selectedItems.filter { here.contains($0.url) }
+            if kept.count != viewModel.selectedItems.count {
+                viewModel.selectedItems = kept
+            }
+            if shift {
+                viewModel.selectionAnchorIndex = columnSelections[url].flatMap { selected in
+                    columnItems.firstIndex { $0.url == selected.url }
+                } ?? index
+            }
+        }
+        viewModel.handleSelection(item: item, index: index, in: columnItems, withShift: shift, withCommand: command)
+
+        let selection = viewModel.selectedItems
+        if selection.count == 1, selection.contains(item) {
+            // Opens a folder's contents to the right
+            selectInColumn(depth: depth, item: item)
+        } else {
+            // Several items (or the clicked one deselected): nothing opens to the right
+            if let lead = selection.contains(item) ? item : columnItems.first(where: { selection.contains($0) }) {
+                columnSelections[url] = lead
+                columnState.selectionIndex[url] = columnItems.firstIndex { $0.url == lead.url }
+            } else {
+                columnSelections.removeValue(forKey: url)
+            }
+            activeColumnIndex = depth
+            truncateColumns(keepingThrough: depth)
+            updateQuickLook(for: selection.contains(item) ? item : nil)
+        }
+        columnState.notePushed(selection)
+    }
+
+    // MARK: - Metadata
+
+    /// Root-column rows appearing on screen load their metadata (and iCloud status), as the list
+    /// does for its visible rows: big folders are listed without it. Coalesced per run loop turn.
+    private func rowAppeared(_ item: FileItem, depth: Int) {
+        guard depth == 0, viewModel.needsHydration(item) else { return }
+        columnState.hydrationURLs.insert(item.url)
+        guard !columnState.isHydrationScheduled else { return }
+        columnState.isHydrationScheduled = true
+        let viewModel = viewModel
+        DispatchQueue.main.async { [weak columnState] in
+            guard let columnState else { return }
+            columnState.isHydrationScheduled = false
+            let urls = Array(columnState.hydrationURLs)
+            columnState.hydrationURLs.removeAll()
+            viewModel.hydrateMetadata(for: urls)
+        }
+    }
+
+    // MARK: - Background Menu
+
+    /// New Folder in a column's folder (the root column's is the view model's).
+    private func createNewFolder(inColumnAt depth: Int) {
+        guard depth > 0, let url = columnURL(atDepth: depth), url.isFileURL, !viewModel.isInsideArchive else {
+            viewModel.createNewFolder()
+            return
+        }
+        // The view model only creates folders in the folder it shows; this one is created here
+        // and selected in its column (once its reload lists it), then renamed
+        let folderURL = FileOperationEngine.uniqueDestinationURL(for: url.appendingPathComponent("untitled folder"))
+        do {
+            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: false)
+        } catch {
+            FileOperationAlerts.reportFailures([FileOperationFailure(url: folderURL, error: error)], verb: "created")
+            return
+        }
+        truncateColumns(keepingThrough: depth)
+        activeColumnIndex = depth
+        viewModel.selectedItems = [FileItem(url: folderURL)]
+        viewModel.renamingURL = folderURL
+    }
+
+    /// Refresh from a column's background menu: the root column refreshes the view model; a
+    /// sub-column relists its folder and re-reads its items' tags.
+    private func refreshColumn(atDepth depth: Int) {
+        guard depth > 0, let url = columnURL(atDepth: depth), let columnItems = columnItems(atDepth: depth) else {
+            viewModel.refresh()
+            return
+        }
+        viewModel.refreshTags(for: columnItems.filter { !$0.isFromArchive }.map(\.url))
+        reloadColumn(at: url)
     }
 
     // MARK: - Keyboard Navigation
@@ -488,7 +882,15 @@ struct ColumnView: View {
             columnState.selectionIndex[columnURL] = newIndex
             // Use the active column's items for range selection
             viewModel.selectRange(to: newIndex, in: columnItems)
-            columnState.notePushed(viewModel.selectedItems)
+            let selection = viewModel.selectedItems
+            if selection.count == 1, let only = selection.first {
+                // Back to one item: its folder opens again
+                selectInColumn(depth: activeColumnIndex, item: only)
+            } else {
+                // Several items: nothing opens to their right (Finder)
+                truncateColumns(keepingThrough: activeColumnIndex)
+            }
+            columnState.notePushed(selection)
             updateQuickLook(for: newItem)
         } else {
             // Updates subsequent columns (opens folders, closes them for files)
@@ -584,12 +986,32 @@ struct ColumnData: Identifiable {
     /// The folder whose contents are listed (the item's own path; an alias's original)
     let url: URL
     let items: [FileItem]
+    /// File identity of each listed item, to recognise one renamed between two listings
+    let fileIDs: [URL: FileIdentity]
+    /// The opened item's own identity (follows it when it's renamed)
+    let folderID: FileIdentity?
 
-    init(id: UUID = UUID(), folder: FileItem, url: URL? = nil, items: [FileItem]) {
+    init(id: UUID = UUID(), folder: FileItem, url: URL? = nil, items: [FileItem], fileIDs: [URL: FileIdentity] = [:], folderID: FileIdentity? = nil) {
         self.id = id
         self.folder = folder
         self.url = url ?? folder.url
         self.items = items
+        self.fileIDs = fileIDs
+        self.folderID = folderID
+    }
+}
+
+/// A file's identity on its volume: the same after a rename, different for a new file at the
+/// same path.
+struct FileIdentity: Hashable {
+    private let identifier: NSObject
+
+    /// From the URL's resource values (prefetched by a directory listing, else read).
+    init?(_ url: URL) {
+        guard let identifier = (try? url.resourceValues(forKeys: [.fileResourceIdentifierKey]))?.fileResourceIdentifier as? NSObject else {
+            return nil
+        }
+        self.identifier = identifier
     }
 }
 
@@ -602,15 +1024,31 @@ final class ColumnViewState: ObservableObject {
     }
 
     let watcher = ColumnDirectoryWatcher()
+    /// Folders shown in sub-columns that changed (the view reloads them)
+    let folderChanges = PassthroughSubject<URL, Never>()
     /// Current load request per column depth
     var loadTokens: [Int: UUID] = [:]
     /// The selection this view last set on the view model
     var pushedSelectionURLs: Set<URL>?
     /// A view-model selection not visible in any column yet
     var pendingSelectionURLs: Set<URL>?
+    /// Folders still to open, root to leaf, to show `pendingSelectionURLs` (a recreated view)
+    var pendingPath: [URL]?
     var deleteGuard: DeleteGuard?
     /// Last known index of each column's selection (to pick a neighbour when it disappears)
     var selectionIndex: [URL: Int] = [:]
+    /// Sub-column folders found missing once (closed if they're still missing on a second look)
+    var missingFolders: Set<URL> = []
+    /// Root-column rows waiting for their metadata (requested together)
+    var hydrationURLs: Set<URL> = []
+    var isHydrationScheduled = false
+
+    init() {
+        // Weak: the watcher must not keep this state (or a view) alive
+        watcher.onChange = { [weak self] url in
+            self?.folderChanges.send(url)
+        }
+    }
 
     func notePushed(_ selection: Set<FileItem>) {
         pushedSelectionURLs = Set(selection.map(\.url))
@@ -622,43 +1060,65 @@ final class ColumnViewState: ObservableObject {
 }
 
 /// Watches the folders shown in sub-columns and reports changes (coalesced) on the main queue.
+/// A folder that is deleted or moved away is watched again at its path (it may be replaced there).
 final class ColumnDirectoryWatcher {
     var onChange: ((URL) -> Void)?
     private var sources: [URL: DispatchSourceFileSystemObject] = [:]
     private var pendingNotifications: [URL: DispatchWorkItem] = [:]
+    /// Watched folders whose directory was deleted or renamed (the watch must be renewed)
+    private var replacedURLs: Set<URL> = []
 
     func watch(_ urls: [URL]) {
         let wanted = Set(urls)
-        for (url, source) in sources where !wanted.contains(url) {
-            source.cancel()
-            sources.removeValue(forKey: url)
-            pendingNotifications.removeValue(forKey: url)?.cancel()
+        for url in sources.keys where !wanted.contains(url) {
+            stopWatching(url)
         }
         for url in wanted where sources[url] == nil {
-            let descriptor = open(url.path, O_EVTONLY)
-            guard descriptor >= 0 else { continue }
-            let source = DispatchSource.makeFileSystemObjectSource(
-                fileDescriptor: descriptor,
-                eventMask: [.write, .delete, .rename, .link],
-                queue: .main
-            )
-            source.setEventHandler { [weak self] in
-                self?.folderChanged(url)
-            }
-            source.setCancelHandler {
-                close(descriptor)
-            }
-            source.resume()
-            sources[url] = source
+            startWatching(url)
         }
     }
 
-    private func folderChanged(_ url: URL) {
+    private func startWatching(_ url: URL) {
+        let descriptor = open(url.path, O_EVTONLY)
+        guard descriptor >= 0 else { return }
+        let source = DispatchSource.makeFileSystemObjectSource(
+            fileDescriptor: descriptor,
+            eventMask: [.write, .delete, .rename, .link],
+            queue: .main
+        )
+        source.setEventHandler { [weak self] in
+            guard let self, let source = self.sources[url] else { return }
+            // The directory itself went away (deleted, renamed, replaced by an atomic swap)
+            let replaced = !source.data.isDisjoint(with: [.delete, .rename])
+            self.folderChanged(url, replaced: replaced)
+        }
+        source.setCancelHandler {
+            close(descriptor)
+        }
+        source.resume()
+        sources[url] = source
+    }
+
+    private func stopWatching(_ url: URL) {
+        sources.removeValue(forKey: url)?.cancel()
+        pendingNotifications.removeValue(forKey: url)?.cancel()
+        replacedURLs.remove(url)
+    }
+
+    private func folderChanged(_ url: URL, replaced: Bool) {
+        if replaced {
+            replacedURLs.insert(url)
+        }
         // Coalesce bursts (a copy of many files) into one reload
         pendingNotifications[url]?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             self.pendingNotifications.removeValue(forKey: url)
+            if self.replacedURLs.remove(url) != nil, self.sources[url] != nil {
+                // Watch whatever is at the path now (nothing: `watch` tries again when asked)
+                self.sources.removeValue(forKey: url)?.cancel()
+                self.startWatching(url)
+            }
             self.onChange?(url)
         }
         pendingNotifications[url] = work
@@ -689,6 +1149,22 @@ enum ColumnBrowsing {
         if item.isFromArchive || !item.url.isFileURL { return true }
         // For a symlink, `isPackage` describes its target (the link itself is never a package)
         return !item.isPackage && !isPackage(item.url)
+    }
+
+    /// `isBrowsableFolder` from what is already known, without reading the disk (for drawing);
+    /// nil when it would have to read.
+    static func cachedIsBrowsableFolder(_ item: FileItem) -> Bool? {
+        if item.isAliasFile { return cachedFlag(item.url.path, inAliasCache: true) }
+        guard item.isDirectory else { return false }
+        if item.isFromArchive || !item.url.isFileURL { return true }
+        if item.isPackage { return false }
+        return cachedFlag(item.url.path, inAliasCache: false).map { !$0 }
+    }
+
+    private static func cachedFlag(_ path: String, inAliasCache: Bool) -> Bool? {
+        packageCacheLock.lock()
+        defer { packageCacheLock.unlock() }
+        return inAliasCache ? aliasCache[path] : packageCache[path]
     }
 
     /// Whether a Finder alias points to a folder, from the alias's bookmark data (a small file
@@ -748,6 +1224,12 @@ enum ColumnBrowsing {
         return isPackage
     }
 
+    /// A sub-column's contents with each item's file identity.
+    struct Listing {
+        let items: [FileItem]
+        let fileIDs: [URL: FileIdentity]
+    }
+
     /// Contents of a sub-column, filtered and sorted like the main file list.
     static func loadItems(
         in folder: URL,
@@ -756,6 +1238,17 @@ enum ColumnBrowsing {
         foldersFirst: Bool,
         reusingIDs existingIDs: [URL: UUID] = [:]
     ) throws -> [FileItem] {
+        try loadListing(in: folder, showHiddenFiles: showHiddenFiles, sortState: sortState, foldersFirst: foldersFirst, reusingIDs: existingIDs).items
+    }
+
+    /// `loadItems`, with the items' file identities (to recognise renamed items).
+    static func loadListing(
+        in folder: URL,
+        showHiddenFiles: Bool,
+        sortState: SortState,
+        foldersFirst: Bool,
+        reusingIDs existingIDs: [URL: UUID] = [:]
+    ) throws -> Listing {
         // contentsOfDirectory(at:) doesn't follow a symlink in the last path component: list the
         // link's target, but keep the children under the link's path (browsed where it's listed)
         var directoryToList = folder
@@ -765,17 +1258,36 @@ enum ColumnBrowsing {
         }
         let listed = try FileManager.default.contentsOfDirectory(
             at: directoryToList,
-            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey, .isPackageKey],
+            includingPropertiesForKeys: [.isDirectoryKey, .fileSizeKey, .contentModificationDateKey, .creationDateKey, .contentTypeKey, .isPackageKey, .fileResourceIdentifierKey],
             options: showHiddenFiles ? [] : [.skipsHiddenFiles]
         )
         // Children keep the folder's path form (/tmp rather than /private/tmp, the link's path)
         let contents = URL.childURLs(listed, reRootedUnder: folder)
-        let fileItems = contents.map { url in
+        var fileIDs: [URL: FileIdentity] = [:]
+        fileIDs.reserveCapacity(contents.count)
+        let fileItems = zip(listed, contents).map { listedURL, url in
             // Warm the package cache from the prefetched value
             _ = isPackage(url)
+            // Prefetched with the listing
+            if let identity = FileIdentity(listedURL) {
+                fileIDs[url] = identity
+            }
             return FileItem(url: url, id: existingIDs[url] ?? UUID())
         }
-        return ListColumnConfigManager.sortedItems(fileItems, sortState: sortState, foldersFirst: foldersFirst)
+        return Listing(
+            items: ListColumnConfigManager.sortedItems(fileItems, sortState: sortState, foldersFirst: foldersFirst),
+            fileIDs: fileIDs
+        )
+    }
+
+    /// `url` once `old` (a folder it's in, or itself) moved to `new`; nil when it isn't inside `old`.
+    static func url(_ url: URL, movedFrom old: URL, to new: URL) -> URL? {
+        let path = url.standardizedPathKey
+        let oldPath = old.standardizedPathKey
+        if path == oldPath { return new }
+        let prefix = oldPath.hasSuffix("/") ? oldPath : oldPath + "/"
+        guard path.hasPrefix(prefix) else { return nil }
+        return new.appendingPathComponent(String(path.dropFirst(prefix.count)), isDirectory: url.hasDirectoryPath)
     }
 
     /// A folder inside a ZIP archive, shown as a column from the archive's entries.
@@ -836,8 +1348,14 @@ struct SingleColumnView: View {
     let selectedItem: FileItem?
     let columnURL: URL
     @ObservedObject var viewModel: FileBrowserViewModel
-    let onSelect: (FileItem) -> Void
+    /// A click on a row: the item, its index in `items` and the modifier keys held
+    let onClick: (FileItem, Int, NSEvent.ModifierFlags) -> Void
     let onDoubleClick: (FileItem) -> Void
+    /// A row came on screen
+    let onRowAppear: (FileItem) -> Void
+    /// Background menu: New Folder and Refresh in this column's folder
+    let onNewFolder: () -> Void
+    let onRefresh: () -> Void
     @State private var dropTargetedItemID: UUID?
     @State private var isColumnDropTargeted = false
 
@@ -871,7 +1389,7 @@ struct SingleColumnView: View {
                                 .opacity(dropTargetedItemID == item.id ? 1 : 0)
                         )
                         .contentShape(Rectangle())
-                        .internalDrag(item: item)
+                        .fileDragItem(item)
                         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                             item: item,
                             viewModel: viewModel,
@@ -881,16 +1399,8 @@ struct SingleColumnView: View {
                             id: item.id,
                             onSingleClick: {
                                 if let index = items.firstIndex(of: item) {
-                                    let modifiers = NSEvent.modifierFlags
-                                    viewModel.handleSelection(
-                                        item: item,
-                                        index: index,
-                                        in: items,
-                                        withShift: modifiers.contains(.shift),
-                                        withCommand: modifiers.contains(.command)
-                                    )
+                                    onClick(item, index, NSEvent.modifierFlags)
                                 }
-                                onSelect(item)
                             },
                             onDoubleClick: {
                                 onDoubleClick(item)
@@ -901,8 +1411,13 @@ struct SingleColumnView: View {
                                 viewModel.renamingURL = item.url
                             }
                         }
+                        .onAppear {
+                            onRowAppear(item)
+                        }
                     }
                 }
+                // Dragging a selected item drags the whole selection
+                .fileDragContainer(for: viewModel)
             }
             .frame(width: appSettings.columnWidthValue)
             .onDrop(of: DropHelper.acceptedDropTypes, delegate: ColumnBackgroundDropDelegate(
@@ -915,9 +1430,10 @@ struct SingleColumnView: View {
                 RoundedRectangle(cornerRadius: 4)
                     .stroke(isColumnDropTargeted && dropTargetedItemID == nil ? Color.accentColor : Color.clear, lineWidth: 2)
             )
+            // The background menu acts on this column's folder
             .contextMenu {
                 Button("New Folder") {
-                    viewModel.createNewFolder()
+                    onNewFolder()
                 }
 
                 if viewModel.canPaste {
@@ -930,11 +1446,15 @@ struct SingleColumnView: View {
                 Divider()
 
                 Button("Refresh") {
-                    viewModel.refresh()
+                    onRefresh()
                 }
 
                 Button("Show in Finder") {
-                    viewModel.showInFinder()
+                    if columnURL.isFileURL && !viewModel.isInsideArchive {
+                        NSWorkspace.shared.activateFileViewerSelecting([columnURL])
+                    } else {
+                        viewModel.showInFinder()
+                    }
                 }
             }
             .onAppear {
@@ -961,6 +1481,10 @@ struct ColumnRowView: View {
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
+    /// Chevron and tags read in the background (drawing never reads the disk), for `loadedURL`
+    @State private var loadedURL: URL?
+    @State private var loadedIsBrowsableFolder: Bool?
+    @State private var loadedTags: [String]?
 
     var body: some View {
         HStack(spacing: 8) {
@@ -973,19 +1497,67 @@ struct ColumnRowView: View {
 
             InlineRenameField(item: item, viewModel: viewModel, font: appSettings.columnFont, alignment: .leading, lineLimit: 1)
 
-            if appSettings.showItemTags, !item.tags.isEmpty {
-                TagDotsView(tags: item.tags)
+            if appSettings.showItemTags, !tags.isEmpty {
+                TagDotsView(tags: tags)
             }
 
             Spacer()
 
-            if ColumnBrowsing.isBrowsableFolder(item) {
+            if isBrowsableFolder {
                 Image(systemName: "chevron.right")
                     .font(appSettings.columnDetailFont)
                     .foregroundColor(.secondary)
             }
         }
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
+        .onAppear {
+            loadDetailsIfNeeded()
+        }
+        .onChange(of: item.url) { _, _ in
+            loadDetailsIfNeeded()
+        }
+        .onChange(of: viewModel.tagRefreshToken) { _, _ in
+            // Tags changed (refresh, edits): read them again
+            loadDetailsIfNeeded()
+        }
+        .onChange(of: appSettings.showItemTags) { _, _ in
+            loadDetailsIfNeeded()
+        }
+    }
+
+    private var hasReadableTags: Bool {
+        appSettings.showItemTags && !item.isFromArchive && item.url.isFileURL
+    }
+
+    private var isBrowsableFolder: Bool {
+        if let cached = ColumnBrowsing.cachedIsBrowsableFolder(item) { return cached }
+        if loadedURL == item.url, let loadedIsBrowsableFolder { return loadedIsBrowsableFolder }
+        // Until it's known: folders are, packages and other files aren't
+        return item.isDirectory && !item.isPackage
+    }
+
+    private var tags: [String] {
+        guard hasReadableTags else { return [] }
+        if let cached = FileTagManager.cachedTags(for: item.url) { return cached }
+        return loadedURL == item.url ? (loadedTags ?? []) : []
+    }
+
+    /// Reads what the caches don't know yet (alias/package status, tags) off the main thread.
+    private func loadDetailsIfNeeded() {
+        let item = item
+        let needsTags = hasReadableTags && FileTagManager.cachedTags(for: item.url) == nil
+        let needsFolderStatus = ColumnBrowsing.cachedIsBrowsableFolder(item) == nil
+        guard needsTags || needsFolderStatus else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            // Both fill their caches
+            let isBrowsableFolder = ColumnBrowsing.isBrowsableFolder(item)
+            let tags = needsTags ? FileTagManager.getTags(for: item.url) : nil
+            DispatchQueue.main.async {
+                loadedURL = item.url
+                loadedIsBrowsableFolder = isBrowsableFolder
+                loadedTags = tags
+            }
+        }
     }
 }
 
@@ -1121,8 +1693,15 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
     @Binding var dropTargetedItemID: UUID?
     @Binding var isColumnDropTargeted: Bool
 
+    /// Not inside an archive, the Photos library or the network browser, and not into the root
+    /// column while it shows Spotlight results (they come from anywhere; folder rows still take drops).
     private var acceptsDrops: Bool {
-        !viewModel.isInsideArchive && columnURL.isFileURL && !DropHelper.isSidebarFavoriteDrag()
+        !viewModel.isInsideArchive
+            && !viewModel.isPhotosLibraryActive
+            && columnURL.isFileURL
+            && columnURL.path != "/Network"
+            && !(columnURL == viewModel.currentPath && FileListActions.showsSearchResults(viewModel))
+            && !DropHelper.isSidebarFavoriteDrag()
     }
 
     private func isUsefulDrop() -> Bool {

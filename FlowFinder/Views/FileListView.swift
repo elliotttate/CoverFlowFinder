@@ -20,8 +20,9 @@ struct FileListView: View {
         )
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // The table takes file drops itself; this catches what it doesn't (file promises from
-        // Mail, Photos, Safari) and shows the badge of the operation that will happen.
-        .onDrop(of: DropHelper.acceptedDropTypes, delegate: ContainerDropDelegate(
+        // Mail, Photos, Safari) and shows the badge of the operation that will happen. Those go into
+        // the folder shown, so none while the list shows Spotlight results.
+        .onDrop(of: FileListActions.showsSearchResults(viewModel) ? [] : DropHelper.acceptedDropTypes, delegate: ContainerDropDelegate(
             viewModel: viewModel,
             isDropTargeted: $isDropTargeted,
             containerHeight: 0,
@@ -140,32 +141,6 @@ enum FileListKeyboardNavigation {
 
 // MARK: - Tags View
 
-struct TagsView: View {
-    @EnvironmentObject private var appSettings: AppSettings
-    let url: URL
-    @State private var tags: [String] = []
-
-    var body: some View {
-        Group {
-            if appSettings.showItemTags {
-                HStack(spacing: 4) {
-                    ForEach(tags.prefix(3), id: \.self) { tag in
-                        TagBadge(name: tag)
-                    }
-                    if tags.count > 3 {
-                        Text("+\(tags.count - 3)")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                    }
-                }
-            }
-        }
-        .onAppear {
-            tags = FileTagManager.getTags(for: url)
-        }
-    }
-}
-
 /// Displays tag dots inline (Finder-style) - just colored circles
 struct TagDotsView: View {
     @EnvironmentObject private var appSettings: AppSettings
@@ -188,27 +163,6 @@ struct TagDotsView: View {
     }
 }
 
-struct TagBadge: View {
-    let name: String
-
-    var body: some View {
-        Text(name)
-            .font(.caption2)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(tagColor.opacity(0.3))
-            .foregroundColor(tagColor)
-            .clipShape(Capsule())
-    }
-
-    private var tagColor: Color {
-        if let finderTag = FinderTag.from(name: name) {
-            return finderTag.color
-        }
-        return .accentColor
-    }
-}
-
 // MARK: - Cloud Status Badge
 
 /// Displays iCloud sync status as an SF Symbol badge
@@ -225,43 +179,3 @@ struct CloudStatusBadgeView: View {
         }
     }
 }
-
-/// Progress indicator for downloading/uploading cloud items
-struct CloudProgressBadgeView: View {
-    let status: CloudSyncStatus
-    var size: CGFloat = 14
-
-    var body: some View {
-        switch status {
-        case .downloading(let progress), .uploading(let progress):
-            if let progress = progress {
-                CircularProgressView(progress: progress, size: size)
-            } else {
-                ProgressView()
-                    .scaleEffect(size / 20)
-                    .frame(width: size, height: size)
-            }
-        default:
-            EmptyView()
-        }
-    }
-}
-
-/// Circular progress indicator
-struct CircularProgressView: View {
-    let progress: Double
-    let size: CGFloat
-
-    var body: some View {
-        ZStack {
-            Circle()
-                .stroke(Color.gray.opacity(0.3), lineWidth: 2)
-            Circle()
-                .trim(from: 0, to: progress)
-                .stroke(Color.accentColor, lineWidth: 2)
-                .rotationEffect(.degrees(-90))
-        }
-        .frame(width: size, height: size)
-    }
-}
-
