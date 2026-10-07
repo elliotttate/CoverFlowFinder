@@ -1206,10 +1206,18 @@ struct InlineRenameField: View {
     let lineLimit: Int
 
     @State private var editText: String = ""
+    /// Whether the field shows file extensions; fixed when editing starts.
+    @State private var showsExtensions: Bool = true
     @FocusState private var isFocused: Bool
     @State private var hasCommitted: Bool = false
     @State private var clickMonitor: Any?
     @State private var keyMonitor: Any?
+    /// The window the field is in: the key window when renaming starts.
+    @State private var fieldWindow = FieldWindow()
+
+    private final class FieldWindow {
+        weak var window: NSWindow?
+    }
 
     init(item: FileItem, viewModel: FileBrowserViewModel, font: Font = .body, alignment: TextAlignment = .leading, lineLimit: Int = 1) {
         self.item = item
@@ -1230,14 +1238,16 @@ struct InlineRenameField: View {
                 .onExitCommand { cancelRename() }
                 .onAppear {
                     hasCommitted = false
-                    editText = item.editingName
+                    showsExtensions = settings.showFileExtensions
+                    editText = item.editingName(showFileExtensions: showsExtensions)
+                    fieldWindow.window = NSApp.keyWindow
                     // Install synchronously so a rename that ends before the field takes focus
                     // still removes them (no monitors installed after the field is gone).
                     installMonitors()
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
                         guard !hasCommitted else { return }
                         isFocused = true
-                        selectAllText()
+                        selectInitialText()
                     }
                 }
                 .onDisappear {
@@ -1262,26 +1272,32 @@ struct InlineRenameField: View {
     private func installMonitors() {
         removeMonitors()
 
-        // Commit when a click lands outside the text field
+        // Commit when a click lands outside the text field: in another window, or in the field's
+        // window where it takes the focus from the field
         clickMonitor = NSEvent.addLocalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { event in
-            // Check if click is outside our text field by checking if the first responder changed
+            let clickedWindow = event.window
+            // Next turn, once the click has moved the focus
             DispatchQueue.main.async {
-                if let window = NSApp.keyWindow,
-                   let firstResponder = window.firstResponder,
-                   !(firstResponder is NSTextView) {
-                    if !hasCommitted {
+                guard !hasCommitted else { return }
+                if let window = fieldWindow.window {
+                    if clickedWindow !== window || !(window.firstResponder is NSTextView) {
                         commitRename()
                     }
+                } else if let window = NSApp.keyWindow, !(window.firstResponder is NSTextView) {
+                    commitRename()
                 }
             }
             return event
         }
 
-        // Tab / Shift+Tab: commit and move to the next / previous item
+        // Tab / Shift+Tab: commit and move to the next / previous item — only for Tab in the
+        // field's window
         keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
             guard !hasCommitted,
                   event.keyCode == 48,
-                  event.window?.firstResponder is NSTextView else {
+                  let window = event.window,
+                  fieldWindow.window == nil || window === fieldWindow.window,
+                  window.firstResponder is NSTextView else {
                 return event
             }
             if event.modifierFlags.contains(.shift) {
@@ -1309,7 +1325,7 @@ struct InlineRenameField: View {
         hasCommitted = true
         removeMonitors()
 
-        if let newName = Self.newName(forEditedText: editText, of: item) {
+        if let newName = item.newName(forEditedText: editText, showFileExtensions: showsExtensions) {
             viewModel.renameItem(item, to: newName)
         }
         viewModel.renamingURL = nil
@@ -1340,15 +1356,35 @@ struct InlineRenameField: View {
         viewModel.renamingURL = nil
     }
 
-    private func selectAllText() {
-        if let window = NSApp.keyWindow,
-           let fieldEditor = window.fieldEditor(false, for: nil) as? NSTextView {
+    /// Selects the name without its extension, as Finder does (all of it when there's none).
+    private func selectInitialText() {
+        guard let window = fieldWindow.window ?? NSApp.keyWindow,
+              let fieldEditor = window.fieldEditor(false, for: nil) as? NSTextView else { return }
+        let selection = item.editingSelection(showFileExtensions: showsExtensions)
+        let length = (fieldEditor.string as NSString).length
+        if fieldEditor.string == editText, NSMaxRange(selection) <= length {
+            fieldEditor.setSelectedRange(selection)
+        } else {
             fieldEditor.selectAll(nil)
         }
     }
 }
 
+// MARK: - Rename Naming Rule
+
+/// The one naming rule of every rename field (the inline field, the list's name cell, Tab/⇧Tab):
+/// - `editingName`: the text the field starts with.
+/// - `editingSelection`: what's selected in it when editing starts (all but `editingExtension`).
+/// - `newName(forEditedText:)`: the full new name for the text typed (nil: nothing to rename), to
+///   hand to `FileBrowserViewModel.renameItem(_:to:)`, which applies Finder's checks (a taken
+///   name, a leading ".", a volume) and asks before an extension is changed or removed.
+///
+/// With "Show file extensions" on, files are edited with their full name, so the extension can be
+/// changed or removed; with it off, the extension is left out of the field and kept. Folders and
+/// packages are always edited with their full name. ":" on disk is shown as "/". The forms without
+/// `showFileExtensions:` use the setting.
 extension FileItem {
+    /// The name without its extension; folders keep their full name ("my.folder").
     var nameWithoutExtension: String {
         if isDirectory { return name }
         let ext = url.pathExtension
@@ -1356,25 +1392,70 @@ extension FileItem {
         return String(name.dropLast(ext.count + 1))
     }
 
-    /// The text a rename field starts with: files without their extension, folders and packages
-    /// with their full name; ":" on disk shown as "/".
-    var editingName: String {
-        nameWithoutExtension.finderDisplayName
+    /// Whether the rename field holds the full name, extension included.
+    func editsFullName(showFileExtensions: Bool) -> Bool {
+        showFileExtensions || isDirectory || url.pathExtension.isEmpty
     }
 
-    /// The full new name for `text` typed in a rename field (inline field, list, Tab/⇧Tab), or nil
-    /// when nothing should change. A file's extension is re-appended unless the user typed it
-    /// (any case: "Notes.TXT" changes the extension's case); folders and packages are edited with
-    /// their full name, so nothing is appended ("my.folder" → "x" stays "x", "Foo.app" stays
-    /// "Foo.app"). Whitespace is kept, as in Finder; "/" is stored as ":" by the rename itself.
-    func newName(forEditedText text: String) -> String? {
+    func editingName(showFileExtensions: Bool) -> String {
+        (editsFullName(showFileExtensions: showFileExtensions) ? name : nameWithoutExtension).finderDisplayName
+    }
+
+    /// The extension the rename field shows but leaves unselected when editing starts (a file's or
+    /// package's, with its extension in the field), or nil when all of the text is selected.
+    func editingExtension(showFileExtensions: Bool) -> String? {
+        let ext = url.pathExtension
+        guard !ext.isEmpty, !isDirectory || isPackage, editsFullName(showFileExtensions: showFileExtensions),
+              name.utf16.count > ext.utf16.count + 1 else { return nil }
+        return ext
+    }
+
+    /// A UTF-16 range of `editingName(showFileExtensions:)`: the name without its extension when
+    /// the field shows a file's or package's extension (as Finder selects it), else everything.
+    func editingSelection(showFileExtensions: Bool) -> NSRange {
+        let length = (editingName(showFileExtensions: showFileExtensions) as NSString).length
+        guard let ext = editingExtension(showFileExtensions: showFileExtensions) else {
+            return NSRange(location: 0, length: length)
+        }
+        return NSRange(location: 0, length: length - ext.utf16.count - 1)
+    }
+
+    /// The full new name for `text` typed in the rename field, or nil when nothing should change.
+    /// When the field held the full name, the text is the new name: an extension typed differently
+    /// or deleted changes or removes it (the view model asks first). When it held the name without
+    /// the extension, the extension is re-appended unless the user typed it (any case:
+    /// "Notes.TXT" changes its case). Whitespace is kept, as in Finder; "/" is stored as ":" by
+    /// the rename itself.
+    func newName(forEditedText text: String, showFileExtensions: Bool) -> String? {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return nil }
-        let hiddenExtension = isDirectory ? "" : url.pathExtension
         var newName = text
-        if !hiddenExtension.isEmpty && !text.lowercased().hasSuffix("." + hiddenExtension.lowercased()) {
-            newName += "." + hiddenExtension
+        if !editsFullName(showFileExtensions: showFileExtensions) {
+            let hiddenExtension = url.pathExtension
+            if !text.lowercased().hasSuffix("." + hiddenExtension.lowercased()) {
+                newName += "." + hiddenExtension
+            }
         }
         return FileOperationEngine.fileSystemName(forDisplayName: newName) == name ? nil : newName
+    }
+
+    /// `editingName(showFileExtensions:)` for the "Show file extensions" setting.
+    @MainActor var editingName: String {
+        editingName(showFileExtensions: AppSettings.shared.showFileExtensions)
+    }
+
+    /// `editingSelection(showFileExtensions:)` for the "Show file extensions" setting.
+    @MainActor var editingSelection: NSRange {
+        editingSelection(showFileExtensions: AppSettings.shared.showFileExtensions)
+    }
+
+    /// `editingExtension(showFileExtensions:)` for the "Show file extensions" setting.
+    @MainActor var editingExtension: String? {
+        editingExtension(showFileExtensions: AppSettings.shared.showFileExtensions)
+    }
+
+    /// `newName(forEditedText:showFileExtensions:)` for the "Show file extensions" setting.
+    @MainActor func newName(forEditedText text: String) -> String? {
+        newName(forEditedText: text, showFileExtensions: AppSettings.shared.showFileExtensions)
     }
 }
 
