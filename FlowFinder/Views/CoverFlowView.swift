@@ -81,6 +81,7 @@ struct CoverFlowView: View {
     @State private var itemsToken: Int = 0
     @State private var selectionFlag = SelectionFlag()
     @State private var thumbState = CoverFlowThumbnailState()
+    @State private var stripReference = CoverFlowViewReference()
 
     // Pending thumbnail updates are applied in batches to reduce re-renders
     private let thumbnailBatchInterval: TimeInterval = 0.1
@@ -168,19 +169,28 @@ struct CoverFlowView: View {
                     cutItemURLs: viewModel.cutItemURLs,
                     coverScale: settings.coverFlowScaleValue,
                     scrollSensitivity: settings.coverFlowSwipeSpeedValue,
-                    currentFolderURL: viewModel.isInsideArchive ? nil : viewModel.currentPath,
-                    canModifyFolder: !viewModel.isInsideArchive,
+                    currentFolderURL: canModifyCurrentFolder ? viewModel.currentPath : nil,
+                    canModifyFolder: canModifyCurrentFolder,
+                    canShowFolderInfo: canShowCurrentFolderInfo,
                     focusViewModel: viewModel,
+                    reference: stripReference,
                     onSelect: { index, intent in
                         applySelection(at: index, intent: intent)
                     },
-                    onOpen: { index in
+                    onBrowse: { index in
+                        // Drag auto-scroll: the strip moves, the selection being dragged stays
                         if index < sortedItemsCache.count {
-                            viewModel.openItem(sortedItemsCache[index])
+                            setCentredIndex(index)
                         }
+                    },
+                    onOpen: { index in
+                        openFromStrip(at: index)
                     },
                     onOpenItems: { targets in
                         openItems(targets)
+                    },
+                    onItemCommand: { command, targets in
+                        performItemCommand(command, on: targets)
                     },
                     onDeselect: {
                         selectionFlag.userClearedSelection = true
@@ -209,7 +219,14 @@ struct CoverFlowView: View {
                         viewModel.cutSelectedItems()
                     },
                     onPaste: {
+                        guard canModifyCurrentFolder, viewModel.canPaste else {
+                            NSSound.beep()
+                            return
+                        }
                         viewModel.paste()
+                    },
+                    canPaste: {
+                        viewModel.canPaste
                     },
                     onDelete: {
                         viewModel.deleteSelectedItems()
@@ -218,15 +235,7 @@ struct CoverFlowView: View {
                         viewModel.navigateTo(item.url)
                     },
                     onQuickLook: { item in
-                        viewModel.previewURL(for: item) { previewURL in
-                            guard let previewURL = previewURL else {
-                                NSSound.beep()
-                                return
-                            }
-                            QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
-                                navigateSelection(by: offset)
-                            }
-                        }
+                        toggleQuickLook(for: item)
                     },
                     onExtendSelect: { index in
                         selectionFlag.userClearedSelection = false
@@ -243,6 +252,10 @@ struct CoverFlowView: View {
                         viewModel.selectedItems = Set(sortedItemsCache)
                     },
                     onNewFolder: {
+                        guard canModifyCurrentFolder else {
+                            NSSound.beep()
+                            return
+                        }
                         viewModel.createNewFolder()
                     },
                     onGetInfo: {
@@ -329,9 +342,13 @@ struct CoverFlowView: View {
         .onAppear {
             thumbState.isActive = true
             thumbState.loadedFolderPath = viewModel.currentPath
-            KeyboardManager.shared.clearHandler()
+            // Cover Flow handles its own keys: a handler registered in this window by the view it
+            // replaces mustn't take them (the strip also does this when it joins a window)
+            if let window = stripReference.window {
+                KeyboardManager.shared.clearHandler(in: window)
+            }
             updateSortedItems(using: items, updateToken: true, newToken: viewModel.coverFlowItemsToken)
-            syncSelection()
+            syncSelection(pruningHiddenItems: true)
             scheduleThumbnailPass()
         }
         .onDisappear {
@@ -353,11 +370,17 @@ struct CoverFlowView: View {
             noteSelectionChange()
             updateQuickLookForSelection()
         }
-        .onChange(of: viewModel.selectedItems) { _, newSelection in
+        .onChange(of: viewModel.selectedItems) { oldSelection, newSelection in
             // Sync Cover Flow selection when file list selection changes
             if newSelection.isEmpty {
+                // Emptied while its items are still shown: the user deselected (⌘-click in the
+                // list, a click on empty space). Keep it that way until something is selected.
+                if oldSelection.contains(where: { thumbState.indexByURL[$0.url] != nil }) {
+                    selectionFlag.userClearedSelection = true
+                }
                 updateQuickLook(for: nil)
             } else {
+                selectionFlag.userClearedSelection = false
                 syncSelection()
             }
         }
@@ -382,16 +405,23 @@ struct CoverFlowView: View {
         let orderChanged = !sortedItemsCache.elementsEqual(newItems) { $0.url == $1.url }
         Self.debugLog("[CoverFlow] onChange(items) old:\(sortedItemsCache.count) new:\(newItems.count) tokenChanged:\(tokenChanged) orderChanged:\(orderChanged)")
 
+        // A different folder in the same view: a deselection made in the last one doesn't carry over
+        let folderChanged = tokenChanged && viewModel.currentPath != thumbState.loadedFolderPath
+        if folderChanged {
+            selectionFlag.userClearedSelection = false
+        }
+
         // Update sortedItemsCache and selection synchronously so the embedded table
         // has the correct items for selection/navigation immediately (e.g. after deletion).
+        // Items the list no longer shows (filtered out, gone) leave the selection, as in Finder:
+        // nothing hidden may be acted on.
         updateSortedItems(using: newItems, updateToken: tokenChanged, newToken: newToken)
-        syncSelection()
+        syncSelection(pruningHiddenItems: true)
 
         if tokenChanged {
-            if viewModel.currentPath != thumbState.loadedFolderPath {
-                // A different folder in the same view: start over (cancels only our requests)
+            if folderChanged {
+                // Start over (cancels only our requests)
                 thumbState.loadedFolderPath = viewModel.currentPath
-                selectionFlag.userClearedSelection = false
                 thumbState.suspend()
                 thumbState.ledger.removeAll()
                 thumbState.lastHydrationRange = nil
@@ -500,8 +530,13 @@ struct CoverFlowView: View {
     // MARK: - Selection
 
     /// Selection flows one way: the view model's lead item decides which cover is centred.
-    private func syncSelection() {
+    /// `pruningHiddenItems`: the displayed items just changed; drop selected items no longer shown.
+    private func syncSelection(pruningHiddenItems: Bool = false) {
         Self.debugLog("[SELECTION] syncSelection: items=\(sortedItemsCache.count), index=\(viewModel.coverFlowSelectedIndex), selected=\(viewModel.selectedItems.count)")
+
+        if pruningHiddenItems {
+            pruneSelectionToDisplayedItems()
+        }
 
         guard !sortedItemsCache.isEmpty else { return }
 
@@ -541,6 +576,16 @@ struct CoverFlowView: View {
         selectCentredItemOnly(at: safeIndex)
     }
 
+    /// Keeps only the selected items the strip shows (Finder: filtering deselects what it hides),
+    /// so Copy, Move to Trash and the rest never act on items the user can't see.
+    private func pruneSelectionToDisplayedItems() {
+        let selected = viewModel.selectedItems
+        guard !selected.isEmpty else { return }
+        let shown = selected.filter { thumbState.indexByURL[$0.url] != nil }
+        guard shown.count != selected.count else { return }
+        viewModel.selectedItems = shown
+    }
+
     private func selectCentredItemOnly(at index: Int) {
         let item = sortedItemsCache[index]
         viewModel.selectedItems = [item]
@@ -553,7 +598,6 @@ struct CoverFlowView: View {
     /// never from the live keyboard state.
     private func applySelection(at index: Int, intent: CoverFlowSelectionIntent) {
         guard index >= 0, index < sortedItemsCache.count else { return }
-        selectionFlag.userClearedSelection = false
         viewModel.coverFlowSelectedIndex = index
         let item = sortedItemsCache[index]
         viewModel.handleSelection(
@@ -564,61 +608,165 @@ struct CoverFlowView: View {
             withCommand: intent.toggles,
             allowRename: false  // Disable click-to-rename in CoverFlow
         )
+        // A ⌘-click that deselected the last item is an explicit deselection: keep it
+        selectionFlag.userClearedSelection = viewModel.selectedItems.isEmpty
         updateQuickLook(for: item)
     }
 
+    // MARK: - Location
+
+    /// Whether the folder shown takes drops, pastes and new folders — the same rule as the list's
+    /// drop delegate: not inside an archive, the Photos library, the Network browser or Spotlight
+    /// results (which come from many folders; the search's root isn't where they are).
+    private var canModifyCurrentFolder: Bool {
+        !viewModel.isInsideArchive
+            && !viewModel.isPhotosLibraryActive
+            && viewModel.currentPath.isFileURL
+            && viewModel.currentPath.path != "/Network"
+            && !isShowingSearchResults
+    }
+
+    /// Whether the background menu's Get Info has a folder to describe.
+    private var canShowCurrentFolderInfo: Bool {
+        !viewModel.isInsideArchive && viewModel.currentPath.isFileURL && !isShowingSearchResults
+    }
+
+    private var isShowingSearchResults: Bool {
+        viewModel.searchMode == .finder && !viewModel.searchText.isEmpty
+    }
+
+    // MARK: - Actions
+
+    /// Return, ⌘↓ and double-click. Like the list, an item of a multi-selection opens all of it.
+    private func openFromStrip(at index: Int) {
+        guard index >= 0, index < sortedItemsCache.count else { return }
+        let item = sortedItemsCache[index]
+        if viewModel.selectedItems.count > 1, viewModel.selectedItems.contains(item) {
+            FileListActions.open(viewModel.orderedSelectedItems, primary: item, viewModel: viewModel)
+        } else {
+            viewModel.openItem(item)
+        }
+    }
+
+    /// Opens what a menu (or a double-click on a multi-selection) named, if it's still shown.
     private func openItems(_ targets: [FileItem]) {
-        guard !targets.isEmpty else { return }
-        if targets.count == 1 {
-            viewModel.openItem(targets[0])
+        let shown = displayedItems(of: targets)
+        guard let first = shown.first else { return }
+        if shown.count > 1 {
+            // A double-click collapsed the selection on its first click: it's still what's open
+            selectTargets(shown)
+        }
+        // The lead item (the one clicked) is the folder entered if several are opened
+        let primary = viewModel.primarySelectedItem.flatMap { shown.contains($0) ? $0 : nil } ?? first
+        FileListActions.open(shown, primary: primary, viewModel: viewModel)
+    }
+
+    private func displayedItems(of targets: [FileItem]) -> [FileItem] {
+        targets.filter { thumbState.indexByURL[$0.url] != nil }
+    }
+
+    /// Makes `targets` the selection (normally they already are), so the view model's selection
+    /// commands act on exactly what the menu showed — never on selected items it didn't.
+    private func selectTargets(_ targets: [FileItem]) {
+        let selection = Set(targets)
+        guard viewModel.selectedItems != selection else { return }
+        selectionFlag.userClearedSelection = false
+        viewModel.selectedItems = selection
+    }
+
+    /// A cover context-menu command, on the items the menu was built for.
+    private func performItemCommand(_ command: CoverFlowItemCommand, on targets: [FileItem]) {
+        let items = displayedItems(of: targets)
+        guard let first = items.first else {
+            NSSound.beep()
             return
         }
-        // Open every file; folders would each navigate this view, so open just the first one
-        let files = targets.filter { $0.fileType != .folder }
-        if files.isEmpty {
-            viewModel.openItem(targets[0])
-        } else {
-            files.forEach { viewModel.openItem($0) }
+        switch command {
+        case .copy:
+            selectTargets(items)
+            viewModel.copySelectedItems()
+        case .cut:
+            selectTargets(items)
+            viewModel.cutSelectedItems()
+        case .duplicate:
+            selectTargets(items)
+            viewModel.duplicateSelectedItems()
+        case .moveToTrash:
+            selectTargets(items)
+            viewModel.deleteSelectedItems()
+        case .getInfo:
+            viewModel.presentInfo(for: first)
+        case .rename:
+            // The embedded list edits the name in place
+            guard items.count == 1, !first.isFromArchive else {
+                NSSound.beep()
+                return
+            }
+            selectTargets(items)
+            viewModel.renamingURL = first.url
+        case .quickLook:
+            toggleQuickLook(for: first)
+        case .toggleTag(let tagName):
+            // Adds the tag to every item, or removes it from all of them if they all have it
+            let editable = items.filter { !$0.isFromArchive }
+            let allTagged = editable.allSatisfy { $0.tags.contains(tagName) }
+            for item in editable {
+                var tags = item.tags
+                if allTagged {
+                    tags.removeAll { $0 == tagName }
+                } else if !tags.contains(tagName) {
+                    tags.append(tagName)
+                } else {
+                    continue
+                }
+                viewModel.setTags(tags, for: item.url)
+            }
+        case .removeAllTags:
+            for item in items where !item.isFromArchive && !item.tags.isEmpty {
+                viewModel.setTags([], for: item.url)
+            }
         }
     }
 
     private func showInfoForCurrentFolder() {
-        guard !viewModel.isInsideArchive else {
+        guard canShowCurrentFolderInfo else {
             NSSound.beep()
             return
         }
-        NotificationCenter.default.post(name: .showGetInfo, object: FileItem(url: viewModel.currentPath))
+        viewModel.presentInfo(for: FileItem(url: viewModel.currentPath))
     }
 
+    // MARK: - Quick Look
+
+    private func toggleQuickLook(for item: FileItem) {
+        let reference = stripReference
+        viewModel.previewURL(for: item) { previewURL in
+            guard let previewURL = previewURL else {
+                NSSound.beep()
+                return
+            }
+            // Weak: the shared controller must not keep a closed tab's strip alive
+            QuickLookControllerView.shared.togglePreview(for: previewURL, in: reference.window) { [weak strip = reference.view] offset in
+                strip?.navigateQuickLook(by: offset)
+            }
+        }
+    }
+
+    /// Shows `item` in an open Quick Look panel, if the panel belongs to this window.
     private func updateQuickLook(for item: FileItem?) {
-        guard let item else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-            return
-        }
-        if let previewURL = viewModel.previewURL(for: item) {
-            QuickLookControllerView.shared.updatePreview(for: previewURL)
-        } else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
-        }
+        // Closed panel: nothing to do (and no preview file to prepare)
+        guard QuickLookControllerView.isPanelVisible, let window = stripReference.window else { return }
+        let previewURL = item.flatMap { viewModel.previewURL(for: $0) }
+        QuickLookControllerView.shared.updatePreview(for: previewURL, from: window)
     }
 
     private func updateQuickLookForSelection() {
         guard !sortedItemsCache.isEmpty else {
-            QuickLookControllerView.shared.updatePreview(for: nil)
+            updateQuickLook(for: nil)
             return
         }
         let index = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
         updateQuickLook(for: sortedItemsCache[index])
-    }
-
-    private func navigateSelection(by offset: Int) {
-        guard !sortedItemsCache.isEmpty else { return }
-
-        let currentIndex = min(max(0, viewModel.coverFlowSelectedIndex), sortedItemsCache.count - 1)
-        let newIndex = max(0, min(sortedItemsCache.count - 1, currentIndex + offset))
-        guard newIndex != currentIndex else { return }
-
-        applySelection(at: newIndex, intent: .plain)
     }
 
     // MARK: - Thumbnails
@@ -934,12 +1082,16 @@ struct CoverFlowContainer: NSViewRepresentable {
     let cutItemURLs: Set<URL>  // URLs of items marked for cut (dimmed)
     let coverScale: CGFloat
     let scrollSensitivity: CGFloat
-    let currentFolderURL: URL?  // Destination for drops onto the background (nil inside archives)
+    let currentFolderURL: URL?  // Destination for drops onto the background (nil where nothing can be dropped)
     let canModifyFolder: Bool
+    let canShowFolderInfo: Bool
     let focusViewModel: FileBrowserViewModel  // Identifies this view to `.focusFileList` posters
+    let reference: CoverFlowViewReference
     let onSelect: (Int, CoverFlowSelectionIntent) -> Void
+    let onBrowse: (Int) -> Void  // Centre a cover without selecting it (drag auto-scroll)
     let onOpen: (Int) -> Void
     let onOpenItems: ([FileItem]) -> Void
+    let onItemCommand: (CoverFlowItemCommand, [FileItem]) -> Void
     let onDeselect: () -> Void
     let onDrop: ([URL], FileDropOperation) -> Void
     let onDropToFolder: ([URL], URL, FileDropOperation) -> Void  // Drop to specific folder
@@ -947,6 +1099,7 @@ struct CoverFlowContainer: NSViewRepresentable {
     let onCopy: () -> Void
     let onCut: () -> Void
     let onPaste: () -> Void
+    let canPaste: () -> Bool
     let onDelete: () -> Void
     let onShowPackageContents: (FileItem) -> Void
     let onQuickLook: (FileItem) -> Void
@@ -989,9 +1142,12 @@ struct CoverFlowContainer: NSViewRepresentable {
     }
 
     private func configure(_ view: CoverFlowNSView) {
+        reference.view = view
         view.onSelect = onSelect
+        view.onBrowse = onBrowse
         view.onOpen = onOpen
         view.onOpenItems = onOpenItems
+        view.onItemCommand = onItemCommand
         view.onDeselect = onDeselect
         view.onDrop = onDrop
         view.onDropToFolder = onDropToFolder
@@ -999,6 +1155,7 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.onCopy = onCopy
         view.onCut = onCut
         view.onPaste = onPaste
+        view.canPaste = canPaste
         view.onDelete = onDelete
         view.onShowPackageContents = onShowPackageContents
         view.onQuickLook = onQuickLook
@@ -1014,19 +1171,54 @@ struct CoverFlowContainer: NSViewRepresentable {
         view.scrollSensitivity = scrollSensitivity
         view.currentFolderURL = currentFolderURL
         view.canModifyFolder = canModifyFolder
+        view.canShowFolderInfo = canShowFolderInfo
         view.focusViewModel = focusViewModel
+    }
+}
+
+/// The AppKit strip behind a `CoverFlowView`, for its SwiftUI side (which window it's in).
+final class CoverFlowViewReference {
+    weak var view: CoverFlowNSView?
+
+    var window: NSWindow? { view?.window }
+}
+
+/// What a cover's context menu does to the items it was opened on.
+enum CoverFlowItemCommand: Equatable {
+    case copy
+    case cut
+    case duplicate
+    case moveToTrash
+    case getInfo
+    case rename
+    case quickLook
+    case toggleTag(String)
+    case removeAllTags
+}
+
+/// A cover context-menu item's represented object: the command and the items it acts on.
+final class CoverFlowMenuAction: NSObject {
+    let command: CoverFlowItemCommand
+    let targets: [FileItem]
+
+    init(_ command: CoverFlowItemCommand, targets: [FileItem]) {
+        self.command = command
+        self.targets = targets
     }
 }
 
 class CoverFlowNSView: NSView, OpenWithActionTarget {
     var onSelect: ((Int, CoverFlowSelectionIntent) -> Void)?
+    var onBrowse: ((Int) -> Void)?
     var onOpen: ((Int) -> Void)?
     var onOpenItems: (([FileItem]) -> Void)?
+    var onItemCommand: ((CoverFlowItemCommand, [FileItem]) -> Void)?
     var onDeselect: (() -> Void)?
     var onScrollStateChange: ((Bool) -> Void)?
     var onCopy: (() -> Void)?
     var onCut: (() -> Void)?
     var onPaste: (() -> Void)?
+    var canPaste: (() -> Bool)?
     var onDelete: (() -> Void)?
     var onShowPackageContents: ((FileItem) -> Void)?
     var onQuickLook: ((FileItem) -> Void)?
@@ -1040,6 +1232,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     var cutItemURLs: Set<URL> = []  // URLs of items marked for cut (dimmed)
     var currentFolderURL: URL?
     var canModifyFolder = true
+    var canShowFolderInfo = true
     /// The view model this view shows; a `.focusFileList` notification may name it (or a window).
     weak var focusViewModel: FileBrowserViewModel?
 
@@ -1048,6 +1241,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     private var thumbnails: [URL: NSImage] = [:]
     /// The centred cover
     private(set) var selectedIndex: Int = 0
+    /// The centred index SwiftUI last asked for (the view model's); the strip leads while scrolling
+    private var requestedIndex: Int = 0
     private var coverLayers: [CALayer] = []
     private var layerPool: [CALayer] = []  // Reusable layer pool
     private var backgroundLayer: CAGradientLayer?
@@ -1057,6 +1252,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     /// A plain click on an item of a multi-selection keeps the selection (for dragging) and
     /// collapses it to that item on mouse-up if no drag started
     private var pendingCollapseIndex: Int?
+    /// The selection a click just collapsed, so a double-click opens all of it (like the list)
+    private var collapsedSelection: (index: Int, items: [FileItem])?
     /// Identity of the last mouse-down handled, to drop a re-delivery of the same click
     private var lastMouseDownIdentity: (timestamp: TimeInterval, eventNumber: Int, clickCount: Int)?
 
@@ -1065,6 +1262,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     private var isViewActive = false
     private var scrollSettleTimer: Timer?
     private var scrollAccumulator = CoverFlowScrollAccumulator()
+    /// The centred item when the current scroll began: settling only selects if it changed
+    private var scrollStartURL: URL?
 
     // Type-ahead search
     private var typeAheadBuffer: String = ""
@@ -1112,7 +1311,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     var onDropToFolder: (([URL], URL, FileDropOperation) -> Void)?  // Drop to specific folder
     private var dragStartLocation: NSPoint?
     private var dragStartIndex: Int?
-    private var dropTargetIndex: Int?  // Which folder cover is being hovered
+    private var dropTargetIndex: Int?  // Which cover takes the drop (folder or application)
     private var dropTargetHighlightLayer: CAShapeLayer?  // Visible hover ring
     private var dragSessionInfo: DragSessionInfo?
 
@@ -1122,6 +1321,16 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         let sourceURLs: [URL]
         let sourceVolumes: [NSObject?]
         var destinationVolumes: [URL: NSObject?] = [:]
+        /// Whether each application hovered can open everything dragged
+        var openableByApplication: [URL: Bool] = [:]
+    }
+
+    /// What dropping on a cover does.
+    private enum CoverDropAction: Equatable {
+        /// Move or copy into the folder
+        case folder(URL)
+        /// Open the dropped items with the application (Finder); never copies into the bundle
+        case application(URL)
     }
 
     // Inline video preview (mirrors Finder's TDesktopInlinePreviewController)
@@ -1471,16 +1680,19 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             CoverFlowView.debugLog("[NSView] updateItems - ITEMS CHANGED oldToken:\(self.itemsToken) newToken:\(itemsToken) oldCount:\(self.items.count) newCount:\(items.count)")
         }
 
+        let previousItems = self.items
         self.items = items
         self.itemsToken = itemsToken
         self.thumbnails = thumbnails
+        requestedIndex = selectedIndex
 
-        // While the user scrolls, the strip leads and the incoming index lags behind
-        let shouldSyncSelection = itemsChanged || !isScrolling
-        let indexChanged = self.selectedIndex != selectedIndex
-        if shouldSyncSelection {
-            self.selectedIndex = selectedIndex
-        }
+        // While the user scrolls, the strip leads and the incoming index lags behind: keep the
+        // centred item, following it if the list changed under it
+        let newIndex = isScrolling
+            ? Self.index(following: self.selectedIndex, from: previousItems, to: items)
+            : selectedIndex
+        let indexChanged = self.selectedIndex != newIndex
+        self.selectedIndex = newIndex
 
         if itemsChanged {
             emptyRebuildWorkItem?.cancel()
@@ -1501,10 +1713,10 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
                 layer?.setNeedsLayout()
                 layer?.layoutIfNeeded()
             }
-            if shouldSyncSelection && indexChanged {
+            if indexChanged {
                 centredIndexDidChange()
             }
-        } else if indexChanged && shouldSyncSelection {
+        } else if indexChanged {
             animateToSelection()
             centredIndexDidChange()
             DispatchQueue.main.async { [weak self] in
@@ -1513,6 +1725,21 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         } else {
             updateCoverImages()
         }
+    }
+
+    /// Where the item at `index` of `oldItems` is in `newItems` (clamped if it's gone).
+    static func index(following index: Int, from oldItems: [FileItem], to newItems: [FileItem]) -> Int {
+        guard !newItems.isEmpty else { return 0 }
+        if index >= 0, index < oldItems.count {
+            let url = oldItems[index].url
+            if index < newItems.count, newItems[index].url == url {
+                return index
+            }
+            if let moved = newItems.firstIndex(where: { $0.url == url }) {
+                return moved
+            }
+        }
+        return min(max(0, index), newItems.count - 1)
     }
 
     private func updateCoverImages() {
@@ -2000,9 +2227,17 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         return CoverFlowGeometry.hitTest(point, candidates: coverCandidates(), stripBand: band, maxGap: coverSpacing)
     }
 
-    /// The index of the cover under `point` (view coordinates). Used for clicks, hover, drop targets.
+    /// The index of the cover under `point` (view coordinates). Used for clicks and hover.
     func coverIndex(at point: NSPoint) -> Int? {
         coverHit(at: point)?.index
+    }
+
+    /// The cover whose drawn outline contains `point`. Drops use this, without the nearest-cover
+    /// fallback that makes clicks forgiving: a drop between two covers goes into the folder
+    /// shown, not into a neighbouring subfolder.
+    func dropTargetCoverIndex(at point: NSPoint) -> Int? {
+        guard let hit = coverHit(at: point), hit.quad.contains(point) else { return nil }
+        return hit.index
     }
 
     // MARK: - Event Handling
@@ -2041,6 +2276,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         window?.makeFirstResponder(self)
         pendingCollapseIndex = nil
+        let collapsed = collapsedSelection
+        collapsedSelection = nil
 
         if event.modifierFlags.contains(.control) {
             showContextMenu(for: event)
@@ -2057,7 +2294,12 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         let isNearLastClick = clickDistance < 50 // points
 
         if isWithinDoubleClickTime && isNearLastClick && lastClickIndex >= 0 && lastClickIndex < items.count {
-            onOpen?(lastClickIndex)
+            if let collapsed, collapsed.index == lastClickIndex {
+                // The first click collapsed a multi-selection: open all of it, like the list
+                onOpenItems?(collapsed.items)
+            } else {
+                onOpen?(lastClickIndex)
+            }
             lastClickTime = .distantPast
             lastClickIndex = -1
             lastClickLocation = .zero
@@ -2118,7 +2360,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
                 itemsToDrag = [clickedItem]
             }
 
-            let draggableItems = itemsToDrag.filter { !$0.isFromArchive }
+            // Only real files: archive entries and Photos assets (photos:// URLs) aren't files
+            let draggableItems = itemsToDrag.filter { !$0.isFromArchive && $0.url.isFileURL }
             guard !draggableItems.isEmpty else { return }
 
             // Create dragging items for each file
@@ -2157,6 +2400,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         if let index = pendingCollapseIndex {
             // Clicked an item of a multi-selection without dragging: select just it (Finder behavior)
             pendingCollapseIndex = nil
+            collapsedSelection = (index, orderedSelectedItems())
             selectIndexLocally(index, forceNotify: true)
         }
         dragStartLocation = nil
@@ -2192,18 +2436,32 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             selectIndexLocally(index, forceNotify: true)
             targets = [clickedItem]
         }
-        return createContextMenu(for: targets.isEmpty ? [clickedItem] : targets)
+        return createContextMenu(for: targets.isEmpty ? [clickedItem] : targets, clickedItem: clickedItem)
     }
 
-    /// Selected items in display order.
+    /// Selected items in display order. Only shown items: a filter may hide part of the selection.
     private func orderedSelectedItems() -> [FileItem] {
-        guard selectedItems.count > 1 else { return Array(selectedItems) }
-        return items.filter { selectedItems.contains($0) }
+        items.filter { selectedItems.contains($0) }
     }
 
-    private func createContextMenu(for targets: [FileItem]) -> NSMenu {
+    /// Every action acts on `targets` (the menu item's represented object), never on whatever is
+    /// selected when it runs.
+    private func createContextMenu(for targets: [FileItem], clickedItem: FileItem) -> NSMenu {
         let menu = NSMenu()
+        menu.autoenablesItems = false
         let singleItem = targets.count == 1 ? targets.first : nil
+        let anyFromArchive = targets.contains { $0.isFromArchive }
+        // Photos assets and network services aren't files: no file operations on them
+        let allFiles = targets.allSatisfy { $0.isFromArchive || $0.url.isFileURL }
+        let canEdit = !anyFromArchive && allFiles
+
+        func addItem(_ title: String, _ command: CoverFlowItemCommand, on items: [FileItem] = targets, enabled: Bool = true, to submenu: NSMenu? = nil) {
+            let item = NSMenuItem(title: title, action: #selector(menuItemCommand(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = CoverFlowMenuAction(command, targets: items)
+            item.isEnabled = enabled
+            (submenu ?? menu).addItem(item)
+        }
 
         let openItem = NSMenuItem(title: "Open", action: #selector(menuOpen(_:)), keyEquivalent: "")
         openItem.target = self
@@ -2211,7 +2469,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         menu.addItem(openItem)
 
         // Show Package Contents for bundles like .app
-        if let item = singleItem, !item.isFromArchive, isPackage(item) {
+        if let item = singleItem, !item.isFromArchive, item.url.isFileURL, isPackage(item) {
             let packageItem = NSMenuItem(title: "Show Package Contents", action: #selector(menuShowPackageContents(_:)), keyEquivalent: "")
             packageItem.target = self
             packageItem.representedObject = item
@@ -2219,7 +2477,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         }
 
         // Open With submenu (only for non-archive files)
-        let openWithURLs = targets.filter { !$0.isFromArchive && !$0.isDirectory }.map(\.url)
+        let openWithURLs = targets.filter { !$0.isFromArchive && !$0.isDirectory && $0.url.isFileURL }.map(\.url)
         if !openWithURLs.isEmpty && openWithURLs.count == targets.count {
             let openWithItem = NSMenuItem(title: "Open With", action: nil, keyEquivalent: "")
             openWithItem.submenu = OpenWithMenuBuilder.buildNSMenu(for: openWithURLs, target: self)
@@ -2228,33 +2486,64 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         menu.addItem(NSMenuItem.separator())
 
-        let copyItem = NSMenuItem(title: "Copy", action: #selector(menuCopy(_:)), keyEquivalent: "")
-        copyItem.target = self
-        menu.addItem(copyItem)
-
-        let cutItem = NSMenuItem(title: "Cut", action: #selector(menuCut(_:)), keyEquivalent: "")
-        cutItem.target = self
-        menu.addItem(cutItem)
+        addItem("Get Info", .getInfo, on: [clickedItem], enabled: canEdit)
+        addItem("Quick Look", .quickLook, on: [clickedItem])
 
         menu.addItem(NSMenuItem.separator())
 
-        let trashItem = NSMenuItem(title: "Move to Trash", action: #selector(menuTrash(_:)), keyEquivalent: "")
-        trashItem.target = self
-        if targets.contains(where: { $0.isFromArchive }) {
-            trashItem.isEnabled = false
+        // Tags submenu
+        if canEdit {
+            let targetTags = targets.map(\.tags)
+            let tagsMenu = NSMenu(title: "Tags")
+            tagsMenu.autoenablesItems = false
+            for tag in FinderTag.allTags {
+                let tagItem = NSMenuItem(title: tag.name, action: #selector(menuItemCommand(_:)), keyEquivalent: "")
+                tagItem.target = self
+                tagItem.representedObject = CoverFlowMenuAction(.toggleTag(tag.name), targets: targets)
+                let taggedCount = targetTags.filter { $0.contains(tag.name) }.count
+                tagItem.state = taggedCount == 0 ? .off : (taggedCount == targets.count ? .on : .mixed)
+                tagItem.image = Self.tagColorImage(NSColor(tag.color))
+                tagsMenu.addItem(tagItem)
+            }
+            if targetTags.contains(where: { !$0.isEmpty }) {
+                tagsMenu.addItem(NSMenuItem.separator())
+                addItem("Remove All Tags", .removeAllTags, to: tagsMenu)
+            }
+            let tagsMenuItem = NSMenuItem(title: "Tags", action: nil, keyEquivalent: "")
+            tagsMenuItem.submenu = tagsMenu
+            menu.addItem(tagsMenuItem)
+
+            menu.addItem(NSMenuItem.separator())
         }
-        menu.addItem(trashItem)
+
+        addItem("Copy", .copy, enabled: allFiles)
+        addItem("Cut", .cut, enabled: allFiles)
+        addItem("Duplicate", .duplicate, enabled: canEdit)
+
+        menu.addItem(NSMenuItem.separator())
+
+        addItem("Rename", .rename, enabled: canEdit && singleItem != nil)
+        addItem("Move to Trash", .moveToTrash, enabled: canEdit)
+
+        menu.addItem(NSMenuItem.separator())
 
         let finderItem = NSMenuItem(title: "Show in Finder", action: #selector(menuShowInFinder(_:)), keyEquivalent: "")
         finderItem.target = self
         finderItem.representedObject = targets
-        if targets.contains(where: { $0.isFromArchive && $0.archiveURL == nil }) {
+        if targets.contains(where: { ($0.isFromArchive && $0.archiveURL == nil) || (!$0.isFromArchive && !$0.url.isFileURL) }) {
             finderItem.isEnabled = false
         }
         menu.addItem(finderItem)
 
-        menu.autoenablesItems = false
         return menu
+    }
+
+    private static func tagColorImage(_ color: NSColor) -> NSImage {
+        NSImage(size: NSSize(width: 12, height: 12), flipped: false) { rect in
+            color.setFill()
+            NSBezierPath(ovalIn: rect).fill()
+            return true
+        }
     }
 
     /// Menu for a right-click on the background (no cover under the mouse).
@@ -2269,14 +2558,14 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         let pasteItem = NSMenuItem(title: "Paste", action: #selector(menuPaste(_:)), keyEquivalent: "")
         pasteItem.target = self
-        pasteItem.isEnabled = canModifyFolder
+        pasteItem.isEnabled = canModifyFolder && (canPaste?() ?? false)
         menu.addItem(pasteItem)
 
         menu.addItem(NSMenuItem.separator())
 
         let infoItem = NSMenuItem(title: "Get Info", action: #selector(menuGetInfo(_:)), keyEquivalent: "")
         infoItem.target = self
-        infoItem.isEnabled = canModifyFolder
+        infoItem.isEnabled = canShowFolderInfo
         menu.addItem(infoItem)
 
         return menu
@@ -2287,16 +2576,9 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         onOpenItems?(targets)
     }
 
-    @objc private func menuCopy(_ sender: NSMenuItem) {
-        onCopy?()
-    }
-
-    @objc private func menuCut(_ sender: NSMenuItem) {
-        onCut?()
-    }
-
-    @objc private func menuTrash(_ sender: NSMenuItem) {
-        onDelete?()
+    @objc private func menuItemCommand(_ sender: NSMenuItem) {
+        guard let action = sender.representedObject as? CoverFlowMenuAction else { return }
+        onItemCommand?(action.command, action.targets)
     }
 
     @objc private func menuShowInFinder(_ sender: NSMenuItem) {
@@ -2359,6 +2641,9 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
         registerPreviewHostIfNeeded()
         requestFocus(onlyIfNothingFocused: false)
+        // This view handles its own keys: a handler the replaced view registered in this window
+        // (not another window's) mustn't take them
+        KeyboardManager.shared.clearHandler(in: window)
 
         // Observe first responder changes to debug focus loss
         if CoverFlowView.isDebugLoggingEnabled {
@@ -2462,6 +2747,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
     @objc private func windowDidResignKey(_ notification: Notification) {
         updateActivityState()
+        // Hover tracking only runs in the key window: no mouse-exit will come to stop the preview
+        stopOwnedVideoPreview()
     }
 
     @objc private func windowDidMiniaturize(_ notification: Notification) {
@@ -2599,6 +2886,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         if scrolling != wasScrolling {
             onScrollStateChange?(scrolling)
             if scrolling {
+                scrollStartURL = selectedIndex < items.count ? items[selectedIndex].url : nil
                 // Covers are about to move under the mouse: stop the hover preview
                 stopOwnedVideoPreview()
             }
@@ -2623,9 +2911,22 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
     }
 
     private func onScrollSettled() {
-        // Notify SwiftUI before flipping scroll state to avoid selection snap-back
-        onSelect?(selectedIndex, .plain)
+        // Only a scroll that moved the strip to another item selects it: a brush that moved
+        // nothing keeps a multi-selection
+        let centredURL = selectedIndex < items.count ? items[selectedIndex].url : nil
+        let moved = centredURL != scrollStartURL
+        scrollStartURL = nil
+        if moved {
+            // Notify SwiftUI before flipping scroll state to avoid selection snap-back
+            onSelect?(selectedIndex, .plain)
+        }
         setScrolling(false)
+        if !moved, requestedIndex != selectedIndex, requestedIndex >= 0, requestedIndex < items.count {
+            // The view model moved meanwhile (the strip ignores it while scrolling): follow it
+            selectedIndex = requestedIndex
+            animateToSelection()
+            centredIndexDidChange()
+        }
 
         // The user scrolled the strip: take focus (unless typing somewhere)
         ensureFirstResponder()
@@ -2748,6 +3049,11 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         } else {
             selectIndexLocally(newIndex)
         }
+    }
+
+    /// Arrow keys pressed while the Quick Look panel is key: a plain move, like the arrow keys here.
+    func navigateQuickLook(by offset: Int) {
+        moveSelection(to: selectedIndex + offset, extend: false)
     }
 
     private var isTypeAheadActive: Bool {
@@ -2877,45 +3183,90 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         let now = Date()
         guard now.timeIntervalSince(lastAutoScrollTime) >= autoScrollInterval else { return }
 
-        // Check if near left or right edges; scrolling is a plain selection whatever keys are held
+        // Near the left or right edge: bring the next cover to the centre without selecting it
+        // (the selection may be what's being dragged)
         if location.x < autoScrollEdgeThreshold && selectedIndex > 0 {
             lastAutoScrollTime = now
-            selectIndexLocally(selectedIndex - 1, forceNotify: true)
+            browse(to: selectedIndex - 1)
         } else if location.x > viewWidth - autoScrollEdgeThreshold && selectedIndex < items.count - 1 {
             lastAutoScrollTime = now
-            selectIndexLocally(selectedIndex + 1, forceNotify: true)
+            browse(to: selectedIndex + 1)
         }
+    }
+
+    /// Centres a cover without changing the selection.
+    private func browse(to index: Int) {
+        guard index >= 0, index < items.count, index != selectedIndex else { return }
+        selectedIndex = index
+        animateToSelection()
+        centredIndexDidChange()
+        onBrowse?(index)
     }
 
     /// The cursor badge for the current drag, matching what a drop here would do.
     private func proposedDragOperation(for sender: NSDraggingInfo) -> NSDragOperation {
-        let destination: URL
-        if let target = dropTargetIndex, target < items.count {
-            destination = items[target].url
-        } else if canModifyFolder, let folder = currentFolderURL {
-            destination = folder
-        } else {
-            return []
-        }
-
         var info = dragSessionInfo(for: sender)
         defer { dragSessionInfo = info }
+        let sourceMask = sender.draggingSourceOperationMask
 
-        // Dropping items back into the folder they're in does nothing
-        if dropTargetIndex == nil, !info.sourceURLs.isEmpty,
-           info.sourceURLs.allSatisfy({ $0.deletingLastPathComponent().standardizedFileURL == destination.standardizedFileURL }) {
-            return []
+        let destination: URL
+        switch dropTargetIndex.flatMap({ dropAction(forCover: $0, info: &info) }) {
+        case .application?:
+            // Opening needs no file operation: the plain arrow
+            if sourceMask.contains(.generic) { return .generic }
+            return sourceMask.contains(.copy) ? .copy : []
+        case .folder(let folderURL)?:
+            destination = folderURL
+        case nil:
+            guard canModifyFolder, let folder = currentFolderURL else { return [] }
+            destination = folder
+            // Dropping items back into the folder they're in does nothing
+            if !info.sourceURLs.isEmpty,
+               info.sourceURLs.allSatisfy({ $0.deletingLastPathComponent().standardizedFileURL == destination.standardizedFileURL }) {
+                return []
+            }
         }
 
         let operation = CoverFlowDropPolicy.operation(
             modifierFlags: NSEvent.modifierFlags,
-            sourceMask: sender.draggingSourceOperationMask
+            sourceMask: sourceMask
         )
         return CoverFlowDropPolicy.dragOperation(
             for: operation,
-            sourceMask: sender.draggingSourceOperationMask,
+            sourceMask: sourceMask,
             sameVolume: isSameVolume(&info, destination: destination)
         )
+    }
+
+    /// What a drop on cover `index` does, or nil if the cover doesn't take drops (the drop then
+    /// goes to the folder shown). Folders take drops; packages aren't folders — documents
+    /// dropped on an application open with it (Finder), nothing is moved into a bundle.
+    private func dropAction(forCover index: Int, info: inout DragSessionInfo) -> CoverDropAction? {
+        guard index >= 0, index < items.count else { return nil }
+        let item = items[index]
+        guard !item.isFromArchive, item.url.isFileURL, item.isDirectory else { return nil }
+        let target = item.url.standardizedFileURL
+        // Not onto itself
+        guard !info.sourceURLs.contains(where: { $0.standardizedFileURL == target }) else { return nil }
+        if item.isPackage || item.fileType == .application {
+            guard item.fileType == .application, applicationCanOpen(item.url, info: &info) else { return nil }
+            return .application(item.url)
+        }
+        return .folder(item.url)
+    }
+
+    /// Whether the application can open everything being dragged (looked up once per drag).
+    private func applicationCanOpen(_ appURL: URL, info: inout DragSessionInfo) -> Bool {
+        if let known = info.openableByApplication[appURL] {
+            return known
+        }
+        let app = appURL.standardizedFileURL
+        // Bounded: a huge drag isn't checked file by file
+        let canOpen = !info.sourceURLs.isEmpty && info.sourceURLs.prefix(50).allSatisfy { url in
+            NSWorkspace.shared.urlsForApplications(toOpen: url).contains { $0.standardizedFileURL == app }
+        }
+        info.openableByApplication[appURL] = canOpen
+        return canOpen
     }
 
     private func dragSessionInfo(for sender: NSDraggingInfo) -> DragSessionInfo {
@@ -2979,7 +3330,8 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             updateDropTarget(from: sender)
         }
 
-        let targetIndex = dropTargetIndex
+        var info = dragSessionInfo(for: sender)
+        let action = dropTargetIndex.flatMap { dropAction(forCover: $0, info: &info) }
         clearDropTargetHighlight()
         dropTargetIndex = nil
         dragSessionInfo = nil
@@ -2989,19 +3341,19 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
             return false
         }
 
-        // If dropping on a folder, drop into that folder
-        if let targetIndex = targetIndex,
-           targetIndex < items.count,
-           items[targetIndex].isDirectory,
-           !items[targetIndex].isFromArchive {
-            onDropToFolder?(urls, items[targetIndex].url, operation)
+        switch action {
+        case .application(let appURL)?:
+            OpenWithMenuBuilder.openFiles(urls, withAppAt: appURL)
+            return true
+        case .folder(let folderURL)?:
+            onDropToFolder?(urls, folderURL, operation)
+            return true
+        case nil:
+            // Into the folder shown, if it takes drops
+            guard canModifyFolder, currentFolderURL != nil else { return false }
+            onDrop?(urls, operation)
             return true
         }
-
-        // Otherwise drop to current directory
-        guard canModifyFolder else { return false }
-        onDrop?(urls, operation)
-        return true
     }
 
     private func draggedURLs(from pasteboard: NSPasteboard) -> [URL] {
@@ -3024,15 +3376,13 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
 
     private func updateDropTarget(from draggingInfo: NSDraggingInfo) {
         let location = normalizedDragLocation(from: draggingInfo)
-        let sourceURLs = Set(dragSessionInfo(for: draggingInfo).sourceURLs.map(\.standardizedFileURL))
+        var info = dragSessionInfo(for: draggingInfo)
+        defer { dragSessionInfo = info }
         let oldTargetIndex = dropTargetIndex
         var newTarget: Int?
 
-        if let index = coverIndex(at: location),
-           index < items.count,
-           items[index].isDirectory,
-           !items[index].isFromArchive,
-           !sourceURLs.contains(items[index].url.standardizedFileURL) {  // not into itself
+        // Only a cover actually under the pointer takes the drop
+        if let index = dropTargetCoverIndex(at: location), dropAction(forCover: index, info: &info) != nil {
             newTarget = index
         }
 
