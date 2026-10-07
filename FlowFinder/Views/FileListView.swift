@@ -4,6 +4,7 @@ import Quartz
 
 struct FileListView: View {
     @EnvironmentObject private var settings: AppSettings
+    @Environment(\.browserWindow) private var browserWindow
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject private var internalDragState = InternalDragState.shared
     let items: [FileItem]
@@ -56,21 +57,24 @@ struct FileListView: View {
 
     private func toggleQuickLook() {
         guard let item = viewModel.primarySelectedItem else { return }
-        let viewModel = viewModel
+        let window = browserWindow?.window
+        // Weak: the shared Quick Look controller must not keep a closed tab's view model alive
+        let navigate: (Int) -> Void = { [weak viewModel] offset in
+            guard let viewModel else { return }
+            FileListKeyboardNavigation.navigate(viewModel, by: offset, extend: false)
+        }
         // Use async version to avoid blocking during archive extraction
         viewModel.previewURL(for: item) { previewURL in
             guard let previewURL else {
                 NSSound.beep()
                 return
             }
-            QuickLookControllerView.shared.togglePreview(for: previewURL) { offset in
-                FileListKeyboardNavigation.navigate(viewModel, by: offset, extend: false)
-            }
+            QuickLookControllerView.shared.togglePreview(for: previewURL, in: window, navigate: navigate)
         }
     }
 
     private func updateQuickLook(for item: FileItem?) {
-        viewModel.updateQuickLookPreview(for: item)
+        viewModel.updateQuickLookPreview(for: item, in: browserWindow?.window)
     }
 }
 

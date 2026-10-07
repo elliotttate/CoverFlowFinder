@@ -56,6 +56,13 @@ final class HostWindowBox: ObservableObject {
     weak var window: NSWindow?
 }
 
+extension EnvironmentValues {
+    /// The browser window the file views are in (set by `ContentView`). Read `window` when acting,
+    /// not while rendering: it is attached after the first render. Quick Look uses it so a view
+    /// only drives the panel opened from its own window.
+    @Entry var browserWindow: HostWindowBox? = nil
+}
+
 private struct ViewModelActivitySyncView: View {
     let selectedTabId: UUID
     let currentViewMode: ViewMode
@@ -258,6 +265,7 @@ struct ContentView: View {
 
     var body: some View {
         splitView
+            .environment(\.browserWindow, hostWindow)
             .toolbar { toolbarItems }
             .navigationTitle(windowTitle)
             .sheet(item: $showingInfoItem) { item in
@@ -288,7 +296,6 @@ struct ContentView: View {
                 }
             }
             .background(activitySyncView)
-            .background(QuickLookWindowController())
             .background(HostingWindowReader { window in
                 attachHostWindow(window)
             })
@@ -541,10 +548,9 @@ struct ContentView: View {
     }
 
     private func shutDown(_ viewModel: FileBrowserViewModel) {
-        // Only the closed tab's preview: other tabs and windows keep theirs.
-        TabInlinePreviews.stop(showing: viewModel)
         PendingSelection.cancel(for: viewModel)
-        // Stops the closed tab's folder watcher, loads, network browsing and searches for good.
+        // Stops the closed tab's inline preview (other tabs and windows keep theirs), folder
+        // watcher, loads, network browsing and searches for good.
         viewModel.tearDown()
     }
 
@@ -1442,6 +1448,46 @@ struct EmptyFolderView: View {
     }
 }
 
+/// Shown instead of the listing when the folder couldn't be listed, with Finder's wording (see
+/// `FileBrowserViewModel.loadError`). Takes no drops, pastes or new folders.
+struct FolderLoadErrorView: View {
+    let message: String
+    let folder: URL
+
+    /// A lock when we may not see the folder's contents, a warning otherwise (gone, I/O error).
+    private var iconName: String {
+        let noPermission = FileBrowserViewModel.loadErrorMessage(for: CocoaError(.fileReadNoPermission), folder: folder)
+        return message == noPermission ? "lock" : "exclamationmark.triangle"
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            Image(systemName: iconName)
+                .font(.system(size: 64))
+                .foregroundColor(.secondary)
+                .accessibilityHidden(true)
+            Text(message)
+                .font(.body)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .frame(maxWidth: 420)
+        }
+        .padding()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+}
+
+/// What the content area shows when there are no items to list.
+@MainActor
+enum EmptyContentPolicy {
+    /// The folder's load error, unless Spotlight results (which don't come from the folder) are shown.
+    static func loadError(of viewModel: FileBrowserViewModel) -> String? {
+        let showsSpotlightResults = viewModel.searchMode == .finder && !viewModel.searchText.isEmpty
+        return showsSpotlightResults ? nil : viewModel.loadError
+    }
+}
+
 /// When the content area shows a spinner instead of the listing.
 enum ContentLoadingPolicy {
     /// Only while there is nothing to show yet: an in-place reload or a Spotlight search that
@@ -1472,7 +1518,11 @@ struct TabContentWrapper: View {
                     ProgressView()
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else if viewModel.filteredItems.isEmpty {
-                    EmptyFolderView(viewModel: viewModel)
+                    if let loadError = EmptyContentPolicy.loadError(of: viewModel) {
+                        FolderLoadErrorView(message: loadError, folder: viewModel.currentPath)
+                    } else {
+                        EmptyFolderView(viewModel: viewModel)
+                    }
                 } else {
                     mainContentView
                 }
@@ -1680,23 +1730,6 @@ final class VolumeLeaveTracker: ObservableObject {
                     self.returnToVolume(volumeURL)
                 }
             }
-        }
-    }
-}
-
-/// Inline media previews of one tab.
-@MainActor
-enum TabInlinePreviews {
-    /// Stops an inline video or audio preview of one of `viewModel`'s items (a closed tab).
-    static func stop(showing viewModel: FileBrowserViewModel) {
-        let items = viewModel.filteredItems
-        let video = InlineVideoPreviewManager.shared
-        if let url = video.currentPreviewURL, items.contains(where: { $0.url == url }) {
-            video.cancelPreview(for: url)
-        }
-        let audio = InlineAudioPreviewManager.shared
-        if let url = audio.currentPreviewURL, items.contains(where: { $0.url == url }) {
-            audio.cancelPreview(for: url)
         }
     }
 }

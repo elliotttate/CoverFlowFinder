@@ -6,6 +6,7 @@ import Quartz
 
 struct ColumnView: View {
     @EnvironmentObject private var appSettings: AppSettings
+    @Environment(\.browserWindow) private var browserWindow
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
 
@@ -74,6 +75,8 @@ struct ColumnView: View {
             onCopy: { viewModel.copySelectedItems() },
             onCut: { viewModel.cutSelectedItems() },
             onPaste: { viewModel.paste(to: activeColumnURL) },
+            // ⌘A selects the active column's items (the view model's are the root column's)
+            onSelectAll: { selectAllInActiveColumn() },
             onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
         .onAppear {
@@ -577,8 +580,7 @@ struct ColumnView: View {
         columnState.notePushed(selection)
     }
 
-    /// Mirror selection changes made elsewhere (delete, Select All, menus, another view) into
-    /// the columns.
+    /// Mirror selection changes made elsewhere (delete, menus, another view) into the columns.
     /// - Parameter restoringColumns: the view just appeared: a selection inside folders below the
     ///   root opens the columns down to it.
     private func syncSelectionFromViewModel(force: Bool, restoringColumns: Bool = false) {
@@ -592,14 +594,6 @@ struct ColumnView: View {
         columnState.pendingPath = nil
 
         followRenamedPathFolder(to: selection)
-
-        // Select All (Edit menu, ⌘A) selects the root column's items: in a sub-column it means
-        // that column's items
-        if activeColumnIndex > 0, selection.count > 1, selection.count == items.count,
-           selectedURLs == Set(items.map(\.url)) {
-            selectAllInActiveColumn()
-            return
-        }
 
         // After deleting in a sub-column the view model selects an item of the root column.
         // Keep the selection in the column the user was working in instead.
@@ -969,13 +963,13 @@ struct ColumnView: View {
     }
 
     private func toggleQuickLook() {
-        viewModel.toggleQuickLookForSelection { [self] offset in
+        viewModel.toggleQuickLookForSelection(in: browserWindow?.window) { [self] offset in
             navigateInActiveColumn(by: offset)
         }
     }
 
     private func updateQuickLook(for item: FileItem?) {
-        viewModel.updateQuickLookPreview(for: item)
+        viewModel.updateQuickLookPreview(for: item, in: browserWindow?.window)
     }
 }
 

@@ -4,6 +4,7 @@ import Quartz
 
 struct IconGridView: View {
     @EnvironmentObject private var settings: AppSettings
+    @Environment(\.browserWindow) private var browserWindow
     @ObservedObject var viewModel: FileBrowserViewModel
     @ObservedObject private var internalDragState = InternalDragState.shared
     private var autoScrollState: DragAutoScrollState { DragAutoScrollState.shared }
@@ -366,13 +367,13 @@ struct IconGridView: View {
     }
 
     private func toggleQuickLook() {
-        viewModel.toggleQuickLookForSelection { [self] offset in
+        viewModel.toggleQuickLookForSelection(in: browserWindow?.window) { [self] offset in
             navigateSelection(by: offset)
         }
     }
 
     private func updateQuickLook(for item: FileItem?) {
-        viewModel.updateQuickLookPreview(for: item)
+        viewModel.updateQuickLookPreview(for: item, in: browserWindow?.window)
     }
 
     private var magnificationGesture: some Gesture {
