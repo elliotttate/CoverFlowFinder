@@ -943,13 +943,16 @@ final class FileTableCoordinator: NSObject, NSTableViewDataSource, NSTableViewDe
 
     func fileNameCellView(_ cell: FileNameCellView, didRenameItem item: FileItem, to newName: String) {
         editingDidEnd()
-        if isCommittingForClick {
+        let movedOn = isCommittingForClick
+        if movedOn {
             // The click that ended editing picks the selection
             let newURL = item.url.deletingLastPathComponent()
                 .appendingPathComponent(FileOperationEngine.fileSystemName(forDisplayName: newName))
             clickCommittedRename = ClickCommittedRename(oldURL: item.url, newURL: newURL, expires: Date().addingTimeInterval(5))
         }
-        viewModel.renameItem(item, to: newName)
+        // Return (or focus going elsewhere) keeps the renamed item selected; a click on another
+        // row leaves the selection where the user went, as Tab does (`commitRenameAndNext`)
+        viewModel.renameItem(item, to: newName, selectRenamedItem: !movedOn)
         viewModel.renamingURL = nil
     }
 
@@ -2383,12 +2386,20 @@ extension FileTableCoordinator {
     }
 
     /// The folder row a drop lands in, or nil when the drop goes into the folder being shown.
+    /// A package (an .rtfd, a .bundle, …) isn't a folder things go into, except an application:
+    /// documents dropped on it open in it, as in Finder (and `UnifiedFolderDropDelegate`).
     func dropTargetFolder(row: Int, dropOperation: NSTableView.DropOperation) -> FileItem? {
         guard dropOperation == .on, row >= 0, row < items.count else { return nil }
         let item = items[row]
-        guard item.isDirectory, !item.isFromArchive, item.url.isFileURL,
-              !NSWorkspace.shared.isFilePackage(atPath: item.url.path) else { return nil }
+        guard item.isDirectory, !item.isFromArchive, item.url.isFileURL else { return nil }
+        if item.isPackage || NSWorkspace.shared.isFilePackage(atPath: item.url.path) {
+            return Self.isApplication(item) ? item : nil
+        }
         return item
+    }
+
+    static func isApplication(_ item: FileItem) -> Bool {
+        item.isDirectory && item.fileType == .application
     }
 
     /// Drops onto rows and into the folder being shown: never inside an archive, the Photos library
@@ -2436,25 +2447,25 @@ extension FileTableCoordinator {
         sameVolume: () -> Bool
     ) -> NSDragOperation {
         guard !urls.isEmpty else { return [] }
-        let destinationPath = destination.standardizedFileURL.path
 
-        // A folder can't be dropped into itself or one of its own subfolders
-        for url in urls {
-            let path = url.standardizedFileURL.path
-            if destinationPath == path || destinationPath.hasPrefix(path.hasSuffix("/") ? path : path + "/") {
-                return []
-            }
+        // A folder can't be dropped into itself or one of its own subfolders. Paths are compared
+        // resolved (/tmp is /private/tmp, a symlinked folder is its original); a dragged symlink
+        // is the link itself.
+        if DropHelper.isSelfOrDescendantDrop(sources: urls, destination: destination) {
+            return []
         }
 
-        // Everything is already in the destination: nothing to do
-        if urls.allSatisfy({ $0.deletingLastPathComponent().standardizedFileURL.path == destinationPath }) {
+        // Everything is already in the destination: nothing to do, unless Option duplicates it
+        // there (Finder)
+        let requested = FileDropOperation(modifierFlags: modifierFlags)
+        if DropHelper.isNoOpDrop(sources: urls, destination: destination, operation: requested) {
             return []
         }
 
         let canMove = sourceMask.contains(.move) || sourceMask.contains(.generic)
         let canCopy = sourceMask.contains(.copy)
 
-        switch FileDropOperation(modifierFlags: modifierFlags) {
+        switch requested {
         case .copy:
             return canCopy ? .copy : []
         case .move:
@@ -2466,6 +2477,15 @@ extension FileTableCoordinator {
         }
     }
 
+    /// Documents dropped on an application open in it (the view model does that): anything but
+    /// the application itself, or a folder it's in.
+    static func applicationDropOperation(for urls: [URL], onto application: URL, sourceMask: NSDragOperation) -> NSDragOperation {
+        guard !urls.isEmpty, !DropHelper.isSelfOrDescendantDrop(sources: urls, destination: application) else { return [] }
+        if sourceMask.contains(.copy) { return .copy }
+        if sourceMask.contains(.generic) { return .generic }
+        return sourceMask.contains(.move) ? .move : []
+    }
+
     func tableView(_ tableView: NSTableView, validateDrop info: NSDraggingInfo, proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation) -> NSDragOperation {
         guard acceptsDrops else { return [] }
         let urls = draggedURLs(info)
@@ -2473,6 +2493,9 @@ extension FileTableCoordinator {
 
         let destination: URL
         if let folder = dropTargetFolder(row: row, dropOperation: dropOperation) {
+            if Self.isApplication(folder) {
+                return Self.applicationDropOperation(for: urls, onto: folder.url, sourceMask: info.draggingSourceOperationMask)
+            }
             destination = folder.url
         } else {
             guard acceptsDropsIntoShownFolder else { return [] }

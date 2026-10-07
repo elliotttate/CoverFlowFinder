@@ -845,23 +845,20 @@ struct ColumnView: View {
 
     /// New Folder in a column's folder (the root column's is the view model's).
     private func createNewFolder(inColumnAt depth: Int) {
-        guard depth > 0, let url = columnURL(atDepth: depth), url.isFileURL, !viewModel.isInsideArchive else {
+        guard depth > 0, let url = columnURL(atDepth: depth) else {
             viewModel.createNewFolder()
             return
         }
-        // The view model only creates folders in the folder it shows; this one is created here
-        // and selected in its column (once its reload lists it), then renamed
-        let folderURL = FileOperationEngine.uniqueDestinationURL(for: url.appendingPathComponent("untitled folder"))
-        do {
-            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: false)
-        } catch {
-            FileOperationAlerts.reportFailures([FileOperationFailure(url: folderURL, error: error)], verb: "created")
-            return
-        }
+        // The view model creates it (with Undo) and selects it for renaming; the column selects
+        // it once its reload lists it, and its row shows the rename field
+        guard let folderURL = viewModel.createNewFolder(in: url) else { return }
         truncateColumns(keepingThrough: depth)
         activeColumnIndex = depth
-        viewModel.selectedItems = [FileItem(url: folderURL)]
-        viewModel.renamingURL = folderURL
+        // As the column will list it (a folder URL, "…/untitled folder/"): the selection and the
+        // rename field match its row by URL
+        let listedURL = url.appendingPathComponent(folderURL.lastPathComponent, isDirectory: true)
+        viewModel.selectedItems = [FileItem(url: listedURL)]
+        viewModel.renamingURL = listedURL
     }
 
     /// Refresh from a column's background menu: the root column refreshes the view model; a
@@ -1820,10 +1817,12 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
             && !DropHelper.isSidebarFavoriteDrag()
     }
 
+    /// Items already in this folder are refused, unless Option duplicates them (Finder).
     private func isUsefulDrop() -> Bool {
         let sources = DropHelper.dragSourceURLs()
+        let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
         return !DropHelper.isSelfOrDescendantDrop(sources: sources, destination: columnURL)
-            && !DropHelper.isNoOpDrop(sources: sources, destination: columnURL)
+            && !DropHelper.isNoOpDrop(sources: sources, destination: columnURL, operation: operation)
     }
 
     func validateDrop(info: DropInfo) -> Bool {

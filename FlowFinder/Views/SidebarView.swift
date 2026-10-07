@@ -655,9 +655,7 @@ struct SidebarOutlineView: NSViewRepresentable {
             (pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver]) ?? []
         }
 
-        /// Receives promised files into a new temporary folder, to send with AirDrop. A receiver's reader runs once
-        /// per file it delivers (a legacy promise can deliver several), so the group is left once per receiver, on
-        /// its first file or error; files delivered after that are still collected. `completion` runs on the main
+        /// Receives promised files into a new temporary folder, to send with AirDrop. `completion` runs on the main
         /// queue and owns the temporary folder. Returns false when there are no promises.
         private func receiveFilePromisesForAirDrop(from info: NSDraggingInfo, completion: @escaping @MainActor ([URL], URL) -> Void) -> Bool {
             let receivers = filePromiseReceivers(from: info.draggingPasteboard)
@@ -667,21 +665,41 @@ struct SidebarOutlineView: NSViewRepresentable {
                 .appendingPathComponent("FlowFinderDrop-\(UUID().uuidString)", isDirectory: true)
             try? FileManager.default.createDirectory(at: tempDirectory, withIntermediateDirectories: true)
 
-            let queue = filePromiseQueue
+            Self.receivePromisedFiles(from: receivers, into: tempDirectory, queue: filePromiseQueue) { urls in
+                completion(urls, tempDirectory)
+            }
+            return true
+        }
+
+        /// Receives every receiver's files into `directory`; `completion` runs once, on the main queue, with the
+        /// files that arrived. A receiver's reader runs once per file it delivers (a legacy promise can deliver
+        /// several), so each receiver leaves the group exactly once: when it has delivered its `fileNames.count`
+        /// files (at least one), or on its first error. Files delivered after that are still collected: they're
+        /// queued behind it on the serial `queue`.
+        static func receivePromisedFiles(
+            from receivers: [NSFilePromiseReceiver],
+            into directory: URL,
+            queue: OperationQueue,
+            completion: @escaping @MainActor ([URL]) -> Void
+        ) {
             let group = DispatchGroup()
             let lock = NSLock()
             var receivedURLs: [URL] = []
 
             for receiver in receivers {
                 group.enter()
+                var deliveries = 0
                 var hasLeft = false
-                receiver.receivePromisedFiles(atDestination: tempDirectory, options: [:], operationQueue: queue) { url, error in
+                receiver.receivePromisedFiles(atDestination: directory, options: [:], operationQueue: queue) { url, error in
                     lock.lock()
                     if error == nil {
                         receivedURLs.append(url)
                     }
-                    let shouldLeave = !hasLeft
-                    hasLeft = true
+                    deliveries += 1
+                    let shouldLeave = !hasLeft && (error != nil || deliveries >= max(1, receiver.fileNames.count))
+                    if shouldLeave {
+                        hasLeft = true
+                    }
                     lock.unlock()
                     if shouldLeave {
                         group.leave()
@@ -690,19 +708,18 @@ struct SidebarOutlineView: NSViewRepresentable {
             }
 
             group.notify(queue: .main) {
-                // Further files from a receiver are queued behind its first one on the serial queue: take those too.
+                // Further files from a receiver are queued behind the ones waited for on the serial queue: take those too.
                 queue.addOperation {
                     lock.lock()
                     let urls = receivedURLs
                     lock.unlock()
                     DispatchQueue.main.async {
                         MainActor.assumeIsolated {
-                            completion(urls, tempDirectory)
+                            completion(urls)
                         }
                     }
                 }
             }
-            return true
         }
 
         private struct DraggedFileKinds {

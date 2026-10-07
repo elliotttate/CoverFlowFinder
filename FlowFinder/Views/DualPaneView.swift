@@ -670,24 +670,34 @@ struct PaneListView: View {
 final class PaneThumbnailState {
     let owner = ThumbnailRequestOwner()
     var visibleURLs: Set<URL> = []
-    var requestedURLs: Set<URL> = []
-    /// The file version each stored thumbnail was made from (an in-place edit needs a new one)
-    var loadedVersions: [URL: FileItem.ContentVersion] = [:]
+    /// The request in flight for each URL, by number: the answer to a cancelled request arrives
+    /// later and must not clear the mark of a newer request for the same URL.
+    private(set) var requestIDs: [URL: Int] = [:]
+    private var lastRequestID = 0
+    /// What each stored thumbnail was made from (an in-place edit or a download needs a new one)
+    var loadedVersions: [URL: GridThumbnailLoader.SourceVersion] = [:]
 
     func cancelAll() {
         ThumbnailCacheManager.shared.cancelRequests(for: owner)
-        requestedURLs.removeAll()
+        requestIDs.removeAll()
         loadedVersions.removeAll()
+    }
+
+    /// What a thumbnail of `item` is made from now: its file version once its metadata is loaded
+    /// (loading it isn't a change), and whether its contents are on disk (iCloud).
+    static func sourceVersion(of item: FileItem) -> GridThumbnailLoader.SourceVersion {
+        let file = item.hasMetadata && item.modificationDate != nil ? ThumbnailCacheManager.shared.fileVersion(for: item) : nil
+        return GridThumbnailLoader.SourceVersion(file: file, isDownloaded: GridThumbnailLoader.SourceVersion.isDownloaded(item.cloudStatus))
     }
 
     /// Shared loader for the dual and quad pane icon views. `store` receives the image (or the
     /// item's placeholder when it has no thumbnail) on the main queue. `current` is kept when it's
-    /// big enough and was made from the item's current version.
+    /// big enough and wasn't made from an older version of the file (or before it was downloaded).
     func load(_ item: FileItem, maxPixelSize: CGFloat, current: NSImage?, store: @escaping (NSImage, URL) -> Void) {
         let url = item.url
-        let version = item.contentVersion
+        let version = Self.sourceVersion(of: item)
         if let current, PaneThumbnailState.image(current, satisfies: maxPixelSize),
-           loadedVersions[url].map({ $0 == version }) ?? true {
+           loadedVersions[url].map({ !$0.isOutdated(comparedTo: version) }) ?? true {
             return
         }
         let cache = ThumbnailCacheManager.shared
@@ -698,11 +708,15 @@ final class PaneThumbnailState {
             }
             return
         }
-        guard !requestedURLs.contains(url) else { return }
-        requestedURLs.insert(url)
+        guard requestIDs[url] == nil else { return }
+        lastRequestID += 1
+        let requestID = lastRequestID
+        requestIDs[url] = requestID
         cache.requestThumbnail(for: item, maxPixelSize: maxPixelSize, owner: owner) { [weak self] result in
             DispatchQueue.main.async {
-                self?.requestedURLs.remove(url)
+                if self?.requestIDs[url] == requestID {
+                    self?.requestIDs.removeValue(forKey: url)
+                }
                 switch result {
                 case .loaded(let image):
                     self?.loadedVersions[url] = version
