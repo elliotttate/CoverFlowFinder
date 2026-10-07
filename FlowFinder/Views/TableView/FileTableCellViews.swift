@@ -134,11 +134,11 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         didSet { updateHiddenItemDimming() }
     }
 
-    /// Hidden items' icon and name at half opacity, like Finder; the name of a selected row stays
-    /// readable on the highlight.
+    /// Hidden items' icon and name at half opacity, like Finder; the name of a selected row, or
+    /// one being renamed, stays readable.
     private func updateHiddenItemDimming() {
         let isCut = alphaValue < 1
-        let isSelected = backgroundStyle == .emphasized
+        let isSelected = backgroundStyle == .emphasized || isEditing
         let iconAlpha = CGFloat(currentItem?.iconOpacity(isCut: isCut) ?? 1)
         let nameAlpha = CGFloat(currentItem?.nameOpacity(isCut: isCut, isSelected: isSelected) ?? 1)
         if iconView.alphaValue != iconAlpha {
@@ -231,6 +231,7 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
 
         isEditing = true
         editingStartedAt = Date()
+        updateHiddenItemDimming()
 
         // Set up for editing (the same naming rule as every other rename field)
         let text = item.editingName
@@ -295,6 +296,7 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         nameTextField.isSelectable = false
         nameTextField.isBordered = false
         nameTextField.drawsBackground = false
+        updateHiddenItemDimming()
     }
 
     /// - Parameter refocusTable: true when editing ended from the keyboard (Return, Tab, Escape);
