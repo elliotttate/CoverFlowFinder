@@ -1299,7 +1299,8 @@ struct StatusBarView: View {
     }
 }
 
-/// A slow copy out of an archive: what's being copied, how far it got, and Cancel.
+/// A long file operation (a copy, move, Move to Trash, delete or copy out of an archive): what's
+/// being done, how far it got, and Stop.
 struct ArchiveCopyProgressView: View {
     @EnvironmentObject private var settings: AppSettings
     let activity: FileBrowserViewModel.ArchiveCopyActivity
@@ -1324,8 +1325,8 @@ struct ArchiveCopyProgressView: View {
                     .foregroundColor(.secondary)
             }
             .buttonStyle(.borderless)
-            .help("Stop copying")
-            .accessibilityLabel("Stop copying")
+            .help("Stop")
+            .accessibilityLabel("Stop")
         }
     }
 }
