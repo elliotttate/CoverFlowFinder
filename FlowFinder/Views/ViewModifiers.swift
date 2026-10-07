@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 // MARK: - Drop Target Overlay Modifier
 // Reusable overlay for drop target indication
@@ -191,5 +192,84 @@ extension View {
     /// Items that can't be dragged as files (archive entries) get none.
     func internalDrag(item: FileItem) -> some View {
         modifier(InternalDragModifier(item: item))
+    }
+}
+
+// MARK: - Multi-Item File Drag
+// Dragging a selected item drags the whole selection (Finder); `onDrag` can only drag one item.
+
+/// A file dragged out of a SwiftUI file view, on the drag pasteboard as a file URL (what Finder,
+/// other apps and this app's drop targets read).
+struct DraggedFile: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        DataRepresentation(exportedContentType: .fileURL) { file in
+            Data(file.url.absoluteString.utf8)
+        }
+    }
+}
+
+/// The container of a file view's draggable items (see `fileDragItem`).
+struct FileDragContainerModifier: ViewModifier {
+    let viewModel: FileBrowserViewModel
+
+    /// The selected items that can be dragged, in display order.
+    @MainActor
+    static func draggableSelection(of viewModel: FileBrowserViewModel) -> [URL] {
+        viewModel.orderedSelectedItems.filter(InternalDragModifier.canDrag).map(\.url)
+    }
+
+    func body(content: Content) -> some View {
+        let viewModel = viewModel
+        content
+            .dragContainer(for: DraggedFile.self, itemID: \.url) { urls in
+                urls.map(DraggedFile.init)
+            }
+            // Read when a drag starts, not on every render.
+            .dragContainerSelection(Self.draggableSelection(of: viewModel))
+            // The drop target decides: move on the same volume, copy across volumes (Finder).
+            .dragConfiguration(DragConfiguration(allowMove: true))
+            .onDragSessionUpdated { session in
+                let dragState = InternalDragState.shared
+                switch session.phase {
+                case .initial, .active:
+                    if dragState.draggedURLs.isEmpty {
+                        dragState.beginDrag(urls: session.draggedItemIDs(for: URL.self))
+                    }
+                case .ended, .dataTransferCompleted:
+                    dragState.endDrag()
+                default:
+                    break
+                }
+            }
+    }
+}
+
+/// One draggable item of a `fileDragContainer`.
+struct FileDragItemModifier: ViewModifier {
+    let item: FileItem
+
+    func body(content: Content) -> some View {
+        if InternalDragModifier.canDrag(item) {
+            content.draggable(containerItemID: item.url)
+        } else {
+            content
+        }
+    }
+}
+
+extension View {
+    /// Makes this view (a grid or stack of `fileDragItem`s) the drag container for
+    /// `viewModel`'s items: dragging a selected item drags every selected file.
+    func fileDragContainer(for viewModel: FileBrowserViewModel) -> some View {
+        modifier(FileDragContainerModifier(viewModel: viewModel))
+    }
+
+    /// Makes `item` draggable as a file within the enclosing `fileDragContainer`: with the rest of
+    /// the selection when it is selected, on its own otherwise. Archive entries and non-files
+    /// can't be dragged.
+    func fileDragItem(_ item: FileItem) -> some View {
+        modifier(FileDragItemModifier(item: item))
     }
 }

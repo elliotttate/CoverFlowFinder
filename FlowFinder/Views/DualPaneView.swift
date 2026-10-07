@@ -567,7 +567,7 @@ struct PaneListView: View {
                         )
                         .contentShape(Rectangle())
                         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
-                        .internalDrag(item: item)
+                        .fileDragItem(item)
                         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                             item: item,
                             viewModel: viewModel,
@@ -601,6 +601,7 @@ struct PaneListView: View {
                         }
                     }
                 }
+                .fileDragContainer(for: viewModel)
             }
             .onAppear {
                 if let lead = viewModel.primarySelectedItem {
@@ -779,7 +780,7 @@ struct PaneIconView: View {
                             .cornerRadius(8)
                             .contentShape(Rectangle())
                             .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
-                            .internalDrag(item: item)
+                            .fileDragItem(item)
                             .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                                 item: item,
                                 viewModel: viewModel,
@@ -813,6 +814,7 @@ struct PaneIconView: View {
                             }
                         }
                     }
+                    .fileDragContainer(for: viewModel)
                     .padding()
                 }
                 .onAppear {
