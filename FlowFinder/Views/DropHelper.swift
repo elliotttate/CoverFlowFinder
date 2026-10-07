@@ -519,6 +519,102 @@ struct UnifiedFolderDropDelegate: DropDelegate {
     }
 }
 
+// MARK: - Tile Grid Drop Delegate
+
+/// Frames of a grid's tiles in the grid's coordinate space, as the tiles report them (see
+/// `reportsTileFrame`). Only tiles that exist are kept. Not observable: writing a frame never
+/// redraws anything.
+@MainActor
+final class TileFrameStore {
+    private var frames: [URL: CGRect] = [:]
+
+    func set(_ frame: CGRect, for url: URL) {
+        frames[url] = frame
+    }
+
+    func remove(_ url: URL) {
+        frames.removeValue(forKey: url)
+    }
+
+    /// The tile containing `point`.
+    func tile(at point: CGPoint) -> URL? {
+        frames.first { $0.value.contains(point) }?.key
+    }
+}
+
+extension View {
+    /// Records this tile's frame in `space` into `store` while the tile exists, for the grid's
+    /// `TileGridDropDelegate`. Cheap: it reports when the tile's layout changes, not on scroll.
+    func reportsTileFrame(_ url: URL, in store: TileFrameStore, space: String) -> some View {
+        onGeometryChange(for: CGRect.self) { proxy in
+            proxy.frame(in: .named(space))
+        } action: { frame in
+            store.set(frame, for: url)
+        }
+        .onDisappear {
+            store.remove(url)
+        }
+    }
+}
+
+/// Drop target over a grid of tiles (icon and masonry views): the folder tile under the pointer
+/// takes the drop (like its own `UnifiedFolderDropDelegate`); anywhere else, a file tile or the
+/// space between tiles, the drop goes into the folder the view shows (`container`), like Finder.
+///
+/// One target for the whole grid: a drop target per tile costs an AppKit view per tile, built
+/// as tiles scroll in, and made scrolling these views several times slower.
+struct TileGridDropDelegate: DropDelegate {
+    let viewModel: FileBrowserViewModel
+    /// The item of the tile at a location in the grid's coordinate space
+    let item: (CGPoint) -> FileItem?
+    @Binding var dropTargetedItemID: UUID?
+    /// Drops outside folder tiles. Its location-based edge auto-scroll must be off: locations
+    /// here are in the grid's (scrolling) coordinates.
+    let container: ContainerDropDelegate
+
+    /// The delegate of the folder tile under the pointer, when that folder takes this drop.
+    private func folderDelegate(at location: CGPoint, info: DropInfo) -> UnifiedFolderDropDelegate? {
+        guard let item = item(location) else { return nil }
+        let delegate = UnifiedFolderDropDelegate(item: item, viewModel: viewModel, dropTargetedItemID: $dropTargetedItemID)
+        return delegate.validateDrop(info: info) ? delegate : nil
+    }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        // Where it may land (a folder tile or the folder shown) is decided as the pointer moves
+        info.hasItemsConforming(to: DropHelper.acceptedDropTypes)
+    }
+
+    func dropEntered(info: DropInfo) {
+        _ = dropUpdated(info: info)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        if let folder = folderDelegate(at: info.location, info: info) {
+            container.dropExited(info: info)
+            if dropTargetedItemID != folder.item.id {
+                folder.dropEntered(info: info)
+            }
+            return folder.dropUpdated(info: info)
+        }
+        dropTargetedItemID = nil
+        return container.dropUpdated(info: info)
+    }
+
+    func dropExited(info: DropInfo) {
+        dropTargetedItemID = nil
+        container.dropExited(info: info)
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        if let folder = folderDelegate(at: info.location, info: info) {
+            container.dropExited(info: info)
+            return folder.performDrop(info: info)
+        }
+        dropTargetedItemID = nil
+        return container.performDrop(info: info)
+    }
+}
+
 // MARK: - Drag Auto-Scroll State
 /// Shared state for triggering auto-scroll during drag operations
 
