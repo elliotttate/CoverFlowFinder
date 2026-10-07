@@ -65,18 +65,41 @@ First bump the version and push it (step 1 of the manual process below). Then, o
 This single command will:
 1. Check you're on `main`, in sync with `origin/main`, with no uncommitted changes
 2. Check that `CURRENT_PROJECT_VERSION` is greater than the newest `sparkle:version` in `docs/appcast.xml`
-3. Build a Release archive and export it with Developer ID signing
-4. Verify the exported app's versions, code signature and timestamp
-5. Notarize and staple the app
-6. Create a signed DMG, then notarize and staple it
-7. Sign the DMG with the Sparkle EdDSA key and regenerate `docs/appcast.xml` (`generate_appcast`)
-8. Create the GitHub release `vX.Y.Z` with the DMG attached
-9. Commit **only** `docs/appcast.xml` and push it to `main`
+3. Check that neither the GitHub release `vX.Y.Z` nor the tag exists yet, and that the release notes (if any) are an
+   HTML fragment, before spending time on the build
+4. Build a Release archive and export it with Developer ID signing
+5. Verify the exported app's versions, code signature and timestamp
+6. Notarize and staple the app
+7. Create a signed DMG, then notarize and staple it
+8. Sign the DMG with the Sparkle EdDSA key and regenerate `docs/appcast.xml` (`generate_appcast`)
+9. Create the GitHub release `vX.Y.Z` with the DMG attached
+10. Commit **only** `docs/appcast.xml` and push it to `main`
+
+The release is created before the appcast is pushed, so Sparkle never offers a download that doesn't exist yet. If
+the script fails after it started publishing (steps 8-10), it prints what to do; see
+[Recovering from a failed release](#recovering-from-a-failed-release).
 
 The Sparkle command-line tools are downloaded once into `build/sparkle-tools`, pinned to the version in
 `SPARKLE_VERSION` and checked against `SPARKLE_SHA256` before they're used (they can read your EdDSA private key).
 
-To include release notes in the update dialog, put them in `release-notes/X.Y.Z.html` before running the script.
+### Release Notes
+
+To show release notes in the update dialog, put them in `release-notes/X.Y.Z.html` before running the script. The
+file must be an **HTML fragment**: no `<!DOCTYPE>`, `<html>` or `<body>` (the script refuses those before building).
+`generate_appcast --embed-release-notes` copies it into the new item's `<description>`, so there's no separate file
+to publish. For example:
+
+```html
+<h2>What's New</h2>
+<ul>
+    <li>Sidebar remembers collapsed sections</li>
+    <li>Fixes for dropping Mail attachments on favorites</li>
+</ul>
+```
+
+(Without `--embed-release-notes`, `generate_appcast` turns a full HTML document into a `sparkle:releaseNotesLink`
+relative to the appcast, i.e. `https://elliotttate.github.io/CoverFlowFinder/FlowFinder-X.Y.Z.html`, a file that
+is never published: users would see an error instead of the notes.)
 
 ## Script Options
 
@@ -235,8 +258,10 @@ Sign (reads the private key from the Keychain):
 Either let Sparkle generate it (this is what the script does; it signs and measures the DMG itself):
 ```bash
 mkdir -p build/releases && cp FlowFinder-1.39.0.dmg docs/appcast.xml build/releases/
-# optional release notes: build/releases/FlowFinder-1.39.0.html
+# optional release notes (an HTML fragment, see "Release Notes" above):
+# cp release-notes/1.39.0.html build/releases/FlowFinder-1.39.0.html
 ./build/sparkle-tools/bin/generate_appcast \
+    --embed-release-notes \
     --download-url-prefix "https://github.com/elliotttate/CoverFlowFinder/releases/download/v1.39.0/" \
     build/releases
 cp build/releases/appcast.xml docs/appcast.xml
@@ -339,6 +364,36 @@ xcrun notarytool log <submission-id> --keychain-profile "FlowFinder-Notarization
 The script refuses to build a release Sparkle would ignore. Bump `CURRENT_PROJECT_VERSION` (both
 configurations) as in step 1, commit, push, and run it again.
 
+### Recovering from a failed release
+
+What to do depends on how far `--release` got. When it fails while publishing, it prints the matching steps.
+
+- **Before "Generating appcast.xml"** (checks, build, notarization, DMG): nothing was published. Fix the problem and
+  run `./scripts/notarize.sh --release` again.
+- **While generating the appcast or creating the GitHub release**: `docs/appcast.xml` is modified but not committed,
+  so a rerun refuses ("Uncommitted changes"). Restore it, delete a half-created release if there is one, and rerun:
+  ```bash
+  git checkout -- docs/appcast.xml
+  gh release view v1.39.0 && gh release delete v1.39.0 --cleanup-tag --yes
+  ./scripts/notarize.sh --release
+  ```
+- **After the GitHub release was created** (committing or pushing the appcast failed): the DMG is downloadable but
+  Sparkle users aren't told yet. Don't rerun the script (the release exists); publish the appcast by hand:
+  ```bash
+  git commit -m "Update appcast.xml for v1.39.0" -- docs/appcast.xml   # skip if it's already committed
+  git push origin main
+  ```
+
+### "GitHub release vX.Y.Z already exists" / "Tag vX.Y.Z already exists on origin"
+
+That version was released already: bump both version numbers (step 1). If it's a leftover from a failed run that
+never reached the appcast, delete it (`gh release delete vX.Y.Z --cleanup-tag --yes`, or for a bare tag
+`git push origin :refs/tags/vX.Y.Z`) and run the script again.
+
+### "release-notes/X.Y.Z.html must be an HTML fragment"
+
+Remove the `<!DOCTYPE>`, `<html>`, `<head>` and `<body>` wrapper and keep only the content (see "Release Notes").
+
 ### "Sparkle download checksum mismatch!"
 
 The downloaded Sparkle archive doesn't match `SPARKLE_SHA256`. Don't bypass this: the tools get access to your
@@ -355,6 +410,7 @@ EdDSA private key. If you deliberately changed `SPARKLE_VERSION`, update `SPARKL
 | `build/sparkle-tools` | Sparkle command-line tools (`sign_update`, `generate_appcast`, `generate_keys`) |
 | `FlowFinder-X.X.X.dmg` | Final DMG installer (not committed; attached to the GitHub release) |
 | `docs/appcast.xml` | Sparkle update feed, served by GitHub Pages |
+| `release-notes/X.Y.Z.html` | Optional release notes (HTML fragment), embedded in the appcast |
 
 ## Configuration
 
