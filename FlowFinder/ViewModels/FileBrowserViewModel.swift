@@ -1055,7 +1055,9 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     @Published var infoItem: FileItem?
-    private var itemsRevision: Int = 0
+    /// Changes whenever `items` is set, including in-place metadata and iCloud status updates
+    /// (which FileItem's identity equality can't see).
+    private(set) var itemsRevision: Int = 0
     private struct FilteredItemsCacheKey: Equatable {
         let itemsRevision: Int
         let searchText: String

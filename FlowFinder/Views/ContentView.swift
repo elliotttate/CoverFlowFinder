@@ -1583,7 +1583,7 @@ struct TabContentWrapper: View {
             FileListView(viewModel: viewModel, items: viewModel.filteredItems)
                 .id("list-\(contentViewId)")
         case .columns:
-            ColumnView(viewModel: viewModel, items: viewModel.filteredItems)
+            ColumnView(viewModel: viewModel, items: viewModel.filteredItems, itemsRevision: viewModel.itemsRevision)
                 .id("columns-\(contentViewId)")
         case .dualPane, .quadPane:
             EmptyView()

@@ -9,6 +9,11 @@ struct ColumnView: View {
     @Environment(\.browserWindow) private var browserWindow
     @ObservedObject var viewModel: FileBrowserViewModel
     let items: [FileItem]
+    /// The view model's `itemsRevision` for `items`. FileItem equality is identity, so after an
+    /// in-place update (metadata or iCloud status loaded) the new `items` compares equal to the old
+    /// and SwiftUI keeps the old array: the preview and badges never showed what was loaded.
+    /// A new revision makes the view take the new array.
+    var itemsRevision = 0
 
     /// Selected item ("path item") of each column, keyed by the column's folder URL
     @State private var columnSelections: [URL: FileItem] = [:]
@@ -83,6 +88,7 @@ struct ColumnView: View {
             columnState.watcher.watch(columns.map(\.url))
             // Show the view model's selection (and the folders it's in) when the view appears
             syncSelectionFromViewModel(force: true, restoringColumns: true)
+            loadRootSelectionMetadata()
         }
         .onDisappear {
             columnState.watcher.watch([])
@@ -112,6 +118,9 @@ struct ColumnView: View {
         .onChange(of: items.map(\.contentVersion)) { _, _ in
             // Keep the root selection (preview column) on the current metadata
             refreshSelection(depth: 0, in: items)
+        }
+        .onChange(of: columnSelections[viewModel.currentPath]?.url) { _, _ in
+            loadRootSelectionMetadata()
         }
         .onChange(of: appSettings.showHiddenFiles) { _, _ in
             reloadAllSubColumns()
@@ -805,8 +814,13 @@ struct ColumnView: View {
 
     /// Root-column rows appearing on screen load their metadata (and iCloud status), as the list
     /// does for its visible rows: big folders are listed without it. Coalesced per run loop turn.
+    /// Rows show no metadata, so scrolling doesn't load it: each loaded batch replaces the view
+    /// model's items and redraws the whole column, which made scrolling large folders stutter.
+    /// Root rows in iCloud folders load their iCloud status (badges); sub-columns load theirs
+    /// with their listing. The preview column's item loads its metadata (`loadRootSelectionMetadata`).
     private func rowAppeared(_ item: FileItem, depth: Int) {
-        guard depth == 0, viewModel.needsHydration(item) else { return }
+        guard depth == 0, item.cloudStatus == nil, !viewModel.isInsideArchive,
+              CloudStatusManager.shared.isInICloud(viewModel.currentPath) else { return }
         columnState.hydrationURLs.insert(item.url)
         guard !columnState.isHydrationScheduled else { return }
         columnState.isHydrationScheduled = true
@@ -816,8 +830,15 @@ struct ColumnView: View {
             columnState.isHydrationScheduled = false
             let urls = Array(columnState.hydrationURLs)
             columnState.hydrationURLs.removeAll()
-            viewModel.hydrateMetadata(for: urls)
+            viewModel.hydrateCloudStatus(for: urls)
         }
+    }
+
+    /// The root column's selected item, once its metadata is loaded, shows its size and date in
+    /// the preview column (large folders list without metadata).
+    private func loadRootSelectionMetadata() {
+        guard let selection = columnSelections[viewModel.currentPath], !selection.hasMetadata else { return }
+        viewModel.hydrateMetadata(for: [selection.url])
     }
 
     // MARK: - Background Menu
@@ -1371,8 +1392,9 @@ struct SingleColumnView: View {
                             tags: appSettings.showItemTags ? tagsByURL[item.url] ?? [] : []
                         )
                         .id(item.url)
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 4)
+                        // Every row is the same height: the column's drop target finds rows by position
+                        .frame(maxWidth: .infinity, minHeight: rowContentHeight, maxHeight: rowContentHeight, alignment: .leading)
+                        .padding(.vertical, ColumnRowMetrics.verticalPadding)
                         .padding(.horizontal, 4)
                         .background(
                             dropTargetedItemID == item.id
@@ -1388,11 +1410,6 @@ struct SingleColumnView: View {
                         )
                         .contentShape(Rectangle())
                         .fileDragItem(item)
-                        .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
-                            item: item,
-                            viewModel: viewModel,
-                            dropTargetedItemID: $dropTargetedItemID
-                        ))
                         .instantTap(
                             id: item.id,
                             onSingleClick: {
@@ -1414,6 +1431,17 @@ struct SingleColumnView: View {
                         }
                     }
                 }
+                // Drops onto the rows: the folder row under the pointer, else this column's folder.
+                // One target for the column, not one per row (an AppKit view each, built as rows
+                // scroll in, which made scrolling slow).
+                .onDrop(of: DropHelper.acceptedDropTypes, delegate: ColumnRowsDropDelegate(
+                    items: items,
+                    rowHeight: rowContentHeight + 2 * ColumnRowMetrics.verticalPadding,
+                    columnURL: columnURL,
+                    viewModel: viewModel,
+                    dropTargetedItemID: $dropTargetedItemID,
+                    isColumnDropTargeted: $isColumnDropTargeted
+                ))
                 // Dragging a selected item drags the whole selection
                 .fileDragContainer(for: viewModel)
             }
@@ -1485,6 +1513,11 @@ struct SingleColumnView: View {
                 startTagRead()
             }
         }
+    }
+
+    /// Height of a row's contents (icon or name, whichever is taller)
+    private var rowContentHeight: CGFloat {
+        ColumnRowMetrics.contentHeight(fontSize: appSettings.columnFontSize, iconSize: appSettings.columnIconSizeValue)
     }
 
     /// Reads the items' tags in the background (like the icon grid); rows show them once they arrive.
@@ -1689,6 +1722,87 @@ struct InfoRow: View {
 /// Drops onto a column's background go into the folder the column shows. Internal drags are
 /// allowed (e.g. from another column or pane); dropping a folder into itself or one of its
 /// descendants, or items into the folder they're already in, is refused.
+enum ColumnRowMetrics {
+    static let verticalPadding: CGFloat = 4
+
+    /// Height of a row's contents: the icon, or a line of the name, whichever is taller.
+    static func contentHeight(fontSize: Double, iconSize: CGFloat) -> CGFloat {
+        let font = NSFont.systemFont(ofSize: CGFloat(fontSize))
+        let lineHeight = ceil(font.ascender - font.descender + font.leading)
+        return max(iconSize, lineHeight)
+    }
+
+    /// The index of the row at `y` (in the rows' coordinates), or nil past the ends.
+    static func rowIndex(atY y: CGFloat, rowHeight: CGFloat, count: Int) -> Int? {
+        guard rowHeight > 0, y >= 0 else { return nil }
+        let index = Int(y / rowHeight)
+        return index < count ? index : nil
+    }
+}
+
+/// Drop target over a column's rows: a folder row under the pointer takes the drop (like its
+/// own `UnifiedFolderDropDelegate`); anywhere else it goes into the column's folder (like
+/// `ColumnBackgroundDropDelegate`, which covers the empty area below the rows).
+struct ColumnRowsDropDelegate: DropDelegate {
+    let items: [FileItem]
+    let rowHeight: CGFloat
+    let columnURL: URL
+    let viewModel: FileBrowserViewModel
+    @Binding var dropTargetedItemID: UUID?
+    @Binding var isColumnDropTargeted: Bool
+
+    private var columnDelegate: ColumnBackgroundDropDelegate {
+        ColumnBackgroundDropDelegate(
+            columnURL: columnURL,
+            viewModel: viewModel,
+            dropTargetedItemID: $dropTargetedItemID,
+            isColumnDropTargeted: $isColumnDropTargeted
+        )
+    }
+
+    /// The delegate of the folder row under the pointer, when that folder takes this drop.
+    private func folderDelegate(at location: CGPoint, info: DropInfo) -> UnifiedFolderDropDelegate? {
+        guard let index = ColumnRowMetrics.rowIndex(atY: location.y, rowHeight: rowHeight, count: items.count) else { return nil }
+        let delegate = UnifiedFolderDropDelegate(item: items[index], viewModel: viewModel, dropTargetedItemID: $dropTargetedItemID)
+        return delegate.validateDrop(info: info) ? delegate : nil
+    }
+
+    func validateDrop(info: DropInfo) -> Bool {
+        // Where it may land (a folder row or the column) is decided as the pointer moves
+        info.hasItemsConforming(to: DropHelper.acceptedDropTypes)
+    }
+
+    func dropEntered(info: DropInfo) {
+        _ = dropUpdated(info: info)
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        if let folder = folderDelegate(at: info.location, info: info) {
+            isColumnDropTargeted = false
+            if dropTargetedItemID != folder.item.id {
+                folder.dropEntered(info: info)
+            }
+            return folder.dropUpdated(info: info)
+        }
+        dropTargetedItemID = nil
+        return columnDelegate.dropUpdated(info: info)
+    }
+
+    func dropExited(info: DropInfo) {
+        dropTargetedItemID = nil
+        isColumnDropTargeted = false
+    }
+
+    func performDrop(info: DropInfo) -> Bool {
+        if let folder = folderDelegate(at: info.location, info: info) {
+            isColumnDropTargeted = false
+            return folder.performDrop(info: info)
+        }
+        dropTargetedItemID = nil
+        return columnDelegate.performDrop(info: info)
+    }
+}
+
 struct ColumnBackgroundDropDelegate: DropDelegate {
     let columnURL: URL
     let viewModel: FileBrowserViewModel
@@ -1718,7 +1832,20 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
 
     func dropEntered(info: DropInfo) {
         if dropTargetedItemID == nil, acceptsDrops, isUsefulDrop() {
-            isColumnDropTargeted = true
+            setColumnHighlighted(true)
+        }
+    }
+
+    /// The column's drop highlight. A drag that leaves without an exit event (it happens with
+    /// the rows' drop target nested inside the column's) still clears it when it ends.
+    private func setColumnHighlighted(_ highlighted: Bool) {
+        guard highlighted != isColumnDropTargeted else { return }
+        isColumnDropTargeted = highlighted
+        if highlighted {
+            let binding = $isColumnDropTargeted
+            DropHighlightReset.shared.clearWhenDragEnds {
+                binding.wrappedValue = false
+            }
         }
     }
 
@@ -1732,7 +1859,7 @@ struct ColumnBackgroundDropDelegate: DropDelegate {
             return DropProposal(operation: .forbidden)
         }
         // Over a folder row that row's delegate takes the drop; highlight the column otherwise
-        isColumnDropTargeted = dropTargetedItemID == nil
+        setColumnHighlighted(dropTargetedItemID == nil)
         let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
         return DropProposal(operation: DropHelper.dropOperation(
             for: operation,
