@@ -19,6 +19,9 @@ struct IconGridView: View {
 
     // Thumbnail loading (visible tiles, batching, memory window)
     @StateObject private var thumbnailLoader = GridThumbnailLoader()
+    @StateObject private var tagReader = GridTagReader()
+    /// Finder tags of the items that have any, read off the main thread (see `startTagRead`)
+    @State private var tagsByURL: [URL: [String]] = [:]
 
     private var cellWidth: CGFloat {
         let iconSize = settings.iconGridIconSizeValue
@@ -60,6 +63,7 @@ struct IconGridView: View {
                                 viewModel: viewModel,
                                 isSelected: viewModel.selectedItems.contains(item),
                                 thumbnail: thumbnailLoader.image(for: item.url),
+                                tags: settings.showItemTags ? tagsByURL[item.url] ?? [] : [],
                                 onSingleClick: { clickedOnTextArea in
                                     if let index = items.firstIndex(of: item) {
                                         let modifiers = NSEvent.modifierFlags
@@ -93,7 +97,7 @@ struct IconGridView: View {
                             .onScrollVisibilityChange(threshold: GridThumbnailLoader.onScreenThreshold) { isVisible in
                                 thumbnailLoader.setOnScreen(item.url, isVisible)
                             }
-                            .internalDrag(item: item)
+                            .fileDragItem(item)
                             .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
                                 item: item,
                                 viewModel: viewModel,
@@ -106,6 +110,8 @@ struct IconGridView: View {
                             }
                         }
                     }
+                    // Dragging a selected tile drags the whole selection
+                    .fileDragContainer(for: viewModel)
                     .padding(20)
                     // Fill remaining space to allow clicking on empty area
                     .frame(minHeight: geometry.size.height, alignment: .top)
@@ -128,6 +134,7 @@ struct IconGridView: View {
                     thumbnailLoader.columnCount = columnCount
                     thumbnailLoader.setTargetPixelSize(iconGridThumbnailPixelSize)
                     thumbnailLoader.setItems(items)
+                    startTagRead()
                     // Scroll to selected item when view appears (e.g., when switching view modes)
                     if let primary = viewModel.primarySelectedItem {
                         // Use DispatchQueue to ensure layout is complete before scrolling
@@ -138,6 +145,7 @@ struct IconGridView: View {
                 }
                 .onDisappear {
                     thumbnailLoader.stop()
+                    tagReader.cancel()
                     autoScrollTimer?.invalidate()
                     autoScrollTimer = nil
                 }
@@ -256,6 +264,14 @@ struct IconGridView: View {
             // Keeps thumbnails of items that remain, drops removed ones and reloads around
             // the visible tiles.
             thumbnailLoader.setItems(newItems)
+            startTagRead()
+        }
+        .onChange(of: settings.showItemTags) { _, _ in
+            startTagRead()
+        }
+        // Tags edited here or elsewhere (the cache entries were dropped): read them again
+        .onChange(of: viewModel.tagRefreshToken) { _, _ in
+            startTagRead()
         }
         .onChange(of: items.map(\.contentVersion)) { _, _ in
             // Metadata/in-place edits: reload the thumbnails whose file version changed
@@ -285,6 +301,16 @@ struct IconGridView: View {
             onTypeAhead: { searchString in jumpToMatch(searchString) }
         )
         .simultaneousGesture(magnificationGesture)
+    }
+
+    /// Reads the items' tags in the background; tiles show them once they arrive.
+    private func startTagRead() {
+        guard settings.showItemTags else { return }
+        tagReader.read(items) { tags in
+            if tags != tagsByURL {
+                tagsByURL = tags
+            }
+        }
     }
 
     private func navigateSelection(by offset: Int, extend: Bool = false) {
@@ -384,6 +410,8 @@ struct IconGridItem: View {
     @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
     let thumbnail: NSImage?
+    /// The item's tags, as read by the grid (never read here: that would hit the disk on main)
+    let tags: [String]
     let onSingleClick: (Bool) -> Void  // Bool indicates if clicked on text area
     let onDoubleClick: () -> Void
 
@@ -440,9 +468,8 @@ struct IconGridItem: View {
                     )
                     .foregroundColor(isSelected && viewModel.renamingURL != item.url ? .white : .primary)
 
-                // Tags are only read (from disk the first time) when they're shown
-                if appSettings.showItemTags, !item.tags.isEmpty {
-                    TagDotsView(tags: item.tags)
+                if !tags.isEmpty {
+                    TagDotsView(tags: tags)
                 }
             }
             .contentShape(Rectangle())
@@ -480,6 +507,36 @@ struct IconGridItem: View {
             clickState.lastClickId = AnyHashable(item.id)
             onSingleClick(onTextArea)
         }
+    }
+}
+
+// MARK: - Grid Tag Reader
+
+/// Reads the Finder tags of grid items off the main thread: the first read of a file's tags hits
+/// its extended attributes, which is slow on network volumes. Only the latest read is delivered.
+@MainActor
+final class GridTagReader: ObservableObject {
+    private var generation = 0
+
+    /// Calls `completion` on the main thread with the tags of the items that have any.
+    func read(_ items: [FileItem], completion: @escaping @MainActor ([URL: [String]]) -> Void) {
+        generation += 1
+        let current = generation
+        let urls = items.filter { !$0.isFromArchive && $0.url.isFileURL }.map(\.url)
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let tags = MasonryRuntime.readTags(for: urls)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    guard let self, self.generation == current else { return }
+                    completion(tags)
+                }
+            }
+        }
+    }
+
+    /// Drops the read in progress.
+    func cancel() {
+        generation += 1
     }
 }
 

@@ -62,10 +62,17 @@ SPARKLE_STAMP="$SPARKLE_TOOLS_DIR/.flowfinder-sparkle-sha256"
 SPARKLE_SIGN="$SPARKLE_TOOLS_DIR/bin/sign_update"
 SPARKLE_APPCAST="$SPARKLE_TOOLS_DIR/bin/generate_appcast"
 
+# How far a --release run got in publishing, so a failure can say how to recover (see print_recovery)
+RELEASE_STAGE=""
+
 # Private scratch space for this run (removed on exit)
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/flowfinder-release.XXXXXX")"
 cleanup() {
+    local status=$?
     rm -rf "$WORK_DIR"
+    if [ "$status" -ne 0 ] && [ -n "$RELEASE_STAGE" ]; then
+        print_recovery
+    fi
 }
 trap cleanup EXIT
 
@@ -167,6 +174,91 @@ check_release_branch() {
         exit 1
     fi
     print_success "On $RELEASE_BRANCH, in sync with origin"
+}
+
+check_github_cli() {
+    if ! command -v gh &>/dev/null; then
+        print_error "GitHub CLI (gh) not installed. Install with: brew install gh"
+        exit 1
+    fi
+    if ! gh auth status &>/dev/null; then
+        print_error "Not authenticated with GitHub. Run: gh auth login"
+        exit 1
+    fi
+}
+
+# Before the long build: the version must not be released or tagged yet.
+check_release_not_published() {
+    print_step "Checking that v$(get_version) isn't published yet..."
+    local tag output status
+    tag="v$(get_version)"
+    check_github_cli
+    cd "$PROJECT_DIR"
+
+    if output=$(gh release view "$tag" 2>&1); then
+        print_error "GitHub release $tag already exists. Bump the version (step 1 in RELEASING.md)."
+        echo "If it's left over from a failed run, see \"Recovering from a failed release\" in RELEASING.md."
+        exit 1
+    elif ! grep -qi "not found" <<<"$output"; then
+        print_error "Couldn't check for an existing release $tag: $output"
+        exit 1
+    fi
+
+    status=0
+    git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1 || status=$?
+    if [ "$status" -eq 0 ]; then
+        print_error "Tag $tag already exists on origin (without a release). Delete it (git push origin :refs/tags/$tag) or bump the version."
+        exit 1
+    elif [ "$status" -ne 2 ]; then
+        print_error "Couldn't list the tags on origin (git ls-remote exit $status)"
+        exit 1
+    fi
+    print_success "No release or tag $tag yet"
+}
+
+# Optional release notes for the update dialog: release-notes/X.Y.Z.html, embedded in the appcast item. They must
+# be an HTML fragment (no DOCTYPE, <html> or <body>), which Sparkle shows inside its own page.
+release_notes_file() {
+    echo "$PROJECT_DIR/release-notes/$(get_version).html"
+}
+
+check_release_notes() {
+    print_step "Checking release notes..."
+    local notes
+    notes=$(release_notes_file)
+    if [ ! -f "$notes" ]; then
+        print_warning "No release-notes/$(get_version).html: the update dialog will show no notes"
+        return
+    fi
+    if grep -qiE '<!doctype|<html([[:space:]>]|$)|<body([[:space:]>]|$)' "$notes"; then
+        print_error "release-notes/$(get_version).html must be an HTML fragment (no DOCTYPE, <html> or <body>): it's embedded in the appcast."
+        exit 1
+    fi
+    print_success "Release notes: release-notes/$(get_version).html"
+}
+
+# After a failed --release: what has been published so far, and how to finish or retry.
+print_recovery() {
+    local version tag
+    version=$(get_version)
+    tag="v$version"
+    echo ""
+    print_warning "The release of $tag stopped partway."
+    case "$RELEASE_STAGE" in
+        appcast)
+            echo "  docs/appcast.xml was regenerated locally but not committed, and the GitHub release may be incomplete."
+            echo "  To retry from scratch:"
+            echo "    git checkout -- docs/appcast.xml"
+            echo "    gh release delete $tag --cleanup-tag --yes   # only if 'gh release view $tag' shows a partial release"
+            echo "    ./scripts/notarize.sh --release"
+            ;;
+        released)
+            echo "  The GitHub release $tag is published, but the appcast isn't pushed, so Sparkle users don't see it yet."
+            echo "  Finish by publishing the appcast (don't rerun the script):"
+            echo "    git commit -m \"Update appcast.xml for $tag\" -- docs/appcast.xml   # skip if already committed"
+            echo "    git push origin $RELEASE_BRANCH"
+            ;;
+    esac
 }
 
 check_credentials() {
@@ -495,9 +587,10 @@ update_appcast() {
     mkdir -p "$releases_dir"
     cp "$dmg_path" "$releases_dir/"
 
-    # Release notes: an HTML file next to the DMG with the same base name is picked up by generate_appcast.
-    if [ -f "$PROJECT_DIR/release-notes/$version.html" ]; then
-        cp "$PROJECT_DIR/release-notes/$version.html" "$releases_dir/$APP_NAME-$version.html"
+    # Release notes: an HTML file next to the DMG with the same base name is picked up by generate_appcast, and
+    # embedded in the item (otherwise it would link to the file, which is never published).
+    if [ -f "$(release_notes_file)" ]; then
+        cp "$(release_notes_file)" "$releases_dir/$APP_NAME-$version.html"
     fi
 
     # If an existing appcast exists, copy it so generate_appcast can append
@@ -507,6 +600,7 @@ update_appcast() {
 
     # generate_appcast reads the EdDSA key from Keychain
     "$SPARKLE_APPCAST" \
+        --embed-release-notes \
         --download-url-prefix "https://github.com/elliotttate/CoverFlowFinder/releases/download/v$version/" \
         "$releases_dir"
 
@@ -558,18 +652,7 @@ create_github_release() {
     fi
 
     print_step "Creating GitHub release $tag..."
-
-    # Check if gh is installed
-    if ! command -v gh &>/dev/null; then
-        print_error "GitHub CLI (gh) not installed. Install with: brew install gh"
-        exit 1
-    fi
-
-    # Check if authenticated
-    if ! gh auth status &>/dev/null; then
-        print_error "Not authenticated with GitHub. Run: gh auth login"
-        exit 1
-    fi
+    check_github_cli
 
     # Get the last commit message for release notes
     commit_msg=$(git log -1 --pretty=%s)
@@ -669,6 +752,8 @@ main() {
         --release)
             check_release_branch
             check_versions
+            check_release_not_published
+            check_release_notes
             check_credentials
             check_certificate
             ensure_sparkle_tools
@@ -684,9 +769,14 @@ main() {
             notarize_dmg
             verify_dmg
             sparkle_sign_dmg
+            # The release goes up before the appcast announces it, so Sparkle never offers a download that isn't
+            # there yet. A failure after this point prints how to recover (print_recovery).
+            RELEASE_STAGE=appcast
             update_appcast
             create_github_release
+            RELEASE_STAGE=released
             commit_appcast
+            RELEASE_STAGE=""
             ;;
         "")
             check_credentials
