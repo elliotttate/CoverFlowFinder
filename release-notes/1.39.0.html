@@ -1,0 +1,25 @@
+<h2>What's New in 1.39</h2>
+<ul>
+    <li><b>Runs on macOS 15 Sequoia</b> again (1.29–1.38 required macOS 26).</li>
+    <li><b>Much smoother scrolling</b> in Column, Icon and Masonry views in large folders (about 3–5× less work per frame).</li>
+    <li><b>Sizes for apps and folders</b>: applications and other packages show their size, and the new <i>Calculate all sizes</i> setting (Settings › List) adds folder sizes, computed in the background like Finder.</li>
+    <li><b>Hidden files</b> are dimmed when shown (⇧⌘.), and <code>.DS_Store</code> is never shown.</li>
+    <li><b>List view</b>: only the column you sort by has a bold title, and the Name column can be as wide as you like.</li>
+    <li><b>Column view</b>: drag a column's divider to resize it (⌥ resizes all), double-click it to fit the names; a tidier preview column that shows sizes and dates in large folders.</li>
+    <li><b>Go to Folder</b> (⇧⌘G), and <b>Move Item Here</b> (⌥⌘V, hold Option in the Edit menu).</li>
+    <li><b>Progress and Stop</b> for long copies, moves and Move to Trash; quitting during one asks first.</li>
+    <li>Double-clicking the path bar selects the whole path, ready to copy.</li>
+</ul>
+
+<h2>Fixes</h2>
+<ul>
+    <li>Dropping files onto folders works in every view; dropping onto a file drops into its folder, and ⌥-dragging duplicates, like Finder.</li>
+    <li>⌘⌫ in a text field (search, rename, path bar) deletes text instead of moving the selected files to the Trash.</li>
+    <li>No more stray mount/unmount sounds: they only play for volumes you can see in the sidebar.</li>
+    <li>Safer file operations: a move to another disk keeps the original until everything was copied, volumes can't be moved to the Trash, same-name conflicts are caught, and Undo/Redo work for copies, moves and renames.</li>
+    <li>Renaming follows Finder's rules for extensions (it asks before changing one) and handles “:” and “/” in names.</li>
+    <li>ZIP archives: browsing and copying out of malformed or malicious archives is safe, and big files inside them are copied without loading them into memory.</li>
+    <li>Quick Look, Cover Flow, selection, keyboard navigation, tabs and windows: many fixes for focus, double-clicks, stale previews and selection jumps.</li>
+    <li>iCloud badges and thumbnails update when a file downloads; folders that can't be opened say why.</li>
+    <li>Better performance and fewer stalls with large folders, network shares, Spotlight results and thumbnails.</li>
+</ul>
