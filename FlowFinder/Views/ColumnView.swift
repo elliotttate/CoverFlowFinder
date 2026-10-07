@@ -1352,6 +1352,9 @@ struct SingleColumnView: View {
     let onRefresh: () -> Void
     @State private var dropTargetedItemID: UUID?
     @State private var isColumnDropTargeted = false
+    /// Finder tags of this column's items that have any, read off the main thread
+    @StateObject private var tagReader = GridTagReader()
+    @State private var tagsByURL: [URL: [String]] = [:]
 
     var body: some View {
         ScrollViewReader { scrollProxy in
@@ -1364,7 +1367,8 @@ struct SingleColumnView: View {
                         ColumnRowView(
                             item: item,
                             viewModel: viewModel,
-                            isSelected: isSelected
+                            isSelected: isSelected,
+                            tags: appSettings.showItemTags ? tagsByURL[item.url] ?? [] : []
                         )
                         .id(item.url)
                         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1452,6 +1456,7 @@ struct SingleColumnView: View {
                 }
             }
             .onAppear {
+                startTagRead()
                 // Scroll to selected item when view appears (e.g., when switching view modes)
                 if let selected = selectedItem {
                     DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
@@ -1459,12 +1464,35 @@ struct SingleColumnView: View {
                     }
                 }
             }
+            .onDisappear {
+                tagReader.cancel()
+            }
             .onChange(of: selectedItem?.url) { _, selectedURL in
                 if let selectedURL {
                     withAnimation {
                         scrollProxy.scrollTo(selectedURL)
                     }
                 }
+            }
+            .onChange(of: items) { _, _ in
+                startTagRead()
+            }
+            .onChange(of: appSettings.showItemTags) { _, _ in
+                startTagRead()
+            }
+            // Tags edited here or elsewhere, or a refresh (the cache entries were dropped)
+            .onChange(of: viewModel.tagRefreshToken) { _, _ in
+                startTagRead()
+            }
+        }
+    }
+
+    /// Reads the items' tags in the background (like the icon grid); rows show them once they arrive.
+    private func startTagRead() {
+        guard appSettings.showItemTags else { return }
+        tagReader.read(items) { tags in
+            if tags != tagsByURL {
+                tagsByURL = tags
             }
         }
     }
@@ -1475,10 +1503,11 @@ struct ColumnRowView: View {
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
     let isSelected: Bool
-    /// Chevron and tags read in the background (drawing never reads the disk), for `loadedURL`
+    /// The item's Finder tags, read by its column in the background
+    let tags: [String]
+    /// Whether it opens as a column, read in the background (drawing never reads the disk)
     @State private var loadedURL: URL?
     @State private var loadedIsBrowsableFolder: Bool?
-    @State private var loadedTags: [String]?
 
     var body: some View {
         HStack(spacing: 8) {
@@ -1505,22 +1534,11 @@ struct ColumnRowView: View {
         }
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .onAppear {
-            loadDetailsIfNeeded()
+            loadFolderStatusIfNeeded()
         }
         .onChange(of: item.url) { _, _ in
-            loadDetailsIfNeeded()
+            loadFolderStatusIfNeeded()
         }
-        .onChange(of: viewModel.tagRefreshToken) { _, _ in
-            // Tags changed (refresh, edits): read them again
-            loadDetailsIfNeeded()
-        }
-        .onChange(of: appSettings.showItemTags) { _, _ in
-            loadDetailsIfNeeded()
-        }
-    }
-
-    private var hasReadableTags: Bool {
-        appSettings.showItemTags && !item.isFromArchive && item.url.isFileURL
     }
 
     private var isBrowsableFolder: Bool {
@@ -1530,26 +1548,16 @@ struct ColumnRowView: View {
         return item.isDirectory && !item.isPackage
     }
 
-    private var tags: [String] {
-        guard hasReadableTags else { return [] }
-        if let cached = FileTagManager.cachedTags(for: item.url) { return cached }
-        return loadedURL == item.url ? (loadedTags ?? []) : []
-    }
-
-    /// Reads what the caches don't know yet (alias/package status, tags) off the main thread.
-    private func loadDetailsIfNeeded() {
+    /// Reads the alias/package status the caches don't know yet off the main thread.
+    private func loadFolderStatusIfNeeded() {
         let item = item
-        let needsTags = hasReadableTags && FileTagManager.cachedTags(for: item.url) == nil
-        let needsFolderStatus = ColumnBrowsing.cachedIsBrowsableFolder(item) == nil
-        guard needsTags || needsFolderStatus else { return }
+        guard ColumnBrowsing.cachedIsBrowsableFolder(item) == nil else { return }
         DispatchQueue.global(qos: .userInitiated).async {
-            // Both fill their caches
+            // Fills the cache
             let isBrowsableFolder = ColumnBrowsing.isBrowsableFolder(item)
-            let tags = needsTags ? FileTagManager.getTags(for: item.url) : nil
             DispatchQueue.main.async {
                 loadedURL = item.url
                 loadedIsBrowsableFolder = isBrowsableFolder
-                loadedTags = tags
             }
         }
     }
