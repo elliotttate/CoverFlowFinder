@@ -260,6 +260,7 @@ struct QuadPaneListView: View {
                         QuadPaneListRow(item: item, viewModel: viewModel, onActivate: onActivate, dropTargetedItemID: $dropTargetedItemID)
                     }
                 }
+                .fileDragContainer(for: viewModel)
             }
             .onAppear {
                 if let lead = viewModel.primarySelectedItem {
@@ -321,7 +322,7 @@ struct QuadPaneListRow: View {
         .contentShape(Rectangle())
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
-        .internalDrag(item: item)
+        .fileDragItem(item)
         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
@@ -434,6 +435,7 @@ struct QuadPaneIconView: View {
                                 }
                         }
                     }
+                    .fileDragContainer(for: viewModel)
                     .padding(8)
                 }
                 .onAppear {
@@ -523,7 +525,7 @@ struct QuadPaneIconCell: View {
         .contentShape(Rectangle())
         .opacity(viewModel.isItemCut(item) ? 0.5 : 1.0)
         .id(item.id)
-        .internalDrag(item: item)
+        .fileDragItem(item)
         .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
             item: item,
             viewModel: viewModel,
