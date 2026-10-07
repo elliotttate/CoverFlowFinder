@@ -345,7 +345,7 @@ struct CoverFlowView: View {
             // Cover Flow handles its own keys: a handler registered in this window by the view it
             // replaces mustn't take them (the strip also does this when it joins a window)
             if let window = stripReference.window {
-                KeyboardManager.shared.suspendHandlers(in: window)
+                KeyboardManager.shared.clearHandler(in: window)
             }
             updateSortedItems(using: items, updateToken: true, newToken: viewModel.coverFlowItemsToken)
             syncSelection(pruningHiddenItems: true)
@@ -2643,7 +2643,7 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         requestFocus(onlyIfNothingFocused: false)
         // This view handles its own keys: a handler the replaced view registered in this window
         // (not another window's) mustn't take them
-        KeyboardManager.shared.suspendHandlers(in: window)
+        KeyboardManager.shared.clearHandler(in: window)
 
         // Observe first responder changes to debug focus loss
         if CoverFlowView.isDebugLoggingEnabled {
