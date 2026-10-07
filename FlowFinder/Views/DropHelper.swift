@@ -106,46 +106,46 @@ enum DropHelper {
     // MARK: Drop validation
 
     /// True when dropping `sources` into `destination` would put a folder inside itself
-    /// (destination is one of the sources or inside one of them).
+    /// (destination is one of the sources or inside one of them). A dragged symlink is the link
+    /// itself: a link to a folder can go into that folder's subfolders.
     static func isSelfOrDescendantDrop(sources: [URL], destination: URL) -> Bool {
-        let destinationPath = normalizedPath(destination)
-        return sources.contains { source in
-            let sourcePath = normalizedPath(source)
-            return destinationPath == sourcePath || destinationPath.hasPrefix(sourcePath + "/")
+        let destinationPath = FileOperationEngine.canonicalPath(destination)
+        return canonicalPaths(of: sources).contains { FileOperationEngine.isPath(destinationPath, sameAsOrInside: $0.item) }
+    }
+
+    /// True when every source already lives directly in `destination`: dropping would do nothing.
+    /// Not for an Option-drag (`.copy`), which duplicates them there, as in Finder.
+    static func isNoOpDrop(sources: [URL], destination: URL, operation: FileDropOperation = .automatic) -> Bool {
+        guard !sources.isEmpty, operation != .copy else { return false }
+        let destinationPath = FileOperationEngine.canonicalPath(destination)
+        return canonicalPaths(of: sources).allSatisfy { $0.parent == destinationPath }
+    }
+
+    private static var canonicalPathsCache: (sources: [URL], paths: [(item: String, parent: String)])?
+
+    /// Real paths of dragged items and their folders. Drop validation runs on every mouse move,
+    /// so the last drag's are remembered.
+    private static func canonicalPaths(of sources: [URL]) -> [(item: String, parent: String)] {
+        if let cache = canonicalPathsCache, cache.sources == sources {
+            return cache.paths
         }
-    }
-
-    /// True when every source already lives directly in `destination` (dropping would do nothing).
-    static func isNoOpDrop(sources: [URL], destination: URL) -> Bool {
-        guard !sources.isEmpty else { return false }
-        let destinationPath = normalizedPath(destination)
-        return sources.allSatisfy { normalizedPath($0.deletingLastPathComponent()) == destinationPath }
-    }
-
-    static func normalizedPath(_ url: URL) -> String {
-        var path = url.standardizedFileURL.resolvingSymlinksInPath().path
-        while path.count > 1 && path.hasSuffix("/") {
-            path.removeLast()
+        let paths = sources.map { source in
+            (item: FileOperationEngine.canonicalItemPath(source),
+             parent: FileOperationEngine.canonicalPath(source.deletingLastPathComponent()))
         }
-        return path
+        canonicalPathsCache = (sources, paths)
+        return paths
     }
 
-    /// Whether two file URLs are on the same volume; nil when either can't be determined.
+    /// Whether a dragged item is on the same volume as the folder `destination`; nil when either
+    /// can't be read.
     static func areOnSameVolume(_ lhs: URL, _ rhs: URL) -> Bool? {
-        guard let lhsVolume = volumeIdentifier(for: lhs),
-              let rhsVolume = volumeIdentifier(for: rhs) else {
-            return nil
-        }
-        return lhsVolume.isEqual(rhsVolume)
-    }
-
-    private static func volumeIdentifier(for url: URL) -> NSObject? {
-        (try? url.resourceValues(forKeys: [.volumeIdentifierKey]))?.volumeIdentifier as? NSObject
+        FileOperationEngine.isSameVolume(lhs, rhs)
     }
 
     /// The cursor badge for a drop: copy only when the drop will copy.
-    /// `.automatic` follows Finder: copy across volumes, move on the same volume; unknown sources
-    /// (e.g. file promises) are created fresh, so they show copy.
+    /// `.automatic` follows Finder: copy across volumes, move on the same volume. Unknown sources
+    /// (e.g. file promises) are created fresh and an unknown volume copies, so they show copy.
     static func dropOperation(for operation: FileDropOperation, sources: [URL], destination: URL) -> DropOperation {
         switch operation {
         case .copy:
@@ -154,11 +154,13 @@ enum DropHelper {
             return .move
         case .automatic:
             guard let first = sources.first else { return .copy }
-            if let sameVolume = cachedSameVolume(first, destination) {
-                return sameVolume ? .move : .copy
-            }
-            return .move
+            return cachedSameVolume(first, destination) == true ? .move : .copy
         }
+    }
+
+    /// ⌥⌘-drag makes aliases (Finder).
+    static func isAliasDrop(modifierFlags: NSEvent.ModifierFlags) -> Bool {
+        modifierFlags.contains([.option, .command])
     }
 
     private static var sameVolumeCache: (source: String, destination: String, result: Bool?)?
@@ -227,33 +229,58 @@ enum DropHelper {
             }
             return true
         }
-        return receivePromisedFiles(into: destination, completion: completion)
+        return receivePromisedFiles(into: destination, viewModel: viewModel, completion: completion)
     }
 
-    /// Receives file promises (Mail attachments, Photos, Safari images) from the current drag into
-    /// `destination` on a background queue. Must be called while the drop is being performed.
+    /// ⌥⌘-drop: makes aliases of the dropped files in `destination` (one undo step).
+    @MainActor
     @discardableResult
-    static func receivePromisedFiles(into destination: URL, completion: (() -> Void)? = nil) -> Bool {
+    static func performAliasDrop(providers: [NSItemProvider], into destination: URL, viewModel: FileBrowserViewModel) -> Bool {
+        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !fileProviders.isEmpty else { return false }
+        collectFileURLs(from: fileProviders) { urls in
+            guard !urls.isEmpty else { return }
+            viewModel.makeAliases(of: urls, in: destination)
+        }
+        return true
+    }
+
+    /// Receives file promises (Mail attachments, Photos, Safari images) from the current drag. Must
+    /// be called while the drop is being performed. With a `viewModel`, the files are received into
+    /// a staging folder (on the destination's volume) and then copied into `destination` like any
+    /// drop, with the name-conflict question and Undo; without one they're written straight there.
+    @discardableResult
+    static func receivePromisedFiles(into destination: URL, viewModel: FileBrowserViewModel? = nil, completion: (() -> Void)? = nil) -> Bool {
         let pasteboard = NSPasteboard(name: .drag)
         guard let receivers = pasteboard.readObjects(forClasses: [NSFilePromiseReceiver.self], options: nil) as? [NSFilePromiseReceiver],
               !receivers.isEmpty else {
             return false
         }
 
-        // One receiver per dragged item; its reader runs once per file it delivers. Completion fires
-        // once every receiver has delivered (or failed) at least once.
+        let staging = viewModel == nil ? nil : stagingDirectory(for: destination)
+        let lock = NSLock()
+        var receivedURLs: [URL] = []
+
+        // A receiver's reader runs once per file it delivers. Completion fires once every receiver
+        // has delivered (or failed) all its files.
         let group = DispatchGroup()
         for receiver in receivers {
             group.enter()
-            let lock = NSLock()
+            var deliveries = 0
             var hasLeft = false
-            receiver.receivePromisedFiles(atDestination: destination, options: [:], operationQueue: promiseQueue) { _, error in
+            receiver.receivePromisedFiles(atDestination: staging ?? destination, options: [:], operationQueue: promiseQueue) { url, error in
                 if let error {
                     os_log(.error, log: dropLog, "File promise failed: %{private}@", error.localizedDescription)
                 }
                 lock.lock()
-                let shouldLeave = !hasLeft
-                hasLeft = true
+                if error == nil {
+                    receivedURLs.append(url)
+                }
+                deliveries += 1
+                let shouldLeave = !hasLeft && deliveries >= max(1, receiver.fileNames.count)
+                if shouldLeave {
+                    hasLeft = true
+                }
                 lock.unlock()
                 if shouldLeave {
                     group.leave()
@@ -261,9 +288,40 @@ enum DropHelper {
             }
         }
         group.notify(queue: .main) {
-            completion?()
+            lock.lock()
+            let urls = receivedURLs
+            lock.unlock()
+            guard let staging, let viewModel else {
+                completion?()
+                return
+            }
+            guard !urls.isEmpty else {
+                try? FileManager.default.removeItem(at: staging)
+                completion?()
+                return
+            }
+            MainActor.assumeIsolated {
+                // New files: always copied in (Undo moves the copies to the Trash).
+                viewModel.handleDrop(urls: urls, to: destination, operation: .copy) {
+                    DispatchQueue.global(qos: .utility).async {
+                        try? FileManager.default.removeItem(at: staging)
+                    }
+                    completion?()
+                }
+            }
         }
         return true
+    }
+
+    /// A fresh temporary folder on `destination`'s volume (so the copy out of it is a clone), or in
+    /// the temporary directory.
+    private static func stagingDirectory(for destination: URL) -> URL? {
+        let fileManager = FileManager.default
+        if let directory = try? fileManager.url(for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: destination, create: true) {
+            return directory
+        }
+        let directory = fileManager.temporaryDirectory.appendingPathComponent("FlowFinderDrop-\(UUID().uuidString)", isDirectory: true)
+        return (try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)) == nil ? nil : directory
     }
 
     /// Legacy entry point for `.onDrop(of:isTargeted:perform:)` closures: resolves the operation now
@@ -357,32 +415,58 @@ struct UnifiedFolderDropDelegate: DropDelegate {
     let viewModel: FileBrowserViewModel
     @Binding var dropTargetedItemID: UUID?
 
+    /// Folders take drops. A package (an app, a Photos library, an .rtfd …) isn't a folder things
+    /// go into — except that files dropped on an application open in it, as in Finder.
     private var acceptsDrops: Bool {
-        item.isDirectory && !item.isFromArchive && !viewModel.isPhotosItem(item) && !DropHelper.isSidebarFavoriteDrag()
+        item.isDirectory
+            && (!item.isPackage || isApplication)
+            && !item.isFromArchive
+            && !viewModel.isPhotosItem(item)
+            && !DropHelper.isSidebarFavoriteDrag()
+    }
+
+    private var isApplication: Bool {
+        item.isPackage && item.fileType == .application
+    }
+
+    /// File promises need a folder to be written to, so an application only takes file URLs.
+    private var acceptedTypes: [UTType] {
+        isApplication ? [.fileURL] : DropHelper.acceptedDropTypes
     }
 
     /// Internal drags are allowed (e.g. onto a folder in the other pane); only dropping a folder
-    /// onto itself / its own descendant, or into the folder the items already live in, is refused.
+    /// onto itself / its own descendant, or into the folder the items already live in (unless
+    /// Option duplicates them), is refused. ⌥⌘ makes aliases, which is always possible.
     private func isUsefulDrop() -> Bool {
+        let flags = NSEvent.modifierFlags
+        if DropHelper.isAliasDrop(modifierFlags: flags) && !isApplication { return true }
         let sources = DropHelper.dragSourceURLs()
         if DropHelper.isSelfOrDescendantDrop(sources: sources, destination: item.url) { return false }
-        if DropHelper.isNoOpDrop(sources: sources, destination: item.url) { return false }
-        return true
+        if isApplication { return true }
+        let operation = FileDropOperation(modifierFlags: flags)
+        return !DropHelper.isNoOpDrop(sources: sources, destination: item.url, operation: operation)
     }
 
     func validateDrop(info: DropInfo) -> Bool {
-        acceptsDrops && info.hasItemsConforming(to: DropHelper.acceptedDropTypes) && isUsefulDrop()
+        // Whether this drag can drop here is decided as it moves (Option can change it)
+        acceptsDrops && info.hasItemsConforming(to: acceptedTypes)
     }
 
     func dropEntered(info: DropInfo) {
         if acceptsDrops && isUsefulDrop() {
-            dropTargetedItemID = item.id
-            let binding = $dropTargetedItemID
-            let itemID = item.id
-            DropHighlightReset.shared.clearWhenDragEnds {
-                if binding.wrappedValue == itemID {
-                    binding.wrappedValue = nil
-                }
+            setTargeted()
+        }
+    }
+
+    /// Turns the highlight on, making sure it goes off again when the drag ends.
+    private func setTargeted() {
+        guard dropTargetedItemID != item.id else { return }
+        dropTargetedItemID = item.id
+        let binding = $dropTargetedItemID
+        let itemID = item.id
+        DropHighlightReset.shared.clearWhenDragEnds {
+            if binding.wrappedValue == itemID {
+                binding.wrappedValue = nil
             }
         }
     }
@@ -394,7 +478,16 @@ struct UnifiedFolderDropDelegate: DropDelegate {
     }
 
     func dropUpdated(info: DropInfo) -> DropProposal? {
-        guard acceptsDrops && isUsefulDrop() else { return DropProposal(operation: .forbidden) }
+        guard acceptsDrops && isUsefulDrop() else {
+            if dropTargetedItemID == item.id {
+                dropTargetedItemID = nil
+            }
+            return DropProposal(operation: .forbidden)
+        }
+        setTargeted()
+        if isApplication {
+            return DropProposal(operation: .copy)
+        }
         let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
         return DropProposal(operation: DropHelper.dropOperation(
             for: operation,
@@ -412,12 +505,16 @@ struct UnifiedFolderDropDelegate: DropDelegate {
 
         // Resolve the operation now: the item providers load asynchronously, after the user may
         // have released Option.
-        let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
+        let flags = NSEvent.modifierFlags
+        let providers = info.itemProviders(for: [.fileURL])
+        if DropHelper.isAliasDrop(modifierFlags: flags) && !isApplication {
+            return DropHelper.performAliasDrop(providers: providers, into: item.url, viewModel: viewModel)
+        }
         return DropHelper.performDrop(
-            providers: info.itemProviders(for: [.fileURL]),
+            providers: providers,
             into: item.url,
             viewModel: viewModel,
-            operation: operation
+            operation: FileDropOperation(modifierFlags: flags)
         )
     }
 }
@@ -460,20 +557,20 @@ struct ContainerDropDelegate: DropDelegate {
 
     private var destination: URL { viewModel.currentPath }
 
+    /// Not inside an archive, the Photos library, the Network browser or Spotlight results.
     private var acceptsDrops: Bool {
-        !viewModel.isInsideArchive
-            && !viewModel.isPhotosLibraryActive
-            && viewModel.currentPath.isFileURL
-            && viewModel.currentPath.path != "/Network"
-            && !DropHelper.isSidebarFavoriteDrag()
+        viewModel.canAddItemsToCurrentLocation && !DropHelper.isSidebarFavoriteDrag()
     }
 
-    /// A drag of items that already live in this folder (e.g. from this very view) would do nothing.
+    /// A drag of items that already live in this folder (e.g. from this very view) would do
+    /// nothing, unless Option duplicates them or ⌥⌘ makes aliases.
     private func isUsefulDrop() -> Bool {
+        let flags = NSEvent.modifierFlags
+        if DropHelper.isAliasDrop(modifierFlags: flags) { return true }
         let sources = DropHelper.dragSourceURLs()
         if DropHelper.isSelfOrDescendantDrop(sources: sources, destination: destination) { return false }
-        if DropHelper.isNoOpDrop(sources: sources, destination: destination) { return false }
-        return true
+        let operation = FileDropOperation(modifierFlags: flags)
+        return !DropHelper.isNoOpDrop(sources: sources, destination: destination, operation: operation)
     }
 
     func validateDrop(info: DropInfo) -> Bool {
@@ -544,12 +641,16 @@ struct ContainerDropDelegate: DropDelegate {
         guard acceptsDrops, isUsefulDrop() else { return false }
 
         // Resolve the operation now, not inside the asynchronous item-provider callbacks.
-        let operation = FileDropOperation(modifierFlags: NSEvent.modifierFlags)
+        let flags = NSEvent.modifierFlags
+        let providers = info.itemProviders(for: [.fileURL])
+        if DropHelper.isAliasDrop(modifierFlags: flags) {
+            return DropHelper.performAliasDrop(providers: providers, into: destination, viewModel: viewModel)
+        }
         return DropHelper.performDrop(
-            providers: info.itemProviders(for: [.fileURL]),
+            providers: providers,
             into: destination,
             viewModel: viewModel,
-            operation: operation,
+            operation: FileDropOperation(modifierFlags: flags),
             completion: onComplete
         )
     }
