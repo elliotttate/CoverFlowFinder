@@ -7,6 +7,7 @@ struct FlowFinderApp: App {
     // ContentView initializer) on any settings change. Views observe it through the environment.
     private let settings = AppSettings.shared
     @StateObject private var soundEffectsMonitor = FinderSoundEffectsMonitor()
+    @NSApplicationDelegateAdaptor(FlowFinderAppDelegate.self) private var appDelegate
 
     private let updaterController: SPUStandardUpdaterController
 
@@ -148,6 +149,21 @@ struct BrowserCommands: Commands {
             }
             .keyboardShortcut("v", modifiers: .command)
             .disabled(!standardEditing && !canPasteFiles)
+            // Finder's ⌥⌘V, shown in Paste's place while Option is held: moves the clipboard's
+            // items here, also when they were copied (a cut is moved by Paste as well)
+            .modifierKeyAlternate(.option) {
+                Button("Move Item Here") {
+                    performFileOnly {
+                        guard let viewModel, viewModel.canPaste else {
+                            NSSound.beep()
+                            return
+                        }
+                        viewModel.pasteMovingItems()
+                    }
+                }
+                .keyboardShortcut("v", modifiers: [.command, .option])
+                .disabled(!canPasteFiles || menuState.usesStandardEditing)
+            }
 
             Divider()
 
@@ -293,5 +309,61 @@ struct BrowserCommands: Commands {
 
     private func perform(_ command: EditCommand) {
         KeyboardManager.shared.performMenuCommand(command, viewModel: viewModel)
+    }
+
+    /// A file command with no text-editing counterpart: routed like Duplicate, so it does nothing
+    /// while a text field is edited or a window other than a browser is in front.
+    private func performFileOnly(_ action: @escaping () -> Void) {
+        KeyboardManager.shared.performMenuCommand(.duplicate, viewModel: viewModel, fileAction: action)
+    }
+}
+
+// MARK: - Quitting
+
+/// Asks before quitting while file operations run: quitting would cut a copy or move short.
+final class FlowFinderAppDelegate: NSObject, NSApplicationDelegate {
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        QuitGuard.terminateReply(confirm: QuitGuard.confirmStoppingOperations) {
+            sender.reply(toApplicationShouldTerminate: true)
+        }
+    }
+}
+
+/// The quit decision while file operations may be queued or running in any window.
+@MainActor
+enum QuitGuard {
+    /// Waiting for stopped operations to end before quitting.
+    private(set) static var isWaitingToQuit = false
+
+    /// The answer to `applicationShouldTerminate`: quit now when no file operation is pending
+    /// (also for Sparkle's install and relaunch). Otherwise `confirm` asks; stopping cancels every
+    /// operation — each keeps what it finished, an item copied part-way is removed — and answers
+    /// `.terminateLater`, and `quit` runs once they have all ended. Cancel keeps the app running.
+    static func terminateReply(confirm: () -> Bool, quit: @escaping () -> Void) -> NSApplication.TerminateReply {
+        // Asked again while the stopped operations wind down: that quit is still coming
+        if isWaitingToQuit { return .terminateCancel }
+        guard FileOperationEngine.hasPendingOperations else { return .terminateNow }
+        guard confirm() else { return .terminateCancel }
+        isWaitingToQuit = true
+        FileOperationEngine.cancelAllOperations()
+        FileOperationEngine.whenIdle {
+            // After the last operation's own completion, never before this returns
+            DispatchQueue.main.async {
+                isWaitingToQuit = false
+                quit()
+            }
+        }
+        return .terminateLater
+    }
+
+    /// Asks whether to stop the file operations and quit: true for Quit.
+    static func confirmStoppingOperations() -> Bool {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "File operations are in progress."
+        alert.informativeText = "Stop them and quit? What’s done stays done; an item copied part-way is removed."
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Cancel")
+        return alert.runModal() == .alertFirstButtonReturn
     }
 }

@@ -9,6 +9,9 @@ struct IconGridView: View {
     @ObservedObject private var internalDragState = InternalDragState.shared
     private var autoScrollState: DragAutoScrollState { DragAutoScrollState.shared }
     let items: [FileItem]
+    /// The view model's `itemsRevision` for `items`: FileItem equality is identity, so without it
+    /// SwiftUI keeps the old array after in-place updates (iCloud status, metadata).
+    var itemsRevision = 0
     @State private var isDropTargeted = false
     @State private var dropTargetedItemID: UUID?
     @State private var currentWidth: CGFloat = 800
@@ -23,6 +26,9 @@ struct IconGridView: View {
     @StateObject private var tagReader = GridTagReader()
     /// Finder tags of the items that have any, read off the main thread (see `startTagRead`)
     @State private var tagsByURL: [URL: [String]] = [:]
+    /// Tile frames for the grid's drop target
+    @State private var tileFrames = TileFrameStore()
+    private static let gridSpace = "iconGrid"
 
     private var cellWidth: CGFloat {
         let iconSize = settings.iconGridIconSizeValue
@@ -99,11 +105,7 @@ struct IconGridView: View {
                                 thumbnailLoader.setOnScreen(item.url, isVisible)
                             }
                             .fileDragItem(item)
-                            .onDrop(of: DropHelper.acceptedDropTypes, delegate: UnifiedFolderDropDelegate(
-                                item: item,
-                                viewModel: viewModel,
-                                dropTargetedItemID: $dropTargetedItemID
-                            ))
+                            .reportsTileFrame(item.url, in: tileFrames, space: Self.gridSpace)
                             .contextMenu {
                                 FileItemContextMenu(item: item, viewModel: viewModel) { item in
                                     viewModel.renamingURL = item.url
@@ -116,6 +118,22 @@ struct IconGridView: View {
                     .padding(20)
                     // Fill remaining space to allow clicking on empty area
                     .frame(minHeight: geometry.size.height, alignment: .top)
+                    // Drops onto the grid: the folder tile under the pointer, else this folder
+                    .coordinateSpace(name: Self.gridSpace)
+                    .onDrop(of: DropHelper.acceptedDropTypes, delegate: TileGridDropDelegate(
+                        viewModel: viewModel,
+                        item: { [tileFrames, items] point in
+                            tileFrames.tile(at: point).flatMap { url in items.first { $0.url == url } }
+                        },
+                        dropTargetedItemID: $dropTargetedItemID,
+                        container: ContainerDropDelegate(
+                            viewModel: viewModel,
+                            isDropTargeted: $isDropTargeted,
+                            containerHeight: currentHeight,
+                            items: items,
+                            autoScroll: false
+                        )
+                    ))
                     .background(
                         Color.clear
                             .contentShape(Rectangle())
@@ -556,9 +574,38 @@ final class GridThumbnailLoader: ObservableObject {
         let image: NSImage
         /// The size it was requested at (the image may be smaller if the source is).
         let pixelSize: CGFloat
-        /// File version it was made from; nil when unknown (no metadata yet).
-        let version: ThumbnailFileVersion?
+        /// What it was made from.
+        let version: SourceVersion
         let isFallback: Bool
+    }
+
+    /// What a thumbnail was made from: the file's version (nil until the item's metadata is
+    /// loaded — loading it isn't a change of the file) and whether the file's contents were on
+    /// disk. An iCloud file that isn't downloaded only gets its icon; downloading it changes
+    /// neither its date nor its size, so this is what makes its thumbnail load then.
+    struct SourceVersion: Equatable {
+        let file: ThumbnailFileVersion?
+        let isDownloaded: Bool
+
+        /// Whether a thumbnail made from `self` is out of date for an item now at `current`: the
+        /// file changed (both versions known and different), or it was downloaded or evicted.
+        func isOutdated(comparedTo current: SourceVersion) -> Bool {
+            if let file, let currentFile = current.file, file != currentFile {
+                return true
+            }
+            return isDownloaded != current.isDownloaded
+        }
+
+        /// False while the item's iCloud status says its contents aren't on disk (yet); true for
+        /// local files and while the status isn't known.
+        static func isDownloaded(_ status: CloudSyncStatus?) -> Bool {
+            switch status {
+            case .notDownloaded, .downloading:
+                return false
+            default:
+                return true
+            }
+        }
     }
 
     /// Fraction of a tile that must be visible to count as on screen.
@@ -584,13 +631,13 @@ final class GridThumbnailLoader: ObservableObject {
 
     private struct Request {
         let pixelSize: CGFloat
-        let version: ThumbnailFileVersion?
+        let version: SourceVersion
         let token: ThumbnailRequestToken?
         let startedAt: Date
     }
     private var inFlight: [URL: Request] = [:]
     /// Preloaded into the shared cache (outside the kept window) at this size/version.
-    private var warmed: [URL: (pixelSize: CGFloat, version: ThumbnailFileVersion?)] = [:]
+    private var warmed: [URL: (pixelSize: CGFloat, version: SourceVersion)] = [:]
     private var keepRange: Range<Int> = 0..<0
 
     private var pendingUpdates: [URL: Thumbnail?] = [:]
@@ -768,14 +815,13 @@ final class GridThumbnailLoader: ObservableObject {
 
     // MARK: Hydration pass
 
-    private func currentVersion(of item: FileItem) -> ThumbnailFileVersion? {
-        guard item.hasMetadata, item.modificationDate != nil else { return nil }
-        return cache.fileVersion(for: item)
+    private func currentVersion(of item: FileItem) -> SourceVersion {
+        let file = item.hasMetadata && item.modificationDate != nil ? cache.fileVersion(for: item) : nil
+        return SourceVersion(file: file, isDownloaded: SourceVersion.isDownloaded(item.cloudStatus))
     }
 
-    private func isOutdated(pixelSize: CGFloat, version: ThumbnailFileVersion?, isFallback: Bool, for item: FileItem) -> Bool {
-        let current = currentVersion(of: item)
-        if let current, let version, current != version {
+    private func isOutdated(pixelSize: CGFloat, version: SourceVersion, isFallback: Bool, for item: FileItem) -> Bool {
+        if version.isOutdated(comparedTo: currentVersion(of: item)) {
             return true
         }
         // A fallback icon doesn't get better at a larger size.
@@ -891,7 +937,7 @@ final class GridThumbnailLoader: ObservableObject {
         }
 
         if loadsPhotosAssets, let viewModel, viewModel.isPhotosItem(item) {
-            inFlight[url] = Request(pixelSize: pixelSize, version: nil, token: nil, startedAt: Date())
+            inFlight[url] = Request(pixelSize: pixelSize, version: version, token: nil, startedAt: Date())
             // Opportunistic delivery may call back twice (degraded, then final).
             viewModel.requestPhotoThumbnail(for: item, targetPixelSize: pixelSize) { [weak self] image, _ in
                 guard let self else { return }
@@ -900,7 +946,7 @@ final class GridThumbnailLoader: ObservableObject {
                     self.inFlight.removeValue(forKey: url)
                 }
                 guard self.indexByURL[url] != nil else { return }
-                self.stage(url, Thumbnail(image: image ?? item.icon, pixelSize: pixelSize, version: nil, isFallback: image == nil))
+                self.stage(url, Thumbnail(image: image ?? item.icon, pixelSize: pixelSize, version: version, isFallback: image == nil))
             }
             return
         }
@@ -918,7 +964,7 @@ final class GridThumbnailLoader: ObservableObject {
         }
     }
 
-    private func handle(_ result: ThumbnailRequestResult, for item: FileItem, pixelSize: CGFloat, version: ThumbnailFileVersion?) {
+    private func handle(_ result: ThumbnailRequestResult, for item: FileItem, pixelSize: CGFloat, version: SourceVersion) {
         let url = item.url
         if let request = inFlight[url] {
             // A newer request (bigger size, new version) replaced this one

@@ -177,17 +177,6 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
         item.displayName(showFileExtensions: showFileExtensions).replacingOccurrences(of: ":", with: "/")
     }
 
-    /// The part of the rename field's text to select when editing starts: the base name when the
-    /// field shows a file's (or package's) extension, as Finder does, else everything. UTF-16 range.
-    static func initialSelection(forEditingText text: String, of item: FileItem) -> NSRange {
-        let all = NSRange(location: 0, length: (text as NSString).length)
-        guard !item.isDirectory || item.isPackage else { return all }
-        let ext = item.url.pathExtension
-        guard !ext.isEmpty, text.count > ext.count + 1,
-              text.lowercased().hasSuffix("." + ext.lowercased()) else { return all }
-        return NSRange(location: 0, length: all.length - (ext as NSString).length - 1)
-    }
-
     /// The field text, or nil when it's blank or unchanged (nothing to rename). Not trimmed:
     /// leading and trailing spaces are part of the name, as in Finder.
     private func editedTextIfChanged(for item: FileItem) -> String? {
@@ -207,6 +196,7 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
 
         // Set up for editing (the same naming rule as every other rename field)
         let text = item.editingName
+        let selection = item.editingSelection
         nameTextField.stringValue = text
         nameTextField.isEditable = true
         nameTextField.isSelectable = true
@@ -221,10 +211,10 @@ final class FileNameCellView: NSTableCellView, NSTextFieldDelegate {
             // First, end any existing editing in the window
             self.window?.endEditing(for: nil)
 
-            // Now start editing our field, with the base name selected
+            // Now start editing our field, with the base name selected (Finder)
             self.nameTextField.selectText(nil)
             if let editor = self.nameTextField.currentEditor(), editor.string == text {
-                editor.selectedRange = Self.initialSelection(forEditingText: text, of: item)
+                editor.selectedRange = selection
             }
         }
     }
