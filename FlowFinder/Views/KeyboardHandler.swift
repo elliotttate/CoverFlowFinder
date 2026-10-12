@@ -365,6 +365,16 @@ final class KeyboardManager {
         window.makeFirstResponder(nil)
     }
 
+    /// An explicit file command moves focus out of search/path input. Never take focus from
+    /// another window or a sheet, and refresh the menu immediately instead of waiting for KVO.
+    func focusFileArea(in window: NSWindow?) {
+        guard let window, window.isKeyWindow, isBrowserWindow(window),
+              window.attachedSheet == nil else { return }
+        focusEngagedWindows.remove(window)
+        window.makeFirstResponder(nil)
+        MenuValidationState.shared.refresh()
+    }
+
     /// A clicked control that took first responder keeps the keys if it uses them (a slider with
     /// Full Keyboard Access on); checked once AppKit has handled the click.
     private func engageIfClickedControlTakesFocus(_ hitView: NSView, in window: NSWindow) {
@@ -543,6 +553,9 @@ final class KeyboardManager {
     @discardableResult
     func performMenuCommand(_ command: EditCommand, viewModel: FileBrowserViewModel?, fileAction: (() -> Void)? = nil) -> EditCommandRoute {
         let window = commandTargetWindow()
+        // Key-window notifications can arrive before NSApp has updated its key window. Refresh
+        // the menu snapshot at dispatch, including file-only actions that read the menu context.
+        MenuValidationState.shared.refresh()
         let route = EditCommandRouting.route(
             command,
             isBrowserWindow: isBrowserWindow(window) && window?.attachedSheet == nil,
@@ -571,7 +584,9 @@ final class KeyboardManager {
     /// falling back to the view model. Internal (not private) so tests can drive it.
     func performFileCommand(_ command: EditCommand, viewModel: FileBrowserViewModel?, in window: NSWindow?) {
         let handlers = window.flatMap { activeHandlers(for: $0) }
-        guard let viewModel else {
+        // Resolve the target window's live pane. The menu's published context can still be nil
+        // (or belong to the previous window) during a focus transition; it is only a snapshot.
+        guard let viewModel = MenuValidationState.shared.context(for: window)?.viewModel ?? viewModel else {
             NSSound.beep()
             return
         }
@@ -824,7 +839,8 @@ final class MenuValidationState: ObservableObject {
     private init() {
         let center = NotificationCenter.default
         for name in [NSWindow.didBecomeKeyNotification, NSWindow.didResignKeyNotification,
-                     NSWindow.willBeginSheetNotification, NSWindow.didEndSheetNotification] {
+                     NSWindow.willBeginSheetNotification, NSWindow.didEndSheetNotification,
+                     NSApplication.didBecomeActiveNotification] {
             observers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     self?.keyWindowChanged()
@@ -842,7 +858,21 @@ final class MenuValidationState: ObservableObject {
         refresh()
     }
 
+    /// The registered context of a specific window, independent of the published menu snapshot.
+    func context(for window: NSWindow?) -> BrowserCommandContext? {
+        window.flatMap { contexts.object(forKey: $0) }
+    }
+
     private func keyWindowChanged() {
+        observeAndUpdateCurrentWindow()
+        // During a window/activation notification, NSApp can still report the previous key
+        // window or nil. Re-read after the transition and observe the actual window's responder.
+        DispatchQueue.main.async { [weak self] in
+            self?.observeAndUpdateCurrentWindow()
+        }
+    }
+
+    private func observeAndUpdateCurrentWindow() {
         firstResponderObservation = KeyboardManager.shared.commandTargetWindow()?.observe(\.firstResponder, options: []) { [weak self] _, _ in
             // Deferred: first-responder changes can happen inside a SwiftUI update.
             DispatchQueue.main.async {
@@ -868,7 +898,7 @@ final class MenuValidationState: ObservableObject {
             || targetWindow?.attachedSheet != nil
             || KeyboardResponderKind.classify(targetWindow?.firstResponder) == .textEditing
         let keyIsBrowser = manager.isBrowserWindow(keyWindow)
-        let context = isTargetBrowser ? targetWindow.flatMap { contexts.object(forKey: $0) } : nil
+        let context = isTargetBrowser ? context(for: targetWindow) : nil
         if usesStandardEditing != standardEditing { usesStandardEditing = standardEditing }
         if isSheetActive != sheetActive { isSheetActive = sheetActive }
         if isKeyWindowBrowser != keyIsBrowser { isKeyWindowBrowser = keyIsBrowser }
@@ -1112,13 +1142,17 @@ extension FileBrowserViewModel {
     /// calling view's window: the panel only follows the window it was opened from, so a view in
     /// another (e.g. background) window can't take it over or close it.
     func updateQuickLookPreview(for item: FileItem?, in window: NSWindow? = nil) {
+        guard QuickLookControllerView.shared.acceptsPreviewUpdate(from: window) else { return }
+        let requestID = UUID()
+        quickLookRequestID = requestID
         guard let item else {
             QuickLookControllerView.shared.updatePreview(for: nil, from: window)
             return
         }
 
         // Use async version to avoid blocking during archive extraction
-        previewURL(for: item) { previewURL in
+        previewURL(for: item) { [weak self] previewURL in
+            guard self?.quickLookRequestID == requestID else { return }
             QuickLookControllerView.shared.updatePreview(for: previewURL, from: window)
         }
     }

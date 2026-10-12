@@ -709,6 +709,12 @@ struct CoverFlowView: View {
             viewModel.renamingURL = first.url
         case .quickLook:
             toggleQuickLook(for: first)
+        case .openAsArchive:
+            viewModel.openAsArchive(first)
+        case .extractArchive(let mode):
+            viewModel.extractArchives(items, mode: mode)
+        case .compressArchive(let format):
+            viewModel.compressItems(items, format: format)
         case .toggleTag(let tagName):
             // Adds the tag to every item, or removes it from all of them if they all have it
             let editable = items.filter { !$0.isFromArchive }
@@ -759,8 +765,7 @@ struct CoverFlowView: View {
     private func updateQuickLook(for item: FileItem?) {
         // Closed panel: nothing to do (and no preview file to prepare)
         guard QuickLookControllerView.isPanelVisible, let window = stripReference.window else { return }
-        let previewURL = item.flatMap { viewModel.previewURL(for: $0) }
-        QuickLookControllerView.shared.updatePreview(for: previewURL, from: window)
+        viewModel.updateQuickLookPreview(for: item, in: window)
     }
 
     private func updateQuickLookForSelection() {
@@ -1195,6 +1200,9 @@ enum CoverFlowItemCommand: Equatable {
     case getInfo
     case rename
     case quickLook
+    case openAsArchive
+    case extractArchive(ArchiveExtractionMode)
+    case compressArchive(ArchiveCompressionFormat)
     case toggleTag(String)
     case removeAllTags
 }
@@ -2474,6 +2482,27 @@ class CoverFlowNSView: NSView, OpenWithActionTarget {
         openItem.target = self
         openItem.representedObject = targets
         menu.addItem(openItem)
+        if let item = singleItem, !item.isDirectory {
+            addItem("Open as Archive", .openAsArchive, on: [item])
+        }
+        let archives = ArchiveExtractionMode.eligibleItems(targets)
+        if !archives.isEmpty {
+            let title = archives.count > 1 ? "Extract Archives" : "Extract Archive"
+            let submenu = NSMenu(title: title)
+            submenu.autoenablesItems = false
+            for mode in ArchiveExtractionMode.allCases {
+                addItem(mode.title(for: archives), .extractArchive(mode), on: archives, to: submenu)
+            }
+            let extractItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            extractItem.submenu = submenu
+            menu.addItem(extractItem)
+        }
+
+        if canModifyFolder && !ArchiveCompressionFormat.eligibleItems(targets).isEmpty {
+            for format in ArchiveCompressionFormat.allCases {
+                addItem(format.title, .compressArchive(format))
+            }
+        }
 
         // Show Package Contents for bundles like .app
         if let item = singleItem, !item.isFromArchive, item.url.isFileURL, isPackage(item) {

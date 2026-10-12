@@ -105,6 +105,24 @@ struct BrowserCommands: Commands {
             .keyboardShortcut("n", modifiers: [.command, .shift])
             .disabled(viewModel == nil)
 
+            Button("Open as Archive") { viewModel?.openAsArchive() }
+                .disabled(viewModel?.canOpenSelectedAsArchive != true)
+            if let viewModel {
+                ArchiveExtractionMenu(viewModel: viewModel)
+                    .disabled(menuState.isSheetActive)
+            } else {
+                Button("Extract Archive") {}.disabled(true)
+            }
+
+            if let viewModel {
+                ArchiveCompressionMenu(viewModel: viewModel)
+                    .disabled(menuState.isSheetActive)
+            } else {
+                ForEach(ArchiveCompressionFormat.allCases, id: \.self) { format in
+                    Button(format.title) {}.disabled(true)
+                }
+            }
+
             Button("Get Info") {
                 viewModel?.presentInfo(for: viewModel?.primarySelectedItem)
             }

@@ -17,7 +17,8 @@ It is geared toward experienced macOS developers who want to extend or refactor 
   - `FileItem` and `FileTagManager` (file metadata and tag caching)
   - `ListColumnConfigManager` (column visibility and `SortState`)
   - `ThumbnailCacheManager` (memory/disk thumbnail caching)
-  - `ZipArchiveManager` (ZIP parsing and extraction)
+  - `ArchiveManager` (archive navigation, native ZIP parsing and safe extraction)
+  - `SevenZipArchiveBackend` (bundled archive engine, passwords, format support and creation)
 - `FlowFinder/ViewModels`
   - `FileBrowserViewModel` (navigation, selection, clipboard, archive state, file ops)
 - `FlowFinder/Views`

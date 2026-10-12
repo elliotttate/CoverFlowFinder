@@ -300,7 +300,8 @@ struct PanePathBar: View {
         let component = components[index]
         if let url = component.url {
             // Also leaves an archive, in one history step
-            viewModel.navigateToAndSelectCurrent(url)
+            if component.archivePath != nil { viewModel.enterArchive(at: url) }
+            else { viewModel.navigateToAndSelectCurrent(url) }
         } else if let archivePath = component.archivePath {
             viewModel.navigateInArchive(to: archivePath)
         }

@@ -141,6 +141,10 @@ class QuickLookControllerView: NSResponder, QLPreviewPanelDataSource, QLPreviewP
         Self.isPanelVisible
     }
 
+    func acceptsPreviewUpdate(from window: NSWindow?) -> Bool {
+        Self.acceptsUpdate(from: window, sessionWindow: sessionWindow, isPanelVisible: isPanelVisible)
+    }
+
     /// Opens the panel on `url` for `window` (default: the key browser window).
     func showPreview(for url: URL, in window: NSWindow? = nil, navigate: @escaping (Int) -> Void) {
         guard let panel = QLPreviewPanel.shared() else { return }

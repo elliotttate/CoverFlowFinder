@@ -1,0 +1,450 @@
+name: SevenZip
+options:
+  deploymentTarget:
+    macOS: "15.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    MACOSX_DEPLOYMENT_TARGET: "15.0"
+    CODE_SIGN_STYLE: Manual
+    CODE_SIGN_IDENTITY: "-"
+    DEVELOPMENT_TEAM: ""
+    ARCHS: "arm64 x86_64"
+    ONLY_ACTIVE_ARCH: YES
+    CLANG_CXX_LIBRARY: libc++
+    GCC_C_LANGUAGE_STANDARD: gnu17
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    DEAD_CODE_STRIPPING: NO
+    SKIP_INSTALL: YES
+    MARKETING_VERSION: "26.04"
+    CURRENT_PROJECT_VERSION: "1"
+  configs:
+    Debug:
+      ENABLE_TESTABILITY: YES
+    Release:
+      ONLY_ACTIVE_ARCH: NO
+      ENABLE_HARDENED_RUNTIME: YES
+      ENABLE_DEBUG_DYLIB: NO
+      ENABLE_TESTABILITY: NO
+targets:
+  SevenZipCore:
+    type: library.static
+    platform: macOS
+    settings:
+      base:
+        PRODUCT_NAME: SevenZipCore
+        CLANG_CXX_LANGUAGE_STANDARD: c++11
+        # pub3: plain textual includes, as upstream's makefiles compile. With clang modules on, the
+        # x86_64 slice fails in C/AesOpt.c: <wmmintrin.h> is a submodule of _Builtin_intrinsics that
+        # does not make <emmintrin.h>'s __m128i visible ("missing '#include <emmintrin.h>'").
+        CLANG_ENABLE_MODULES: NO
+        GCC_OPTIMIZATION_LEVEL: 2
+        # SZ_LZMA_DEC_OPT_DEFS: Z7_LZMA_DEC_OPT on arm64 only, where Asm/arm64/LzmaDecOpt.S
+        # provides LzmaDec_DecodeReal_3. The x86_64 slice is upstream's clang x64 build without
+        # USE_ASM (var_mac_x64.mak: USE_ASM=, 7zip_gcc.mak:1266-1345): the x86 .asm files are MASM
+        # syntax, so every *Opt.c is compiled as C and LzmaDec.c without Z7_LZMA_DEC_OPT. The
+        # define only matters to LzmaDec.c (the one file that tests it), so a target-wide
+        # per-arch setting replaces the per-file flag, which Xcode cannot make per-arch.
+        SZ_LZMA_DEC_OPT_DEFS: ""
+        "SZ_LZMA_DEC_OPT_DEFS[arch=arm64]": "Z7_LZMA_DEC_OPT"
+        GCC_PREPROCESSOR_DEFINITIONS: ["$(inherited)", "NDEBUG=1", "_REENTRANT=1", "_FILE_OFFSET_BITS=64", "_LARGEFILE_SOURCE=1", "$(SZ_LZMA_DEC_OPT_DEFS)"]
+        GCC_TREAT_WARNINGS_AS_ERRORS: NO
+        GCC_WARN_INHIBIT_ALL_WARNINGS: NO
+        CLANG_WARN_DOCUMENTATION_COMMENTS: NO
+        GCC_WARN_64_TO_32_BIT_CONVERSION: NO
+        CLANG_WARN_COMMA: NO
+        CLANG_WARN_STRICT_PROTOTYPES: NO
+        # LzmaDecOpt.S has no __aarch64__ guard: the x86_64 slice excludes it (and has no
+        # Z7_LZMA_DEC_OPT, above).
+        "EXCLUDED_SOURCE_FILE_NAMES[arch=x86_64]": LzmaDecOpt.S
+    sources:
+      # Platform layer (macOS implementations of the link-time obligations,
+      # 02-engine-api.md section 4.3). Warnings are errors here.
+      - path: Core/Platform
+        compilerFlags: "-Wall -Wextra -Werror"
+      # Agent (archive-as-folder), patched per 02-engine-api.md section 4.2
+      - path: ../CPP/7zip/UI/Agent/Agent.cpp
+      - path: ../CPP/7zip/UI/Agent/AgentOut.cpp
+      - path: ../CPP/7zip/UI/Agent/AgentProxy.cpp
+      - path: ../CPP/7zip/UI/Agent/ArchiveFolder.cpp
+      - path: ../CPP/7zip/UI/Agent/ArchiveFolderOpen.cpp
+      - path: ../CPP/7zip/UI/Agent/ArchiveFolderOut.cpp
+      - path: ../CPP/7zip/UI/Agent/UpdateCallbackAgent.cpp
+      # Portable UI/Common extras not in 7zz
+      - path: ../CPP/7zip/UI/Common/WorkDir.cpp
+      - path: ../CPP/7zip/UI/Common/ArchiveName.cpp
+      # Portable FileManager helpers (SplitUtils patched; PropertyName/FormatUtils need MyLoadString)
+      - path: ../CPP/7zip/UI/FileManager/StringUtils.cpp
+      - path: ../CPP/7zip/UI/FileManager/TextPairs.cpp
+      - path: ../CPP/7zip/UI/FileManager/SplitUtils.cpp
+      - path: ../CPP/7zip/UI/FileManager/PropertyName.cpp
+      - path: ../CPP/7zip/UI/FileManager/FormatUtils.cpp
+      # Lang file reader
+      - path: ../CPP/Common/Lang.cpp
+      # ---- exact 7zz set (02-engine-api.md 1.4) minus CPP/7zip/UI/Console ----
+      - path: ../Asm/arm64/LzmaDecOpt.S
+      - path: ../C/7zBuf2.c
+      - path: ../C/7zCrc.c
+      - path: ../C/7zCrcOpt.c
+      - path: ../C/7zStream.c
+      - path: ../C/Aes.c
+      - path: ../C/AesOpt.c
+      - path: ../C/Alloc.c
+      - path: ../C/Bcj2.c
+      - path: ../C/Bcj2Enc.c
+      - path: ../C/Blake2s.c
+      - path: ../C/Bra.c
+      - path: ../C/Bra86.c
+      - path: ../C/BraIA64.c
+      - path: ../C/BwtSort.c
+      - path: ../C/CpuArch.c
+      - path: ../C/Delta.c
+      - path: ../C/HuffEnc.c
+      - path: ../C/LzFind.c
+      - path: ../C/LzFindMt.c
+      - path: ../C/LzFindOpt.c
+      - path: ../C/Lzma2Dec.c
+      - path: ../C/Lzma2DecMt.c
+      - path: ../C/Lzma2Enc.c
+      - path: ../C/LzmaDec.c
+      - path: ../C/LzmaEnc.c
+      - path: ../C/Md5.c
+      - path: ../C/MtCoder.c
+      - path: ../C/MtDec.c
+      - path: ../C/Ppmd7.c
+      - path: ../C/Ppmd7Dec.c
+      - path: ../C/Ppmd7Enc.c
+      - path: ../C/Ppmd7aDec.c
+      - path: ../C/Ppmd8.c
+      - path: ../C/Ppmd8Dec.c
+      - path: ../C/Ppmd8Enc.c
+      - path: ../C/Sha1.c
+      - path: ../C/Sha1Opt.c
+      - path: ../C/Sha256.c
+      - path: ../C/Sha256Opt.c
+      - path: ../C/Sha3.c
+      - path: ../C/Sha512.c
+      - path: ../C/Sha512Opt.c
+      - path: ../C/Sort.c
+      - path: ../C/SwapBytes.c
+      - path: ../C/Threads.c
+      - path: ../C/Xxh64.c
+      - path: ../C/Xz.c
+      - path: ../C/XzCrc64.c
+      - path: ../C/XzCrc64Opt.c
+      - path: ../C/XzDec.c
+      - path: ../C/XzEnc.c
+      - path: ../C/XzIn.c
+      - path: ../C/ZstdDec.c
+      - path: ../CPP/Common/CRC.cpp
+      - path: ../CPP/Common/CommandLineParser.cpp
+      - path: ../CPP/Common/CrcReg.cpp
+      - path: ../CPP/Common/DynLimBuf.cpp
+      - path: ../CPP/Common/IntToString.cpp
+      - path: ../CPP/Common/ListFileUtils.cpp
+      - path: ../CPP/Common/LzFindPrepare.cpp
+      - path: ../CPP/Common/Md5Reg.cpp
+      - path: ../CPP/Common/MyMap.cpp
+      - path: ../CPP/Common/MyString.cpp
+      - path: ../CPP/Common/MyVector.cpp
+      - path: ../CPP/Common/MyWindows.cpp
+      - path: ../CPP/Common/MyXml.cpp
+      - path: ../CPP/Common/NewHandler.cpp
+      - path: ../CPP/Common/Sha1Prepare.cpp
+      - path: ../CPP/Common/Sha1Reg.cpp
+      - path: ../CPP/Common/Sha256Prepare.cpp
+      - path: ../CPP/Common/Sha256Reg.cpp
+      - path: ../CPP/Common/Sha3Reg.cpp
+      - path: ../CPP/Common/Sha512Prepare.cpp
+      - path: ../CPP/Common/Sha512Reg.cpp
+      - path: ../CPP/Common/StdInStream.cpp
+      - path: ../CPP/Common/StdOutStream.cpp
+      - path: ../CPP/Common/StringConvert.cpp
+      - path: ../CPP/Common/StringToInt.cpp
+      - path: ../CPP/Common/UTFConvert.cpp
+      - path: ../CPP/Common/Wildcard.cpp
+      - path: ../CPP/Common/Xxh64Reg.cpp
+      - path: ../CPP/Common/XzCrc64Init.cpp
+      - path: ../CPP/Common/XzCrc64Reg.cpp
+      - path: ../CPP/Windows/ErrorMsg.cpp
+      - path: ../CPP/Windows/FileDir.cpp
+      - path: ../CPP/Windows/FileFind.cpp
+      - path: ../CPP/Windows/FileIO.cpp
+      - path: ../CPP/Windows/FileLink.cpp
+      - path: ../CPP/Windows/FileName.cpp
+      - path: ../CPP/Windows/PropVariant.cpp
+      - path: ../CPP/Windows/PropVariantConv.cpp
+      - path: ../CPP/Windows/PropVariantUtils.cpp
+      - path: ../CPP/Windows/Synchronization.cpp
+      - path: ../CPP/Windows/System.cpp
+      - path: ../CPP/Windows/SystemInfo.cpp
+      - path: ../CPP/Windows/TimeUtils.cpp
+      - path: ../CPP/7zip/Common/CWrappers.cpp
+      - path: ../CPP/7zip/Common/CreateCoder.cpp
+      - path: ../CPP/7zip/Common/FilePathAutoRename.cpp
+      - path: ../CPP/7zip/Common/FileStreams.cpp
+      - path: ../CPP/7zip/Common/FilterCoder.cpp
+      - path: ../CPP/7zip/Common/InBuffer.cpp
+      - path: ../CPP/7zip/Common/InOutTempBuffer.cpp
+      - path: ../CPP/7zip/Common/LimitedStreams.cpp
+      - path: ../CPP/7zip/Common/LockedStream.cpp
+      - path: ../CPP/7zip/Common/MemBlocks.cpp
+      - path: ../CPP/7zip/Common/MethodId.cpp
+      - path: ../CPP/7zip/Common/MethodProps.cpp
+      - path: ../CPP/7zip/Common/MultiOutStream.cpp
+      - path: ../CPP/7zip/Common/OffsetStream.cpp
+      - path: ../CPP/7zip/Common/OutBuffer.cpp
+      - path: ../CPP/7zip/Common/OutMemStream.cpp
+      - path: ../CPP/7zip/Common/ProgressMt.cpp
+      - path: ../CPP/7zip/Common/ProgressUtils.cpp
+      - path: ../CPP/7zip/Common/PropId.cpp
+      - path: ../CPP/7zip/Common/StreamBinder.cpp
+      - path: ../CPP/7zip/Common/StreamObjects.cpp
+      - path: ../CPP/7zip/Common/StreamUtils.cpp
+      - path: ../CPP/7zip/Common/UniqBlocks.cpp
+      - path: ../CPP/7zip/Common/VirtThread.cpp
+      - path: ../CPP/7zip/Archive/ApfsHandler.cpp
+      - path: ../CPP/7zip/Archive/ApmHandler.cpp
+      - path: ../CPP/7zip/Archive/ArHandler.cpp
+      - path: ../CPP/7zip/Archive/ArjHandler.cpp
+      - path: ../CPP/7zip/Archive/Base64Handler.cpp
+      - path: ../CPP/7zip/Archive/Bz2Handler.cpp
+      - path: ../CPP/7zip/Archive/ComHandler.cpp
+      - path: ../CPP/7zip/Archive/CpioHandler.cpp
+      - path: ../CPP/7zip/Archive/CramfsHandler.cpp
+      - path: ../CPP/7zip/Archive/DeflateProps.cpp
+      - path: ../CPP/7zip/Archive/DmgHandler.cpp
+      - path: ../CPP/7zip/Archive/ElfHandler.cpp
+      - path: ../CPP/7zip/Archive/ExtHandler.cpp
+      - path: ../CPP/7zip/Archive/FatHandler.cpp
+      - path: ../CPP/7zip/Archive/FlvHandler.cpp
+      - path: ../CPP/7zip/Archive/GptHandler.cpp
+      - path: ../CPP/7zip/Archive/GzHandler.cpp
+      - path: ../CPP/7zip/Archive/HandlerCont.cpp
+      - path: ../CPP/7zip/Archive/HfsHandler.cpp
+      - path: ../CPP/7zip/Archive/IhexHandler.cpp
+      - path: ../CPP/7zip/Archive/LpHandler.cpp
+      - path: ../CPP/7zip/Archive/LzhHandler.cpp
+      - path: ../CPP/7zip/Archive/LzmaHandler.cpp
+      - path: ../CPP/7zip/Archive/MachoHandler.cpp
+      - path: ../CPP/7zip/Archive/MbrHandler.cpp
+      - path: ../CPP/7zip/Archive/MslzHandler.cpp
+      - path: ../CPP/7zip/Archive/MubHandler.cpp
+      - path: ../CPP/7zip/Archive/NtfsHandler.cpp
+      - path: ../CPP/7zip/Archive/PeHandler.cpp
+      - path: ../CPP/7zip/Archive/PpmdHandler.cpp
+      - path: ../CPP/7zip/Archive/QcowHandler.cpp
+      - path: ../CPP/7zip/Archive/RpmHandler.cpp
+      - path: ../CPP/7zip/Archive/SparseHandler.cpp
+      - path: ../CPP/7zip/Archive/SplitHandler.cpp
+      - path: ../CPP/7zip/Archive/SquashfsHandler.cpp
+      - path: ../CPP/7zip/Archive/SwfHandler.cpp
+      - path: ../CPP/7zip/Archive/UefiHandler.cpp
+      - path: ../CPP/7zip/Archive/VdiHandler.cpp
+      - path: ../CPP/7zip/Archive/VhdHandler.cpp
+      - path: ../CPP/7zip/Archive/VhdxHandler.cpp
+      - path: ../CPP/7zip/Archive/VmdkHandler.cpp
+      - path: ../CPP/7zip/Archive/XarHandler.cpp
+      - path: ../CPP/7zip/Archive/XzHandler.cpp
+      - path: ../CPP/7zip/Archive/ZHandler.cpp
+      - path: ../CPP/7zip/Archive/ZstdHandler.cpp
+      - path: ../CPP/7zip/Archive/Common/CoderMixer2.cpp
+      - path: ../CPP/7zip/Archive/Common/DummyOutStream.cpp
+      - path: ../CPP/7zip/Archive/Common/FindSignature.cpp
+      - path: ../CPP/7zip/Archive/Common/HandlerOut.cpp
+      - path: ../CPP/7zip/Archive/Common/InStreamWithCRC.cpp
+      - path: ../CPP/7zip/Archive/Common/ItemNameUtils.cpp
+      - path: ../CPP/7zip/Archive/Common/MultiStream.cpp
+      - path: ../CPP/7zip/Archive/Common/OutStreamWithCRC.cpp
+      - path: ../CPP/7zip/Archive/Common/OutStreamWithSha1.cpp
+      - path: ../CPP/7zip/Archive/Common/ParseProperties.cpp
+      - path: ../CPP/7zip/Archive/7z/7zCompressionMode.cpp
+      - path: ../CPP/7zip/Archive/7z/7zDecode.cpp
+      - path: ../CPP/7zip/Archive/7z/7zEncode.cpp
+      - path: ../CPP/7zip/Archive/7z/7zExtract.cpp
+      - path: ../CPP/7zip/Archive/7z/7zFolderInStream.cpp
+      - path: ../CPP/7zip/Archive/7z/7zHandler.cpp
+      - path: ../CPP/7zip/Archive/7z/7zHandlerOut.cpp
+      - path: ../CPP/7zip/Archive/7z/7zHeader.cpp
+      - path: ../CPP/7zip/Archive/7z/7zIn.cpp
+      - path: ../CPP/7zip/Archive/7z/7zOut.cpp
+      - path: ../CPP/7zip/Archive/7z/7zProperties.cpp
+      - path: ../CPP/7zip/Archive/7z/7zRegister.cpp
+      - path: ../CPP/7zip/Archive/7z/7zSpecStream.cpp
+      - path: ../CPP/7zip/Archive/7z/7zUpdate.cpp
+      - path: ../CPP/7zip/Archive/Cab/CabBlockInStream.cpp
+      - path: ../CPP/7zip/Archive/Cab/CabHandler.cpp
+      - path: ../CPP/7zip/Archive/Cab/CabHeader.cpp
+      - path: ../CPP/7zip/Archive/Cab/CabIn.cpp
+      - path: ../CPP/7zip/Archive/Cab/CabRegister.cpp
+      - path: ../CPP/7zip/Archive/Chm/ChmHandler.cpp
+      - path: ../CPP/7zip/Archive/Chm/ChmIn.cpp
+      - path: ../CPP/7zip/Archive/Iso/IsoHandler.cpp
+      - path: ../CPP/7zip/Archive/Iso/IsoHeader.cpp
+      - path: ../CPP/7zip/Archive/Iso/IsoIn.cpp
+      - path: ../CPP/7zip/Archive/Iso/IsoRegister.cpp
+      - path: ../CPP/7zip/Archive/Nsis/NsisDecode.cpp
+      - path: ../CPP/7zip/Archive/Nsis/NsisHandler.cpp
+      - path: ../CPP/7zip/Archive/Nsis/NsisIn.cpp
+      - path: ../CPP/7zip/Archive/Nsis/NsisRegister.cpp
+      - path: ../CPP/7zip/Archive/Rar/Rar5Handler.cpp
+      - path: ../CPP/7zip/Archive/Rar/RarHandler.cpp
+      - path: ../CPP/7zip/Archive/Tar/TarHandler.cpp
+      - path: ../CPP/7zip/Archive/Tar/TarHandlerOut.cpp
+      - path: ../CPP/7zip/Archive/Tar/TarHeader.cpp
+      - path: ../CPP/7zip/Archive/Tar/TarIn.cpp
+      - path: ../CPP/7zip/Archive/Tar/TarOut.cpp
+      - path: ../CPP/7zip/Archive/Tar/TarRegister.cpp
+      - path: ../CPP/7zip/Archive/Tar/TarUpdate.cpp
+      - path: ../CPP/7zip/Archive/Udf/UdfHandler.cpp
+      - path: ../CPP/7zip/Archive/Udf/UdfIn.cpp
+      - path: ../CPP/7zip/Archive/Wim/WimHandler.cpp
+      - path: ../CPP/7zip/Archive/Wim/WimHandlerOut.cpp
+      - path: ../CPP/7zip/Archive/Wim/WimIn.cpp
+      - path: ../CPP/7zip/Archive/Wim/WimRegister.cpp
+      - path: ../CPP/7zip/Archive/Zip/ZipAddCommon.cpp
+      - path: ../CPP/7zip/Archive/Zip/ZipHandler.cpp
+      - path: ../CPP/7zip/Archive/Zip/ZipHandlerOut.cpp
+      - path: ../CPP/7zip/Archive/Zip/ZipIn.cpp
+      - path: ../CPP/7zip/Archive/Zip/ZipItem.cpp
+      - path: ../CPP/7zip/Archive/Zip/ZipOut.cpp
+      - path: ../CPP/7zip/Archive/Zip/ZipRegister.cpp
+      - path: ../CPP/7zip/Archive/Zip/ZipUpdate.cpp
+      - path: ../CPP/7zip/Compress/BZip2Crc.cpp
+      - path: ../CPP/7zip/Compress/BZip2Decoder.cpp
+      - path: ../CPP/7zip/Compress/BZip2Encoder.cpp
+      - path: ../CPP/7zip/Compress/BZip2Register.cpp
+      - path: ../CPP/7zip/Compress/Bcj2Coder.cpp
+      - path: ../CPP/7zip/Compress/Bcj2Register.cpp
+      - path: ../CPP/7zip/Compress/BcjCoder.cpp
+      - path: ../CPP/7zip/Compress/BcjRegister.cpp
+      - path: ../CPP/7zip/Compress/BitlDecoder.cpp
+      - path: ../CPP/7zip/Compress/BranchMisc.cpp
+      - path: ../CPP/7zip/Compress/BranchRegister.cpp
+      - path: ../CPP/7zip/Compress/ByteSwap.cpp
+      - path: ../CPP/7zip/Compress/CopyCoder.cpp
+      - path: ../CPP/7zip/Compress/CopyRegister.cpp
+      - path: ../CPP/7zip/Compress/Deflate64Register.cpp
+      - path: ../CPP/7zip/Compress/DeflateDecoder.cpp
+      - path: ../CPP/7zip/Compress/DeflateEncoder.cpp
+      - path: ../CPP/7zip/Compress/DeflateRegister.cpp
+      - path: ../CPP/7zip/Compress/DeltaFilter.cpp
+      - path: ../CPP/7zip/Compress/ImplodeDecoder.cpp
+      - path: ../CPP/7zip/Compress/LzOutWindow.cpp
+      - path: ../CPP/7zip/Compress/LzfseDecoder.cpp
+      - path: ../CPP/7zip/Compress/LzhDecoder.cpp
+      - path: ../CPP/7zip/Compress/Lzma2Decoder.cpp
+      - path: ../CPP/7zip/Compress/Lzma2Encoder.cpp
+      - path: ../CPP/7zip/Compress/Lzma2Register.cpp
+      - path: ../CPP/7zip/Compress/LzmaDecoder.cpp
+      - path: ../CPP/7zip/Compress/LzmaEncoder.cpp
+      - path: ../CPP/7zip/Compress/LzmaRegister.cpp
+      - path: ../CPP/7zip/Compress/LzmsDecoder.cpp
+      - path: ../CPP/7zip/Compress/LzxDecoder.cpp
+      - path: ../CPP/7zip/Compress/PpmdDecoder.cpp
+      - path: ../CPP/7zip/Compress/PpmdEncoder.cpp
+      - path: ../CPP/7zip/Compress/PpmdRegister.cpp
+      - path: ../CPP/7zip/Compress/PpmdZip.cpp
+      - path: ../CPP/7zip/Compress/QuantumDecoder.cpp
+      - path: ../CPP/7zip/Compress/Rar1Decoder.cpp
+      - path: ../CPP/7zip/Compress/Rar2Decoder.cpp
+      - path: ../CPP/7zip/Compress/Rar3Decoder.cpp
+      - path: ../CPP/7zip/Compress/Rar3Vm.cpp
+      - path: ../CPP/7zip/Compress/Rar5Decoder.cpp
+      - path: ../CPP/7zip/Compress/RarCodecsRegister.cpp
+      - path: ../CPP/7zip/Compress/ShrinkDecoder.cpp
+      - path: ../CPP/7zip/Compress/XpressDecoder.cpp
+      - path: ../CPP/7zip/Compress/XzDecoder.cpp
+      - path: ../CPP/7zip/Compress/XzEncoder.cpp
+      - path: ../CPP/7zip/Compress/ZDecoder.cpp
+      - path: ../CPP/7zip/Compress/ZlibDecoder.cpp
+      - path: ../CPP/7zip/Compress/ZlibEncoder.cpp
+      - path: ../CPP/7zip/Compress/ZstdDecoder.cpp
+      - path: ../CPP/7zip/Crypto/7zAes.cpp
+      - path: ../CPP/7zip/Crypto/7zAesRegister.cpp
+      - path: ../CPP/7zip/Crypto/HmacSha1.cpp
+      - path: ../CPP/7zip/Crypto/HmacSha256.cpp
+      - path: ../CPP/7zip/Crypto/MyAes.cpp
+      - path: ../CPP/7zip/Crypto/MyAesReg.cpp
+      - path: ../CPP/7zip/Crypto/Pbkdf2HmacSha1.cpp
+      - path: ../CPP/7zip/Crypto/RandGen.cpp
+      - path: ../CPP/7zip/Crypto/Rar20Crypto.cpp
+      - path: ../CPP/7zip/Crypto/Rar5Aes.cpp
+      - path: ../CPP/7zip/Crypto/RarAes.cpp
+      - path: ../CPP/7zip/Crypto/WzAes.cpp
+      - path: ../CPP/7zip/Crypto/ZipCrypto.cpp
+      - path: ../CPP/7zip/Crypto/ZipStrong.cpp
+      - path: ../CPP/7zip/UI/Common/ArchiveCommandLine.cpp
+      - path: ../CPP/7zip/UI/Common/ArchiveExtractCallback.cpp
+      - path: ../CPP/7zip/UI/Common/ArchiveOpenCallback.cpp
+      - path: ../CPP/7zip/UI/Common/Bench.cpp
+      - path: ../CPP/7zip/UI/Common/DefaultName.cpp
+      - path: ../CPP/7zip/UI/Common/EnumDirItems.cpp
+      - path: ../CPP/7zip/UI/Common/Extract.cpp
+      - path: ../CPP/7zip/UI/Common/ExtractingFilePath.cpp
+      - path: ../CPP/7zip/UI/Common/HashCalc.cpp
+      - path: ../CPP/7zip/UI/Common/LoadCodecs.cpp
+      - path: ../CPP/7zip/UI/Common/OpenArchive.cpp
+      - path: ../CPP/7zip/UI/Common/PropIDUtils.cpp
+      - path: ../CPP/7zip/UI/Common/SetProperties.cpp
+      - path: ../CPP/7zip/UI/Common/SortUtils.cpp
+      - path: ../CPP/7zip/UI/Common/TempFiles.cpp
+      - path: ../CPP/7zip/UI/Common/Update.cpp
+      - path: ../CPP/7zip/UI/Common/UpdateAction.cpp
+      - path: ../CPP/7zip/UI/Common/UpdateCallback.cpp
+      - path: ../CPP/7zip/UI/Common/UpdatePair.cpp
+      - path: ../CPP/7zip/UI/Common/UpdateProduce.cpp
+
+  # ---------------------------------------------------------------------------
+  # SevenZipKit: Objective-C++ bridge framework. Swift sees only Core/include.
+  # ---------------------------------------------------------------------------
+  SevenZipKit:
+    type: framework
+    platform: macOS
+    sources:
+      - path: Core
+        headerVisibility: project
+        excludes:
+          - "Platform/**"
+          - "include/**"
+          - "Info.plist"
+      - path: Core/include
+        headerVisibility: public
+      - path: Resources/Lang
+        type: folder
+        buildPhase: resources
+    dependencies:
+      - target: SevenZipCore
+        link: true
+      - sdk: Foundation.framework
+      - sdk: CoreServices.framework
+    settings:
+      base:
+        PRODUCT_NAME: SevenZipKit
+        PRODUCT_BUNDLE_IDENTIFIER: com.yrambler2001.7zip.SevenZipKit
+        INFOPLIST_FILE: Core/Info.plist
+        DEFINES_MODULE: YES
+        MODULEMAP_FILE: ""
+        CLANG_ENABLE_OBJC_ARC: YES
+        CLANG_ENABLE_MODULES: YES
+        CLANG_CXX_LANGUAGE_STANDARD: c++17
+        GCC_PREPROCESSOR_DEFINITIONS: ["$(inherited)", "NDEBUG=1", "_REENTRANT=1", "_FILE_OFFSET_BITS=64", "_LARGEFILE_SOURCE=1"]
+        GCC_TREAT_WARNINGS_AS_ERRORS: YES
+        CLANG_WARN_DOCUMENTATION_COMMENTS: NO
+        WARNING_CFLAGS: ["-Wall", "-Wextra"]
+        # The engine registers formats/codecs from static constructors in
+        # *Register.cpp; nothing references those objects, so force-load the
+        # whole archive (02-engine-api.md 4.5).
+        OTHER_LDFLAGS: ["$(inherited)", "-lc++", "-Wl,-force_load,$(BUILT_PRODUCTS_DIR)/libSevenZipCore.a"]
+        LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/../Frameworks", "@loader_path/Frameworks"]
+        DYLIB_INSTALL_NAME_BASE: "@rpath"
+        SKIP_INSTALL: YES
+      # packaging scope: the bridge used to be pinned at -O0 in *every* configuration, so a Release
+      # build shipped an unoptimized ObjC++ layer while Swift got -O and the engine -O2. Debug keeps
+      # -O0 for debuggability; Release matches SevenZipCore at -O2.
+      configs:
+        Debug:
+          GCC_OPTIMIZATION_LEVEL: 0
+        Release:
+          GCC_OPTIMIZATION_LEVEL: 2
+

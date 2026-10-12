@@ -14,7 +14,7 @@ A beautiful macOS file browser that brings back the classic Cover Flow view from
 - **Full File Browser** - Navigate your entire file system with a familiar Finder-like interface
 - **Sidebar Navigation** - Quick access to Favorites, iCloud, and mounted volumes
 - **Sorting & Search** - Sort files by name, date, size, or kind; search to filter files instantly
-- **ZIP Archive Browsing** - Navigate ZIP contents without extracting the whole archive
+- **Archive Browsing** - Browse ZIP, RAR, 7z, TAR and other formats, including passwords, nested archives, multipart sets, Quick Look, thumbnails, single or batch extraction, and ZIP / 7z creation
 - **Clipboard Operations** - Copy, Cut, Paste, and Duplicate files with keyboard shortcuts
 - **Context Menus** - Right-click for quick access to file operations
 - **Type-Ahead Search** - Start typing to jump to matching files instantly
@@ -48,6 +48,15 @@ See [DEVELOPMENT.md](DEVELOPMENT.md) for architecture details and how to add a n
 - **Double-click** or press **Return** to open files/folders
 - **Arrow keys** to navigate between items
 - **Scroll wheel** for smooth momentum scrolling through covers
+
+### Archives
+Double-click a supported archive to browse it. Double-click an archive inside it to continue into that archive; Up and Back return through the nested locations. For a file with an unfamiliar extension, choose **Open as Archive** from the File menu or context menu. Compressed TAR files can be entered through their inner TAR member.
+
+Select files or folders and choose **Compress to ZIP** or **Compress to 7z** in the File menu or context menu. The archive is created in the current folder; a single selection uses its name and multiple selections create `Archive.zip` or `Archive.7z`. Existing archive names receive numbered suffixes. Compression preserves the originals and supports progress, cancellation, and Undo / Redo.
+
+Choose **Extract Archive** in the File menu or context menu to extract here, into a folder named after the archive, or into a folder you choose. With multiple archives selected, choose **Extract to Separate Folders** or **Extract All to One Folder…**. Existing items keep their contents; conflicting output names receive numbered suffixes. Extraction supports progress, cancellation, and Undo / Redo. Passwords are requested for interactive opening or extraction and kept only in the current engine session. Background thumbnails never ask for a password. For multipart archives, keep every volume together and open the first RAR/7z volume or the main `.zip` file.
+
+Quick Look and thumbnails prepare only the selected member. Copying a file or folder out uses private temporary storage, validates the data and paths, and retains download quarantine. Long operations have progress and cancellation. Browsing is read-only.
 
 ### Keyboard Shortcuts
 | Shortcut | Action |

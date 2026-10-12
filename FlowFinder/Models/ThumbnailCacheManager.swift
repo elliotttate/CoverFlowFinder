@@ -118,6 +118,7 @@ class ThumbnailCacheManager {
         /// file's version first (set before the cache is used).
         var cacheKey: String
         var waiters: [Waiter] = []
+        var archiveProgress: Progress?
         var qlRequest: QLThumbnailGenerator.Request?
         var isCancelled = false
         var isFinished = false
@@ -277,7 +278,9 @@ class ThumbnailCacheManager {
         for item: FileItem,
         maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize
     ) -> NSImage? {
-        if item.isFromArchive { return nil }
+        if item.isFromArchive {
+            return memoryCache.object(forKey: ArchiveManager.shared.previewCacheKey(for: item, maxPixelSize: clampPixelSize(maxPixelSize)) as NSString)
+        }
         if item.isDirectory {
             return memoryCache.object(forKey: directoryKey(path: item.url.path, maxPixelSize: maxPixelSize) as NSString)
         }
@@ -327,7 +330,11 @@ class ThumbnailCacheManager {
     }
 
     func isPending(item: FileItem, maxPixelSize: CGFloat = ThumbnailCacheManager.defaultMaxPixelSize) -> Bool {
-        guard !item.isFromArchive else { return false }
+        if item.isFromArchive {
+            let key = ArchiveManager.shared.previewCacheKey(for: item, maxPixelSize: clampPixelSize(maxPixelSize))
+            stateLock.lock(); defer { stateLock.unlock() }
+            return jobs[key] != nil
+        }
         let keys: [String]
         if item.isDirectory {
             keys = [directoryKey(path: item.url.path, maxPixelSize: maxPixelSize)]
@@ -387,10 +394,28 @@ class ThumbnailCacheManager {
         owner: ThumbnailRequestOwner?,
         completion: @escaping (ThumbnailRequestResult) -> Void
     ) -> ThumbnailRequestToken? {
-        // Skip archive items entirely - extraction causes freezes
         if item.isFromArchive {
-            completion(.failed)
-            return nil
+            guard !item.isDirectory, let archive = item.archiveURL, let path = item.archivePath,
+                  item.size <= 32 << 20 else { completion(.failed); return nil }
+            let size = clampPixelSize(maxPixelSize)
+            let key = ArchiveManager.shared.previewCacheKey(for: item, maxPixelSize: size)
+            if let cached = memoryCache.object(forKey: key as NSString) { completion(.loaded(cached)); return nil }
+            return enqueue(key: key, owner: owner, completion: completion) { job in
+                let progress = Progress(totalUnitCount: max(1, item.size))
+                stateLock.lock()
+                job.archiveProgress = progress
+                if job.isCancelled { progress.cancel() }
+                stateLock.unlock()
+                workQueue.addOperation { [weak self] in
+                    guard let self, !self.isCancelled(job) else { return }
+                    do {
+                        let url = try ArchiveManager.shared.extractByPath(path, from: archive, progress: progress,
+                                                                         allowPasswordPrompt: false)
+                        guard !self.isCancelled(job) else { return }
+                        self.startThumbnailJob(job, url: url, version: self.fileVersion(for: url), pixelSize: size)
+                    } catch { self.finish(job, result: .failed, cgImage: nil, version: nil) }
+                }
+            }
         }
 
         let targetSize = clampPixelSize(maxPixelSize)
@@ -495,6 +520,7 @@ class ThumbnailCacheManager {
 
             if job.waiters.isEmpty && !job.isFinished {
                 job.isCancelled = true
+                job.archiveProgress?.cancel()
                 if jobs[job.key] === job {
                     jobs.removeValue(forKey: job.key)
                 }
@@ -1107,7 +1133,8 @@ class ThumbnailCacheManager {
 
     /// Disk cache key for a thumbnail (exposed for tests).
     func diskCacheKey(for item: FileItem, maxPixelSize: CGFloat) -> String {
-        thumbnailKey(fileVersion(for: item), maxPixelSize: maxPixelSize)
+        if item.isFromArchive { return ArchiveManager.shared.previewCacheKey(for: item, maxPixelSize: clampPixelSize(maxPixelSize)) }
+        return thumbnailKey(fileVersion(for: item), maxPixelSize: maxPixelSize)
     }
 
     /// pruneQueue: drop the legacy cache folder, enforce age and size limits, and total up the cache.

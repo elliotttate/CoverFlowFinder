@@ -1,0 +1,533 @@
+﻿;!@Lang2@!UTF-8!
+;  2.30 : Marius Navickas
+;  4.57 : Domas Jokubauskis
+; 15.05 : Vaidas777
+; 26.02 : Dalius Gužauskas (aka Tichij)
+;
+;
+;
+;
+;
+;
+;
+0
+7-Zip
+Lithuanian
+Lietuvių
+401
+Gerai
+Atšaukti
+
+
+
+&Taip
+&Ne
+&Uždaryti
+Pagalba
+
+&Tęsti
+440
+T&aip Visiems
+Ne v&isiems
+Sustabdyti
+Iš naujo
+&Fone
+&Priekiniame plane
+&Laikinai sustabdyti
+Laikinai sustabdyta
+Ar tikrai norite atšaukti?
+500
+&Failas
+K&eisti
+&Rodyti
+Mėgi&amiausi
+Įran&kiai
+&Žinynas
+540
+&Atverti
+Atverti v&iduje
+Atverti iš&orėje
+&Rodyti
+K&eisti
+Pervadi&nti
+&Kopijuoti į...
+&Perkelti į...
+Šalin&ti
+&Skaidyti failą...
+Jungti &failus...
+Savy&bės
+Kome&ntuoti
+Skaičiuoti kontrolinę sumą
+Sulyginti
+Sukurti aplanką
+Sukurti failą
+Išei&ti
+Saitai
+&Alternatyvūs srautai
+600
+P&ažymėti viską
+Atžymėti viską
+&Invertuoti pažymėjimą
+Pažymėti...
+Atžymėti...
+Pažymėti pagal tipą
+Atžymėti pagal tipą
+700
+Did&elės piktogramos
+&Mažos piktogramos
+&Sąrašas
+&Išsamiai
+730
+Nerūšiuota
+Nepaisyti aplankų
+&2 skydeliai
+&Mygtukų juostos
+Atverti šakninį aplanką
+Lygiu aukščiau
+Aplankų istorija...
+&Atnaujinti
+Automatiškai atnaujinti
+750
+Archyvo mygtukų juosta
+Standartinė mygtukų juosta
+Dideli mygtukai
+Rodyti užrašus ant mygtukų
+800
+&Pridėti aplanką prie mėgiamiausiųjų kaip
+Žymelė
+900
+&Nuostatos...
+Spartos &bandymas
+910
+Šalinti laikinuosius failus...
+960
+&Turinys...
+&Apie „7-Zip“...
+1003
+Kelias
+Pavadinimas
+Plėtinys
+Aplankas
+Dydis
+Dydis archyve
+Atributai
+Sukurta
+Naudota
+Pakeista
+Vientisas
+Komentaras
+Šifruotas
+Perskyra prieš
+Perskyra po
+Žodynas
+
+Tipas
+Anti
+Būdas
+Kompiuterio OS
+Bylų sistema
+Vartotojas
+Grupė
+Blokas
+Komentaras
+Pozicija
+Kelio priešdėlis
+Aplankai
+Failai
+Versija
+Tomas
+Daugiatomis
+Poslinkis
+Saitai
+Blokai
+Tomai
+
+64-bit
+Mažėjantys baitai
+Procesorius
+Fizinis dysis
+Antraštės dydis
+Kontrolinė suma
+Charakteristikos
+Virtualus adresas
+ID
+Trumpas pavadinimas
+Sukūrusi programa
+Sektoriaus dydis
+Režimas
+Simbolinis saitas
+Klaida
+Visas dydis
+Laisva vieta
+Blokinio dydis
+Etiketė
+Vietinis pavadinimas
+Teikėjas
+NT saugumas
+Alternatyvus srautas
+Pagalbinis
+Ištrintas
+Medis
+
+
+Klaidos tipas
+Klaidos
+Klaidos
+Perspėjimai
+Perspėjimas
+Srautai
+Alternatyvūs srautai
+Alternatyvių srautų dydis
+Virtualus dydis
+Išpakuoto dydis
+Visas fizinis dydis
+Tomo numeris
+Subtipas
+Trumpas komentaras
+Kodų lentelė
+
+
+
+Pabaigos dydis
+Įterpto bloko dydis
+Saitas
+Tiesioginis saitas
+iNode
+
+Tik skaitymui
+
+Kopijuoti saitą
+
+
+Metaduomenys pakeisti
+2100
+Nuostatos
+Kalba
+Kalba:
+Redaktorius
+R&edaguoti:
+&Sulyginti:
+2200
+Sistema
+Susieti „7-Zip“ su:
+Visi vartotojai
+2301
+Integruoti „7-Zip“ į kontekstinį meniu
+Pakopinis kontekstinis meniu
+Kontekstinio meniu įrašai:
+Piktogramos kontekstiniame meniu
+2320
+<Aplankas>
+<Archyvas>
+Atverti archyvą
+Išskleisti failus...
+Įtraukti į archyvą...
+Patikrinti archyvą
+Išskleisti čia
+Išskleisti į {0}
+Įtraukti į {0}
+Suglaudinti ir išsiųsti el. paštu...
+Suglaudinti į {0} ir išsiųsti el. paštu
+2400
+Aplankai
+&Darbinis aplankas
+&Sisteminis laikinas aplankas
+D&abartinis
+Nurodyta&s:
+Naudoti tik išimamiems diskams
+Nurodyti vietą laikiniems archyviniams failams.
+2500
+Nuostatos
+Rodyti „..“ failų sąraše
+Rodyti tikras failų piktogramas
+Rodyti sisteminį meniu
+&Žymėti visą eilutę
+Rodyti tinklelio linija&s
+Atverti elementus vienu spustelėjimu
+&Kitoks žymėjimo būdas
+Naudoti didžiu&lius atminties puslapius
+2900
+Apie „7-Zip“
+„7-Zip“ yra nemokama programa.
+3000
+Sistema begali skirti reikalingo atminties kiekio
+Klaidų nerasta
+Pasirinkta {0} objektų
+Negalima sukurti aplanko „{0}“
+Šiam archyvui atnaujinimo operacijos nepalaikomos.
+Negalima atverti „{0}“ failo kaip archyvo
+Negalima atverti šifruoto archyvo „{0}“. Neteisingas slaptažodis?
+Nepalaikomas archyvo tipas
+Failas pavadinimu {0} yra
+Failas „{0}“ buvo pakeistas.\nAr norite jį atnaujinti archyve?
+Negalima atnaujinti failo\n„{0}“
+Negalima paleisti redaktoriaus.
+Šis failas panašus į virusą (failo pavadinime yra pasikartojančių tarpų).
+Šis veiksmas negali būti vykdomas iš aplanko, kuris turi ilgą kelią.
+Jūs privalote pažymėti vieną failą
+Jūs privalote pažymėti bent vieną failą
+Per daug elementų
+Negalima atverti failo kaip {0} archyvo
+Failas yra atvertas kaip {0} archyvas
+Archyvas yra atvertas su ofsetu
+3300
+Išskleidžiama
+Glaudinama
+Tikrinama
+Atidaroma...
+Skenuojama...
+Šalinama
+3320
+Glaudinama
+Atnaujinama
+Analizuojama
+Dubliuojama
+Glaudinama iš naujo
+Praleidžiama
+Šalinama
+Kuriama antraštė
+3400
+Išskleisti
+Iš&skleisti į:
+Nurodyti vietą išskleidžiamiems failams.
+3410
+Kelio režimas:
+Pilni kelių vardai
+Jokių kelių vardų
+Absoliutūs kelių vardai
+Santykiniai kelių vardai
+3420
+Perrašymo režimas
+Paklausti prieš perrašant
+Perrašyti neįspėjant
+Praleisti esančius failus
+Automatiškai pervadinti
+Automatiškai pervadinti esančius failus
+3430
+Pašalinti šakninio aplanko pasikartojimą
+Atstatyti failų saugumo nuostatas
+3440
+Platinti Zone.Id srautą:
+„Office“ failams
+3500
+Failų pakeitimo patvirtinimas
+Paskirtame aplanke jau yra apdorojamas failas.
+Ar norėtumėte pakeisti esančią failą
+šiuo failu?
+{0} baitų
+A&utomatinis pervadinimas
+3700
+Nepalaikomas glaudinimo metodas failui „{0}“.
+Duomenų klaida „{0}“. Failas pažeistas.
+CRC klaida „{0}“. Failas pažeistas.
+Duomenų klaida šifruotame faile „{0}“. Neteisingas slaptažodis?
+CRC neatitikimas šifruotame faile „{0}“. Neteisingas slaptažodis?
+3710
+Neteisingas slaptažodis?
+3721
+Nepalaikomas glaudinimo metodas
+Duomenų klaida
+CRC neatitikimas
+Nepasiekiami duomenys
+Netikėta duomenų pabaiga
+Yra papildomi duomenys po naudingų duomenų
+Tai nėra archyvas
+Klaida antraštėse
+Klaidingas slaptažodis
+3763
+Nepasiekiama archyvo pradžia
+Nepatvirtinta archyvo pradžia
+
+
+
+Nepalaikoma ypatybė
+3800
+Slaptažodžio įvedimas
+Įveskite slaptažodį:
+Pakartokite slaptažodį:
+Rodyti &slaptažodį
+Slaptažodžiai nesutampa
+Slaptažodžiui naudokite tik lotyniškas raides, numerius bei specialiuosius simbolius (!, #, $, ...)
+Slaptažodis yra per ilgas
+Slaptažodis
+3900
+Praėjęs laikas:
+Likęs laikas:
+Dydis:
+Sparta:
+Apdorota:
+Glaudinimo laipsnis:
+Klaidos:
+Archyvai:
+4000
+Įtraukti į archyvą
+&Archyvas:
+Atna&ujinimo režimas:
+Archyvo &formatas:
+Glaudinimo &lygis:
+Glaudini&mo būdas:
+Žo&dyno dydis:
+Ž&odžio dydis:
+Vientiso bloko dydis:
+CPU gijų skaičius:
+&Parametrai:
+Nuostatos
+Sukurti iš&sipakuojantį archyvą
+Glaudinti įrašymui atvertus failus
+Šifravimas
+Šifravimo metodas:
+Už&šifruoti failų pavadinimus
+Atminties naudojimas suglaudinimui:
+Atminties naudojimas išskleidimui:
+Pašalinti failus suglaudinus
+4040
+Išsaugoti simbolinius saitus
+Išsaugoti tiesioginius saitus
+Išsaugoti alternatyvius duomenų srautus
+Išsaugoti failų saugumo nuostatas
+4050
+Neglaudinti
+Greitesnis
+Greitas
+Normalus
+Didžiausias
+Ypač didelis
+4060
+Įtraukti ir pakeisti failus
+Atnaujinti ir įtraukti failus
+Atnaujinti esančius failus
+Sinchronizuoti failus
+4070
+Naršyti
+Visus failus
+Ne vientisas
+Vientisas archyvas
+4080
+Laikas
+Laiko žymos tikslumas:
+Išsaugoti modifikavimo laiką
+Išsaugoti sukūrimo laiką
+Išsaugoti vėliausio naudojimo laiką
+Archyvavimo laiką nustatyti kaip naujausio failo laiką
+Nekeisti pradinių failų vėliausio naudojimo laiko
+4090
+sek
+ns
+6000
+Kopijuoti
+Perkelti
+Kopijuoti į:
+Perkelti į:
+Kopijuojama...
+Perkeliama...
+Pervadinama...
+Pasirinkite paskirties aplanką.
+Šiam aplankui veiksmas nepalaikomas.
+Klaida pervadinant failą ar aplanką
+Failų kopijavimo patvirtinimas
+Ar esate įsitikinę, jog norite kopijuoti failus į archyvą?
+6100
+Patvirtinkite failo šalinimą
+Patvirtinkite aplanko šalinimą
+Patvirtinkite kelių failų šalinimą
+Ar esate įsitikinę, jog norite pašalinti „{0}“?
+Ar esate įsitikinę, jog norite pašalinti „{0}“ aplanką ir visą jo turinį?
+Ar esate įsitikinę, jog norite pašalinti šiuos {0} elementus?
+Šalinama...
+Klaida trinant failą ar aplanką
+Sistema negali perkelti failo į šiukšlinę, kadangi per ilgas kelias
+6300
+Sukurti aplanką
+Sukurti failą
+Aplanko pavadinimas:
+Failo pavadinimas:
+Naujas aplankas
+Naujas failas
+Klaida kuriant aplanką
+Klaida kuriant failą
+6400
+Komentaras
+&Komentaras:
+Pažymėti
+Panaikinti žymėjimą
+Šablonas:
+6600
+Nuostatos
+Aplankų istorija
+Diagnostiniai pranešimai
+Pranešimas
+7100
+Kompiuteris
+Tinklas
+Dokumentai
+Sistema
+7200
+Glaudinti
+Išskleisti
+Bandyti
+Kopijuoti
+Perkelti
+Šalinti
+Informacija
+7300
+Skaidyti failą
+&Skaidyti į:
+Skaidyti į dalis bai&tais:
+Skaidoma...
+Skaidymo patvirtinimas
+Ar esate įsitikinę, jog norite failą skaidyti į {0} dalis?
+Dalies dydis privalo būti mažesnis už dalijamo failo dydį
+Neteisingas dalies dydis
+Nurodytas dalies dydis: {0} baitai.\nAr esate įsitikinę, jog norite archyvą skaidyti į tokias dalis?
+7400
+Sujungti failus
+&Sujungti į:
+Sujungiami failai...
+Pažymėkite tik pirmą suskaidyto archyvo failą
+Nepavyko atpažinti suskaldyto failo
+Nepavyko surasti daugiau nei vienos suskaldymo failo dalies
+7500
+Skaičiuojama kontrolinė suma...
+Kontrolinės sumos informacija
+Duomenų CRC kontrolinė suma:
+Duomenų ir failų pavadinimų CRC kontrolinė suma:
+7600
+Spartos bandymas
+Atminties naudojimas:
+Suglaudinama
+Išskleidžiama
+Įvertis
+Galutinis įvertis
+Dabartinis
+Galutinis
+CPU naudojimas
+Įvertis/naudojimas
+Kartai:
+7700
+Saitas
+Susieti
+Saitas iš:
+Saitas į:
+7710
+Saito tipas
+Tiesioginis saitas
+Failo simbolinis saitas
+Katalogo simbolinis saitas
+Sujungimo taškas (Junction)
+7800
+Atminties naudojimo užklausa
+Keisti leidžiamą limitą kitoms operacijoms
+Paka&rtoti pasirinktą veiksmą dabartinei operacijai
+Veiksmas
+7810
+Operaciją užblokavo „7-Zip“.
+Šiai operacijai reikia daug atminties (RAM).
+reikalaujamas atminties panaudojimo kiekis
+leistinas atminties panaudojimo limitas
+„7-Zip“ nustatytas atminties panaudojimo limitas
+RAM kiekis
+Maksimalus atminties kiekis, kurį leidžiama naudoti išpakuojant archyvus:
+7820
+Leisti išpakuoti &archyvą
+Pralei&sti archyvo išpakavimą
+Archyvo išpakavimas buvo praleistas.

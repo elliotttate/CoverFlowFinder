@@ -1,0 +1,57 @@
+7-Zip for macOS (unofficial port)
+Copyright (C) 2026 Yurii Synyshyn (yrambler2001)
+Native macOS design revision Copyright (C) 2026 Brian Tate
+
+This product includes 7-Zip
+Copyright (C) 1999-2026 Igor Pavlov
+https://www.7-zip.org
+
+Not affiliated with or endorsed by Igor Pavlov or the 7-Zip project.
+---------------------------------------------------------------------
+This is an independent, unofficial port. "7-Zip" is the name of Igor Pavlov's software and is used
+here only to say what this port is built from and compatible with. Please do not report problems
+with this port to the 7-Zip project; use this repository's issue tracker.
+
+Licences
+--------
+The upstream sources (C/, CPP/, Asm/, DOC/) are under the licences stated in DOC/License.txt:
+GNU LGPL 2.1 or later for most files, the BSD 3-clause License for
+CPP/7zip/Compress/LzfseDecoder.cpp and C/ZstdDec.c (derived from code by Apple Inc. and
+Facebook, Inc.), the BSD 2-clause License for C/Xxh64.c (derived from code by Yann Collet), and the
+GNU LGPL with the unRAR license restriction for CPP/7zip/Compress/Rar* (DOC/unRarLicense.txt; RAR
+decompression code derived from unRAR by Alexander Roshal).
+
+The macOS port (Mac/, docs/, ai/ and the files at the repository root) is licensed under the GNU
+LGPL 2.1 or later. See LICENSE.
+
+Changes to upstream files
+-------------------------
+The port modifies a small number of upstream C/C++ files. Every change is guarded by
+#ifdef _WIN32 / __APPLE__, leaves Windows behaviour unchanged, and is listed with its reason in
+Mac/docs/upstream-patches.md (exact diff: Mac/docs/upstream-patches.diff).
+
+Bundled assets from the official 7-Zip release
+----------------------------------------------
+Taken unmodified from the official 7-Zip 26.04 Windows release (7z2604-x64.exe, verified by
+SHA-256 in Mac/scripts/fetch-assets.sh), Copyright (C) Igor Pavlov and, for the translations, their
+respective translators:
+
+  - Mac/Resources/Help/        the help pages (HTML and CSS) unpacked from 7-zip.chm
+  - Mac/Resources/Lang/        the 93 translation files (Lang/*.txt, Lang/en.ttt)
+  - Mac/Resources/SFX/         the Windows self-extracting archive modules 7z.sfx and 7zCon.sfx,
+                               with the release's License.txt and readme.txt
+
+Icons
+-----
+The native app, archive document, folder, and toolbar artwork is original and dedicated
+under CC0 1.0 Universal; see Mac/Resources/Icons/LICENSE.md. System sidebar symbols
+are supplied by macOS at runtime and are not redistributed. Retained upstream icon
+and bitmap resources keep their original licenses.
+
+AI assistance
+-------------
+Much of the macOS port was written with AI assistance (Claude Code, by Anthropic) under the
+direction of the maintainer. Commits written by an AI agent carry Co-Authored-By and
+Claude-Session trailers; the working files of that process are kept in ai/.
+
+The native design revision and release preparation used Codex assistance (OpenAI).

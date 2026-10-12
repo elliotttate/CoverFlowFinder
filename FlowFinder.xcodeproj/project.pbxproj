@@ -31,7 +31,7 @@
 		A1000023001 /* TabBarView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000023000 /* TabBarView.swift */; };
 		A1000024001 /* ThumbnailCacheManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000024000 /* ThumbnailCacheManager.swift */; };
 		A1000025001 /* QuadPaneView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000025000 /* QuadPaneView.swift */; };
-		A1000026001 /* ZipArchiveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000026000 /* ZipArchiveManager.swift */; };
+		A1000026001 /* ArchiveManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000026000 /* ArchiveManager.swift */; };
 		A1000027001 /* AppSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000027000 /* AppSettings.swift */; };
 		A1000032001 /* FinderSoundEffects.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000032000 /* FinderSoundEffects.swift */; };
 		A1000028001 /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000028000 /* SettingsView.swift */; };
@@ -47,6 +47,10 @@
 		A1000037001 /* InlineVideoPreviewManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000037000 /* InlineVideoPreviewManager.swift */; };
 		A1000038001 /* VideoPreviewOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000038000 /* VideoPreviewOverlay.swift */; };
 		A1000039001 /* InlineAudioPreviewManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1000039000 /* InlineAudioPreviewManager.swift */; };
+		B70000000000000000000001 /* SevenZipKit in Frameworks */ = {isa = PBXBuildFile; fileRef = B70000000000000000000008; };
+		B70000000000000000000002 /* SevenZipKit in Embed Frameworks */ = {isa = PBXBuildFile; fileRef = B70000000000000000000008; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
+		B70000000000000000000003 /* SevenZipArchiveBackend.swift in Sources */ = {isa = PBXBuildFile; fileRef = B70000000000000000000004; };
+		B7000000000000000000000D /* ThirdPartyNotices in Resources */ = {isa = PBXBuildFile; fileRef = B7000000000000000000000C; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -71,7 +75,7 @@
 		A1000023000 /* TabBarView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TabBarView.swift; sourceTree = "<group>"; };
 		A1000024000 /* ThumbnailCacheManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ThumbnailCacheManager.swift; sourceTree = "<group>"; };
 		A1000025000 /* QuadPaneView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuadPaneView.swift; sourceTree = "<group>"; };
-		A1000026000 /* ZipArchiveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ZipArchiveManager.swift; sourceTree = "<group>"; };
+		A1000026000 /* ArchiveManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ArchiveManager.swift; sourceTree = "<group>"; };
 		A1000027000 /* AppSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppSettings.swift; sourceTree = "<group>"; };
 		A1000032000 /* FinderSoundEffects.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FinderSoundEffects.swift; sourceTree = "<group>"; };
 		A1000028000 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
@@ -92,7 +96,24 @@
 		A1000039000 /* InlineAudioPreviewManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InlineAudioPreviewManager.swift; sourceTree = "<group>"; };
 		A100003A000 /* CheckForUpdatesViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckForUpdatesViewModel.swift; sourceTree = "<group>"; };
 		A100003B000 /* CheckForUpdatesView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckForUpdatesView.swift; sourceTree = "<group>"; };
+		B70000000000000000000004 /* SevenZipArchiveBackend.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SevenZipArchiveBackend.swift; sourceTree = "<group>"; };
+		B70000000000000000000005 /* SevenZip.xcodeproj */ = {isa = PBXFileReference; lastKnownFileType = "wrapper.pb-project"; path = Vendor/SevenZip/Mac/SevenZip.xcodeproj; sourceTree = "<group>"; };
+		B7000000000000000000000C /* ThirdPartyNotices */ = {isa = PBXFileReference; lastKnownFileType = folder; path = Resources/ThirdPartyNotices; sourceTree = "<group>"; };
 /* End PBXFileReference section */
+
+/* Begin PBXContainerItemProxy section */
+		B70000000000000000000007 = {isa = PBXContainerItemProxy; containerPortal = B70000000000000000000005; proxyType = 2; remoteGlobalIDString = CF8AF343FEE3377065956365; remoteInfo = SevenZipKit; };
+		B70000000000000000000009 = {isa = PBXContainerItemProxy; containerPortal = B70000000000000000000005; proxyType = 1; remoteGlobalIDString = FCEC2E199BAA9A75CED0848B; remoteInfo = SevenZipKit; };
+/* End PBXContainerItemProxy section */
+/* Begin PBXReferenceProxy section */
+		B70000000000000000000008 /* SevenZipKit.framework */ = {isa = PBXReferenceProxy; fileType = wrapper.framework; path = SevenZipKit.framework; remoteRef = B70000000000000000000007; sourceTree = BUILT_PRODUCTS_DIR; };
+/* End PBXReferenceProxy section */
+/* Begin PBXTargetDependency section */
+		B7000000000000000000000A = {isa = PBXTargetDependency; name = SevenZipKit; targetProxy = B70000000000000000000009; };
+/* End PBXTargetDependency section */
+/* Begin PBXCopyFilesBuildPhase section */
+		B7000000000000000000000B /* Embed Frameworks */ = {isa = PBXCopyFilesBuildPhase; buildActionMask = 2147483647; dstPath = ""; dstSubfolderSpec = 10; files = (B70000000000000000000002, ); name = "Embed Frameworks"; runOnlyForDeploymentPostprocessing = 0; };
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFrameworksBuildPhase section */
 		A100000D000 /* Frameworks */ = {
@@ -100,6 +121,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				A100003C002 /* Sparkle in Frameworks */,
+				B70000000000000000000001 /* SevenZipKit in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -110,6 +132,7 @@
 			isa = PBXGroup;
 			children = (
 				A100000F000 /* FlowFinder */,
+				B70000000000000000000005 /* SevenZip.xcodeproj */,
 				A1000010000 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -125,6 +148,7 @@
 				A1000033000 /* FlowFinder.icon */,
 				A100000B000 /* Info.plist */,
 				A100000C000 /* FlowFinder.entitlements */,
+				B7000000000000000000000C /* ThirdPartyNotices */,
 			);
 			path = FlowFinder;
 			sourceTree = "<group>";
@@ -152,7 +176,8 @@
 				A1000036000 /* OpenWithMenuBuilder.swift */,
 				A1000037000 /* InlineVideoPreviewManager.swift */,
 				A1000039000 /* InlineAudioPreviewManager.swift */,
-				A1000026000 /* ZipArchiveManager.swift */,
+				A1000026000 /* ArchiveManager.swift */,
+				B70000000000000000000004 /* SevenZipArchiveBackend.swift */,
 			);
 			path = Models;
 			sourceTree = "<group>";
@@ -202,6 +227,7 @@
 			path = TableView;
 			sourceTree = "<group>";
 		};
+		B70000000000000000000006 /* SevenZip Products */ = {isa = PBXGroup; children = (B70000000000000000000008, ); name = Products; sourceTree = "<group>"; };
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -212,10 +238,12 @@
 				A1000016000 /* Sources */,
 				A100000D000 /* Frameworks */,
 				A1000017000 /* Resources */,
+				B7000000000000000000000B /* Embed Frameworks */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				B7000000000000000000000A,
 			);
 			name = FlowFinder;
 			packageProductDependencies = (
@@ -253,6 +281,7 @@
 				A100003C000 /* XCRemoteSwiftPackageReference "Sparkle" */,
 			);
 			productRefGroup = A1000010000 /* Products */;
+			projectReferences = ({ProductGroup = B70000000000000000000006; ProjectRef = B70000000000000000000005; }, );
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
@@ -268,6 +297,7 @@
 			files = (
 				A100000A001 /* Assets.xcassets in Resources */,
 				A1000033001 /* FlowFinder.icon in Resources */,
+				B7000000000000000000000D /* ThirdPartyNotices in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -301,7 +331,8 @@
 				A1000021001 /* QuickLookController.swift in Sources */,
 				A1000023001 /* TabBarView.swift in Sources */,
 				A1000024001 /* ThumbnailCacheManager.swift in Sources */,
-				A1000026001 /* ZipArchiveManager.swift in Sources */,
+				A1000026001 /* ArchiveManager.swift in Sources */,
+				B70000000000000000000003 /* SevenZipArchiveBackend.swift in Sources */,
 				A1000027001 /* AppSettings.swift in Sources */,
 				A1000032001 /* FinderSoundEffects.swift in Sources */,
 				A1000028001 /* SettingsView.swift in Sources */,
@@ -454,7 +485,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 139;
+				CURRENT_PROJECT_VERSION = 140;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "";
 				"DEVELOPMENT_TEAM[sdk=macosx*]" = RH4U5VJHM6;
@@ -463,11 +494,12 @@
 				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = FlowFinder/Info.plist;
+				FRAMEWORK_SEARCH_PATHS = ("$(inherited)", "$(BUILT_PRODUCTS_DIR)", );
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.39.0;
+				MARKETING_VERSION = 1.40.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.flowfinder.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";
@@ -492,7 +524,7 @@
 				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
-				CURRENT_PROJECT_VERSION = 139;
+				CURRENT_PROJECT_VERSION = 140;
 				DEAD_CODE_STRIPPING = YES;
 				DEVELOPMENT_TEAM = "";
 				"DEVELOPMENT_TEAM[sdk=macosx*]" = RH4U5VJHM6;
@@ -501,11 +533,12 @@
 				ENABLE_RESOURCE_ACCESS_PHOTO_LIBRARY = YES;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = FlowFinder/Info.plist;
+				FRAMEWORK_SEARCH_PATHS = ("$(inherited)", "$(BUILT_PRODUCTS_DIR)", );
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/../Frameworks",
 				);
-				MARKETING_VERSION = 1.39.0;
+				MARKETING_VERSION = 1.40.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.flowfinder.app;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				PROVISIONING_PROFILE_SPECIFIER = "";

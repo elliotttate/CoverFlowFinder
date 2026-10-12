@@ -174,11 +174,11 @@ enum FileListActions {
     /// Opening more external items than this at once asks for confirmation.
     static let openConfirmationThreshold = 20
 
-    /// True if opening `item` navigates inside the browser (folders, ZIPs, folders in archives)
+    /// True if opening `item` navigates inside the browser (folders and archives)
     /// rather than handing it to another app.
     static func navigatesInApp(_ item: FileItem) -> Bool {
-        if item.isFromArchive { return item.isDirectory }
-        if item.isZipArchive { return true }
+        if item.isFromArchive { return item.isDirectory || item.isBrowsableArchive }
+        if item.isBrowsableArchive { return true }
         guard item.url.isFileURL, item.isDirectory else { return false }
         return !NSWorkspace.shared.isFilePackage(atPath: item.url.path)
     }
@@ -2125,6 +2125,35 @@ extension FileTableCoordinator: NSMenuDelegate {
         openItem.target = self
         menu.addItem(openItem)
 
+        if isSingle && !item.isDirectory {
+            let openArchive = NSMenuItem(title: "Open as Archive", action: #selector(menuOpenAsArchive(_:)), keyEquivalent: "")
+            openArchive.target = self
+            menu.addItem(openArchive)
+        }
+        let archives = ArchiveExtractionMode.eligibleItems(targets)
+        if !archives.isEmpty {
+            let title = archives.count > 1 ? "Extract Archives" : "Extract Archive"
+            let submenu = NSMenu(title: title)
+            for mode in ArchiveExtractionMode.allCases {
+                let option = NSMenuItem(title: mode.title(for: archives), action: #selector(menuExtractArchive(_:)), keyEquivalent: "")
+                option.target = self
+                option.representedObject = mode
+                submenu.addItem(option)
+            }
+            let extractItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            extractItem.submenu = submenu
+            menu.addItem(extractItem)
+        }
+
+        if !viewModel.itemsForCompression(targets).isEmpty {
+            for format in ArchiveCompressionFormat.allCases {
+                let option = NSMenuItem(title: format.title, action: #selector(menuCompressArchive(_:)), keyEquivalent: "")
+                option.target = self
+                option.representedObject = format
+                menu.addItem(option)
+            }
+        }
+
         // Show Package Contents (for .app, .bundle, etc.)
         if isSingle && isPackage(item) {
             let packageItem = NSMenuItem(title: "Show Package Contents", action: #selector(menuShowPackageContents(_:)), keyEquivalent: "")
@@ -2270,6 +2299,20 @@ extension FileTableCoordinator: NSMenuDelegate {
     }
 
     // MARK: - Row Menu Actions
+
+    @objc private func menuOpenAsArchive(_ sender: NSMenuItem) {
+        viewModel.openAsArchive(contextMenuClickedItem)
+    }
+
+    @objc private func menuExtractArchive(_ sender: NSMenuItem) {
+        guard let mode = sender.representedObject as? ArchiveExtractionMode else { return }
+        viewModel.extractArchives(contextMenuItems, mode: mode)
+    }
+
+    @objc private func menuCompressArchive(_ sender: NSMenuItem) {
+        guard let format = sender.representedObject as? ArchiveCompressionFormat else { return }
+        viewModel.compressItems(contextMenuItems, format: format)
+    }
 
     @objc private func menuOpen(_ sender: NSMenuItem) {
         FileListActions.open(contextMenuItems, primary: contextMenuClickedItem, viewModel: viewModel)

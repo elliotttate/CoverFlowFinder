@@ -313,7 +313,7 @@ struct ColumnView: View {
         }
     }
 
-    /// Lists a folder (or a folder inside a ZIP archive) in the background. Each depth has one
+    /// Lists a folder (or a folder inside an archive) in the background. Each depth has one
     /// current request: a newer open or a truncation invalidates older ones, so holding ↓ over
     /// folders never stacks columns.
     /// - Parameter rename: a folder the column is inside was renamed: its items keep their IDs
@@ -1335,7 +1335,7 @@ enum ColumnBrowsing {
         return new.appendingPathComponent(String(path.dropFirst(prefix.count)), isDirectory: url.hasDirectoryPath)
     }
 
-    /// A folder inside a ZIP archive, shown as a column from the archive's entries.
+    /// A folder inside an archive, shown as a column from the archive's entries.
     struct ArchiveFolder: Equatable {
         let archiveURL: URL
         /// The folder's path inside the archive
@@ -1349,8 +1349,8 @@ enum ColumnBrowsing {
         return ArchiveFolder(archiveURL: archiveURL, path: path)
     }
 
-    /// Contents of a folder inside a ZIP archive, filtered and sorted like `loadItems`. The archive
-    /// is read through ZipArchiveManager's cache, so item IDs stay the same while it's unchanged.
+    /// Contents of a folder inside an archive, filtered and sorted like `loadItems`. The archive
+    /// is read through ArchiveManager's cache, so item IDs stay the same while it's unchanged.
     static func loadArchiveItems(
         in archiveURL: URL,
         at path: String,
@@ -1358,7 +1358,7 @@ enum ColumnBrowsing {
         sortState: SortState,
         foldersFirst: Bool
     ) throws -> [FileItem] {
-        let archive = ZipArchiveManager.shared
+        let archive = ArchiveManager.shared
         let entries = try archive.readContents(of: archiveURL)
         var fileItems = archive.fileItems(from: archive.entriesAtPath(path, in: entries), archiveURL: archiveURL)
         if !showHiddenFiles {

@@ -1746,8 +1746,7 @@ private struct PhotosMasonryRepresentable: NSViewRepresentable {
 
         /// Shows `item` in an open Quick Look panel, if the panel belongs to this view's window.
         private func updateQuickLook(for item: FileItem?) {
-            let previewURL = item.flatMap { viewModel.previewURL(for: $0) }
-            QuickLookControllerView.shared.updatePreview(for: previewURL, from: collectionView?.window)
+            viewModel.updateQuickLookPreview(for: item, in: collectionView?.window)
         }
 
         private func navigateLinear(by offset: Int) {

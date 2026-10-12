@@ -443,9 +443,9 @@ struct FileItem: Identifiable, Hashable {
         return IconCache.shared.genericIcon(for: .folder)
     }()
 
-    /// Check if this item is a ZIP archive that can be browsed
-    var isZipArchive: Bool {
-        !isFromArchive && fileType == .archive && url.pathExtension.lowercased() == "zip"
+    /// Whether opening this item can navigate into an archive
+    var isBrowsableArchive: Bool {
+        !isDirectory && ArchiveManager.canBrowse(url)
     }
 
     enum FileType {

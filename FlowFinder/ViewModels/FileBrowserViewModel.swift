@@ -64,6 +64,177 @@ enum NavigationLocation: Equatable {
     case photosLibrary(PhotosLibraryInfo)
 }
 
+enum ArchiveCompressionFormat: String, CaseIterable, Hashable {
+    case zip
+    case sevenZip = "7z"
+
+    var title: String { self == .zip ? "Compress to ZIP" : "Compress to 7z" }
+
+    static func eligibleItems(_ items: [FileItem]) -> [FileItem] {
+        guard !items.isEmpty, items.allSatisfy({ !$0.isFromArchive && $0.url.isFileURL }) else { return [] }
+        return items
+    }
+
+    func archiveName(for items: [FileItem]) -> String {
+        let name = items.count == 1 ? items[0].name : "Archive"
+        return name + "." + rawValue
+    }
+}
+
+/// Stages a complete archive beside its destination, then publishes without replacing anything.
+/// Only the new archive enters the journal; the selected originals are never moved or deleted.
+enum ArchiveCompressionEngine {
+    static func compress(_ items: [FileItem], format: ArchiveCompressionFormat, destination: URL,
+                         journal: FileOperationJournal, progress: Progress) -> FileOperationResult {
+        if progress.isCancelled { return FileOperationResult(wasCancelled: true) }
+        do {
+            guard !ArchiveCompressionFormat.eligibleItems(items).isEmpty,
+                  destination.isFileURL,
+                  try destination.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+                throw FileOperationEngine.makeError("Choose local files or folders and a folder for the archive.")
+            }
+            var sources: [(url: URL, path: String, directory: Bool)] = []
+            for item in items {
+                let url = item.url.standardizedFileURL
+                var info = stat()
+                guard lstat(url.path, &info) == 0 else { throw CocoaError(.fileReadNoSuchFile) }
+                let kind = info.st_mode & S_IFMT
+                guard kind == S_IFREG || kind == S_IFDIR || kind == S_IFLNK else {
+                    throw FileOperationEngine.makeError("“\(item.name)” is not a regular file or folder.")
+                }
+                let path = FileOperationEngine.canonicalItemPath(url)
+                if !sources.contains(where: { $0.path == path }) {
+                    sources.append((url, path, kind == S_IFDIR))
+                }
+            }
+            // An explicitly selected child is already included by its selected folder.
+            sources = sources.filter { source in
+                !sources.contains { $0.directory && $0.path != source.path && FileOperationEngine.isPath(source.path, sameAsOrInside: $0.path) }
+            }
+            let destinationPath = FileOperationEngine.canonicalPath(destination)
+            guard !sources.contains(where: { $0.directory && FileOperationEngine.isPath(destinationPath, sameAsOrInside: $0.path) }) else {
+                throw FileOperationEngine.makeError("Create the archive outside the selected folders.")
+            }
+            // Relative paths put each selected root at the archive's top level.
+            let names = sources.map { $0.url.lastPathComponent.precomposedStringWithCanonicalMapping.lowercased() }
+            guard Set(names).count == names.count else {
+                throw FileOperationEngine.makeError("Selected items from different folders have the same name. Compress them separately.")
+            }
+            let staging = destination.appendingPathComponent(".FlowFinder-compress-" + UUID().uuidString, isDirectory: true)
+            try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false,
+                                                    attributes: [.posixPermissions: 0o700])
+            defer { try? FileManager.default.removeItem(at: staging) }
+            let archive = staging.appendingPathComponent(format.archiveName(for: items))
+            progress.totalUnitCount = 100
+            let compression = Progress(totalUnitCount: 1)
+            progress.addChild(compression, withPendingUnitCount: 99)
+            let publication = Progress(totalUnitCount: 1)
+            progress.addChild(publication, withPendingUnitCount: 1)
+            try SevenZipArchiveBackend.shared.createArchive(at: archive, sources: sources.map(\.url), format: format, progress: compression)
+            if progress.isCancelled { return FileOperationResult(wasCancelled: true) }
+            let published = FileOperationJournal()
+            let result = FileOperationEngine.transfer([
+                FileTransferItem(source: archive, destination: destination.appendingPathComponent(archive.lastPathComponent),
+                                 kind: .move, placement: .keepBoth)
+            ], journal: published, progress: publication)
+            journal.steps += published.placedURLs.map { .created($0) }
+            if !result.wasCancelled { progress.completedUnitCount = progress.totalUnitCount }
+            return result
+        } catch {
+            if FileOperationEngine.isCancellation(error) || progress.isCancelled {
+                return FileOperationResult(wasCancelled: true)
+            }
+            return FileOperationResult(failures: [FileOperationFailure(url: items.first?.url ?? destination, error: error)])
+        }
+    }
+}
+
+enum ArchiveExtractionMode: CaseIterable, Hashable {
+    case here
+    case separateFolders
+    case chosenFolder
+
+    func title(for items: [FileItem]) -> String {
+        switch self {
+        case .here: return "Extract Here"
+        case .separateFolders:
+            if items.count == 1 {
+                let name = ArchiveManager.extractionFolderName(for: URL(fileURLWithPath: items[0].name))
+                return "Extract to “\(name)” Folder"
+            }
+            return "Extract to Separate Folders"
+        case .chosenFolder: return items.count > 1 ? "Extract All to One Folder…" : "Extract to Folder…"
+        }
+    }
+
+    static func eligibleItems(_ items: [FileItem]) -> [FileItem] {
+        guard !items.isEmpty, items.allSatisfy({ $0.isBrowsableArchive && ($0.isFromArchive || $0.url.isFileURL) }) else { return [] }
+        return items
+    }
+}
+
+/// Runs off the main thread. Extraction uses the same verified writer as archive browsing;
+/// publishing keeps both names on conflicts and records the new files for Undo / Redo.
+enum ArchiveExtractionEngine {
+    static func extract(_ items: [FileItem], mode: ArchiveExtractionMode, destination: URL? = nil,
+                        journal: FileOperationJournal, progress: Progress) -> FileOperationResult {
+        var result = FileOperationResult()
+        if mode == .chosenFolder, destination == nil {
+            return FileOperationResult(failures: items.map {
+                FileOperationFailure(url: $0.url, error: FileOperationEngine.makeError("Choose a folder to extract the archive into."))
+            })
+        }
+        let manager = ArchiveManager.shared
+        progress.totalUnitCount = Int64(max(1, items.count * 2))
+        for item in items {
+            if progress.isCancelled { result.wasCancelled = true; break }
+            let extractionProgress = Progress(totalUnitCount: 1)
+            progress.addChild(extractionProgress, withPendingUnitCount: 1)
+            let placementProgress = Progress(totalUnitCount: 1)
+            progress.addChild(placementProgress, withPendingUnitCount: 1)
+            do {
+                let original = item.isFromArchive ? (item.archiveURL ?? item.url) : item.url
+                let directory = destination ?? manager.rootArchiveURL(for: original).deletingLastPathComponent()
+                guard directory.isFileURL,
+                      try directory.resourceValues(forKeys: [.isDirectoryKey]).isDirectory == true else {
+                    throw FileOperationEngine.makeError("Choose a folder to extract the archive into.")
+                }
+                let source: URL
+                if item.isFromArchive, let parent = item.archiveURL, let path = item.archivePath {
+                    source = try manager.openNestedArchive(at: path, in: parent, progress: extractionProgress)
+                } else { source = item.url }
+                let staged = try manager.extractArchiveForCopy(from: source, progress: extractionProgress)
+                defer { manager.discardCopyExtraction(staged.url) }
+                result.failures += staged.failures.map {
+                    FileOperationFailure(url: item.url.appendingPathComponent($0.path), error: $0.error)
+                }
+                if progress.isCancelled { result.wasCancelled = true; break }
+                let roots = mode == .separateFolders ? [staged.url]
+                    : try FileManager.default.contentsOfDirectory(at: staged.url, includingPropertiesForKeys: nil)
+                        .sorted { $0.lastPathComponent < $1.lastPathComponent }
+                let transfers = roots.map {
+                    FileTransferItem(source: $0, destination: directory.appendingPathComponent($0.lastPathComponent),
+                                     kind: .move, placement: .keepBoth)
+                }
+                let published = FileOperationJournal()
+                let moved = FileOperationEngine.transfer(transfers, journal: published, progress: placementProgress)
+                // Output is a new item, even when publishing was an atomic rename from staging.
+                journal.steps += published.placedURLs.map { .created($0) }
+                result.failures += moved.failures
+                if moved.wasCancelled { result.wasCancelled = true; break }
+            } catch {
+                if FileOperationEngine.isCancellation(error) || progress.isCancelled {
+                    result.wasCancelled = true
+                    break
+                }
+                result.failures.append(FileOperationFailure(url: item.url, error: error))
+            }
+        }
+        if !result.wasCancelled { progress.completedUnitCount = progress.totalUnitCount }
+        return result
+    }
+}
+
 enum ClipboardOperation {
     case copy
     case cut
@@ -274,7 +445,7 @@ final class FileClipboard {
     private func setContents(_ urls: [URL], operation: ClipboardOperation) {
         notifyObservers()
         // The new lease is taken before the old one ends, so extractions on both stay.
-        extractionLease = ZipArchiveManager.shared.leaseCopyExtractions(urls)
+        extractionLease = ArchiveManager.shared.leaseCopyExtractions(urls)
         items = urls
         self.operation = operation
         cutURLs = operation == .cut ? Set(urls) : []
@@ -1747,11 +1918,13 @@ class FileBrowserViewModel: ObservableObject {
     @Published var isInsideArchive: Bool = false
     @Published var currentArchiveURL: URL? = nil
     @Published var currentArchivePath: String = ""
-    private var archiveEntries: [ZipEntry] = []
+    private var archiveEntries: [ArchiveEntry] = []
     /// The archive file as it was when `archiveEntries` were read (changed → re-read)
-    private var archiveEntriesSignature: FileSignature?
-    /// Invalidates in-flight archive reads (ZipArchiveManager.readContents runs off the main thread)
+    private var archiveEntriesSignature: String?
+    /// Invalidates in-flight archive reads (ArchiveManager.readContents runs off the main thread)
+    var quickLookRequestID = UUID()
     private var archiveReadToken = UUID()
+    private var archiveReadProgress: Progress?
     /// Token of the archive read that turned on the loading spinner (slow reads only)
     private var archiveReadSpinnerToken: UUID?
     /// The folder last entered with `enterFolder` and the item it was entered from (an alias may
@@ -1763,7 +1936,7 @@ class FileBrowserViewModel: ObservableObject {
         var components: [(name: String, url: URL?, archivePath: String?)] = []
 
         // Add regular filesystem path components up to the archive
-        let basePath = isInsideArchive ? (currentArchiveURL?.deletingLastPathComponent() ?? currentPath) : currentPath
+        let basePath = isInsideArchive ? (currentArchiveURL.map { ArchiveManager.shared.rootArchiveURL(for: $0).deletingLastPathComponent() } ?? currentPath) : currentPath
         var url = basePath.isFileURL ? basePath.standardized : basePath
         var pathComps: [(name: String, url: URL)] = []
 
@@ -1787,6 +1960,9 @@ class FileBrowserViewModel: ObservableObject {
         // If inside archive, add archive and its internal path components
         if isInsideArchive, let archiveURL = currentArchiveURL {
             // Add the archive itself (clicking navigates to archive root)
+            for level in ArchiveManager.shared.archiveChain(for: archiveURL).dropLast() {
+                components.append((name: level.lastPathComponent, url: level, archivePath: ""))
+            }
             components.append((name: archiveURL.lastPathComponent, url: nil, archivePath: ""))
 
             // Add internal path components
@@ -2849,6 +3025,8 @@ class FileBrowserViewModel: ObservableObject {
         photosLoadCancellation?.cancel()
         photosLoadCancellation = nil
         archiveReadToken = UUID()
+        archiveReadProgress?.cancel()
+        archiveReadProgress = nil
         archiveReadSpinnerToken = nil
         // In-flight hydration is dropped; forget it so visible rows are requested again on resume
         resetHydrationState()
@@ -3931,7 +4109,7 @@ class FileBrowserViewModel: ObservableObject {
         }
     }
 
-    /// Load contents from within a ZIP archive (the listing is built off the main thread)
+    /// Load contents from within an archive (the listing is built off the main thread)
     private func loadArchiveContents() {
         guard let archiveURL = currentArchiveURL else {
             isInsideArchive = false
@@ -3961,8 +4139,8 @@ class FileBrowserViewModel: ObservableObject {
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             // Get entries at the current path within the archive
-            let entriesAtPath = ZipArchiveManager.shared.entriesAtPath(archivePath, in: entries)
-            var fileItems = ZipArchiveManager.shared.fileItems(from: entriesAtPath, archiveURL: archiveURL)
+            let entriesAtPath = ArchiveManager.shared.entriesAtPath(archivePath, in: entries)
+            var fileItems = ArchiveManager.shared.fileItems(from: entriesAtPath, archiveURL: archiveURL)
             if !showHiddenFiles {
                 fileItems = fileItems.filter { !$0.name.hasPrefix(".") }
             } else {
@@ -3987,7 +4165,7 @@ class FileBrowserViewModel: ObservableObject {
         guard isInsideArchive, let archiveURL = currentArchiveURL else { return }
         let knownSignature = archiveEntriesSignature
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let signature = FileSignature(path: archiveURL.path)
+            let signature = FileSignature(path: ArchiveManager.shared.rootArchiveURL(for: archiveURL).path) == nil ? nil : ArchiveManager.shared.revision(for: archiveURL)
             DispatchQueue.main.async { [weak self] in
                 guard let self, self.isInsideArchive, self.currentArchiveURL == archiveURL else { return }
                 if signature == nil {
@@ -4010,7 +4188,7 @@ class FileBrowserViewModel: ObservableObject {
                 self.archiveEntries = read.entries
                 self.archiveEntriesSignature = read.signature
                 var path = self.currentArchivePath
-                while !path.isEmpty, ZipArchiveManager.shared.entry(atPath: path, in: read.entries)?.isDirectory != true {
+                while !path.isEmpty, ArchiveManager.shared.entry(atPath: path, in: read.entries)?.isDirectory != true {
                     path = path.split(separator: "/").dropLast().joined(separator: "/")
                 }
                 if path != self.currentArchivePath {
@@ -4028,7 +4206,7 @@ class FileBrowserViewModel: ObservableObject {
     /// The archive being browsed was deleted, moved or can't be read anymore: show its folder.
     private func leaveVanishedArchive() {
         guard isInsideArchive, let archiveURL = currentArchiveURL else { return }
-        let folder = archiveURL.deletingLastPathComponent()
+        let folder = ArchiveManager.shared.rootArchiveURL(for: archiveURL).deletingLastPathComponent()
         prepareForNavigation()
         resetArchiveState()
         // Still selects the archive if it's there (e.g. rewritten unreadable)
@@ -4622,6 +4800,8 @@ class FileBrowserViewModel: ObservableObject {
         stopInlinePreviews()
         cancelPendingRename()
         archiveReadToken = UUID()
+        archiveReadProgress?.cancel()
+        archiveReadProgress = nil
         selectedItems.removeAll()
         lastSelectedIndex = 0
         selectionAnchorIndex = 0
@@ -4775,7 +4955,7 @@ class FileBrowserViewModel: ObservableObject {
                     self.showArchive(archiveURL, entries: read.entries, signature: read.signature, at: internalPath)
                 case .failure(let error):
                     zipNavLogger.error("Failed to restore archive state: \(error.localizedDescription)")
-                    self.applyNavigationLocation(.filesystem(archiveURL.deletingLastPathComponent()), selecting: archiveURL)
+                    self.applyNavigationLocation(.filesystem(ArchiveManager.shared.rootArchiveURL(for: archiveURL).deletingLastPathComponent()), selecting: archiveURL)
                 }
             }
         case .photosLibrary(let info):
@@ -4791,15 +4971,17 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     /// Shows a location inside an archive whose entries are already read.
-    private func showArchive(_ archiveURL: URL, entries: [ZipEntry], signature: FileSignature?, at internalPath: String) {
+    private func showArchive(_ archiveURL: URL, entries: [ArchiveEntry], signature: String?, at internalPath: String,
+                             selecting selection: URL? = nil) {
         prepareForNavigation()
+        pendingSelectionURL = selection
         photosLibraryInfo = nil
         clearPhotosCaches()
         archiveEntries = entries
         archiveEntriesSignature = signature
         currentArchiveURL = archiveURL
         currentArchivePath = internalPath
-        currentPath = archiveURL.deletingLastPathComponent()
+        currentPath = ArchiveManager.shared.rootArchiveURL(for: archiveURL).deletingLastPathComponent()
         isInsideArchive = true
         coverFlowSelectedIndex = 0
         loadContents()
@@ -4809,10 +4991,15 @@ class FileBrowserViewModel: ObservableObject {
     /// The signature is the archive file's as it was read (to notice it change later).
     private func readArchiveEntries(
         at archiveURL: URL,
-        completion: @escaping (Result<(entries: [ZipEntry], signature: FileSignature?), Error>) -> Void
+        completion: @escaping (Result<(entries: [ArchiveEntry], signature: String?), Error>) -> Void
     ) {
         let token = UUID()
+        archiveReadProgress?.cancel()
+        let progress = Progress(totalUnitCount: 1)
+        archiveReadProgress = progress
         archiveReadToken = token
+        FileOperationEngine.operationDidStart(progress)
+        showActivity(progress, title: "Opening Archive")
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
             // Still reading (the token is replaced when the read completes or is superseded)
             guard let self, self.archiveReadToken == token else { return }
@@ -4821,10 +5008,13 @@ class FileBrowserViewModel: ObservableObject {
         }
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            let signature = FileSignature(path: archiveURL.path)
-            let result = Result { (entries: try ZipArchiveManager.shared.readContents(of: archiveURL), signature: signature) }
+            let signature = FileSignature(path: ArchiveManager.shared.rootArchiveURL(for: archiveURL).path) == nil ? nil : ArchiveManager.shared.revision(for: archiveURL)
+            let result = Result { (entries: try ArchiveManager.shared.readContents(of: archiveURL, progress: progress), signature: signature) }
             DispatchQueue.main.async { [weak self] in
+                FileOperationEngine.operationDidEnd(progress)
+                self?.endActivity(progress)
                 guard let self, self.archiveReadToken == token else { return }
+                self.archiveReadProgress = nil
                 self.archiveReadToken = UUID()
                 if case .failure = result, self.archiveReadSpinnerToken == token {
                     self.isLoading = false
@@ -4856,15 +5046,16 @@ class FileBrowserViewModel: ObservableObject {
                 if let archivePath = item.archivePath {
                     navigateInArchive(to: archivePath)
                 }
+            } else if item.isBrowsableArchive {
+                openAsArchive(item)
             } else {
-                // Extract and open the file
                 openArchiveItem(item)
             }
             return
         }
 
-        // Check if this is a ZIP file we should browse into
-        if item.isZipArchive {
+        // Browse a supported archive
+        if item.isBrowsableArchive {
             enterArchive(at: item.url)
             return
         }
@@ -4935,7 +5126,7 @@ class FileBrowserViewModel: ObservableObject {
 
     // MARK: - Archive Navigation
 
-    /// Enter a ZIP archive and browse its contents (the archive is read off the main thread)
+    /// Enter an archive and browse its contents (the archive is read off the main thread)
     func enterArchive(at url: URL) {
         stopInlinePreviews()
         readArchiveEntries(at: url) { [weak self] result in
@@ -4956,16 +5147,154 @@ class FileBrowserViewModel: ObservableObject {
                 self.archiveEntriesSignature = read.signature
                 self.currentArchiveURL = url
                 self.currentArchivePath = ""
-                self.currentPath = url.deletingLastPathComponent()
+                self.currentPath = ArchiveManager.shared.rootArchiveURL(for: url).deletingLastPathComponent()
                 self.isInsideArchive = true
                 self.coverFlowSelectedIndex = 0
                 self.loadContents()
                 self.addToHistory(.archive(archiveURL: url, internalPath: ""))
             case .failure(let error):
-                // Fall back to opening with default app
                 zipNavLogger.error("Error reading archive: \(error.localizedDescription)")
-                NSWorkspace.shared.open(url)
+                if (error as NSError).code != CocoaError.userCancelled.rawValue {
+                    FileOperationAlerts.reportFailures([FileOperationFailure(url: url, error: error)], verb: "opened")
+                }
             }
+        }
+    }
+
+    var canOpenSelectedAsArchive: Bool { primarySelectedItem.map { !$0.isDirectory } ?? false }
+
+    var selectedItemsForCompression: [FileItem] {
+        itemsForCompression(selectedItemsInOrder)
+    }
+
+    func itemsForCompression(_ targets: [FileItem]) -> [FileItem] {
+        guard canAddItemsToCurrentLocation, !targets.contains(where: { isPhotosItem($0) }) else { return [] }
+        return ArchiveCompressionFormat.eligibleItems(targets)
+    }
+
+    func itemsForCompression(clicked item: FileItem) -> [FileItem] {
+        itemsForCompression(selectedItems.contains(item) ? selectedItemsInOrder : [item])
+    }
+
+    func compressItems(_ targets: [FileItem]? = nil, format: ArchiveCompressionFormat) {
+        let sources = itemsForCompression(targets ?? selectedItemsForCompression)
+        guard !sources.isEmpty else { return }
+        let destination = currentPath
+        let window = commandWindow()
+        cancelPendingRename()
+        // The File menu can compress the selection while a search/path field still has focus.
+        // Give the file area the keys now, so the newly selected archive can immediately be
+        // trashed. Do this at command time, before the user can resume typing during compression.
+        // An active rename keeps its editor: committing it here could invalidate `sources`.
+        if renamingURL == nil {
+            KeyboardManager.shared.focusFileArea(in: window)
+        }
+        runFileOperation(
+            actionName: "Compress to " + (format == .zip ? "ZIP" : "7z"),
+            failureVerb: "compressed",
+            title: sources.count == 1 ? "Compressing “\(sources[0].name)”" : "Compressing \(sources.count) items",
+            window: window,
+            work: { journal, progress in
+                ArchiveCompressionEngine.compress(sources, format: format, destination: destination, journal: journal, progress: progress)
+            }
+        ) { [weak self] journal, _ in
+            guard let self else { return }
+            let created = journal.steps.compactMap { step -> URL? in
+                if case .created(let url) = step { return url }
+                return nil
+            }
+            if let archive = created.first, !self.isInsideArchive,
+               self.isShownLocation(archive.deletingLastPathComponent()) {
+                self.pendingSelectionURLs = [archive]
+                self.pendingSelectionURL = archive
+            }
+            self.refresh()
+        }
+    }
+
+    var selectedArchivesForExtraction: [FileItem] {
+        ArchiveExtractionMode.eligibleItems(selectedItemsInOrder)
+    }
+
+    func archivesForExtraction(clicked item: FileItem) -> [FileItem] {
+        ArchiveExtractionMode.eligibleItems(selectedItems.contains(item) ? selectedItemsInOrder : [item])
+    }
+
+    func openAsArchive(_ target: FileItem? = nil) {
+        guard let item = target ?? primarySelectedItem, !item.isDirectory else { return }
+        guard item.isFromArchive, let parent = item.archiveURL, let path = item.archivePath else {
+            enterArchive(at: item.url); return
+        }
+        archiveReadProgress?.cancel()
+        let token = UUID()
+        archiveReadToken = token
+        let progress = Progress(totalUnitCount: max(1, item.size))
+        archiveReadProgress = progress
+        FileOperationEngine.operationDidStart(progress)
+        showActivity(progress, title: "Opening Archive")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try ArchiveManager.shared.openNestedArchive(at: path, in: parent, progress: progress) }
+            DispatchQueue.main.async {
+                FileOperationEngine.operationDidEnd(progress)
+                guard let self else { return }
+                self.endActivity(progress)
+                guard self.archiveReadToken == token, !progress.isCancelled else { return }
+                self.archiveReadProgress = nil
+                switch result {
+                case .success(let url): self.enterArchive(at: url)
+                case .failure(let error):
+                    if (error as NSError).code != CocoaError.userCancelled.rawValue {
+                        FileOperationAlerts.reportFailures([FileOperationFailure(url: item.url, error: error)], verb: "opened")
+                    }
+                }
+            }
+        }
+    }
+
+    func extractArchives(_ targets: [FileItem]? = nil, mode: ArchiveExtractionMode, destination: URL? = nil) {
+        let archives = ArchiveExtractionMode.eligibleItems(targets ?? selectedArchivesForExtraction)
+        guard !archives.isEmpty else { return }
+        let window = commandWindow()
+        if mode == .chosenFolder, destination == nil {
+            let panel = NSOpenPanel()
+            panel.title = archives.count == 1 ? "Extract Archive" : "Extract Archives"
+            panel.message = archives.count == 1 ? "Choose a folder for the extracted contents."
+                : "Choose one folder for the contents of all \(archives.count) archives."
+            panel.prompt = "Extract"
+            panel.canChooseDirectories = true
+            panel.canChooseFiles = false
+            panel.canCreateDirectories = true
+            panel.allowsMultipleSelection = false
+            let original = archives[0].archiveURL ?? archives[0].url
+            panel.directoryURL = ArchiveManager.shared.rootArchiveURL(for: original).deletingLastPathComponent()
+            let extract: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+                guard response == .OK, let folder = panel.url else { return }
+                self?.extractArchives(archives, mode: mode, destination: folder)
+            }
+            if let window { panel.beginSheetModal(for: window, completionHandler: extract) }
+            else { extract(panel.runModal()) }
+            return
+        }
+        runFileOperation(
+            actionName: archives.count == 1 ? "Extract Archive" : "Extract Archives",
+            failureVerb: "extracted",
+            title: archives.count == 1 ? "Extracting “\(archives[0].name)”" : "Extracting \(archives.count) archives",
+            window: window,
+            work: { journal, progress in
+                ArchiveExtractionEngine.extract(archives, mode: mode, destination: destination, journal: journal, progress: progress)
+            }
+        ) { [weak self] journal, _ in
+            guard let self else { return }
+            let created = journal.steps.compactMap { step -> URL? in
+                if case .created(let url) = step { return url }
+                return nil
+            }
+            let shown = created.filter { !self.isInsideArchive && self.isShownLocation($0.deletingLastPathComponent()) }
+            if !shown.isEmpty {
+                self.pendingSelectionURLs = Set(shown)
+                self.pendingSelectionURL = shown.first
+            }
+            self.refresh()
         }
     }
 
@@ -4982,7 +5311,7 @@ class FileBrowserViewModel: ObservableObject {
         let normalizedPath = path.hasSuffix("/") ? String(path.dropLast()) : path
         prepareForNavigation()
         if let selectedPath {
-            // How archive items are addressed (see `ZipArchiveManager.fileItems`)
+            // How archive items are addressed (see `ArchiveManager.fileItems`)
             pendingSelectionURL = URL(fileURLWithPath: archiveURL.path + "#" + selectedPath)
         }
         currentArchivePath = normalizedPath
@@ -4994,7 +5323,22 @@ class FileBrowserViewModel: ObservableObject {
     /// Exit the current archive and return to the folder containing it (the archive is selected)
     func exitArchive() {
         guard isInsideArchive, let archiveURL = currentArchiveURL else { return }
-        navigateToAndSelectCurrent(archiveURL.deletingLastPathComponent())
+        if let parent = ArchiveManager.shared.parentArchive(of: archiveURL) {
+            let folder = parent.memberPath.split(separator: "/").dropLast().joined(separator: "/")
+            readArchiveEntries(at: parent.url) { [weak self] result in
+                guard let self else { return }
+                switch result {
+                case .success(let read):
+                    self.showArchive(parent.url, entries: read.entries, signature: read.signature, at: folder,
+                                     selecting: URL(fileURLWithPath: parent.url.path + "#" + parent.memberPath))
+                    self.addToHistory(.archive(archiveURL: parent.url, internalPath: folder))
+                case .failure:
+                    self.navigateToAndSelectCurrent(ArchiveManager.shared.rootArchiveURL(for: archiveURL).deletingLastPathComponent())
+                }
+            }
+        } else {
+            navigateToAndSelectCurrent(archiveURL.deletingLastPathComponent())
+        }
     }
 
     /// Navigate up one level (handles both archive and filesystem)
@@ -5023,25 +5367,30 @@ class FileBrowserViewModel: ObservableObject {
 
         guard !item.isDirectory else { return }
 
-        // Extract on background thread to avoid blocking UI
-        DispatchQueue.global(qos: .userInitiated).async {
-            do {
-                let tempURL = try ZipArchiveManager.shared.extractByPath(archivePath, from: archiveURL)
-                DispatchQueue.main.async {
-                    NSWorkspace.shared.open(tempURL)
-                }
-            } catch {
-                DispatchQueue.main.async {
-                    FileOperationAlerts.reportFailures([FileOperationFailure(url: item.url, error: error)], verb: "opened")
+        let progress = Progress(totalUnitCount: max(1, item.size))
+        let window = commandWindow()
+        FileOperationEngine.operationDidStart(progress)
+        showActivity(progress, title: "Opening File")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try ArchiveManager.shared.extractByPath(archivePath, from: archiveURL, progress: progress) }
+            DispatchQueue.main.async {
+                FileOperationEngine.operationDidEnd(progress)
+                self?.endActivity(progress)
+                switch result {
+                case .success(let url): if !progress.isCancelled { NSWorkspace.shared.open(url) }
+                case .failure(let error):
+                    if (error as NSError).code != CocoaError.userCancelled.rawValue {
+                        FileOperationAlerts.reportFailures([FileOperationFailure(url: item.url, error: error)], verb: "opened", in: window)
+                    }
                 }
             }
         }
     }
 
     func previewURL(for item: FileItem) -> URL? {
-        // Quick Look is disabled for archive items
         if item.isFromArchive {
-            return nil
+            guard let archive = item.archiveURL, let path = item.archivePath, !item.isDirectory else { return nil }
+            return ArchiveManager.shared.cachedPreviewURL(for: path, in: archive)
         }
         if let identifier = photosAssetIdentifier(from: item.url) {
             return photosExportCache[identifier]
@@ -5049,9 +5398,30 @@ class FileBrowserViewModel: ObservableObject {
         return item.url
     }
 
-    /// Completion-based variant used by the Quick Look callers (archive items have no preview URL)
+    /// Prepares only the requested member for Quick Look
     func previewURL(for item: FileItem, completion: @escaping (URL?) -> Void) {
-        completion(previewURL(for: item))
+        if let cached = previewURL(for: item) { completion(cached); return }
+        guard item.isFromArchive, !item.isDirectory, let archive = item.archiveURL, let path = item.archivePath else {
+            completion(nil); return
+        }
+        let progress = Progress(totalUnitCount: max(1, item.size))
+        FileOperationEngine.operationDidStart(progress)
+        showActivity(progress, title: "Preparing Preview")
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = Result { try ArchiveManager.shared.extractByPath(path, from: archive, progress: progress) }
+            DispatchQueue.main.async {
+                FileOperationEngine.operationDidEnd(progress)
+                self?.endActivity(progress)
+                switch result {
+                case .success(let url): completion(url)
+                case .failure(let error):
+                    completion(nil)
+                    if (error as NSError).code != CocoaError.userCancelled.rawValue {
+                        FileOperationAlerts.reportFailures([FileOperationFailure(url: item.url, error: error)], verb: "previewed")
+                    }
+                }
+            }
+        }
     }
 
     /// The lead ("focused") item of the selection: the most recently clicked or navigated item
@@ -5822,7 +6192,7 @@ class FileBrowserViewModel: ObservableObject {
                 // Nothing is copied: drop what was already extracted (the interrupted item's
                 // partial output is removed by the extraction itself)
                 for url in extractedURLs {
-                    ZipArchiveManager.shared.discardCopyExtraction(url)
+                    ArchiveManager.shared.discardCopyExtraction(url)
                 }
             }
 
@@ -5838,7 +6208,7 @@ class FileBrowserViewModel: ObservableObject {
                     // Something else was copied meanwhile: this copy lost.
                     DispatchQueue.global(qos: .utility).async {
                         for url in extractedURLs {
-                            ZipArchiveManager.shared.discardCopyExtraction(url)
+                            ArchiveManager.shared.discardCopyExtraction(url)
                         }
                     }
                 }
@@ -5862,7 +6232,7 @@ class FileBrowserViewModel: ObservableObject {
     }
 
     /// Extracts an archive item into a fresh private temp directory for copy/paste, off the main
-    /// thread. ZipArchiveManager validates against the archive on disk (path containment, size
+    /// thread. ArchiveManager validates against the archive on disk (path containment, size
     /// caps, CRC, permissions, quarantine). Problems are returned, to be shown in one alert per
     /// copy; a cancelled extraction (via `progress`) has none.
     nonisolated private static func extractArchiveItemForCopy(_ item: FileItem, progress: Progress?) -> ArchiveExtraction {
@@ -5872,9 +6242,9 @@ class FileBrowserViewModel: ObservableObject {
             return .failed(FileOperationFailure(url: item.url, error: error))
         }
 
-        let result: ZipExtractionResult
+        let result: ArchiveExtractionResult
         do {
-            result = try ZipArchiveManager.shared.extractItemForCopy(archivePath: archivePath, from: archiveURL, progress: progress)
+            result = try ArchiveManager.shared.extractItemForCopy(archivePath: archivePath, from: archiveURL, progress: progress)
         } catch let error as CocoaError where error.code == .userCancelled {
             return .cancelled
         } catch {
@@ -5944,7 +6314,7 @@ class FileBrowserViewModel: ObservableObject {
         let isMove = contents.isCut || movingItems
         // Archive copy-outs being pasted stay on disk until the paste is done, even if the
         // clipboard changes meanwhile.
-        let extractionLease = ZipArchiveManager.shared.leaseCopyExtractions(contents.urls)
+        let extractionLease = ArchiveManager.shared.leaseCopyExtractions(contents.urls)
 
         transferItems(
             contents.urls.map { (source: $0, directory: destination) },

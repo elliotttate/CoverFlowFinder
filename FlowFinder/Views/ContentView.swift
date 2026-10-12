@@ -728,6 +728,35 @@ enum ContextMenuTarget {
     }
 }
 
+struct ArchiveCompressionMenu: View {
+    // File commands resolve live selection; context menus pass their captured targets.
+    var items: [FileItem]? = nil
+    @ObservedObject var viewModel: FileBrowserViewModel
+
+    var body: some View {
+        let targets = items ?? viewModel.selectedItemsForCompression
+        ForEach(ArchiveCompressionFormat.allCases, id: \.self) { format in
+            Button(format.title) { viewModel.compressItems(items, format: format) }
+                .disabled(targets.isEmpty)
+        }
+    }
+}
+
+struct ArchiveExtractionMenu: View {
+    var items: [FileItem]? = nil
+    @ObservedObject var viewModel: FileBrowserViewModel
+
+    var body: some View {
+        let targets = items ?? viewModel.selectedArchivesForExtraction
+        Menu(targets.count > 1 ? "Extract Archives" : "Extract Archive") {
+            ForEach(ArchiveExtractionMode.allCases, id: \.self) { mode in
+                Button(mode.title(for: targets)) { viewModel.extractArchives(items, mode: mode) }
+            }
+        }
+        .disabled(targets.isEmpty)
+    }
+}
+
 struct FileItemContextMenu: View {
     let item: FileItem
     @ObservedObject var viewModel: FileBrowserViewModel
@@ -745,6 +774,19 @@ struct FileItemContextMenu: View {
         Group {
             Button("Open") {
                 viewModel.openItem(item)
+            }
+
+            if !item.isDirectory {
+                Button("Open as Archive") { viewModel.openAsArchive(item) }
+            }
+            let archives = viewModel.archivesForExtraction(clicked: item)
+            if !archives.isEmpty {
+                ArchiveExtractionMenu(items: archives, viewModel: viewModel)
+            }
+
+            let compressionItems = viewModel.itemsForCompression(clicked: item)
+            if !compressionItems.isEmpty {
+                ArchiveCompressionMenu(items: compressionItems, viewModel: viewModel)
             }
 
             // Show Package Contents option for bundles like .app
@@ -1117,7 +1159,8 @@ struct PathBarView: View {
 
         if let url = component.url {
             // Regular filesystem navigation (also leaves an archive, in one history step)
-            viewModel.navigateToAndSelectCurrent(url)
+            if component.archivePath != nil { viewModel.enterArchive(at: url) }
+            else { viewModel.navigateToAndSelectCurrent(url) }
         } else if let archivePath = component.archivePath {
             // Navigate within archive
             viewModel.navigateInArchive(to: archivePath)
