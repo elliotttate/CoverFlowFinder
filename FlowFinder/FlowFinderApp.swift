@@ -305,7 +305,7 @@ struct BrowserCommands: Commands {
                     viewModel?.navigateTo(downloads)
                 }
             }
-            .keyboardShortcut("l", modifiers: [.command, .shift])
+            .keyboardShortcut("l", modifiers: [.command, .option])
             .disabled(viewModel == nil)
 
             Button("Applications") {
